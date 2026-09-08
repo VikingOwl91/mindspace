@@ -94,18 +94,21 @@ pub fn normalize_subject(s: &str) -> String {
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     File,
+    GitBlob,
 }
 
 impl SourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SourceKind::File => "file",
+            SourceKind::GitBlob => "git_blob",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "file" => Some(SourceKind::File),
+            "git_blob" => Some(SourceKind::GitBlob),
             _ => None,
         }
     }
@@ -287,6 +290,39 @@ impl fmt::Display for SourcePresence {
     }
 }
 
+/// The kind of a logical source identity: a plain file path, or a git
+/// (repository, commit, path) material. Distinct from SourceKind, which
+/// types content versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalKind {
+    File,
+    GitPath,
+}
+
+impl LogicalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogicalKind::File => "file",
+            LogicalKind::GitPath => "git_path",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "file" => Some(LogicalKind::File),
+            "git_path" => Some(LogicalKind::GitPath),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for LogicalKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The stable identity of a source across moves and renames. This is the
 /// mutable lifecycle entity of the source side of the model; versions
 /// (Source rows) are immutable. Adapters of future source kinds bring their
@@ -295,7 +331,7 @@ impl fmt::Display for SourcePresence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicalSource {
     pub id: Uuid,
-    pub kind: SourceKind,
+    pub kind: LogicalKind,
     pub state: SourcePresence,
     /// Last known location. Kept when the source disappears so a
     /// reappearance at the same path can be recognized.
@@ -414,7 +450,8 @@ pub struct MemorySummary {
 }
 
 /// Everything the engine knows about one memory, including the full
-/// provenance chain down to the source.
+/// provenance chain down to the source, plus git provenance when the
+/// source version was derived from a git blob.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryDetail {
     pub memory: Memory,
@@ -425,6 +462,21 @@ pub struct MemoryDetail {
     pub spaces: Vec<Space>,
     pub superseded_by: Option<MemorySummary>,
     pub supersedes: Vec<MemorySummary>,
+    pub git: Option<GitProvenance>,
+}
+
+/// The git provenance of a source version derived from a text blob:
+/// repository, blob, path, commit, and the refs that currently point at
+/// the commit (ref context is observational, not part of identity).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitProvenance {
+    pub repository_path: String,
+    pub blob_oid: String,
+    pub path: String,
+    pub commit_oid: String,
+    pub commit_time: Ts,
+    pub commit_message: String,
+    pub refs: Vec<String>,
 }
 
 /// A space membership as it contributed to a search hit. `via` records the
@@ -497,12 +549,14 @@ pub struct ConflictGroup {
 /// The boundary of one ingest operation. A `Directory` observation covers a
 /// whole ingest root and drives the full lifecycle reconciliation (moves,
 /// disappearances); a `File` observation is a partial, path-local
-/// observation that never marks anything disappeared.
+/// observation that never marks anything disappeared; a `GitRepository`
+/// observation scans committed objects and refs of one git repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestScope {
     Directory,
     File,
+    GitRepository,
 }
 
 impl IngestScope {
@@ -510,6 +564,7 @@ impl IngestScope {
         match self {
             IngestScope::Directory => "directory",
             IngestScope::File => "file",
+            IngestScope::GitRepository => "git_repository",
         }
     }
 
@@ -517,6 +572,7 @@ impl IngestScope {
         match s {
             "directory" => Some(IngestScope::Directory),
             "file" => Some(IngestScope::File),
+            "git_repository" => Some(IngestScope::GitRepository),
             _ => None,
         }
     }
@@ -640,6 +696,227 @@ pub struct ObservationReport {
     pub scope: IngestScope,
     pub files: Vec<FileObservation>,
     pub events: Vec<SourceEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// Git observation structures
+//
+// These are plain, git-library-free types: the ingest side reads a git
+// repository and hands the store normalized data. Objects are immutable and
+// identified by (repository, oid); refs are observations with a
+// transaction-time journal.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitObjectKind {
+    Commit,
+    Tree,
+    Blob,
+    Tag,
+}
+
+impl GitObjectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitObjectKind::Commit => "commit",
+            GitObjectKind::Tree => "tree",
+            GitObjectKind::Blob => "blob",
+            GitObjectKind::Tag => "tag",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "commit" => Some(GitObjectKind::Commit),
+            "tree" => Some(GitObjectKind::Tree),
+            "blob" => Some(GitObjectKind::Blob),
+            "tag" => Some(GitObjectKind::Tag),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GitObjectKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitRefObservation {
+    pub name: String,
+    pub target_oid: String,
+    pub target_kind: GitObjectKind,
+    /// Set when the ref is symbolic (e.g. HEAD -> refs/heads/main).
+    pub symbolic_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitData {
+    pub oid: String,
+    pub tree_oid: String,
+    /// Parent oids in order; a merge has two or more.
+    pub parents: Vec<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_time: Ts,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub commit_time: Ts,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitTreeEntryData {
+    pub name: String,
+    pub mode: String,
+    pub target_oid: String,
+    pub target_kind: GitObjectKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitTreeData {
+    pub oid: String,
+    pub entries: Vec<GitTreeEntryData>,
+}
+
+/// A blob object. `content` is present only for text blobs
+/// (`.md`, `.markdown`, `.txt`), which are the derivation inputs; other
+/// blobs are recorded as identity and size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitBlobData {
+    pub oid: String,
+    pub size_bytes: u64,
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitTagData {
+    pub oid: String,
+    pub target_oid: String,
+    pub target_kind: GitObjectKind,
+    pub tagger_name: String,
+    pub tagger_email: String,
+    pub tag_time: Option<Ts>,
+    pub message: String,
+}
+
+/// One text file derived at a ref tip: a git blob routed through the
+/// existing evidence/assertion pipeline with git extraction rule ids.
+#[derive(Debug, Clone)]
+pub struct GitDerivedFile {
+    pub path: String,
+    pub blob_oid: String,
+    pub commit_oid: String,
+    pub content: String,
+    pub content_hash: String,
+    pub title: String,
+    pub media_type: String,
+    pub evidences: Vec<EvidenceDraft>,
+    pub assertions: Vec<AssertionDraft>,
+    pub memories: Vec<MemorySpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRefEventKind {
+    Created,
+    FastForward,
+    NonFastForward,
+    Deleted,
+}
+
+impl GitRefEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitRefEventKind::Created => "created",
+            GitRefEventKind::FastForward => "fast_forward",
+            GitRefEventKind::NonFastForward => "non_fast_forward",
+            GitRefEventKind::Deleted => "deleted",
+        }
+    }
+}
+
+/// A computed ref delta handed to the store. Classification happens in the
+/// ingest side (which can ask git the ancestor question); the store only
+/// journals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitRefEventDraft {
+    pub name: String,
+    pub kind: GitRefEventKind,
+    pub from_oid: Option<String>,
+    pub to_oid: Option<String>,
+}
+
+/// Everything one git observation saw, handed to the store in a single
+/// call. The store owns the transaction, identity decisions, and counters.
+#[derive(Debug, Clone)]
+pub struct GitObservation {
+    pub session: SessionDraft,
+    pub repository_id: Uuid,
+    pub repository_path: String,
+    pub refs: Vec<GitRefObservation>,
+    pub commits: Vec<GitCommitData>,
+    pub trees: Vec<GitTreeData>,
+    pub blobs: Vec<GitBlobData>,
+    pub tags: Vec<GitTagData>,
+    pub derivations: Vec<GitDerivedFile>,
+    pub ref_events: Vec<GitRefEventDraft>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitFileOutcome {
+    /// The version (repository, commit, path, content) already existed.
+    Unchanged,
+    /// The version is new in this session.
+    New,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitFileReport {
+    pub path: String,
+    pub commit_oid: String,
+    pub blob_oid: String,
+    pub outcome: GitFileOutcome,
+    pub actions: Vec<MemoryAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitRefEventRecord {
+    pub ref_name: String,
+    pub kind: GitRefEventKind,
+    pub from_oid: Option<String>,
+    pub to_oid: Option<String>,
+    pub created_at: Ts,
+}
+
+/// Deterministic counters and per-file results of one git observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitObservationReport {
+    pub session_id: Uuid,
+    pub repository_id: Uuid,
+    pub repository_path: String,
+    pub refs_observed: u64,
+    pub refs_added: u64,
+    pub refs_changed: u64,
+    pub refs_removed: u64,
+    pub objects_discovered: u64,
+    pub objects_new: u64,
+    pub objects_existing: u64,
+    pub derivations_new: u64,
+    pub derivations_reused: u64,
+    pub files: Vec<GitFileReport>,
+    pub events: Vec<GitRefEventRecord>,
+}
+
+/// What `ingest_path` did: a file/directory observation or a git
+/// repository observation.
+#[derive(Debug, Clone)]
+pub enum IngestOutcome {
+    Files(ObservationReport),
+    Git(GitObservationReport),
 }
 
 /// Active-memory counts per space, keyed by space name, for listings.

@@ -223,6 +223,7 @@ The commands implemented in v0:
 mind init
 mind ingest ./notes.md --space coding
 mind ingest ~/Documents --space personal   # directory: full source-lifecycle scan
+mind ingest ~/src/owlry --space coding     # git repo: committed objects + ref journal
 mind space list
 mind space create eragon
 mind space link coding linux
@@ -329,7 +330,19 @@ and tested. What works today:
 - temporal queries (`search --at`) over the stored timeline
 - full provenance chains (`inspect`, `trace`) that never lose history:
   superseded and retired memories stay inspectable forever
+- git repository ingest: committed objects (commits, trees, blobs, tags)
+  as immutable graph nodes, refs as a transaction-time journal, text blobs
+  at ref tips derived through the normal evidence/assertion pipeline
 - a CLI (`mind`) with human and `--json` output
+
+What git ingest observes and what it defers: it reads committed objects and
+refs only. Uncommitted working-tree content belongs to no ref and is not
+modeled (a future working-tree observation would be its own session kind,
+not a fake commit). Fast-forward is claimed only when provable by git's own
+ancestor check; rewritten history is recorded as non-fast-forward without
+guessing rebase or force-push. Same blob at two paths or two branches is one
+object with separate derivations; two clones stay two repositories, qualified
+by their own identity markers. See `docs/memory-model.md` section 12.
 
 Explicitly deferred: AI extraction, embeddings, sync, auth, remote or hosted
 operation, PostgreSQL implementation, GUI/TUI. See `docs/decisions.md` for

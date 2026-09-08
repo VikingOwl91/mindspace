@@ -3,8 +3,9 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    ConflictGroup, IngestObservation, Memory, MemoryDetail, MemorySummary, ObservationReport,
-    Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts,
+    ConflictGroup, GitObservation, GitObservationReport, GitRefObservation, IngestObservation,
+    Memory, MemoryDetail, MemorySummary, ObservationReport, Result, SearchHitRaw, SearchQuery,
+    SourceLifecycle, Space, SpaceLink, Ts,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and
@@ -34,6 +35,15 @@ pub trait Store {
     fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport>;
     /// The logical identity and lifecycle journal of one source.
     fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>>;
+
+    /// Atomically records one git repository observation: the session,
+    /// repository identity, all newly discovered immutable objects, the
+    /// latest ref states plus their journal events, and the derivation of
+    /// text blobs at ref tips through the normal evidence/assertion
+    /// pipeline. Counters in the report are deterministic.
+    fn record_git_observation(&self, observation: GitObservation) -> Result<GitObservationReport>;
+    /// Latest observed ref states of one repository, ordered by name.
+    fn git_refs_current(&self, repository_id: Uuid) -> Result<Vec<GitRefObservation>>;
 
     // -- memory inspection ---------------------------------------------------
 

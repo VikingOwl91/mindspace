@@ -197,3 +197,61 @@ stronger identity signals through the same adapter shape.
 
 **Revisit when.** Directory ingest UX expands (ignore rules), Git adapters
 arrive, or cross-root move inference is wanted.
+
+## ADR-014: Git via the system binary, plumbing only (2026-09-08)
+
+**Decision.** Git repository ingest reads the system `git` binary with
+stable, machine-readable plumbing commands only: `for-each-ref --format`
+(NUL-separated), `rev-parse`, `symbolic-ref -q`, `rev-list --objects
+--no-object-names`, `cat-file --batch-check` / `--batch` (streaming object
+payloads), `ls-tree -r -z`, and `merge-base --is-ancestor` (exit-code
+semantics). No localized human output is ever parsed. `gix` (gitoxide) was
+considered and deferred.
+
+**Why.** The plumbing surface is stable across git versions, requires no new
+Cargo dependency tree, and keeps the reader a thin, auditable adapter: every
+command is read-only, so hooks, scripts, and the working tree are never
+involved (repository contents are treated as untrusted input). Raw object
+payload parsing (commit headers, tree entries, tag objects) is parsing of a
+documented binary/text object format, not of human output.
+
+**Consequences.** Git is a runtime requirement for git ingest (explicit
+`GitUnavailable` error otherwise). Commands run per session, not per object
+(`rev-list` once, `batch-check` once, one `--batch` for structural objects,
+one for text blob contents, one `ls-tree` per ref tip), so a session is a
+fixed number of subprocesses plus batched SQL. gix stays open as a future
+swap behind the same reader shape if the subprocess becomes a bottleneck.
+
+**Revisit when.** Very large repositories make the subprocess count or
+output size a real problem, or a no-system-dependency build is required.
+
+## ADR-015: Git history is a graph of immutable objects plus a transaction-time ref journal (2026-09-08)
+
+**Decision.** Commits, trees, blobs, and annotated tag objects are stored as
+immutable objects keyed `(repository, oid)`; refs (heads, remotes, tags,
+HEAD) are mutable pointers observed over transaction time with a journal of
+created / fast_forward / non_fast_forward / deleted events. Repository
+identity is a Mindspace marker file in the git common dir, so moving a
+repository keeps its identity while a fresh clone gets its own; remote URLs
+are observations, never identity. Text blobs at ref tips are derived through
+the existing evidence/assertion pipeline with `git:`-prefixed extractor ids;
+the logical source of a derivation is scoped per `(repository, commit,
+path)`, so git-derived memories never auto-supersede across commits.
+Fast-forward is a proven ancestor check; everything else is recorded as
+non_fast_forward without claiming rebase or force-push.
+
+**Why.** Flattening git into files would destroy exactly what git knows
+exactly (topology, ref movements, object identity); deriving beliefs per
+branch timeline would invent continuity that ref names do not have (branch
+names are not durable identity, ref deletion is not history deletion, ref
+name reuse is an observation not a rebirth). Deriving only at tips keeps
+"what do we believe" at the heads of development while the full graph stays
+provenance-inspectable.
+
+**Explicit non-identities.** Same blob != same logical source; same patch !=
+same commit; patch-equivalent != identical; ref name != durable branch
+identity; ref disappearance != history deletion; non-fast-forward !=
+automatically rebase.
+
+**Revisit when.** Per-branch belief timelines, cross-repository dedup, or
+history-rewrite explanation (rebase detection) become real requirements.

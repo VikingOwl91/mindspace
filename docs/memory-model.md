@@ -523,3 +523,79 @@ defined here.
 - Any AI-assisted extraction (the extraction column is designed to carry
   model-assisted rule identifiers when that day comes, without schema or
   conceptual changes).
+
+## 12. Git repositories (v0.2)
+
+Git history is a graph of immutable objects plus a transaction-time journal
+of mutable refs. Mindspace models both faithfully and never flattens a
+repository into a directory of files.
+
+### 12.1 Objects
+
+Commits, trees, blobs, and annotated tag objects are immutable and
+identified by `(repository, oid)`; objects are never deduplicated across
+repositories (two clones stay distinct stores of knowledge). A commit keeps
+its parent list in order, so merges are topologically real. Trees keep
+their entries (name, mode, target oid, kind), which is how blob-at-path
+provenance is reconstructed. Blob content is stored only for text blobs
+(`.md`, `.markdown`, `.txt`), the derivation inputs; every other blob is
+recorded as identity and size. Objects are never deleted: a commit that
+became unreachable after a history rewrite was still observed once, and the
+store keeps it.
+
+### 12.2 Repository identity
+
+A repository's Mindspace identity lives in a marker file inside the git
+common dir. Moving the repository moves the marker; a fresh clone starts
+without it and gets its own; a byte-level copy inherits it (it is the same
+repository bit-for-bit). If the marker cannot be read or written, ingestion
+fails rather than guessing. Remote URLs are observations, not identity, and
+changing them never rewrites identity.
+
+### 12.3 Refs
+
+Refs (heads, remotes, tags, HEAD) are mutable pointers observed at
+transaction time. Each session records the full ref state and journals only
+changes: created, fast_forward, non_fast_forward, deleted. Fast-forward is
+claimed only when git itself proves the old target is an ancestor of the
+new one (`merge-base --is-ancestor`); everything else is non_fast_forward,
+never "rebase" or "force-push". Deleting a ref removes its current-state
+row and journals the deletion; it deletes no history and no objects. A ref
+name that reappears is just the next observation of that name. A symbolic
+HEAD is a view of its branch and produces no events of its own; a detached
+HEAD is a real pointer and is journalled. Lightweight tags are refs
+pointing at commits; annotated tags are tag objects with tagger and
+message, preserved as such, and moving a tag is journalled like any ref
+update.
+
+### 12.4 Derivations
+
+Text blobs at ref tips are derived through the normal pipeline (evidence ->
+assertions -> memories) with git-prefixed extractor ids
+(`git:markdown:section-heading`, ...). The logical source of a derivation is
+scoped per `(repository, commit, path)`: branches are not belief timelines,
+so git-derived memories never auto-supersede across commits, and the same
+text at two commits yields two coexisting memories whose provenance differs
+by exactly the commit. Same blob != same logical source: one blob object,
+many path relations. The working tree is never consulted; uncommitted
+content belongs to no ref and is deferred (see README).
+
+Provenance chain for a git-derived memory:
+
+```text
+Memory -> Assertion -> Evidence -> Source version (git blob text)
+  -> blob oid + path -> commit (parents, author, committer, message)
+  -> repository (marker identity) -> refs pointing at the commit
+```
+
+### 12.5 Idempotence layers
+
+Three independent guarantees, all tested:
+
+1. **Object idempotence**: ingesting the same repository again discovers
+   the same oids and writes nothing new (`objects_new = 0`).
+2. **Observation idempotence**: an unchanged ref state produces no events;
+   sessions still record that a scan happened.
+3. **Derivation idempotence**: the same immutable input (blob content at
+   the same commit and path) with the same extractor produces no new
+   evidence, assertions, or memories (`derivations_reused`).

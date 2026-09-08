@@ -37,7 +37,10 @@ src/
   ingest/      deterministic observation: file and directory scans,
                markdown/text parsing into evidence drafts, subject/title
                rules, and the ingest orchestration that calls the store.
-               Pure parsing functions are unit-tested without a DB.
+               `ingest/git.rs` reads git repositories through the system
+               git binary (plumbing only; ADR-014) and hands normalized
+               object/ref data to the store. Pure parsing functions are
+               unit-tested without a DB or a repository.
   retrieval/   search orchestration: query filters, directed space traversal
                (BFS, cycle-safe), hit assembly and explanation.
   cli/         clap definitions and human/JSON rendering. Knows the engine,
@@ -130,6 +133,23 @@ memories(id, assertion_id -> assertions, state CHECK active|superseded|retired,
 memory_spaces(memory_id -> memories, space_id -> spaces, created_at,
               PRIMARY KEY (memory_id, space_id))
 assertion_fts  FTS5(assertion_id UNINDEXED, subject, content)
+
+Git objects and refs (migration 0003; ADR-015):
+
+repositories(id, current_path, created_at)
+git_commits(repository_id, oid, tree_oid, author/committer name/email/time,
+            message, parents in order via git_commit_parents; PK (repository_id, oid))
+git_trees(repository_id, oid) + git_tree_entries(tree, name, mode, target, kind)
+git_blobs(repository_id, oid, size, content NULL except text blobs)
+git_tags(repository_id, oid, target, target_kind, tagger, message)
+git_refs(repository_id, name, target_oid, target_kind, symbolic_target,
+         last_observed_at)                 -- latest observed state
+git_ref_events(id, repository_id, ref_name, kind created|fast_forward|
+         non_fast_forward|deleted, from_oid, to_oid, session_id, created_at)
+git_source_versions(source_id, repository_id, blob_oid, path, commit_oid)
+logical_sources gains (repository_id, commit_oid, git_path) with a partial
+UNIQUE index: git logical identity is per (repository, commit, path).
+ingest_sessions.scope gains 'git_repository'.
 ```
 
 An assertion is the stable interpretation of a piece of evidence; a memory is

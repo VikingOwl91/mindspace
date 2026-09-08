@@ -7,10 +7,12 @@ use uuid::Uuid;
 
 use crate::core::{
     sha256_hex, Assertion, AssertionKind, ConflictGroup, Error, Evidence, EvidenceKind,
-    FileObservation, FileOutcome, IngestObservation, IngestScope, LogicalSource, Memory,
-    MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
-    ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
-    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, Ts,
+    FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
+    GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
+    IngestScope, LogicalSource, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
+    MemorySummary, ObservationReport, ObservedFile, Result, SearchHitRaw, SearchQuery, Source,
+    SourceEvent, SourceEventKind, SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink,
+    Ts,
 };
 use crate::storage::Store;
 
@@ -20,6 +22,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         2,
         include_str!("../../migrations/0002_source_lifecycle.sql"),
     ),
+    (3, include_str!("../../migrations/0003_git_ingest.sql")),
 ];
 
 pub struct SqliteStore {
@@ -89,6 +92,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             applied.insert(v.map_err(dberr)?);
         }
     }
+    // Migrations run with foreign keys disabled: table rebuilds (the
+    // documented SQLite way to change constraints) drop referenced tables.
+    // The setting is a no-op inside a transaction, so it is toggled at the
+    // connection level around the migration batch and restored after.
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(dberr)?;
     for (version, sql) in MIGRATIONS {
         if applied.contains(version) {
             continue;
@@ -102,6 +111,8 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .map_err(dberr)?;
         tx.commit().map_err(dberr)?;
     }
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(dberr)?;
     Ok(())
 }
 
@@ -502,6 +513,7 @@ impl Store for SqliteStore {
             "m.superseded_by = ?",
             vec![Value::Text(memory.id.to_string())],
         )?;
+        let git = load_git_provenance(&self.conn, &source.id)?;
         Ok(Some(MemoryDetail {
             memory,
             assertion,
@@ -511,7 +523,43 @@ impl Store for SqliteStore {
             spaces,
             superseded_by,
             supersedes,
+            git,
         }))
+    }
+
+    fn record_git_observation(
+        &self,
+        observation: crate::core::GitObservation,
+    ) -> Result<GitObservationReport> {
+        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let report = record_git_observation_tx(&tx, &observation)?;
+        tx.commit().map_err(dberr)?;
+        Ok(report)
+    }
+
+    fn git_refs_current(&self, repository_id: Uuid) -> Result<Vec<GitRefObservation>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, target_oid, target_kind, symbolic_target FROM git_refs \
+                 WHERE repository_id = ?1 ORDER BY name",
+            )
+            .map_err(dberr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![repository_id.to_string()], |r| {
+                Ok(GitRefObservation {
+                    name: r.get(0)?,
+                    target_oid: r.get(1)?,
+                    target_kind: enum_col(r, "target_kind", crate::core::GitObjectKind::parse)?,
+                    symbolic_target: r.get(3)?,
+                })
+            })
+            .map_err(dberr)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(dberr)?);
+        }
+        Ok(out)
     }
 
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {
@@ -996,7 +1044,8 @@ fn record_observation_tx(
                 // and a manually retired memory must be recreated on an
                 // explicit re-ingest. Content equality guarantees the
                 // reconciliation can only reuse (never supersede).
-                let (_, _, evidence_ids) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let (_, _, evidence_ids) =
+                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
                 let actions =
                     reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
@@ -1012,7 +1061,8 @@ fn record_observation_tx(
                 logical,
                 file_idx,
             } => {
-                let (_, _, evidence_ids) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let (_, _, evidence_ids) =
+                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
                 let actions =
                     reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
@@ -1025,7 +1075,8 @@ fn record_observation_tx(
             }
             Plan::Created { location, file_idx } => {
                 let logical = create_logical_source(conn, &files[file_idx], at)?;
-                let (_, _, evidence_ids) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let (_, _, evidence_ids) =
+                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
                 let actions =
                     reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
@@ -1044,7 +1095,8 @@ fn record_observation_tx(
             } => {
                 // The content version already exists and is reused; only
                 // the lifecycle moves. No knowledge is touched.
-                let (added, _, _) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let (added, _, _) =
+                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
                 debug_assert!(!added, "a continued source reuses its version");
                 conn.execute(
                     "UPDATE logical_sources SET state = 'present', current_location = ?1 \
@@ -1175,6 +1227,7 @@ fn create_logical_source(conn: &Connection, file: &ObservedFile, at: Ts) -> Resu
 fn ensure_version(
     conn: &Connection,
     logical: Uuid,
+    kind: SourceKind,
     file: &ObservedFile,
     at: Ts,
 ) -> Result<(bool, Uuid, Vec<Uuid>)> {
@@ -1211,10 +1264,11 @@ fn ensure_version(
     conn.execute(
         "INSERT INTO sources (id, logical_id, kind, location, title, content, content_hash, \
              media_type, size_bytes, ingested_at) \
-         VALUES (?1, ?2, 'file', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             version_id.to_string(),
             logical.to_string(),
+            kind.as_str(),
             file.location,
             file.title,
             file.content,
@@ -1788,7 +1842,7 @@ fn load_evidence(conn: &Connection, id: Uuid) -> Result<Evidence> {
 fn row_logical_source(row: &Row) -> rusqlite::Result<LogicalSource> {
     Ok(LogicalSource {
         id: uuid_col(row, "id")?,
-        kind: enum_col(row, "kind", SourceKind::parse)?,
+        kind: enum_col(row, "kind", crate::core::LogicalKind::parse)?,
         state: enum_col(row, "state", SourcePresence::parse)?,
         current_location: row.get("current_location")?,
         created_at: ts_col(row, "created_at")?,
@@ -1852,4 +1906,417 @@ fn load_source_lifecycle(conn: &Connection, logical_id: Uuid) -> Result<Option<S
         events.push(r.map_err(dberr)?);
     }
     Ok(Some(SourceLifecycle { logical, events }))
+}
+
+// ---------------------------------------------------------------------------
+// Git observation transaction
+// ---------------------------------------------------------------------------
+
+fn record_git_observation_tx(
+    conn: &Connection,
+    observation: &GitObservation,
+) -> Result<GitObservationReport> {
+    let at = observation.session.observed_at;
+
+    // 1. Session journal entry.
+    let session_id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO ingest_sessions (id, root, scope, observed_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            session_id.to_string(),
+            observation.session.root,
+            observation.session.scope.as_str(),
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+
+    // 2. Repository identity: the marker-backed id. current_path tracks the
+    //    last observed location, like logical_sources.current_location.
+    conn.execute(
+        "INSERT INTO repositories (id, current_path, created_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(id) DO UPDATE SET current_path = excluded.current_path",
+        rusqlite::params![
+            observation.repository_id.to_string(),
+            observation.repository_path,
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+
+    // 3. Objects: immutable, keyed (repository, oid). Existing ones are
+    //    reused; only new ones are written. Objects are never deleted, so
+    //    unreachable objects that were observed before are retained.
+    let mut existing: HashSet<String> = HashSet::new();
+    for table in ["git_commits", "git_trees", "git_blobs", "git_tags"] {
+        let sql = format!("SELECT oid FROM {table} WHERE repository_id = ?1");
+        let mut stmt = conn.prepare(&sql).map_err(dberr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![observation.repository_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(dberr)?;
+        for r in rows {
+            existing.insert(r.map_err(dberr)?);
+        }
+    }
+    let all_oids: Vec<&String> = observation
+        .commits
+        .iter()
+        .map(|c| &c.oid)
+        .chain(observation.trees.iter().map(|t| &t.oid))
+        .chain(observation.blobs.iter().map(|b| &b.oid))
+        .chain(observation.tags.iter().map(|t| &t.oid))
+        .collect();
+    let mut objects_new: u64 = 0;
+    let mut objects_existing: u64 = 0;
+    for oid in &all_oids {
+        if existing.contains(*oid) {
+            objects_existing += 1;
+        } else {
+            objects_new += 1;
+        }
+    }
+    let is_new = |oid: &str| !existing.contains(oid);
+    for c in &observation.commits {
+        if !is_new(&c.oid) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO git_commits (repository_id, oid, tree_oid, author_name, author_email, \
+                 author_time, committer_name, committer_email, commit_time, message) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                observation.repository_id.to_string(),
+                c.oid,
+                c.tree_oid,
+                c.author_name,
+                c.author_email,
+                c.author_time.0,
+                c.committer_name,
+                c.committer_email,
+                c.commit_time.0,
+                c.message,
+            ],
+        )
+        .map_err(dberr)?;
+        for (position, parent) in c.parents.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO git_commit_parents (repository_id, commit_oid, position, parent_oid) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    observation.repository_id.to_string(),
+                    c.oid,
+                    position as i64,
+                    parent,
+                ],
+            )
+            .map_err(dberr)?;
+        }
+    }
+    for t in &observation.trees {
+        if !is_new(&t.oid) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO git_trees (repository_id, oid) VALUES (?1, ?2)",
+            rusqlite::params![observation.repository_id.to_string(), t.oid],
+        )
+        .map_err(dberr)?;
+        for e in &t.entries {
+            conn.execute(
+                "INSERT INTO git_tree_entries (repository_id, tree_oid, name, mode, target_oid, \
+                     target_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    observation.repository_id.to_string(),
+                    t.oid,
+                    e.name,
+                    e.mode,
+                    e.target_oid,
+                    e.target_kind.as_str(),
+                ],
+            )
+            .map_err(dberr)?;
+        }
+    }
+    for b in &observation.blobs {
+        if !is_new(&b.oid) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO git_blobs (repository_id, oid, size_bytes, content) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                observation.repository_id.to_string(),
+                b.oid,
+                b.size_bytes as i64,
+                b.content,
+            ],
+        )
+        .map_err(dberr)?;
+    }
+    for t in &observation.tags {
+        if !is_new(&t.oid) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO git_tags (repository_id, oid, target_oid, target_kind, tagger_name, \
+                 tagger_email, tag_time, message) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                observation.repository_id.to_string(),
+                t.oid,
+                t.target_oid,
+                t.target_kind.as_str(),
+                t.tagger_name,
+                t.tagger_email,
+                t.tag_time.map(|ts| ts.0),
+                t.message,
+            ],
+        )
+        .map_err(dberr)?;
+    }
+
+    // 4. Refs: the latest observed state, plus the journal of what changed.
+    //    Ref names are observations, not identity: a deleted ref loses its
+    //    current-state row (once), never its journal and never its objects.
+    for r in &observation.refs {
+        conn.execute(
+            "INSERT INTO git_refs (repository_id, name, target_oid, target_kind, \
+                 symbolic_target, last_observed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(repository_id, name) DO UPDATE SET \
+                 target_oid = excluded.target_oid, \
+                 target_kind = excluded.target_kind, \
+                 symbolic_target = excluded.symbolic_target, \
+                 last_observed_at = excluded.last_observed_at",
+            rusqlite::params![
+                observation.repository_id.to_string(),
+                r.name,
+                r.target_oid,
+                r.target_kind.as_str(),
+                r.symbolic_target,
+                at.0,
+            ],
+        )
+        .map_err(dberr)?;
+    }
+    let mut events = Vec::with_capacity(observation.ref_events.len());
+    let (mut refs_added, mut refs_changed, mut refs_removed) = (0u64, 0u64, 0u64);
+    for e in &observation.ref_events {
+        match e.kind {
+            crate::core::GitRefEventKind::Created => refs_added += 1,
+            crate::core::GitRefEventKind::FastForward
+            | crate::core::GitRefEventKind::NonFastForward => refs_changed += 1,
+            crate::core::GitRefEventKind::Deleted => {
+                refs_removed += 1;
+                // The ref disappears from the current-state table, so the
+                // deletion is journalled exactly once.
+                conn.execute(
+                    "DELETE FROM git_refs WHERE repository_id = ?1 AND name = ?2",
+                    rusqlite::params![observation.repository_id.to_string(), e.name],
+                )
+                .map_err(dberr)?;
+            }
+        }
+        conn.execute(
+            "INSERT INTO git_ref_events (id, repository_id, ref_name, kind, from_oid, to_oid, \
+                 session_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                Uuid::now_v7().to_string(),
+                observation.repository_id.to_string(),
+                e.name,
+                e.kind.as_str(),
+                e.from_oid,
+                e.to_oid,
+                session_id.to_string(),
+                at.0,
+            ],
+        )
+        .map_err(dberr)?;
+        events.push(GitRefEventRecord {
+            ref_name: e.name.clone(),
+            kind: e.kind,
+            from_oid: e.from_oid.clone(),
+            to_oid: e.to_oid.clone(),
+            created_at: at,
+        });
+    }
+
+    // 5. Derivations: text blobs at ref tips routed through the existing
+    //    spine. The logical source is scoped per (repository, commit, path):
+    //    branches are not belief timelines, so content never supersedes
+    //    across commits; same content reconciles to reuse.
+    let mut files = Vec::with_capacity(observation.derivations.len());
+    let mut derivations_new: u64 = 0;
+    let mut derivations_reused: u64 = 0;
+    for d in &observation.derivations {
+        let logical = find_or_create_git_logical(
+            conn,
+            observation.repository_id,
+            &d.commit_oid,
+            &d.path,
+            at,
+        )?;
+        let location = git_display_location(&d.path, &d.commit_oid);
+        let observed = ObservedFile {
+            location,
+            content: d.content.clone(),
+            content_hash: d.content_hash.clone(),
+            title: d.title.clone(),
+            media_type: d.media_type.clone(),
+            size_bytes: d.content.len() as u64,
+            evidences: d.evidences.clone(),
+            assertions: d.assertions.clone(),
+            memories: d.memories.clone(),
+        };
+        let (added, version_id, evidence_ids) =
+            ensure_version(conn, logical, SourceKind::GitBlob, &observed, at)?;
+        if added {
+            conn.execute(
+                "INSERT INTO git_source_versions (source_id, repository_id, blob_oid, path, \
+                     commit_oid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    version_id.to_string(),
+                    observation.repository_id.to_string(),
+                    d.blob_oid,
+                    d.path,
+                    d.commit_oid,
+                ],
+            )
+            .map_err(dberr)?;
+            derivations_new += 1;
+        } else {
+            derivations_reused += 1;
+        }
+        let actions = reconcile_logical(conn, logical, &observed, &evidence_ids, at)?;
+        files.push(GitFileReport {
+            path: d.path.clone(),
+            commit_oid: d.commit_oid.clone(),
+            blob_oid: d.blob_oid.clone(),
+            outcome: if added {
+                GitFileOutcome::New
+            } else {
+                GitFileOutcome::Unchanged
+            },
+            actions,
+        });
+    }
+
+    Ok(GitObservationReport {
+        session_id,
+        repository_id: observation.repository_id,
+        repository_path: observation.repository_path.clone(),
+        refs_observed: observation.refs.len() as u64,
+        refs_added,
+        refs_changed,
+        refs_removed,
+        objects_discovered: all_oids.len() as u64,
+        objects_new,
+        objects_existing,
+        derivations_new,
+        derivations_reused,
+        files,
+        events,
+    })
+}
+
+/// Find-or-create the logical source of one (repository, commit, path).
+fn find_or_create_git_logical(
+    conn: &Connection,
+    repository_id: Uuid,
+    commit_oid: &str,
+    path: &str,
+    at: Ts,
+) -> Result<Uuid> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM logical_sources WHERE repository_id = ?1 AND commit_oid = ?2 \
+             AND git_path = ?3",
+            rusqlite::params![repository_id.to_string(), commit_oid, path],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(dberr)?;
+    if let Some(id) = existing {
+        return Uuid::parse_str(&id).map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")));
+    }
+    let id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO logical_sources (id, kind, state, current_location, created_at, \
+             repository_id, commit_oid, git_path) \
+         VALUES (?1, 'git_path', 'present', ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            id.to_string(),
+            git_display_location(path, commit_oid),
+            at.0,
+            repository_id.to_string(),
+            commit_oid,
+            path,
+        ],
+    )
+    .map_err(dberr)?;
+    Ok(id)
+}
+
+fn git_display_location(path: &str, commit_oid: &str) -> String {
+    format!("{path} @ {}", &commit_oid[..12.min(commit_oid.len())])
+}
+
+/// Git provenance of a source version, if it was derived from a git blob.
+fn load_git_provenance(conn: &Connection, source_id: &Uuid) -> Result<Option<GitProvenance>> {
+    let row = conn
+        .query_row(
+            "SELECT g.repository_id, g.blob_oid, g.path, g.commit_oid, r.current_path, \
+                    c.commit_time, c.message \
+             FROM git_source_versions g \
+             JOIN repositories r ON r.id = g.repository_id \
+             JOIN git_commits c ON c.repository_id = g.repository_id AND c.oid = g.commit_oid \
+             WHERE g.source_id = ?1",
+            rusqlite::params![source_id.to_string()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(dberr)?;
+    let Some((repository_id, blob_oid, path, commit_oid, repository_path, commit_time, message)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM git_refs WHERE repository_id = ?1 AND target_oid = ?2 ORDER BY name",
+        )
+        .map_err(dberr)?;
+    let rows = stmt
+        .query_map(rusqlite::params![repository_id, commit_oid], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(dberr)?;
+    let mut refs = Vec::new();
+    for r in rows {
+        refs.push(r.map_err(dberr)?);
+    }
+    Ok(Some(GitProvenance {
+        repository_path,
+        blob_oid,
+        path,
+        commit_oid,
+        commit_time: Ts(commit_time),
+        commit_message: message,
+        refs,
+    }))
 }

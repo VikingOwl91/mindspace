@@ -1,24 +1,34 @@
+pub mod git;
 pub mod markdown;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::core::{
-    normalize_subject, sha256_hex, AssertionDraft, Error, EvidenceDraft, IngestObservation,
-    IngestScope, MemorySpec, ObservationReport, ObservedFile, Result, SessionDraft, Ts,
+    normalize_subject, sha256_hex, AssertionDraft, Error, EvidenceDraft, GitDerivedFile,
+    GitObjectKind, GitObservation, GitObservationReport, GitRefEventDraft, GitRefEventKind,
+    IngestObservation, IngestOutcome, IngestScope, MemorySpec, ObservationReport, ObservedFile,
+    Result, SessionDraft, Ts, Uuid,
 };
 use crate::storage::Store;
 
-/// Ingests a file or a directory as one observation.
+/// Ingests a path: a single file, a plain directory, or a git repository
+/// (detected by the presence of `.git` or bare-repository markers).
 ///
-/// A file is a partial (file-scope) observation: path-local continuity only.
-/// A directory is a full observation of that root: it also infers moves and
-/// records disappearances against the previous full observation of the same
-/// root. Spaces must already exist and apply to every ingested file.
+/// - A file is a partial (file-scope) observation: path-local continuity
+///   only.
+/// - A directory is a full observation of that root: it also infers moves
+///   and records disappearances against the previous full observation of
+///   the same root.
+/// - A git repository is an observation of committed objects and refs;
+///   the working tree is never consulted.
+///
+/// Spaces must already exist and apply to every ingested file.
 pub fn ingest_path<S: AsRef<str>>(
     store: &dyn Store,
     path: &Path,
     space_names: &[S],
-) -> Result<ObservationReport> {
+) -> Result<IngestOutcome> {
     let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
         source: e,
@@ -28,16 +38,23 @@ pub fn ingest_path<S: AsRef<str>>(
         source: e,
     })?;
 
+    // A git repository wins over directory ingest: committed history is
+    // what it observes, not the working tree.
+    if metadata.is_dir() && git::looks_like_git_repository(&canonical) {
+        return Ok(IngestOutcome::Git(ingest_git_repository(
+            store,
+            &canonical,
+            space_names,
+        )?));
+    }
+
     // A single file must fail on its format before spaces are resolved.
     if metadata.is_file() {
         media_type_of(&canonical)?;
     }
 
     // Spaces must pre-exist; the first missing one fails the ingest.
-    let mut space_ids = Vec::with_capacity(space_names.len());
-    for name in space_names {
-        space_ids.push(store.get_space(name.as_ref())?.id);
-    }
+    let space_ids = resolve_spaces(store, space_names)?;
 
     let (root, scope, files) = if metadata.is_dir() {
         (
@@ -62,7 +79,7 @@ pub fn ingest_path<S: AsRef<str>>(
         },
         files,
     };
-    store.record_observation(observation)
+    Ok(IngestOutcome::Files(store.record_observation(observation)?))
 }
 
 /// Single-file ingest: a partial observation (kept for API compatibility
@@ -72,13 +89,240 @@ pub fn ingest_file<S: AsRef<str>>(
     path: &Path,
     space_names: &[S],
 ) -> Result<ObservationReport> {
-    ingest_path(store, path, space_names)
+    match ingest_path(store, path, space_names)? {
+        IngestOutcome::Files(report) => Ok(report),
+        IngestOutcome::Git(_) => Err(Error::UnsupportedFormat {
+            path: path.display().to_string(),
+        }),
+    }
 }
+
+fn resolve_spaces<S: AsRef<str>>(store: &dyn Store, space_names: &[S]) -> Result<Vec<Uuid>> {
+    let mut space_ids = Vec::with_capacity(space_names.len());
+    for name in space_names {
+        space_ids.push(store.get_space(name.as_ref())?.id);
+    }
+    Ok(space_ids)
+}
+
+// ---------------------------------------------------------------------------
+// Git repository observation
+// ---------------------------------------------------------------------------
+
+/// Ingests one git repository: reads committed objects and refs through the
+/// plumbing reader, derives text memories from ref tips through the normal
+/// evidence/assertion pipeline, and hands everything to the store in a
+/// single transaction.
+pub fn ingest_git_repository<S: AsRef<str>>(
+    store: &dyn Store,
+    repo_path: &Path,
+    space_names: &[S],
+) -> Result<GitObservationReport> {
+    let reader = git::GitReader::open(repo_path)?;
+    let repository_id = reader.repository_id()?;
+    let space_ids = resolve_spaces(store, space_names)?;
+
+    // Refs: heads, remotes, tags, and HEAD, sorted by name.
+    let refs = reader.refs()?;
+
+    // Object discovery: everything reachable from the ref targets.
+    let tips: Vec<String> = refs.iter().map(|r| r.target_oid.clone()).collect();
+    let reachable = reader.reachable_oids(&tips)?;
+    let checked = reader.batch_check(&reachable)?;
+    let mut structural: Vec<String> = Vec::new();
+    let mut blob_sizes: Vec<(String, u64)> = Vec::new();
+    for (oid, kind, size) in checked {
+        if kind == GitObjectKind::Blob {
+            blob_sizes.push((oid, size));
+        } else {
+            structural.push(oid);
+        }
+    }
+    let (commits, trees, tags) = reader.objects(&reachable)?;
+    let blob_datas: Vec<crate::core::GitBlobData> = blob_sizes
+        .into_iter()
+        .map(|(oid, size_bytes)| crate::core::GitBlobData {
+            oid,
+            size_bytes,
+            content: None,
+        })
+        .collect();
+
+    // Derivation tips: every commit a ref directly points at, plus the
+    // commits annotated tags resolve to (peeled through nested tags).
+    let mut tip_commits: BTreeSet<String> = refs
+        .iter()
+        .filter(|r| r.target_kind == GitObjectKind::Commit)
+        .map(|r| r.target_oid.clone())
+        .collect();
+    let tag_by_oid: std::collections::HashMap<&str, &crate::core::GitTagData> =
+        tags.iter().map(|t| (t.oid.as_str(), t)).collect();
+    let mut peel_queue: Vec<String> = tags
+        .iter()
+        .filter(|t| t.target_kind == GitObjectKind::Commit)
+        .map(|t| t.target_oid.clone())
+        .collect();
+    while let Some(oid) = peel_queue.pop() {
+        tip_commits.insert(oid.clone());
+        // Nested tags (tag of a tag) keep peeling.
+        if let Some(t) = tag_by_oid.get(oid.as_str()) {
+            if t.target_kind == GitObjectKind::Tag {
+                peel_queue.push(t.target_oid.clone());
+            }
+        }
+    }
+
+    // Text paths at each tip, then blob contents in one batch.
+    let mut tip_files: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut text_blob_oids: BTreeSet<String> = BTreeSet::new();
+    for commit in &tip_commits {
+        let mut files: Vec<(String, String)> = Vec::new();
+        for (mode, kind, oid, path) in reader.commit_files(commit)? {
+            if kind != "blob" || mode.starts_with("12") {
+                // Not a blob, or a symlink: never derived, never traversed.
+                continue;
+            }
+            if !is_ingestable(Path::new(&path)) {
+                continue;
+            }
+            text_blob_oids.insert(oid.clone());
+            files.push((oid, path));
+        }
+        tip_files.push((commit.clone(), files));
+    }
+    let text_oids: Vec<String> = text_blob_oids.into_iter().collect();
+    let contents = reader.blob_contents(&text_oids)?;
+    let content_by_oid: std::collections::HashMap<String, String> = contents
+        .into_iter()
+        .map(|b| (b.oid, b.content.unwrap_or_default()))
+        .collect();
+
+    let mut derivations: Vec<GitDerivedFile> = Vec::new();
+    for (commit, files) in tip_files {
+        for (blob_oid, path) in files {
+            let Some(content) = content_by_oid.get(&blob_oid) else {
+                continue;
+            };
+            let media_type = media_type_of(Path::new(&path))
+                .map_err(|_| Error::UnsupportedFormat { path: path.clone() })?;
+            let stem = Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("untitled")
+                .to_string();
+            let mut parsed = parse_material(&stem, content, media_type, &space_ids);
+            // Git derivations carry their own extractor identity: the rule
+            // is the same parser, applied to git material.
+            for a in &mut parsed.assertions {
+                a.extraction = format!("git:{}", a.extraction);
+            }
+            derivations.push(GitDerivedFile {
+                path,
+                blob_oid,
+                commit_oid: commit.clone(),
+                content_hash: sha256_hex(content.as_bytes()),
+                content: content.clone(),
+                title: parsed.title,
+                media_type: media_type.to_string(),
+                evidences: parsed.evidences,
+                assertions: parsed.assertions,
+                memories: parsed.memories,
+            });
+        }
+    }
+    derivations.sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
+
+    // Ref delta against the last observed state. The fast-forward question
+    // is asked to git itself (ancestor check); anything not provably a
+    // fast-forward is recorded as non_fast_forward, never as rebase or
+    // force-push. A symbolic HEAD is a view of its branch, not an
+    // independent pointer: it is observed in the ref state but produces no
+    // events of its own. A detached HEAD is a real pointer and is journalled.
+    let current = store.git_refs_current(repository_id)?;
+    let current_by_name: std::collections::HashMap<String, &crate::core::GitRefObservation> =
+        current.iter().map(|r| (r.name.clone(), r)).collect();
+    let mut ref_events: Vec<GitRefEventDraft> = Vec::new();
+    for r in &refs {
+        if r.name == "HEAD" && r.symbolic_target.is_some() {
+            continue;
+        }
+        match current_by_name.get(&r.name) {
+            None => ref_events.push(GitRefEventDraft {
+                name: r.name.clone(),
+                kind: GitRefEventKind::Created,
+                from_oid: None,
+                to_oid: Some(r.target_oid.clone()),
+            }),
+            Some(prev) if prev.target_oid != r.target_oid => {
+                let kind = if prev.target_kind == GitObjectKind::Commit
+                    && r.target_kind == GitObjectKind::Commit
+                    && reader.is_ancestor(&prev.target_oid, &r.target_oid)?
+                {
+                    GitRefEventKind::FastForward
+                } else {
+                    GitRefEventKind::NonFastForward
+                };
+                ref_events.push(GitRefEventDraft {
+                    name: r.name.clone(),
+                    kind,
+                    from_oid: Some(prev.target_oid.clone()),
+                    to_oid: Some(r.target_oid.clone()),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for prev in &current {
+        if prev.name == "HEAD" && prev.symbolic_target.is_some() {
+            continue;
+        }
+        if !refs.iter().any(|r| r.name == prev.name) {
+            ref_events.push(GitRefEventDraft {
+                name: prev.name.clone(),
+                kind: GitRefEventKind::Deleted,
+                from_oid: Some(prev.target_oid.clone()),
+                to_oid: None,
+            });
+        }
+    }
+    ref_events.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Blob rows: content only for the text blobs actually fetched.
+    let content_oids: BTreeSet<String> = derivations.iter().map(|d| d.blob_oid.clone()).collect();
+    let mut blobs = blob_datas;
+    for b in &mut blobs {
+        if content_oids.contains(&b.oid) {
+            b.content = content_by_oid.get(&b.oid).cloned();
+        }
+    }
+
+    let observation = GitObservation {
+        session: SessionDraft {
+            root: repo_path.display().to_string(),
+            scope: IngestScope::GitRepository,
+            observed_at: Ts::now(),
+        },
+        repository_id,
+        repository_path: repo_path.display().to_string(),
+        refs,
+        commits,
+        trees,
+        blobs,
+        tags,
+        derivations,
+        ref_events,
+    };
+    store.record_git_observation(observation)
+}
+
+// ---------------------------------------------------------------------------
+// Directory and file observation
+// ---------------------------------------------------------------------------
 
 /// Recursively walks one directory, deterministic order, no ignore rules,
 /// symlinks skipped. Only `.md`, `.markdown`, and `.txt` files take part in
 /// the observed set.
-fn observe_directory(root: &Path, space_ids: &[crate::core::Uuid]) -> Result<Vec<ObservedFile>> {
+fn observe_directory(root: &Path, space_ids: &[Uuid]) -> Result<Vec<ObservedFile>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     collect_files(root, &mut paths)?;
     paths.sort();
@@ -140,7 +384,7 @@ fn media_type_of(path: &Path) -> Result<&'static str> {
 }
 
 /// Reads and deterministically parses one file into an observed file.
-fn observe_file(path: &Path, space_ids: &[crate::core::Uuid]) -> Result<ObservedFile> {
+fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<ObservedFile> {
     let media_type = media_type_of(path)?;
     let bytes = std::fs::read(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
@@ -157,17 +401,43 @@ fn observe_file(path: &Path, space_ids: &[crate::core::Uuid]) -> Result<Observed
         .display()
         .to_string();
 
-    let stem = path
-        .file_stem()
+    let stem = file_stem(path);
+    let parsed = parse_material(&stem, &text, media_type, space_ids);
+    Ok(ObservedFile {
+        location,
+        content: text,
+        content_hash: sha256_hex(&bytes),
+        title: parsed.title,
+        media_type: media_type.to_string(),
+        size_bytes: bytes.len() as u64,
+        evidences: parsed.evidences,
+        assertions: parsed.assertions,
+        memories: parsed.memories,
+    })
+}
+
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("untitled")
-        .to_string();
+        .to_string()
+}
 
+/// Deterministic parse of one material into evidence and assertion drafts
+/// with requested spaces. Shared by file and git derivation paths.
+struct ParsedMaterial {
+    title: String,
+    evidences: Vec<EvidenceDraft>,
+    assertions: Vec<AssertionDraft>,
+    memories: Vec<MemorySpec>,
+}
+
+fn parse_material(stem: &str, text: &str, media_type: &str, space_ids: &[Uuid]) -> ParsedMaterial {
     let (title, fragments) = if media_type == "text/markdown" {
-        let parsed = markdown::parse_markdown(&text, &stem);
+        let parsed = markdown::parse_markdown(text, stem);
         (parsed.title, parsed.fragments)
     } else {
-        (stem.clone(), markdown::parse_text(&text, &stem))
+        (stem.to_string(), markdown::parse_text(text, stem))
     };
 
     let mut evidences = Vec::with_capacity(fragments.len());
@@ -197,16 +467,10 @@ fn observe_file(path: &Path, space_ids: &[crate::core::Uuid]) -> Result<Observed
             spaces: space_ids.to_vec(),
         });
     }
-
-    Ok(ObservedFile {
-        location,
-        content: text,
-        content_hash: sha256_hex(&bytes),
+    ParsedMaterial {
         title,
-        media_type: media_type.to_string(),
-        size_bytes: bytes.len() as u64,
         evidences,
         assertions,
         memories,
-    })
+    }
 }

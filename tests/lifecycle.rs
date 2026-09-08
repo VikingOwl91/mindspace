@@ -42,7 +42,12 @@ impl Env {
 
     fn scan(&self, store: &mindspace::SqliteStore) -> mindspace::core::ObservationReport {
         let _ = store.create_space("coding", "");
-        ingest::ingest_path(store, self.root(), &["coding"]).unwrap()
+        match ingest::ingest_path(store, self.root(), &["coding"]).unwrap() {
+            mindspace::core::IngestOutcome::Files(report) => report,
+            mindspace::core::IngestOutcome::Git(_) => {
+                panic!("plain directory ingested as git repository")
+            }
+        }
     }
 }
 

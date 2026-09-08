@@ -23,6 +23,15 @@ pub enum Error {
     #[error("a space cannot link to itself: '{name}'")]
     SelfLink { name: String },
 
+    #[error("git is not available: {detail}")]
+    GitUnavailable { detail: String },
+
+    #[error("git command failed: {command}: {stderr}")]
+    GitCommand { command: String, stderr: String },
+
+    #[error("cannot establish repository identity for {path}: {reason}")]
+    RepositoryIdentity { path: String, reason: String },
+
     #[error("unsupported file format '{path}'; supported formats: .md, .markdown, .txt")]
     UnsupportedFormat { path: String },
 

@@ -3,8 +3,8 @@
 
 use crate::cli::action_label;
 use crate::core::{
-    ConflictGroup, IngestScope, Memory, MemoryDetail, MemorySummary, ObservationReport,
-    SourceEventKind, Space,
+    ConflictGroup, GitObservationReport, IngestScope, Memory, MemoryDetail, MemorySummary,
+    ObservationReport, SourceEventKind, Space,
 };
 
 fn json<T: serde::Serialize>(value: &T) {
@@ -22,6 +22,7 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
     let scope = match report.scope {
         IngestScope::Directory => "directory",
         IngestScope::File => "file",
+        IngestScope::GitRepository => "git_repository",
     };
     println!(
         "session {} root {} ({})",
@@ -67,6 +68,77 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
                 event.logical_id,
                 from_location.as_deref().unwrap_or("?")
             ),
+        }
+    }
+}
+
+/// Human and JSON output of one git repository observation. The counters
+/// are the deterministic deltas of the session.
+pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
+    if as_json {
+        json(report);
+        return;
+    }
+    println!(
+        "session {} repository {} ({})",
+        report.session_id, report.repository_id, report.repository_path
+    );
+    println!(
+        "refs: {} observed, {} added, {} changed, {} removed",
+        report.refs_observed, report.refs_added, report.refs_changed, report.refs_removed
+    );
+    println!(
+        "objects: {} discovered, {} new, {} existing",
+        report.objects_discovered, report.objects_new, report.objects_existing
+    );
+    println!(
+        "derivations: {} new, {} reused",
+        report.derivations_new, report.derivations_reused
+    );
+    for event in &report.events {
+        match event.kind {
+            crate::core::GitRefEventKind::Created => {
+                println!(
+                    "  ref created: {} -> {}",
+                    event.ref_name,
+                    event.to_oid.as_deref().unwrap_or("?")
+                )
+            }
+            crate::core::GitRefEventKind::FastForward => println!(
+                "  ref fast-forward: {} {} -> {}",
+                event.ref_name,
+                event.from_oid.as_deref().unwrap_or("?"),
+                event.to_oid.as_deref().unwrap_or("?")
+            ),
+            crate::core::GitRefEventKind::NonFastForward => println!(
+                "  ref non-fast-forward: {} {} -> {}",
+                event.ref_name,
+                event.from_oid.as_deref().unwrap_or("?"),
+                event.to_oid.as_deref().unwrap_or("?")
+            ),
+            crate::core::GitRefEventKind::Deleted => {
+                println!(
+                    "  ref deleted: {} (last at {})",
+                    event.ref_name,
+                    event.from_oid.as_deref().unwrap_or("?")
+                )
+            }
+        }
+    }
+    for file in &report.files {
+        let outcome = match file.outcome {
+            crate::core::GitFileOutcome::New => "new",
+            crate::core::GitFileOutcome::Unchanged => "unchanged",
+        };
+        println!("  {} @ {} ({})", file.path, file.commit_oid, outcome);
+        for action in &file.actions {
+            println!(
+                "    memory {} \"{}\" {} [{}]",
+                action.memory_id,
+                action.subject,
+                action_label(&action.action),
+                action.spaces.join(", ")
+            );
         }
     }
 }
@@ -189,6 +261,15 @@ pub fn inspect(detail: &MemoryDetail, as_json: bool) {
         s.location,
         &s.content_hash[..16.min(s.content_hash.len())]
     );
+    if let Some(git) = &detail.git {
+        println!(
+            "git      repo {} blob {} path {} commit {} ({})",
+            git.repository_path, git.blob_oid, git.path, git.commit_oid, git.commit_time
+        );
+        if !git.refs.is_empty() {
+            println!("  refs: {}", git.refs.join(", "));
+        }
+    }
     println!(
         "spaces   {}",
         if detail.spaces.is_empty() {
@@ -236,6 +317,16 @@ pub fn trace(detail: &MemoryDetail, as_json: bool) {
     );
     println!("  sha256:{}", s.content_hash);
     render_lifecycle(&detail.source_lifecycle);
+    if let Some(git) = &detail.git {
+        println!(
+            "git       repo {} blob {} path {} commit {} ({})",
+            git.repository_path, git.blob_oid, git.path, git.commit_oid, git.commit_time
+        );
+        println!("  commit message: {}", first_line(&git.commit_message));
+        if !git.refs.is_empty() {
+            println!("  refs: {}", git.refs.join(", "));
+        }
+    }
     println!(
         "spaces    {}",
         detail

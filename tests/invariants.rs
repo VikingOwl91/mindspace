@@ -738,3 +738,93 @@ fn filtered_by_requested_space_only() {
         .unwrap()
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial model tests (v0 architecture review)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn heading_rename_supersedes_and_preserves_lineage() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let path = e.write("notes.md", "# Storage\n\nEverything lives in SQLite.\n");
+    let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+    let old_id = first.actions[0].memory_id;
+
+    // Only the heading changes; the proposition survives.
+    std::fs::write(&path, "# Persistence\n\nEverything lives in SQLite.\n").unwrap();
+    let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+
+    assert_eq!(second.actions.len(), 1, "{:?}", second.actions);
+    assert!(matches!(
+        &second.actions[0].action,
+        MemoryActionKind::Superseded { .. }
+    ));
+    let new_id = second.actions[0].memory_id;
+
+    let old = store.get_memory_detail(old_id).unwrap().unwrap();
+    assert_eq!(old.memory.state, MemoryState::Superseded);
+    assert_eq!(old.memory.superseded_by, Some(new_id));
+    assert_eq!(old.assertion.content, "Everything lives in SQLite.");
+
+    let new = store.get_memory_detail(new_id).unwrap().unwrap();
+    assert_eq!(new.memory.state, MemoryState::Active);
+    assert_eq!(new.assertion.subject, "Persistence");
+    assert_eq!(new.assertion.content, "Everything lives in SQLite.");
+}
+
+#[test]
+fn recreate_after_retire_reuses_the_assertion() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let path = e.write("notes.md", "# Kernel\n\nThe scheduler is CFS.\n");
+    let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+    let first_id = first.actions[0].memory_id;
+    store
+        .retire_memory(first_id, Some("manual".into()), Ts::now())
+        .unwrap();
+
+    let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+    let second_id = second.actions[0].memory_id;
+    assert_ne!(second_id, first_id);
+
+    // The interpretation did not change; only the belief episode did.
+    // Two assertion rows identical in every observable column would be
+    // manufactured identity.
+    let a = store.get_memory_detail(first_id).unwrap().unwrap();
+    let b = store.get_memory_detail(second_id).unwrap().unwrap();
+    assert_eq!(
+        a.assertion.id, b.assertion.id,
+        "same evidence + rule + subject + content must be the same assertion"
+    );
+    assert_eq!(a.assertion.created_at, b.assertion.created_at);
+}
+
+#[test]
+fn proposition_flip_flop_keeps_episodes_and_reuses_interpretations() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let path = e.write("notes.md", "# Toolkit\n\nThe project uses iced.\n");
+    let h1 = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+    let iced1 = h1.actions[0].memory_id;
+
+    std::fs::write(&path, "# Toolkit\n\nThe project uses slint.\n").unwrap();
+    ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+
+    // v3 is byte-identical to v1: the file flips back.
+    std::fs::write(&path, "# Toolkit\n\nThe project uses iced.\n").unwrap();
+    let h3 = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+    let iced2 = h3.actions[0].memory_id;
+
+    let a = store.get_memory_detail(iced1).unwrap().unwrap();
+    let b = store.get_memory_detail(iced2).unwrap().unwrap();
+    assert_eq!(a.memory.state, MemoryState::Superseded);
+    assert_eq!(b.memory.state, MemoryState::Active);
+    assert_eq!(b.memory.superseded_by, None);
+    // Byte-identical revert: same source, same evidence, same interpretation,
+    // one new belief episode.
+    assert_eq!(a.assertion.id, b.assertion.id);
+}

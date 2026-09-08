@@ -111,14 +111,21 @@ sources(id, kind, location, title, content, content_hash, media_type,
 evidence(id, source_id -> sources, kind, heading_path, start_line, end_line,
          ordinal, content, content_hash, UNIQUE (source_id, kind, ordinal))
 assertions(id, kind, subject, subject_normalized, predicate, content,
-           extraction, evidence_id -> evidence)
-memories(id, assertion_id UNIQUE -> assertions, state CHECK active|superseded|retired,
+           content_hash, extraction, created_at, evidence_id -> evidence,
+           UNIQUE (evidence_id, extraction, subject_normalized, content_hash))
+memories(id, assertion_id -> assertions, state CHECK active|superseded|retired,
          created_at, superseded_by -> memories, superseded_at,
          retired_at, retire_reason)
+  partial UNIQUE index: memories(assertion_id) WHERE state = 'active'
 memory_spaces(memory_id -> memories, space_id -> spaces, created_at,
               PRIMARY KEY (memory_id, space_id))
 assertion_fts  FTS5(assertion_id UNINDEXED, subject, content)
 ```
+
+An assertion is the stable interpretation of a piece of evidence; a memory is
+one belief episode of that interpretation, so several memory rows may share
+an assertion over time (believed, retired, believed again) while at most one
+of them is active. The FTS index is written exactly once per assertion.
 
 Indexes exist for the hot lookups: assertions by normalized subject, memories
 by state, memory_spaces by space, sources by location.

@@ -44,6 +44,10 @@ CREATE TABLE evidence (
     UNIQUE (source_id, kind, ordinal)
 );
 
+-- Assertions are interpretations extracted from evidence by a named rule.
+-- Their identity is the interpretation itself: the same evidence, rule,
+-- subject, and content is the same assertion, however many belief episodes
+-- reference it over time. content_hash is sha256 over `content`.
 CREATE TABLE assertions (
     id                 TEXT PRIMARY KEY,
     kind               TEXT NOT NULL,
@@ -51,13 +55,20 @@ CREATE TABLE assertions (
     subject_normalized TEXT NOT NULL,
     predicate          TEXT,
     content            TEXT NOT NULL,
+    content_hash       TEXT NOT NULL,
     extraction         TEXT NOT NULL,
-    evidence_id        TEXT NOT NULL REFERENCES evidence(id)
+    created_at         INTEGER NOT NULL,
+    evidence_id        TEXT NOT NULL REFERENCES evidence(id),
+    UNIQUE (evidence_id, extraction, subject_normalized, content_hash)
 );
 
+-- Memories are belief episodes: the lifecycle of one interpretation in the
+-- store. An interpretation may be believed, retired, and believed again,
+-- which yields several memory rows sharing one assertion; at most one of
+-- them may be active at a time (partial unique index below).
 CREATE TABLE memories (
     id            TEXT PRIMARY KEY,
-    assertion_id  TEXT NOT NULL UNIQUE REFERENCES assertions(id),
+    assertion_id  TEXT NOT NULL REFERENCES assertions(id),
     state         TEXT NOT NULL CHECK (state IN ('active', 'superseded', 'retired')),
     created_at    INTEGER NOT NULL,
     superseded_by TEXT REFERENCES memories(id),
@@ -65,6 +76,9 @@ CREATE TABLE memories (
     retired_at    INTEGER,
     retire_reason TEXT
 );
+
+CREATE UNIQUE INDEX idx_memories_active_per_assertion
+    ON memories(assertion_id) WHERE state = 'active';
 
 CREATE TABLE memory_spaces (
     memory_id  TEXT NOT NULL REFERENCES memories(id),
@@ -100,5 +114,5 @@ END;
 CREATE TRIGGER assertions_immutable
 BEFORE UPDATE ON assertions
 BEGIN
-    SELECT RAISE(ABORT, 'assertions are immutable; supersession creates new assertions');
+    SELECT RAISE(ABORT, 'assertions are immutable; changed interpretations create new assertions');
 END;

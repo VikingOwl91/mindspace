@@ -234,7 +234,9 @@ mind retire <memory> --reason "why"
 ```
 
 `--json` on informational commands prints the exact engine structs, so
-scripts and humans see the same data. Every command honors a global `--db`
+scripts and humans see the same data. Treat the JSON shape as unstable
+pre-alpha output: it may change without notice while the model settles.
+Every command honors a global `--db`
 flag (or `MINDSPACE_DB`); the default database lives under
 `$XDG_DATA_HOME/mindspace/mind.db`.
 

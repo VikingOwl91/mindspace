@@ -262,7 +262,10 @@ pub struct Evidence {
     pub content_hash: String,
 }
 
-/// The meaning extracted from a piece of evidence. Immutable.
+/// The meaning extracted from a piece of evidence by a named rule.
+/// Identity is the interpretation itself: the same evidence, rule, subject,
+/// and content is the same assertion, no matter how many belief episodes
+/// (memories) reference it over time. Immutable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Assertion {
     pub id: Uuid,
@@ -271,7 +274,10 @@ pub struct Assertion {
     pub subject_normalized: String,
     pub predicate: Option<String>,
     pub content: String,
+    pub content_hash: String,
     pub extraction: String,
+    /// Transaction time the interpretation was extracted.
+    pub created_at: Ts,
     pub evidence_id: Uuid,
 }
 

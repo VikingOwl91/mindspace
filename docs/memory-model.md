@@ -20,12 +20,18 @@ Evidence          an immutable, normalized fragment derived from a source
   |
 Assertion         an immutable statement derived from evidence by a named,
   |               deterministic extraction rule (v0: claims only; events and
-  |               relations are reserved kinds).
+  |               relations are reserved kinds). Identity is the
+  |               interpretation itself: identical evidence, rule, subject,
+  |               and content is the same assertion, however many memories
+  |               reference it over time.
   |
-Memory            the addressable knowledge unit. Wraps exactly one assertion
-                  in v0 and carries all mutable lifecycle state: which spaces
-                  it belongs to, whether it is active, superseded, or retired,
-                  and the timestamps of those transitions.
+Memory            the addressable knowledge unit: one belief episode of one
+                  assertion. Carries all mutable lifecycle state: which
+                  spaces it belongs to, whether it is active, superseded, or
+                  retired, and the timestamps of those transitions. The same
+                  interpretation may be believed, retired, and believed
+                  again; each episode is its own memory, and at most one
+                  episode per assertion is active at a time.
 ```
 
 Every arrow is a foreign-key relationship stored in the database, so the chain
@@ -41,8 +47,8 @@ UTC Unix epoch microseconds and rendered as RFC 3339 at the CLI edge.
 |-----------|----------|--------------------------------------|----------|
 | Source    | uuid     | (kind, location, content_hash)       | never    |
 | Evidence  | uuid     | (source_id, kind, ordinal)           | never    |
-| Assertion | uuid     | —                                    | never    |
-| Memory    | uuid     | —                                    | state fields only |
+| Assertion | uuid     | (evidence_id, extraction, subject_normalized, content_hash) | never |
+| Memory    | uuid     | — (belief episode)                   | state fields only |
 | Space     | uuid     | name (case-sensitive, unique)        | never in v0 |
 | SpaceLink | (from, to) | —                                  | never in v0 |
 
@@ -105,24 +111,41 @@ explicit, named, deterministic rule:
 - `predicate`: reserved, `NULL` in v0 (subject-predicate-object claims arrive
   with rules that can determine predicates deterministically).
 - `content`: what is asserted (in v0, the evidence text).
+- `content_hash`: SHA-256 over `content`; part of the assertion's identity.
 - `extraction`: the rule identifier, e.g. `markdown:section-heading`,
   `markdown:preamble`, `markdown:document`, or `text:document`. This is the
   provenance of *how* the interpretation was produced, not just where the
   material came from.
+- `created_at`: transaction time the interpretation was extracted. Stable
+  across belief episodes: re-extracting the same interpretation finds the
+  existing assertion instead of duplicating it.
 - `evidence_id`: the exact evidence the statement was derived from.
+
+The natural key `(evidence_id, extraction, subject_normalized, content_hash)`
+is enforced by a UNIQUE constraint. Two *different* fragments with identical
+text are two assertions (they cite different evidence): that is corroboration,
+not duplication. A new extraction rule (for example a future AI-assisted one)
+produces new assertions from old evidence because the rule identifier is part
+of identity; nothing is overwritten.
 
 ### 2.4 Memory
 
-A memory is the unit users search, inspect, and organize. In v0 it wraps
-exactly one assertion (`1:1`). This split is deliberate:
+A memory is the unit users search, inspect, and organize. It is one *belief
+episode* of one assertion: memories reference assertions many-to-one, and at
+most one memory per assertion is active at a time (enforced by a partial
+unique index). The split is deliberate:
 
-- the assertion answers **what** is claimed and **from where** (immutable),
-- the memory answers **is it current**, **where does it apply** (mutable
-  lifecycle, spaces).
+- the assertion answers **what** is claimed, **how it was interpreted**, and
+  **from where** (immutable),
+- the memory answers **is it currently believed**, **where does it apply**
+  (mutable lifecycle, spaces).
 
-A later version may aggregate several assertions into one memory (for example
+A proposition that is believed, retired, and believed again is one assertion
+with several memory episodes; each episode keeps its own creation time, so
+the store answers "we believed this from T1 to T2, and again from T3". A
+later version may aggregate several assertions into one memory (for example
 AI-derived claims merged with deterministic ones); that changes the
-memory-to-assertion cardinality, not the immutability rules.
+memory-to-assertion cardinality further and is additive.
 
 Lifecycle state machine:
 
@@ -165,6 +188,11 @@ explain *why* they matched (e.g. `via project:owlry -> coding`).
 
 `--space X` on `mind search` means: memories directly in X **or** in any space
 reachable from X through directed links.
+
+Space links are knowledge-import semantics, nothing more. They must never be
+treated as, or grown into, access-control boundaries: permissions need their
+own objects and rules, because "who may read" and "which knowledge imports
+which" are different questions that happen to both involve graphs.
 
 ## 3. Provenance
 
@@ -212,12 +240,34 @@ timeline, so "what did we believe then?" is a real query, not a narrative.
 When `--at` is given it replaces the default state filter (the timeline, not
 today's state, decides what is visible).
 
+Two consequences worth naming:
+
+- **Late ingestion is not time travel.** A document written in January and
+  ingested in September enters the store with September transaction times.
+  `--at` for August will not show it, and must not: the store did not believe
+  it in August. Valid-time modeling (when the statement was true in the
+  world) is a separate, additive axis (section 11).
+- **Historical wording stays historical.** A 2024 source asserting "Foo is
+  the current implementation" becomes an active memory when ingested in
+  2026, because transaction time says "believed now". Interpreting such
+  relative wording is a semantic problem and is deferred; the data model
+  keeps the assertion immutable and dated, so a future valid-time or
+  re-interpretation pass can correct the view without rewriting history.
+
 ## 5. Conflict
 
 Definition (v0, deterministic): two or more **active** memories whose
 normalized subjects are equal and that are direct members of the same space.
 They coexist; nothing is collapsed. `mind conflicts` lists each group with the
 member memories, their sources, and creation times.
+
+These groups are **candidate conflicts**: collisions of subject that deserve
+human inspection. v0 cannot and does not claim to detect contradictions
+(that needs interpretation): equal subjects may corroborate, duplicate, or
+simply be unrelated sections that happen to share a heading, and genuine
+disagreements often use different subjects. The guarantee that matters is
+negative: nothing is silently merged, ranked away, or dropped, and the full
+disagreement history stays reconstructable.
 
 Notable consequences:
 
@@ -274,21 +324,28 @@ the same location `L`:
      **reuse** the old memory (add any newly requested spaces);
    - content differs: **supersede** the old memory with a new memory built
      from the new fragment.
-4. Leftover `news` (no old partner): **create** active memories.
-5. Leftover `olds` (subject no longer present in the file): **retire** with
-   reason `subject no longer present in source at re-ingest`.
+4. Leftover olds and news (no same-subject partner) are matched across
+   subjects by identical content, olds in `(created_at, id)` order against
+   news in ordinal order, first match wins: a match **supersedes** (this is
+   how a renamed or moved heading keeps its lineage). Deterministic.
+5. Remaining leftover `news`: **create** active memories.
+6. Remaining leftover `olds` (subject no longer present and content gone):
+   **retire** with reason `subject no longer present in source at re-ingest`.
 
 Consequences worth knowing:
 
 - Editing a file and re-ingesting it updates knowledge *with full history*;
   the old memory remains inspectable at its old id forever.
+- Renaming a heading or moving a paragraph does not break the lineage: the
+  new memory supersedes the old one across subjects, because the proposition
+  is identical.
 - Removing a section from a file and re-ingesting retires the corresponding
   memory with an explicit reason (it does not silently vanish).
 - Re-ingesting unchanged content after a manual `mind retire` recreates the
-  memory: an explicit re-ingest is an explicit request. A recreated (or
-  superseding) memory always gets a *fresh assertion* citing the fragment's
-  evidence, so the 1:1 assertion-to-memory rule holds and the old assertion
-  stays bound to the old memory forever.
+  memory: an explicit re-ingest is an explicit request. The recreated memory
+  *reuses* the existing assertion, because the interpretation (same
+  evidence, rule, subject, content) already exists; what is new is the
+  belief episode.
 - Multiple fragments sharing one subject inside a single file pair up with
   old memories index-wise; surplus fragments become separate active memories
   and surface in `mind conflicts`. This is deterministic and inspectable
@@ -327,9 +384,9 @@ deleted, and stays fully traceable (`mind inspect <old-id>` keeps working; the
 default search excludes it, `--include-superseded` includes it).
 
 v0 creates supersessions in exactly one place: the reconciliation rule of
-section 6.2 (same source location, same subject, changed content). Manual
-`mind supersedes <a> <b>` is a natural future command; the schema already
-supports it.
+section 6.2, in two shapes: same subject with changed content, and identical
+content under a changed subject (rename/move). Manual `mind supersedes <a>
+<b>` is a natural future command; the schema already supports it.
 
 Many old memories may point at one new memory (e.g. after duplicate-subject
 fragments collapsed); a memory is superseded by at most one successor.
@@ -356,6 +413,20 @@ There is no destructive deletion in v0, by design:
 
 Derived data (evidence, assertions, memories) is recomputable from a source
 by re-running the deterministic rules; hashes make drift detectable.
+
+Three invalidation words must never collapse into one mechanism:
+
+- **retire** (implemented): a memory episode ends, timestamped and reasoned;
+  everything upstream and the row itself remain inspectable.
+- **forget** (future): a source or location is withdrawn; its derived
+  memories are retired, never destroyed. The chain memory -> assertion ->
+  evidence -> source defines exactly what is derived, so impact is
+  computable.
+- **purge** (future, privacy/legal): hard deletion of specific rows. The
+  immutability triggers block UPDATE only; DELETE is deliberately not
+  blocked, so true erasure stays possible. A purge must remove FTS rows in
+  the same transaction and respect foreign keys; it is a separate, explicit,
+  audited operation, never a side effect of ingest or retire.
 
 ## 10. Scope versus space
 

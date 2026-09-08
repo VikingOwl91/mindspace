@@ -6,9 +6,9 @@ use rusqlite::{Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
 use crate::core::{
-    Assertion, AssertionKind, ConflictGroup, Error, Evidence, EvidenceKind, IngestBundle,
-    IngestRecord, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary,
-    Result, SearchHitRaw, SearchQuery, Source, SourceKind, Space, SpaceLink, Ts,
+    sha256_hex, Assertion, AssertionKind, ConflictGroup, Error, Evidence, EvidenceKind,
+    IngestBundle, IngestRecord, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
+    MemorySummary, Result, SearchHitRaw, SearchQuery, Source, SourceKind, Space, SpaceLink, Ts,
 };
 use crate::storage::Store;
 
@@ -686,8 +686,39 @@ impl Store for SqliteStore {
     }
 
     fn retire_memory(&self, id: Uuid, reason: Option<String>, at: Ts) -> Result<Memory> {
-        let memory = self
+        // The state check and the transition are one conditional statement,
+        // so only an active memory can be retired, atomically.
+        let changed = self
             .conn
+            .execute(
+                "UPDATE memories SET state = 'retired', retired_at = ?1, retire_reason = ?2 \
+                 WHERE id = ?3 AND state = 'active'",
+                rusqlite::params![at.0, reason, id.to_string()],
+            )
+            .map_err(dberr)?;
+        if changed == 0 {
+            let state: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT state FROM memories WHERE id = ?1",
+                    rusqlite::params![id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(dberr)?;
+            return match state {
+                Some(state) => Err(Error::NotRetirable {
+                    id: id.to_string(),
+                    state: MemoryState::parse(&state)
+                        .map(|s| s.to_string())
+                        .unwrap_or(state),
+                }),
+                None => Err(Error::MemoryNotFound {
+                    prefix: id.to_string(),
+                }),
+            };
+        }
+        self.conn
             .query_row(
                 "SELECT id, assertion_id, state, created_at, superseded_by, superseded_at, \
                         retired_at, retire_reason \
@@ -695,30 +726,7 @@ impl Store for SqliteStore {
                 rusqlite::params![id.to_string()],
                 row_memory,
             )
-            .optional()
-            .map_err(dberr)?
-            .ok_or_else(|| Error::MemoryNotFound {
-                prefix: id.to_string(),
-            })?;
-        if memory.state != MemoryState::Active {
-            return Err(Error::NotRetirable {
-                id: id.to_string(),
-                state: memory.state.to_string(),
-            });
-        }
-        self.conn
-            .execute(
-                "UPDATE memories SET state = 'retired', retired_at = ?1, retire_reason = ?2 \
-                 WHERE id = ?3",
-                rusqlite::params![at.0, reason, id.to_string()],
-            )
-            .map_err(dberr)?;
-        Ok(Memory {
-            state: MemoryState::Retired,
-            retired_at: Some(at),
-            retire_reason: reason,
-            ..memory
-        })
+            .map_err(dberr)
     }
 }
 
@@ -841,39 +849,66 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
             .collect::<Result<Vec<_>>>()?
     };
 
-    // 4. Assertions are created lazily, only for fragments that actually
-    //    become or replace memories, and every new memory gets a fresh
-    //    assertion (one assertion per memory, one memory per assertion)
-    //    citing the fragment's evidence. A reused section never produces
-    //    orphan assertion rows.
+    // 4. Assertions are the stable interpretations; they are looked up by
+    //    their natural key (evidence, rule, subject, content) and inserted
+    //    only when genuinely new. Belief episodes (memories) reference them,
+    //    possibly several over time. A reused section never produces orphan
+    //    assertion rows, and a recreated belief never duplicates an
+    //    interpretation that already exists.
     let mut assertion_cache: Vec<Option<Uuid>> = vec![None; bundle.assertions.len()];
     let mut get_assertion = |conn: &Connection, idx: usize| -> Result<Uuid> {
         if let Some(id) = assertion_cache[idx] {
             return Ok(id);
         }
         let d = &bundle.assertions[idx];
-        let id = Uuid::now_v7();
-        conn.execute(
-            "INSERT INTO assertions (id, kind, subject, subject_normalized, predicate, \
-                 content, extraction, evidence_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                id.to_string(),
-                d.kind.as_str(),
-                d.subject,
-                d.subject_normalized,
-                d.predicate,
-                d.content,
-                d.extraction,
-                fragment_evidence[d.evidence_idx].to_string(),
-            ],
-        )
-        .map_err(dberr)?;
-        conn.execute(
-            "INSERT INTO assertion_fts (assertion_id, subject, content) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id.to_string(), d.subject, d.content],
-        )
-        .map_err(dberr)?;
+        let evidence_id = fragment_evidence[d.evidence_idx];
+        let content_hash = sha256_hex(d.content.as_bytes());
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM assertions WHERE evidence_id = ?1 AND extraction = ?2 \
+                 AND subject_normalized = ?3 AND content_hash = ?4",
+                rusqlite::params![
+                    evidence_id.to_string(),
+                    d.extraction,
+                    d.subject_normalized,
+                    content_hash,
+                ],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(dberr)?;
+        let id = match existing {
+            Some(s) => {
+                Uuid::parse_str(&s).map_err(|e| Error::Storage(format!("corrupt id '{s}': {e}")))?
+            }
+            None => {
+                let id = Uuid::now_v7();
+                conn.execute(
+                    "INSERT INTO assertions (id, kind, subject, subject_normalized, predicate, \
+                         content, content_hash, extraction, created_at, evidence_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        id.to_string(),
+                        d.kind.as_str(),
+                        d.subject,
+                        d.subject_normalized,
+                        d.predicate,
+                        d.content,
+                        content_hash,
+                        d.extraction,
+                        ingested_at.0,
+                        evidence_id.to_string(),
+                    ],
+                )
+                .map_err(dberr)?;
+                conn.execute(
+                    "INSERT INTO assertion_fts (assertion_id, subject, content) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id.to_string(), d.subject, d.content],
+                )
+                .map_err(dberr)?;
+                id
+            }
+        };
         assertion_cache[idx] = Some(id);
         Ok(id)
     };
@@ -936,6 +971,8 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
     }
 
     let mut actions: Vec<MemoryAction> = Vec::new();
+    let mut pending_news: Vec<usize> = Vec::new();
+    let mut pending_olds: Vec<MemorySummary> = Vec::new();
     let subjects: BTreeSet<String> = olds_by_subject
         .keys()
         .chain(news_by_subject.keys())
@@ -981,64 +1018,84 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
                             )?;
                         }
                     } else {
-                        let assertion_id = get_assertion(conn, ai)?;
-                        let new_id = create_memory(conn, assertion_id, ingested_at)?;
-                        let requested =
-                            requested_by_assertion.get(&ai).cloned().unwrap_or_default();
-                        add_spaces(conn, new_id, &requested, ingested_at)?;
-                        conn.execute(
-                            "UPDATE memories SET state = 'superseded', superseded_by = ?1, \
-                             superseded_at = ?2 WHERE id = ?3 AND state = 'active'",
-                            rusqlite::params![
-                                new_id.to_string(),
-                                ingested_at.0,
-                                old.memory_id.to_string(),
-                            ],
-                        )
-                        .map_err(dberr)?;
-                        push_action(
+                        supersede(
                             conn,
+                            old,
+                            ai,
+                            &bundle,
+                            &mut get_assertion,
+                            ingested_at,
+                            &requested_by_assertion,
                             &mut actions,
-                            new_id,
-                            &draft.subject,
-                            MemoryActionKind::Superseded {
-                                old_memory_id: old.memory_id,
-                            },
                         )?;
                     }
                 }
                 (Some(old), None) => {
-                    retire_conn(
-                        conn,
-                        old.memory_id,
-                        ingested_at,
-                        "subject no longer present in source at re-ingest",
-                    )?;
-                    push_action(
-                        conn,
-                        &mut actions,
-                        old.memory_id,
-                        &old.subject,
-                        MemoryActionKind::Retired,
-                    )?;
+                    pending_olds.push(old.clone());
                 }
                 (None, Some(&ai)) => {
-                    let draft = &bundle.assertions[ai];
-                    let assertion_id = get_assertion(conn, ai)?;
-                    let new_id = create_memory(conn, assertion_id, ingested_at)?;
-                    let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
-                    add_spaces(conn, new_id, &requested, ingested_at)?;
-                    push_action(
-                        conn,
-                        &mut actions,
-                        new_id,
-                        &draft.subject,
-                        MemoryActionKind::Created,
-                    )?;
+                    pending_news.push(ai);
                 }
                 (None, None) => unreachable!("pairing loop bounds"),
             }
         }
+    }
+
+    // 6. Content that survived a rename or a move keeps its lineage: match
+    //    leftover old and new fragments by identical content and supersede.
+    //    Only propositions that really left the source get retired, and only
+    //    genuinely new propositions get created. Order is deterministic:
+    //    olds (created_at, id) as collected, news in subject/ordinal order.
+    let mut unmatched_olds: Vec<MemorySummary> = Vec::new();
+    for old in pending_olds {
+        match pending_news
+            .iter()
+            .position(|&ai| bundle.assertions[ai].content == old.content)
+        {
+            Some(pos) => {
+                let ai = pending_news.remove(pos);
+                supersede(
+                    conn,
+                    &old,
+                    ai,
+                    &bundle,
+                    &mut get_assertion,
+                    ingested_at,
+                    &requested_by_assertion,
+                    &mut actions,
+                )?;
+            }
+            None => unmatched_olds.push(old),
+        }
+    }
+    for ai in pending_news {
+        let draft = &bundle.assertions[ai];
+        let assertion_id = get_assertion(conn, ai)?;
+        let new_id = create_memory(conn, assertion_id, ingested_at)?;
+        let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
+        add_spaces(conn, new_id, &requested, ingested_at)?;
+        push_action(
+            conn,
+            &mut actions,
+            new_id,
+            &draft.subject,
+            MemoryActionKind::Created,
+        )?;
+    }
+    for old in unmatched_olds {
+        retire_conn(
+            conn,
+            old.memory_id,
+            ingested_at,
+            "subject no longer present in source at re-ingest",
+        )?;
+        push_action(
+            conn,
+            &mut actions,
+            old.memory_id,
+            &old.subject,
+            MemoryActionKind::Retired,
+        )?;
     }
 
     Ok(IngestRecord {
@@ -1048,6 +1105,58 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         assertion_count: bundle.assertions.len(),
         actions,
     })
+}
+
+/// Supersedes `old` with a new active memory built from fragment `ai`.
+#[allow(clippy::too_many_arguments)]
+fn supersede(
+    conn: &Connection,
+    old: &MemorySummary,
+    ai: usize,
+    bundle: &IngestBundle,
+    get_assertion: &mut dyn FnMut(&Connection, usize) -> Result<Uuid>,
+    ingested_at: Ts,
+    requested_by_assertion: &HashMap<usize, Vec<Uuid>>,
+    actions: &mut Vec<MemoryAction>,
+) -> Result<()> {
+    let draft = &bundle.assertions[ai];
+    let assertion_id = get_assertion(conn, ai)?;
+    let new_id = create_memory(conn, assertion_id, ingested_at)?;
+    let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
+    add_spaces(conn, new_id, &requested, ingested_at)?;
+    conn.execute(
+        "UPDATE memories SET state = 'superseded', superseded_by = ?1, \
+         superseded_at = ?2 WHERE id = ?3 AND state = 'active'",
+        rusqlite::params![new_id.to_string(), ingested_at.0, old.memory_id.to_string(),],
+    )
+    .map_err(dberr)?;
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.name FROM memory_spaces ms JOIN spaces s ON s.id = ms.space_id \
+                 WHERE ms.memory_id = ?1 ORDER BY s.name",
+            )
+            .map_err(dberr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![new_id.to_string()], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(dberr)?;
+        let mut names = Vec::new();
+        for r in rows {
+            names.push(r.map_err(dberr)?);
+        }
+        names
+    };
+    actions.push(MemoryAction {
+        memory_id: new_id,
+        subject: draft.subject.clone(),
+        action: MemoryActionKind::Superseded {
+            old_memory_id: old.memory_id,
+        },
+        spaces: names,
+    });
+    Ok(())
 }
 
 fn find_source_conn(
@@ -1193,8 +1302,8 @@ fn run_search_sql(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<Ve
 
 fn load_assertion(conn: &Connection, id: Uuid) -> Result<Assertion> {
     conn.query_row(
-        "SELECT id, kind, subject, subject_normalized, predicate, content, extraction, \
-             evidence_id \
+        "SELECT id, kind, subject, subject_normalized, predicate, content, content_hash, \
+             extraction, created_at, evidence_id \
          FROM assertions WHERE id = ?1",
         rusqlite::params![id.to_string()],
         |r| {
@@ -1205,7 +1314,9 @@ fn load_assertion(conn: &Connection, id: Uuid) -> Result<Assertion> {
                 subject_normalized: r.get("subject_normalized")?,
                 predicate: r.get("predicate")?,
                 content: r.get("content")?,
+                content_hash: r.get("content_hash")?,
                 extraction: r.get("extraction")?,
+                created_at: ts_col(r, "created_at")?,
                 evidence_id: uuid_col(r, "evidence_id")?,
             })
         },

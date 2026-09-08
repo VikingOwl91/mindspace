@@ -187,8 +187,8 @@ pub fn trace(detail: &MemoryDetail, as_json: bool) {
         m.id, m.state, m.created_at
     );
     println!(
-        "assertion {} kind={} subject=\"{}\" extraction={}",
-        a.id, a.kind, a.subject, a.extraction
+        "assertion {} kind={} subject=\"{}\" extraction={} extracted={}",
+        a.id, a.kind, a.subject, a.extraction, a.created_at
     );
     println!("  content: {}", first_line(&a.content));
     println!(

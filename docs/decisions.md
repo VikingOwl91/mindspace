@@ -39,30 +39,66 @@ keeps every command working after an upgrade without a separate migrate step.
 
 **Revisit when.** Migration count or review requirements grow.
 
-## ADR-004: Assertion-Memory is 1:1; supersession creates a new memory (2026-09-08)
+## ADR-004: Assertion-Memory split with immutable assertions; supersession creates a new memory (2026-09-08, amended by ADR-012)
 
-**Decision.** A memory wraps exactly one assertion. Superseding a memory
-creates a new memory and sets `old.superseded_by = new`. History is the chain
-of memories, not a mutable content slot.
+**Decision.** Assertions are immutable statements derived from evidence;
+memories carry the lifecycle and supersede each other instead of mutating.
+Superseding a memory creates a new memory and sets `old.superseded_by = new`.
+History is the chain of memories, not a mutable content slot.
 
 **Why.** It keeps assertions immutable all the way through, makes "what was
 considered true at T" a pure timestamp query, and avoids mutable
-"active assertion" pointers. Aggregating multiple assertions into one memory
-later changes only the cardinality.
+"active assertion" pointers.
+
+**Amendment.** ADR-012 revised the cardinality and identity rules; see there.
 
 **Revisit when.** Aggregation or AI-derived multi-claim memories arrive.
 
-## ADR-005: Reconciliation keyed on (source location, subject) (2026-09-08)
+## ADR-012: Assertion identity is the interpretation; Assertion->Memory is 1:N (2026-09-08)
+
+**Decision.** Assertions carry a natural key
+`UNIQUE (evidence_id, extraction, subject_normalized, content_hash)` and a
+`created_at` (extraction transaction time). Memories are belief episodes
+referencing an assertion many-to-one, with a partial unique index enforcing
+at most one active episode per assertion. Ingestion looks assertions up by
+natural key and inserts only when the interpretation is genuinely new; the
+FTS row is written exactly once per assertion.
+
+**Why.** The v0 rule "every new memory gets a fresh assertion" manufactured
+rows that differed from existing ones by nothing but a uuid (retire then
+re-ingest, or a file reverting to earlier bytes). In an append-only,
+inspectable store that is semantic garbage: the interpretation did not
+change, only the belief episode did. With 1:N, a flip-flop (iced -> slint ->
+iced) reuses the interpretation and keeps one immutable object per meaning,
+while each episode keeps its own created_at, so "believed T1..T2 and again
+from T3" is directly representable. Corroboration stays distinguishable from
+duplication because different fragments (different evidence ids) still yield
+different assertions.
+
+**Consequences.** Search may return several episodes of one assertion when
+history flags are widened; that is intended (episodes are the results).
+Consolidation of several assertions into one memory remains an additive
+future join and is not implied by this ADR.
+
+**Revisit when.** Consolidation arrives, or assertion extraction becomes
+nondeterministic per run.
+
+## ADR-005: Reconciliation keyed on (source location, subject), lineage follows content (2026-09-08, amended by the v0 review)
 
 **Decision.** Re-ingest of a changed file supersedes/reuses per-subject
 memories derived from the same source location, per the exact algorithm in
 `docs/memory-model.md` section 6.2, including retirement of subjects that
 disappeared from the file. Cross-source same-subject content is never
-auto-superseded; it surfaces as a conflict.
+auto-superseded; it surfaces as a conflict. Leftover old and new fragments
+are additionally matched across subjects by identical content, so a renamed
+or moved heading supersedes its predecessor instead of severing the lineage.
 
 **Why.** Location+subject is the only strictly deterministic key available
 without interpretation. Auto-superseding across sources would silently
-resolve conflicts, which the model forbids.
+resolve conflicts, which the model forbids. Content-equality matching is
+equally deterministic: identical text under a new heading is the same
+proposition with a new label, and "what superseded this?" must keep working
+through renames, the most common real-world edit.
 
 **Revisit when.** Explicit user-driven supersession commands arrive.
 

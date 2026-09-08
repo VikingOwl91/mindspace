@@ -11,16 +11,23 @@ Historical evidence is never destroyed because newer information superseded it.
 ## 1. Object overview
 
 ```text
-Source            an immutable record of external material (a file, later: a
-  |               URL, a conversation). Owns the raw content and its hash.
+LogicalSource     the stable identity of a source across moves and
+  |               renames. Carries the mutable source lifecycle state
+  |               (presence, current location); history lives in the
+  |               journal. Future source kinds bring their own identity
+  |               signals; a filesystem path is only an observation
+  |               attribute, never the identity.
   |
-Evidence          an immutable, normalized fragment derived from a source
-  |               (a markdown section, or a whole plain document), with an
-  |               explicit anchor inside the source.
+Source (version)  an immutable content version of a logical source: the
+  |               bytes observed at a location at a transaction time.
+  |               Same logical source + same bytes = one version.
+  |
+Evidence          an immutable, normalized fragment derived from one
+  |               source version (a markdown section, or a whole plain
+  |               document), with an explicit anchor inside it.
   |
 Assertion         an immutable statement derived from evidence by a named,
-  |               deterministic extraction rule (v0: claims only; events and
-  |               relations are reserved kinds). Identity is the
+  |               deterministic extraction rule. Identity is the
   |               interpretation itself: identical evidence, rule, subject,
   |               and content is the same assertion, however many memories
   |               reference it over time.
@@ -43,14 +50,15 @@ queries and with `mind trace <id>`.
 All objects are identified by UUIDv7 (time-ordered). Timestamps are stored as
 UTC Unix epoch microseconds and rendered as RFC 3339 at the CLI edge.
 
-| Object    | Identity | Natural key                          | Mutable? |
-|-----------|----------|--------------------------------------|----------|
-| Source    | uuid     | (kind, location, content_hash)       | never    |
-| Evidence  | uuid     | (source_id, kind, ordinal)           | never    |
-| Assertion | uuid     | (evidence_id, extraction, subject_normalized, content_hash) | never |
-| Memory    | uuid     | — (belief episode)                   | state fields only |
-| Space     | uuid     | name (case-sensitive, unique)        | never in v0 |
-| SpaceLink | (from, to) | —                                  | never in v0 |
+| Object        | Identity | Natural key                          | Mutable? |
+|---------------|----------|--------------------------------------|----------|
+| LogicalSource | uuid     | — (adapter-provided identity later)  | lifecycle fields only |
+| Source        | uuid     | (logical_id, content_hash)           | never    |
+| Evidence      | uuid     | (source_id, kind, ordinal)           | never    |
+| Assertion     | uuid     | (evidence_id, extraction, subject_normalized, content_hash) | never |
+| Memory        | uuid     | — (belief episode)                   | state fields only |
+| Space         | uuid     | name (case-sensitive, unique)        | never in v0 |
+| SpaceLink     | (from, to) | —                                  | never in v0 |
 
 Immutability of Source, Evidence, and Assertion is not a convention: the
 SQLite store installs `BEFORE UPDATE` triggers that abort any update to those
@@ -63,22 +71,73 @@ Mutability of Memory is limited to its lifecycle columns
 A memory's content never changes, because its assertion never changes.
 Superseding a memory creates a *new* memory (section 7).
 
-### 2.1 Source
+### 2.1 Source identity, versions, and lifecycle
 
-- `kind`: what kind of material. v0 implements `file`.
-- `location`: canonical absolute path (for `file`). Part of the natural key.
-- `title`: deterministic document title (section 6.4).
-- `content`: the raw text of the material. v0 ingests text only.
-- `content_hash`: SHA-256 over the raw bytes (hex).
-- `media_type`: `text/markdown` or `text/plain`.
-- `ingested_at`: transaction time of first ingestion.
+Source identity is split into two concepts:
 
-Sources are versioned by content: re-ingesting a *changed* file at the same
-location produces a *new* source row (new hash). The old source row and
-everything derived from it remain. Source-level lineage (an explicit
-"previous version" pointer between sources of one location) is deferred; the
-information is recoverable from memories' supersession chains and shared
-locations.
+- **Logical source** (`logical_sources`): the stable identity of the
+  document across moves and renames. Mutable lifecycle state only:
+  `kind`, presence state (`present`/`absent`), the last known location
+  (kept when absent so a reappearance can be recognized), and the
+  creation time. Location is an observation attribute, never the
+  identity; future source kinds (EPUBs, chats, Git repositories, remote
+  datasets) will bring their own deterministic identity signals, and the
+  schema already separates identity from location for them.
+- **Source version** (`sources`): one immutable content state of a logical
+  source. `location` records where this content version was *first
+  observed* and never changes afterwards. Version identity is
+  `(logical_id, content_hash)`: the same bytes of the same logical source
+  are one version, however often they are re-observed or relocated. A
+  flip-flop (content X -> Y -> X) therefore reuses the first X version
+  and, through it, the original evidence and assertion.
+
+Move and disappearance are lifecycle facts recorded in a journal
+(`source_events`), against an ingest root:
+
+- An ingest operation is a **session** (`ingest_sessions`) with a root
+  (canonical boundary path) and a scope: **directory** (full observation
+  of everything ingestable under the root) or **file** (partial,
+  path-local observation).
+- **Full observation** (directory) reconciles the whole boundary against
+  the current logical state:
+  - same path, same content: *unchanged*; only space completion and
+    recreate-after-retire can act.
+  - same path, different content: the same logical source gains a new
+    version (unless that version already exists), reconciliation runs.
+  - new path with content identical to exactly one logical source that is
+    unaccounted for (just disappeared from this root, or already absent
+    from it): a **move/reappearance** is inferred; the logical source
+    continues at the new path, no version and no knowledge is touched,
+    and a `moved` event is journaled.
+  - otherwise, a new path is a **new logical source**. In particular:
+    a copy (the original is still observed) stays separate, and two new
+    paths with identical content are never merged into one continuation
+    (choosing one would be arbitrary).
+  - a logical source whose location was not observed is marked **absent**
+    with a `disappeared` event. Absence is an availability fact, not a
+    truth fact: derived memories stay active and searchable (section 9).
+- **Partial observation** (single file) does path-local continuity only:
+  unchanged, changed content of the logical source currently at that
+  path, reappearance of an absent source at its last known path with
+  identical content, or a new logical source. It never marks anything
+  disappeared and never infers moves.
+- **Ambiguity is preserved, never guessed.** Identical content is
+  evidence, not proof of identity. The move rule requires exactly one
+  candidate and exactly one new path; any other combination stays
+  separate. A rename followed by an edit (content changed across the
+  rename) cannot be proven to be one document: the old source is recorded
+  as absent and the new path is a new logical source. Renaming first and
+  editing second (two observations) preserves lineage through both steps.
+
+Known limitations (deterministic by design, all documented for later
+milestones): moves are inferred only within one ingest root; an ingest
+root that is itself renamed looks like an entirely new boundary; symlinked
+files are skipped; directory walks apply no ignore rules; unsupported file
+extensions do not take part in the observed set; no filesystem inode or
+device identity is used (inodes are observation signals at best, not
+portable identity). Future Git-aware ingest will supply stronger identity
+signals (repository, commit, blob, tree paths), which this model accepts
+as additional adapters without schema reinterpretation.
 
 ### 2.2 Evidence
 
@@ -294,30 +353,32 @@ read bytes -> sha256 -> resolve canonical location
   -> detect kind by extension (unsupported => actionable error)
   -> parse (pulldown-cmark for markdown; plain split for text)
   -> evidence fragments (sections / whole document)
-  -> assertions (one per fragment, named extraction rule)
-  -> reconcile against active memories of the same source location
+  -> observations handed to the store in one call
+  -> store decides source identity and lifecycle per section 2.1
+  -> reconcile memories per logical source
   -> commit atomically (single transaction)
 ```
 
+`mind ingest` accepts a file (partial observation) or a directory (full
+observation of the ingest root: recursive, deterministic order, no ignore
+rules, symlinks skipped, only `.md`/`.markdown`/`.txt` participate).
+
 ### 6.2 Idempotency and reconciliation (exact semantics)
 
-Ingestion is keyed on `(kind, location, content_hash)`:
+Version identity is `(logical_id, content_hash)`, and lifecycle decisions
+happen before reconciliation (section 2.1). Reconciliation itself is scoped
+per **logical source**: old memories are all active episodes whose evidence
+derives from any version of this logical source, regardless of where the
+source was observed. This is what makes a move with unchanged content a
+no-op for knowledge, while a changed content reconciles across the move.
 
-- **Same content at same location**: no new source, evidence, or assertions.
-  Existing active memories derived from that location are *reused*; any
-  requested space the memory does not yet have is added. Ingesting twice with
-  the same flags is a full no-op.
-- **Changed content at same location**: a new source (and evidence,
-  assertions) is recorded; reconciliation runs (below).
-- **Same content at a different location**: a genuinely new source; no
-  supersession (different provenance).
+Reconciliation is scoped per subject `S` of one logical source in the union
+of (a) subjects derived from the observed version and (b) subjects of
+currently active memories derived from the same logical source:
 
-Reconciliation is scoped per subject `S` in the union of (a) subjects derived
-from the new source and (b) subjects of currently active memories derived from
-the same location `L`:
-
-1. `olds` = active memories whose provenance source location is `L` and whose
-   normalized subject is `S`, ordered by `created_at`, then id.
+1. `olds` = active memories whose provenance derives from this logical
+   source and whose normalized subject is `S`, ordered by `created_at`,
+   then id.
 2. `news` = new fragments with subject `S`, ordered by ordinal.
 3. Pair them index-wise (`olds[i]` with `news[i]`):
    - fragment content identical to the old memory's assertion content:
@@ -405,6 +466,12 @@ There is no destructive deletion in v0, by design:
 
 - Invalidating a memory = `mind retire <id> [--reason]` (soft, timestamped,
   inspectable). Retiring a non-active memory is an error.
+- **Source disappearance is not memory retirement.** When a full
+  observation no longer sees a source, the logical source is marked absent
+  and the event is journaled; its memories stay active and searchable.
+  Deleting a file does not make its claims false. A future explicit
+  withdrawal command (section 9's "forget") may retire by provenance; that
+  is a deliberate human decision, never an ingest side effect.
 - Deleting the underlying file on disk changes nothing inside Mindspace; the
   stored source and its memories remain.
 - When source-level removal is introduced later, its semantics are already

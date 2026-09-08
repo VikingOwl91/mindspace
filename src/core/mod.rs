@@ -234,9 +234,16 @@ pub struct SpaceLink {
     pub created_at: Ts,
 }
 
+/// One immutable content version of a logical source: the bytes observed at
+/// a location at a transaction time. `location` is where this version was
+/// first observed and never changes; the logical source's current location
+/// lives in the lifecycle state. Version identity is
+/// `(logical_id, content_hash)`: the same bytes of the same logical source
+/// are one version, however often they are re-observed or relocated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub id: Uuid,
+    pub logical_id: Uuid,
     pub kind: SourceKind,
     pub location: String,
     pub title: String,
@@ -245,6 +252,91 @@ pub struct Source {
     pub media_type: String,
     pub size_bytes: u64,
     pub ingested_at: Ts,
+}
+
+/// Whether a logical source is currently observable at its last known
+/// location. Absence is a source-availability fact, not a truth fact:
+/// derived memories stay active while a source is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePresence {
+    Present,
+    Absent,
+}
+
+impl SourcePresence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourcePresence::Present => "present",
+            SourcePresence::Absent => "absent",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "present" => Some(SourcePresence::Present),
+            "absent" => Some(SourcePresence::Absent),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SourcePresence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The stable identity of a source across moves and renames. This is the
+/// mutable lifecycle entity of the source side of the model; versions
+/// (Source rows) are immutable. Adapters of future source kinds bring their
+/// own deterministic identity signals; location is only an observation
+/// attribute, never the identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogicalSource {
+    pub id: Uuid,
+    pub kind: SourceKind,
+    pub state: SourcePresence,
+    /// Last known location. Kept when the source disappears so a
+    /// reappearance at the same path can be recognized.
+    pub current_location: Option<String>,
+    pub created_at: Ts,
+}
+
+/// A source lifecycle change recorded in the journal. Only changes are
+/// journaled; routine re-observations live in the session records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceEvent {
+    pub id: Uuid,
+    pub logical_id: Uuid,
+    pub kind: SourceEventKind,
+    /// The version this event refers to (the continuation point of a move).
+    pub version_id: Option<Uuid>,
+    pub session_id: Option<Uuid>,
+    pub created_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceEventKind {
+    /// Inferred continuation of one logical source at a new location
+    /// (rename, move, or reappearance after absence). `from_location` is
+    /// the last known location.
+    Moved {
+        from_location: Option<String>,
+        to_location: String,
+    },
+    /// A full observation no longer sees the logical source within its
+    /// root. Derived memories are NOT retired: disappearance is an
+    /// availability fact, not a truth fact.
+    Disappeared { from_location: Option<String> },
+}
+
+/// The logical identity and lifecycle journal behind one source version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceLifecycle {
+    pub logical: LogicalSource,
+    pub events: Vec<SourceEvent>,
 }
 
 /// A span of a source that asserts something: a whole document, a section,
@@ -329,6 +421,7 @@ pub struct MemoryDetail {
     pub assertion: Assertion,
     pub evidence: Evidence,
     pub source: Source,
+    pub source_lifecycle: SourceLifecycle,
     pub spaces: Vec<Space>,
     pub superseded_by: Option<MemorySummary>,
     pub supersedes: Vec<MemorySummary>,
@@ -401,16 +494,65 @@ pub struct ConflictGroup {
 // Ingest structures
 // ---------------------------------------------------------------------------
 
+/// The boundary of one ingest operation. A `Directory` observation covers a
+/// whole ingest root and drives the full lifecycle reconciliation (moves,
+/// disappearances); a `File` observation is a partial, path-local
+/// observation that never marks anything disappeared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestScope {
+    Directory,
+    File,
+}
+
+impl IngestScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IngestScope::Directory => "directory",
+            IngestScope::File => "file",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "directory" => Some(IngestScope::Directory),
+            "file" => Some(IngestScope::File),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct SourceDraft {
-    pub kind: SourceKind,
+pub struct SessionDraft {
+    pub root: String,
+    pub scope: IngestScope,
+    pub observed_at: Ts,
+}
+
+/// One observed file handed to the store: content identity plus the
+/// deterministic parse into evidence and assertion drafts with requested
+/// spaces. Parsing happens before the store call; the store owns all
+/// identity, lifecycle, and reconciliation decisions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedFile {
     pub location: String,
-    pub title: String,
     pub content: String,
     pub content_hash: String,
+    pub title: String,
     pub media_type: String,
     pub size_bytes: u64,
-    pub ingested_at: Ts,
+    pub evidences: Vec<EvidenceDraft>,
+    pub assertions: Vec<AssertionDraft>,
+    pub memories: Vec<MemorySpec>,
+}
+
+/// Everything one ingest operation observed, handed to the store in a
+/// single call. The store owns the transaction, the lifecycle rules, and
+/// the reconciliation rules.
+#[derive(Debug, Clone)]
+pub struct IngestObservation {
+    pub session: SessionDraft,
+    pub files: Vec<ObservedFile>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -426,7 +568,7 @@ pub struct EvidenceDraft {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssertionDraft {
-    /// Index into the bundle's `evidences`.
+    /// Index into the observed file's `evidences`.
     pub evidence_idx: usize,
     pub kind: AssertionKind,
     pub subject: String,
@@ -438,19 +580,9 @@ pub struct AssertionDraft {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemorySpec {
-    /// Index into the bundle's `assertions`.
+    /// Index into the observed file's `assertions`.
     pub assertion_idx: usize,
     pub spaces: Vec<Uuid>,
-}
-
-/// Everything one ingestion contributes, handed to the store in a single
-/// call. The store owns the transaction and the reconciliation rules.
-#[derive(Debug, Clone)]
-pub struct IngestBundle {
-    pub source: SourceDraft,
-    pub evidences: Vec<EvidenceDraft>,
-    pub assertions: Vec<AssertionDraft>,
-    pub memories: Vec<MemorySpec>,
 }
 
 /// What happened to one memory during an ingestion.
@@ -473,13 +605,41 @@ pub enum MemoryActionKind {
     Retired,
 }
 
+/// How one observed file was classified against known source identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IngestRecord {
-    pub source: Source,
-    pub source_reused: bool,
-    pub evidence_count: usize,
-    pub assertion_count: usize,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileOutcome {
+    /// Same logical source, same content as last observed: nothing to do.
+    Unchanged,
+    /// An existing logical source observed with changed content (a new
+    /// version, or a version that already existed from a flip-flop).
+    Changed,
+    /// A new logical source was created with its first version.
+    Created,
+    /// An existing logical source was continued at this path by
+    /// deterministic move inference (rename, move, or reappearance).
+    /// The content version already existed and is reused.
+    Continued { from_location: Option<String> },
+}
+
+/// The per-path result of one observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileObservation {
+    pub location: String,
+    pub logical_id: Uuid,
+    pub outcome: FileOutcome,
+    /// Memory changes for this logical source, if reconciliation ran.
     pub actions: Vec<MemoryAction>,
+}
+
+/// What one ingest operation did, per file and to the lifecycle journal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservationReport {
+    pub session_id: Uuid,
+    pub root: String,
+    pub scope: IngestScope,
+    pub files: Vec<FileObservation>,
+    pub events: Vec<SourceEvent>,
 }
 
 /// Active-memory counts per space, keyed by space name, for listings.

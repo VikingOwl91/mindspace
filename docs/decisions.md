@@ -161,3 +161,39 @@ line numbers. Plain text is ingested whole (subject = file stem).
 correctly; regex approximations would mis-split exactly where it matters.
 
 **Revisit when.** Front matter or more formats arrive (deferred slice).
+
+## ADR-013: Logical source identity and lifecycle via observations (2026-09-08)
+
+**Decision.** Source identity splits into a mutable **logical source**
+(`logical_sources`: stable uuid, presence state, last known location) and
+immutable **content versions** (`sources`: one row per distinct content of
+a logical source, `UNIQUE (logical_id, content_hash)`). Ingest operations
+are sessions over a declared root; directory scans are full observations
+that classify every path (unchanged / changed / created / continued) and
+journal lifecycle changes (`moved`, `disappeared`) in `source_events`.
+Single-file ingests are partial observations: path-local continuity only.
+
+**Why.** With identity tied to `(kind, location, content_hash)`, a rename
+manufactured a second logical source, duplicated active memories, and
+invented candidate conflicts - normal filesystem operations became fake
+knowledge changes. Identical content is deliberately NOT treated as
+identity: a move is inferred only when exactly one candidate logical source
+with that content is unaccounted for and exactly one new path with that
+content appears; copies, multi-way matches, and rename-plus-edit stay
+separate (false merging is worse than failing to infer). Disappearance
+records absence without retiring memories: a vanished file does not make
+its claims false. Location never rewrites history: a version's location is
+where that content was first observed; current location lives on the
+logical source and its changes are journaled, so "where was this version
+observed, where is the source now, when did it move" are all answerable
+from immutable facts.
+
+**Consequences.** The lifecycle baseline is derived from logical source
+state (root-scoped), so interleaved partial ingests are handled correctly;
+session/observation rows remain as raw inspectable history. Moves are
+inferred only within one root; root renames look like new boundaries;
+symlinks are skipped; no ignore rules. Git-aware ingest later supplies
+stronger identity signals through the same adapter shape.
+
+**Revisit when.** Directory ingest UX expands (ignore rules), Git adapters
+arrive, or cross-root move inference is wanted.

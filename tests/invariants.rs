@@ -5,8 +5,9 @@
 use std::path::PathBuf;
 
 use mindspace::core::{
-    AssertionDraft, AssertionKind, EvidenceDraft, EvidenceKind, IngestBundle, MemoryActionKind,
-    MemoryState, SearchHit, SearchQuery, SourceDraft, SourceKind, Ts,
+    AssertionDraft, AssertionKind, EvidenceDraft, EvidenceKind, FileOutcome, IngestObservation,
+    IngestScope, MemoryActionKind, MemorySpec, MemoryState, ObservedFile, SearchHit, SearchQuery,
+    SessionDraft, SourceKind, Ts,
 };
 use mindspace::ingest;
 use mindspace::retrieval;
@@ -128,9 +129,9 @@ fn reingest_same_content_changes_nothing() {
     let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
     let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
 
-    assert!(second.source_reused);
-    assert_eq!(first.source.id, second.source.id);
-    for action in &second.actions {
+    assert!(matches!(second.files[0].outcome, FileOutcome::Unchanged));
+    assert_eq!(first.files[0].logical_id, second.files[0].logical_id);
+    for action in &second.files[0].actions {
         assert_eq!(action.action, MemoryActionKind::Unchanged, "{action:?}");
     }
     // No new memories: same count of subjects as the first ingest.
@@ -154,7 +155,7 @@ fn reingest_completes_requested_spaces() {
     ingest::ingest_file(&store, &path, &["coding"]).unwrap();
     let second = ingest::ingest_file(&store, &path, &["coding", "linux"]).unwrap();
 
-    assert!(second.actions.iter().all(
+    assert!(second.files[0].actions.iter().all(
         |a| matches!(&a.action, MemoryActionKind::Reused { spaces_added }
             if spaces_added == &vec!["linux".to_string()])
     ));
@@ -266,7 +267,7 @@ fn changed_file_supersedes_and_keeps_history() {
     let path = e.write("notes.md", TWO_SECTIONS_V1);
     let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
     // Actions are ordered by subject, not by position in the file.
-    let old_id = first
+    let old_id = first.files[0]
         .actions
         .iter()
         .find(|a| a.subject == "Storage")
@@ -279,7 +280,7 @@ fn changed_file_supersedes_and_keeps_history() {
     )
     .unwrap();
     let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let storage_action = second
+    let storage_action = second.files[0]
         .actions
         .iter()
         .find(|a| a.subject == "Storage")
@@ -326,7 +327,7 @@ fn removed_section_retires_with_reason() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", TWO_SECTIONS_V1);
     let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let parsing_id = first
+    let parsing_id = first.files[0]
         .actions
         .iter()
         .find(|a| a.subject == "Parsing")
@@ -340,7 +341,7 @@ fn removed_section_retires_with_reason() {
     .unwrap();
     let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
 
-    assert!(second
+    assert!(second.files[0]
         .actions
         .iter()
         .any(|a| { a.memory_id == parsing_id && a.action == MemoryActionKind::Retired }));
@@ -360,14 +361,14 @@ fn reingest_after_manual_retire_recreates() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", "# Solitary\n\nOne memory only.\n");
     let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let id = first.actions[0].memory_id;
+    let id = first.files[0].actions[0].memory_id;
     store
         .retire_memory(id, Some("manual".into()), Ts::now())
         .unwrap();
 
     let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    assert_eq!(second.actions[0].action, MemoryActionKind::Created);
-    assert_ne!(second.actions[0].memory_id, id);
+    assert_eq!(second.files[0].actions[0].action, MemoryActionKind::Created);
+    assert_ne!(second.files[0].actions[0].memory_id, id);
     assert_eq!(search(&store, "Solitary", Some("coding")).len(), 1);
 }
 
@@ -420,8 +421,8 @@ fn duplicate_sections_in_one_file_conflict() {
         "# Kernel\n\nClaim one.\n\n# Kernel\n\nClaim two.\n",
     );
     let record = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    assert_eq!(record.actions.len(), 2);
-    assert!(record
+    assert_eq!(record.files[0].actions.len(), 2);
+    assert!(record.files[0]
         .actions
         .iter()
         .all(|a| a.action == MemoryActionKind::Created));
@@ -439,7 +440,7 @@ fn retire_is_non_destructive_and_one_way() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", "# Stale\n\nThis claim went stale.\n");
     let record = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let id = record.actions[0].memory_id;
+    let id = record.files[0].actions[0].memory_id;
 
     let at = Ts::now();
     let retired = store
@@ -495,49 +496,53 @@ fn search_at_time_sees_the_past() {
     let store = e.open();
     store.create_space("coding", "").unwrap();
 
-    // Hand-built bundles with controlled timestamps: t1 < t2.
+    // Hand-built observations with controlled timestamps: t1 < t2.
     let t1 = Ts::now();
     let t2 = Ts(t1.0 + 1_000_000); // one second later
-    let bundle = |ts: Ts, fact: &str| IngestBundle {
-        source: SourceDraft {
-            kind: SourceKind::File,
+    let coding = store.get_space("coding").unwrap().id;
+    let observation = |ts: Ts, fact: &str| IngestObservation {
+        session: SessionDraft {
+            root: "/tmp/facts.md".into(),
+            scope: IngestScope::File,
+            observed_at: ts,
+        },
+        files: vec![ObservedFile {
             location: "/tmp/facts.md".into(),
-            title: "Facts".into(),
             content: fact.to_string(),
             content_hash: mindspace::core::sha256_hex(fact.as_bytes()),
+            title: "Facts".into(),
             media_type: "text/markdown".into(),
             size_bytes: fact.len() as u64,
-            ingested_at: ts,
-        },
-        evidences: vec![EvidenceDraft {
-            kind: EvidenceKind::Document,
-            heading_path: None,
-            start_line: Some(1),
-            end_line: Some(1),
-            ordinal: 0,
-            content: fact.to_string(),
-            content_hash: mindspace::core::sha256_hex(fact.as_bytes()),
-        }],
-        assertions: vec![AssertionDraft {
-            evidence_idx: 0,
-            kind: AssertionKind::Claim,
-            subject: "Speed".into(),
-            subject_normalized: "speed".into(),
-            predicate: None,
-            content: fact.to_string(),
-            extraction: "markdown:preamble".into(),
-        }],
-        memories: vec![mindspace::core::MemorySpec {
-            assertion_idx: 0,
-            spaces: vec![store.get_space("coding").unwrap().id],
+            evidences: vec![EvidenceDraft {
+                kind: EvidenceKind::Document,
+                heading_path: None,
+                start_line: Some(1),
+                end_line: Some(1),
+                ordinal: 0,
+                content: fact.to_string(),
+                content_hash: mindspace::core::sha256_hex(fact.as_bytes()),
+            }],
+            assertions: vec![AssertionDraft {
+                evidence_idx: 0,
+                kind: AssertionKind::Claim,
+                subject: "Speed".into(),
+                subject_normalized: "speed".into(),
+                predicate: None,
+                content: fact.to_string(),
+                extraction: "markdown:preamble".into(),
+            }],
+            memories: vec![MemorySpec {
+                assertion_idx: 0,
+                spaces: vec![coding],
+            }],
         }],
     };
 
     store
-        .record_ingestion(bundle(t1, "The tool is fast."))
+        .record_observation(observation(t1, "The tool is fast."))
         .unwrap();
     store
-        .record_ingestion(bundle(t2, "The tool is faster."))
+        .record_observation(observation(t2, "The tool is faster."))
         .unwrap();
 
     let coding = store.get_space("coding").unwrap().id;
@@ -579,19 +584,19 @@ fn id_prefixes_resolve_uniquely_or_fail_loudly() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", "# Alpha\n\nFirst.\n\n# Beta\n\nSecond.\n");
     let record = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let full_a = record.actions[0].memory_id.to_string();
-    let full_b = record.actions[1].memory_id.to_string();
+    let full_a = record.files[0].actions[0].memory_id.to_string();
+    let full_b = record.files[0].actions[1].memory_id.to_string();
 
     // Full ids resolve.
     assert_eq!(
         resolve_memory_id(&store, &full_a).unwrap(),
-        record.actions[0].memory_id
+        record.files[0].actions[0].memory_id
     );
     // The full id without hyphens is also accepted as a (unique) prefix.
     let stripped_a: String = full_a.chars().filter(|c| *c != '-').collect();
     assert_eq!(
         resolve_memory_id(&store, &stripped_a).unwrap(),
-        record.actions[0].memory_id
+        record.files[0].actions[0].memory_id
     );
     // Too short or unknown fails.
     assert!(matches!(
@@ -646,7 +651,7 @@ fn database_persists_across_restarts() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", TWO_SECTIONS_V1);
     let record = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let id = record.actions[0].memory_id;
+    let id = record.files[0].actions[0].memory_id;
     store
         .retire_memory(id, Some("gone".into()), Ts::now())
         .unwrap();
@@ -750,18 +755,23 @@ fn heading_rename_supersedes_and_preserves_lineage() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", "# Storage\n\nEverything lives in SQLite.\n");
     let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let old_id = first.actions[0].memory_id;
+    let old_id = first.files[0].actions[0].memory_id;
 
     // Only the heading changes; the proposition survives.
     std::fs::write(&path, "# Persistence\n\nEverything lives in SQLite.\n").unwrap();
     let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
 
-    assert_eq!(second.actions.len(), 1, "{:?}", second.actions);
+    assert_eq!(
+        second.files[0].actions.len(),
+        1,
+        "{:?}",
+        second.files[0].actions
+    );
     assert!(matches!(
-        &second.actions[0].action,
+        &second.files[0].actions[0].action,
         MemoryActionKind::Superseded { .. }
     ));
-    let new_id = second.actions[0].memory_id;
+    let new_id = second.files[0].actions[0].memory_id;
 
     let old = store.get_memory_detail(old_id).unwrap().unwrap();
     assert_eq!(old.memory.state, MemoryState::Superseded);
@@ -781,13 +791,13 @@ fn recreate_after_retire_reuses_the_assertion() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", "# Kernel\n\nThe scheduler is CFS.\n");
     let first = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let first_id = first.actions[0].memory_id;
+    let first_id = first.files[0].actions[0].memory_id;
     store
         .retire_memory(first_id, Some("manual".into()), Ts::now())
         .unwrap();
 
     let second = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let second_id = second.actions[0].memory_id;
+    let second_id = second.files[0].actions[0].memory_id;
     assert_ne!(second_id, first_id);
 
     // The interpretation did not change; only the belief episode did.
@@ -809,7 +819,7 @@ fn proposition_flip_flop_keeps_episodes_and_reuses_interpretations() {
     store.create_space("coding", "").unwrap();
     let path = e.write("notes.md", "# Toolkit\n\nThe project uses iced.\n");
     let h1 = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let iced1 = h1.actions[0].memory_id;
+    let iced1 = h1.files[0].actions[0].memory_id;
 
     std::fs::write(&path, "# Toolkit\n\nThe project uses slint.\n").unwrap();
     ingest::ingest_file(&store, &path, &["coding"]).unwrap();
@@ -817,7 +827,7 @@ fn proposition_flip_flop_keeps_episodes_and_reuses_interpretations() {
     // v3 is byte-identical to v1: the file flips back.
     std::fs::write(&path, "# Toolkit\n\nThe project uses iced.\n").unwrap();
     let h3 = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
-    let iced2 = h3.actions[0].memory_id;
+    let iced2 = h3.files[0].actions[0].memory_id;
 
     let a = store.get_memory_detail(iced1).unwrap().unwrap();
     let b = store.get_memory_detail(iced2).unwrap().unwrap();

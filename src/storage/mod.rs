@@ -3,14 +3,15 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    ConflictGroup, IngestBundle, IngestRecord, Memory, MemoryDetail, MemorySummary, Result,
-    SearchHitRaw, SearchQuery, Source, SourceKind, Space, SpaceLink, Ts,
+    ConflictGroup, IngestObservation, Memory, MemoryDetail, MemorySummary, ObservationReport,
+    Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and
 /// traffic exclusively in `core` types. Multi-invariant operations are
-/// single methods that own their transaction (`record_ingestion`); a future
-/// PostgreSQL backend would implement this trait without any other change.
+/// single methods that own their transaction (`record_observation`); a
+/// future PostgreSQL backend would implement this trait without any other
+/// change.
 pub trait Store {
     // -- spaces -------------------------------------------------------------
 
@@ -22,19 +23,17 @@ pub trait Store {
     fn list_space_links(&self) -> Result<Vec<SpaceLink>>;
     fn link_spaces(&self, from: Uuid, to: Uuid) -> Result<SpaceLink>;
 
-    // -- ingestion ----------------------------------------------------------
+    // -- observation / ingestion --------------------------------------------
 
-    fn find_source(
-        &self,
-        kind: SourceKind,
-        location: &str,
-        content_hash: &str,
-    ) -> Result<Option<Source>>;
-    /// Atomically records one ingestion: source, evidence, assertions, FTS
-    /// index entries, memories, space memberships, and the reconciliation
-    /// against active memories at the same location (supersessions and
-    /// retirements), exactly as specified in docs/memory-model.md 6.2.
-    fn record_ingestion(&self, bundle: IngestBundle) -> Result<IngestRecord>;
+    /// Atomically records one ingest operation: the session, per-file
+    /// observations, source identity and lifecycle decisions (unchanged,
+    /// new version, inferred move, new logical source, disappearance), new
+    /// versions with their evidence, and the memory reconciliation for
+    /// changed logical sources, exactly as specified in
+    /// docs/memory-model.md section 6.
+    fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport>;
+    /// The logical identity and lifecycle journal of one source.
+    fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>>;
 
     // -- memory inspection ---------------------------------------------------
 

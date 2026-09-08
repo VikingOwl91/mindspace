@@ -7,12 +7,20 @@ use uuid::Uuid;
 
 use crate::core::{
     sha256_hex, Assertion, AssertionKind, ConflictGroup, Error, Evidence, EvidenceKind,
-    IngestBundle, IngestRecord, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
-    MemorySummary, Result, SearchHitRaw, SearchQuery, Source, SourceKind, Space, SpaceLink, Ts,
+    FileObservation, FileOutcome, IngestObservation, IngestScope, LogicalSource, Memory,
+    MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
+    ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
+    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, Ts,
 };
 use crate::storage::Store;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../migrations/0001_init.sql")),
+    (
+        2,
+        include_str!("../../migrations/0002_source_lifecycle.sql"),
+    ),
+];
 
 pub struct SqliteStore {
     conn: Connection,
@@ -138,6 +146,7 @@ fn row_space(row: &Row) -> rusqlite::Result<Space> {
 fn row_source(row: &Row) -> rusqlite::Result<Source> {
     Ok(Source {
         id: uuid_col(row, "id")?,
+        logical_id: uuid_col(row, "logical_id")?,
         kind: enum_col(row, "kind", SourceKind::parse)?,
         location: row.get("location")?,
         title: row.get("title")?,
@@ -421,29 +430,15 @@ impl Store for SqliteStore {
         })
     }
 
-    fn find_source(
-        &self,
-        kind: SourceKind,
-        location: &str,
-        content_hash: &str,
-    ) -> Result<Option<Source>> {
-        self.conn
-            .query_row(
-                "SELECT id, kind, location, title, content, content_hash, media_type, \
-                        size_bytes, ingested_at \
-                 FROM sources WHERE kind = ?1 AND location = ?2 AND content_hash = ?3",
-                rusqlite::params![kind.as_str(), location, content_hash],
-                row_source,
-            )
-            .optional()
-            .map_err(dberr)
+    fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport> {
+        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let report = record_observation_tx(&tx, observation)?;
+        tx.commit().map_err(dberr)?;
+        Ok(report)
     }
 
-    fn record_ingestion(&self, bundle: IngestBundle) -> Result<IngestRecord> {
-        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
-        let record = record_ingestion_tx(&tx, bundle)?;
-        tx.commit().map_err(dberr)?;
-        Ok(record)
+    fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>> {
+        load_source_lifecycle(&self.conn, logical_id)
     }
 
     fn get_memory_detail(&self, id: Uuid) -> Result<Option<MemoryDetail>> {
@@ -466,13 +461,15 @@ impl Store for SqliteStore {
         let source = self
             .conn
             .query_row(
-                "SELECT id, kind, location, title, content, content_hash, media_type, \
-                        size_bytes, ingested_at \
+                "SELECT id, logical_id, kind, location, title, content, content_hash, \
+                        media_type, size_bytes, ingested_at \
                  FROM sources WHERE id = ?1",
                 rusqlite::params![evidence.source_id.to_string()],
                 row_source,
             )
             .map_err(dberr)?;
+        let source_lifecycle = load_source_lifecycle(&self.conn, source.logical_id)?
+            .ok_or_else(|| Error::Storage("source without logical identity".to_string()))?;
         let mut spaces_stmt = self
             .conn
             .prepare(
@@ -510,6 +507,7 @@ impl Store for SqliteStore {
             assertion,
             evidence,
             source,
+            source_lifecycle,
             spaces,
             superseded_by,
             supersedes,
@@ -733,135 +731,660 @@ impl Store for SqliteStore {
 use rusqlite::params_from_iter;
 
 // ---------------------------------------------------------------------------
-// Ingestion transaction (docs/memory-model.md section 6.2)
+// Observation / ingestion transaction (docs/memory-model.md section 6)
 // ---------------------------------------------------------------------------
 
-fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<IngestRecord> {
-    let ingested_at = bundle.source.ingested_at;
+/// The per-path classification before execution.
+enum Plan {
+    Unchanged {
+        location: String,
+        logical: Uuid,
+        file_idx: usize,
+    },
+    Changed {
+        location: String,
+        logical: Uuid,
+        file_idx: usize,
+    },
+    Created {
+        location: String,
+        file_idx: usize,
+    },
+    Continue {
+        location: String,
+        logical: Uuid,
+        from: Option<String>,
+        file_idx: usize,
+    },
+}
 
-    // 1. The source, keyed by (kind, location, content_hash). Re-ingesting
-    //    identical content reuses the existing source row.
-    let existing = find_source_conn(
-        conn,
-        bundle.source.kind,
-        &bundle.source.location,
-        &bundle.source.content_hash,
-    )?;
-    let (source, source_reused) = match existing {
-        Some(s) => (s, true),
-        None => {
-            let id = Uuid::now_v7();
-            conn.execute(
-                "INSERT INTO sources (id, kind, location, title, content, content_hash, \
-                     media_type, size_bytes, ingested_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    id.to_string(),
-                    bundle.source.kind.as_str(),
-                    bundle.source.location,
-                    bundle.source.title,
-                    bundle.source.content,
-                    bundle.source.content_hash,
-                    bundle.source.media_type,
-                    bundle.source.size_bytes as i64,
-                    ingested_at.0,
-                ],
+/// What the engine believes about one logical source inside an ingest
+/// root: its expected location and the hash of its latest version.
+type KnownSource = (String, Option<String>);
+
+fn record_observation_tx(
+    conn: &Connection,
+    observation: IngestObservation,
+) -> Result<ObservationReport> {
+    let IngestObservation { session, mut files } = observation;
+    let at = session.observed_at;
+    let full = session.scope == IngestScope::Directory;
+    let root = session.root.clone();
+
+    let session_id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO ingest_sessions (id, root, scope, observed_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            session_id.to_string(),
+            session.root,
+            session.scope.as_str(),
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+
+    // Deterministic processing order.
+    files.sort_by(|a, b| a.location.cmp(&b.location));
+
+    // What the engine currently believes exists under this root, derived
+    // from logical source state (not from the previous session), so
+    // interleaved partial ingests are handled correctly. Only file-kind
+    // logical sources participate in file observations; future source
+    // kinds bring their own observation adapters.
+    let mut present: BTreeMap<Uuid, KnownSource> = BTreeMap::new();
+    let mut absent: BTreeMap<Uuid, KnownSource> = BTreeMap::new();
+    if full {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, state, current_location FROM logical_sources \
+                 WHERE kind = 'file' AND current_location IS NOT NULL",
             )
             .map_err(dberr)?;
-            (
-                Source {
-                    id,
-                    kind: bundle.source.kind,
-                    location: bundle.source.location.clone(),
-                    title: bundle.source.title.clone(),
-                    content: bundle.source.content.clone(),
-                    content_hash: bundle.source.content_hash.clone(),
-                    media_type: bundle.source.media_type.clone(),
-                    size_bytes: bundle.source.size_bytes,
-                    ingested_at,
-                },
-                false,
-            )
-        }
-    };
-
-    // 2. Evidence for a new source version. Evidence is written once, when
-    //    the source row is written; a reused source already has its evidence.
-    let mut evidence_ids = Vec::with_capacity(bundle.evidences.len());
-    if !source_reused {
-        for d in &bundle.evidences {
-            let id = Uuid::now_v7();
-            conn.execute(
-                "INSERT INTO evidence (id, source_id, kind, heading_path, start_line, end_line, \
-                     ordinal, content, content_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    id.to_string(),
-                    source.id.to_string(),
-                    d.kind.as_str(),
-                    d.heading_path,
-                    d.start_line.map(i64::from),
-                    d.end_line.map(i64::from),
-                    i64::from(d.ordinal),
-                    d.content,
-                    d.content_hash,
-                ],
-            )
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(dberr)?;
-            evidence_ids.push(id);
+        for r in rows {
+            let (id, state, location) = r.map_err(dberr)?;
+            let logical = Uuid::parse_str(&id)
+                .map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")))?;
+            // Root scoping: only logical sources living under the observed
+            // root take part in this boundary's lifecycle reasoning.
+            if !Path::new(&location).starts_with(&root) {
+                continue;
+            }
+            let hash = latest_version_hash(conn, &logical)?;
+            if state == "present" {
+                present.insert(logical, (location, hash));
+            } else {
+                absent.insert(logical, (location, hash));
+            }
         }
     }
 
-    // 3. Fragment -> evidence mapping. A new source version carries fresh
-    //    evidence rows; a reused source keeps its existing ones.
-    let fragment_evidence: Vec<Uuid> = if !source_reused {
-        evidence_ids
+    // --- classification -----------------------------------------------------
+    let mut plans: Vec<Plan> = Vec::new();
+    let mut unmatched_new: Vec<usize> = Vec::new(); // indices into files
+    let mut matched: HashMap<Uuid, usize> = HashMap::new(); // logical -> file idx
+    let mut gone: BTreeMap<Uuid, String> = BTreeMap::new(); // logical -> last location
+
+    if full {
+        let mut expected: HashMap<String, Uuid> = HashMap::new();
+        for (logical, (location, _)) in &present {
+            expected.insert(location.clone(), *logical);
+        }
+        for (idx, file) in files.iter().enumerate() {
+            if let Some(logical) = expected.get(&file.location).copied() {
+                let latest = present[&logical].1.as_deref();
+                if latest == Some(file.content_hash.as_str()) {
+                    plans.push(Plan::Unchanged {
+                        location: file.location.clone(),
+                        logical,
+                        file_idx: idx,
+                    });
+                } else {
+                    plans.push(Plan::Changed {
+                        location: file.location.clone(),
+                        logical,
+                        file_idx: idx,
+                    });
+                }
+            } else {
+                plans.push(Plan::Created {
+                    location: file.location.clone(),
+                    file_idx: idx,
+                });
+                unmatched_new.push(idx);
+            }
+        }
+        for (logical, (location, _)) in &present {
+            if !files.iter().any(|f| &f.location == location) {
+                gone.insert(*logical, location.clone());
+            }
+        }
     } else {
-        bundle
-            .evidences
-            .iter()
-            .map(|d| -> Result<Uuid> {
-                let existing: Option<String> = conn
+        // Partial (file-scope) observation: path-local continuity only.
+        // Never marks anything disappeared, never infers moves.
+        for (idx, file) in files.iter().enumerate() {
+            if let Some(logical) = present_logical_at(conn, &file.location)? {
+                if latest_version_hash(conn, &logical)?.as_deref()
+                    == Some(file.content_hash.as_str())
+                {
+                    plans.push(Plan::Unchanged {
+                        location: file.location.clone(),
+                        logical,
+                        file_idx: idx,
+                    });
+                } else {
+                    plans.push(Plan::Changed {
+                        location: file.location.clone(),
+                        logical,
+                        file_idx: idx,
+                    });
+                }
+            } else if let Some(logical) = absent_logical_at(conn, &file.location)? {
+                let continues =
+                    latest_version_hash(conn, &logical)?.is_some_and(|h| h == file.content_hash);
+                if continues {
+                    plans.push(Plan::Continue {
+                        location: file.location.clone(),
+                        logical,
+                        from: Some(file.location.clone()),
+                        file_idx: idx,
+                    });
+                    continue;
+                }
+                // A new document recycled the path of an absent source and
+                // its content differs; identity is not proven.
+                plans.push(Plan::Created {
+                    location: file.location.clone(),
+                    file_idx: idx,
+                });
+            } else {
+                plans.push(Plan::Created {
+                    location: file.location.clone(),
+                    file_idx: idx,
+                });
+            }
+        }
+    }
+
+    // Move inference (full observations only). Identical content is
+    // evidence, not proof: a move is inferred only when exactly one
+    // candidate logical source with that content is unaccounted for AND
+    // exactly one new path with that content appeared. Candidates are
+    // logicals that just went missing from this root plus logicals already
+    // absent from it (reappearance). Copies and ambiguous multi-way
+    // matches stay separate; false merging is worse than failing to infer
+    // a move.
+    if full {
+        for (idx, file) in files.iter().enumerate() {
+            if !unmatched_new.contains(&idx) {
+                continue;
+            }
+            let mut candidates: Vec<(Uuid, Option<String>)> = Vec::new();
+            for logical in gone.keys() {
+                if !matched.contains_key(logical) {
+                    candidates.push((*logical, Some(gone[logical].clone())));
+                }
+            }
+            for logical in absent.keys() {
+                if !matched.contains_key(logical) && !gone.contains_key(logical) {
+                    candidates.push((*logical, Some(absent[logical].0.clone())));
+                }
+            }
+            let hash_of = |logical: &Uuid| -> Option<String> {
+                if gone.contains_key(logical) {
+                    latest_version_hash(conn, logical).ok().flatten()
+                } else {
+                    absent.get(logical).and_then(|(_, h)| h.clone())
+                }
+            };
+            let same_hash_candidates: Vec<Uuid> = candidates
+                .iter()
+                .filter(|(logical, _)| {
+                    hash_of(logical).as_deref() == Some(file.content_hash.as_str())
+                })
+                .map(|(logical, _)| *logical)
+                .collect();
+            let same_hash_new: Vec<usize> = unmatched_new
+                .iter()
+                .copied()
+                .filter(|&i| files[i].content_hash == file.content_hash)
+                .collect();
+            if same_hash_candidates.len() == 1 && same_hash_new.len() == 1 {
+                let logical = same_hash_candidates[0];
+                matched.insert(logical, idx);
+                unmatched_new.retain(|&i| i != idx);
+                let from = candidates
+                    .iter()
+                    .find(|(l, _)| *l == logical)
+                    .and_then(|(_, from)| from.clone());
+                if let Some(plan) = plans
+                    .iter_mut()
+                    .find(|p| matches!(p, Plan::Created { file_idx, .. } if *file_idx == idx))
+                {
+                    *plan = Plan::Continue {
+                        location: file.location.clone(),
+                        logical,
+                        from,
+                        file_idx: idx,
+                    };
+                }
+            }
+        }
+    }
+
+    // --- execution -----------------------------------------------------------
+    let mut report_files: Vec<FileObservation> = Vec::new();
+    let mut events: Vec<SourceEvent> = Vec::new();
+
+    for plan in plans {
+        match plan {
+            Plan::Unchanged {
+                location,
+                logical,
+                file_idx,
+            } => {
+                // Reconcile even for unchanged content: re-ingest with
+                // additional --space flags must complete space memberships,
+                // and a manually retired memory must be recreated on an
+                // explicit re-ingest. Content equality guarantees the
+                // reconciliation can only reuse (never supersede).
+                let (_, _, evidence_ids) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let actions =
+                    reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
+                record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
+                report_files.push(FileObservation {
+                    location,
+                    logical_id: logical,
+                    outcome: FileOutcome::Unchanged,
+                    actions,
+                });
+            }
+            Plan::Changed {
+                location,
+                logical,
+                file_idx,
+            } => {
+                let (_, _, evidence_ids) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let actions =
+                    reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
+                record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
+                report_files.push(FileObservation {
+                    location,
+                    logical_id: logical,
+                    outcome: FileOutcome::Changed,
+                    actions,
+                });
+            }
+            Plan::Created { location, file_idx } => {
+                let logical = create_logical_source(conn, &files[file_idx], at)?;
+                let (_, _, evidence_ids) = ensure_version(conn, logical, &files[file_idx], at)?;
+                let actions =
+                    reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
+                record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
+                report_files.push(FileObservation {
+                    location,
+                    logical_id: logical,
+                    outcome: FileOutcome::Created,
+                    actions,
+                });
+            }
+            Plan::Continue {
+                location,
+                logical,
+                from,
+                file_idx,
+            } => {
+                // The content version already exists and is reused; only
+                // the lifecycle moves. No knowledge is touched.
+                let (added, _, _) = ensure_version(conn, logical, &files[file_idx], at)?;
+                debug_assert!(!added, "a continued source reuses its version");
+                conn.execute(
+                    "UPDATE logical_sources SET state = 'present', current_location = ?1 \
+                     WHERE id = ?2",
+                    rusqlite::params![location, logical.to_string()],
+                )
+                .map_err(dberr)?;
+                let event = insert_source_event(
+                    conn,
+                    logical,
+                    SourceEventKind::Moved {
+                        from_location: from.clone(),
+                        to_location: location.clone(),
+                    },
+                    None,
+                    session_id,
+                    at,
+                )?;
+                events.push(event);
+                record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
+                report_files.push(FileObservation {
+                    location,
+                    logical_id: logical,
+                    outcome: FileOutcome::Continued {
+                        from_location: from,
+                    },
+                    actions: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // Disappearances: full observations only, scoped to the observed root.
+    // This records absence; it does NOT retire derived memories
+    // (disappearance is not falsehood).
+    if full {
+        for (logical, location) in &gone {
+            if matched.contains_key(logical) {
+                continue;
+            }
+            conn.execute(
+                "UPDATE logical_sources SET state = 'absent' WHERE id = ?1",
+                rusqlite::params![logical.to_string()],
+            )
+            .map_err(dberr)?;
+            let event = insert_source_event(
+                conn,
+                *logical,
+                SourceEventKind::Disappeared {
+                    from_location: Some(location.clone()),
+                },
+                None,
+                session_id,
+                at,
+            )?;
+            events.push(event);
+        }
+    }
+
+    Ok(ObservationReport {
+        session_id,
+        root,
+        scope: session.scope,
+        files: report_files,
+        events,
+    })
+}
+
+/// Latest version of a logical source as (version id, content hash).
+fn latest_version(conn: &Connection, logical: &Uuid) -> Result<Option<(Uuid, String)>> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, content_hash FROM sources WHERE logical_id = ?1 \
+             ORDER BY ingested_at DESC, id DESC LIMIT 1",
+            rusqlite::params![logical.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(dberr)?;
+    row.map(|(id, hash)| {
+        Ok((
+            Uuid::parse_str(&id).map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")))?,
+            hash,
+        ))
+    })
+    .transpose()
+}
+
+fn latest_version_hash(conn: &Connection, logical: &Uuid) -> Result<Option<String>> {
+    Ok(latest_version(conn, logical)?.map(|(_, hash)| hash))
+}
+
+fn present_logical_at(conn: &Connection, location: &str) -> Result<Option<Uuid>> {
+    logical_at(conn, location, "present")
+}
+
+fn absent_logical_at(conn: &Connection, location: &str) -> Result<Option<Uuid>> {
+    logical_at(conn, location, "absent")
+}
+
+fn logical_at(conn: &Connection, location: &str, state: &str) -> Result<Option<Uuid>> {
+    let sql = format!(
+        "SELECT id FROM logical_sources WHERE current_location = ?1 AND state = '{state}' \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    let id: Option<String> = conn
+        .query_row(&sql, rusqlite::params![location], |r| r.get(0))
+        .optional()
+        .map_err(dberr)?;
+    id.map(|s| Uuid::parse_str(&s).map_err(|e| Error::Storage(format!("corrupt id '{s}': {e}"))))
+        .transpose()
+}
+
+fn create_logical_source(conn: &Connection, file: &ObservedFile, at: Ts) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO logical_sources (id, kind, state, current_location, created_at) \
+         VALUES (?1, 'file', 'present', ?2, ?3)",
+        rusqlite::params![id.to_string(), file.location, at.0],
+    )
+    .map_err(dberr)?;
+    Ok(id)
+}
+
+/// Finds the version of this logical source with this content, or creates
+/// it (with its evidence rows). Returns
+/// (version was added, version id, evidence ids in draft order).
+fn ensure_version(
+    conn: &Connection,
+    logical: Uuid,
+    file: &ObservedFile,
+    at: Ts,
+) -> Result<(bool, Uuid, Vec<Uuid>)> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM sources WHERE logical_id = ?1 AND content_hash = ?2",
+            rusqlite::params![logical.to_string(), file.content_hash],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(dberr)?;
+    if let Some(id) = existing {
+        let version_id =
+            Uuid::parse_str(&id).map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")))?;
+        let mut evidence_ids = Vec::with_capacity(file.evidences.len());
+        let mut stmt = conn
+            .prepare("SELECT id FROM evidence WHERE source_id = ?1 ORDER BY ordinal")
+            .map_err(dberr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![version_id.to_string()], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(dberr)?;
+        for r in rows {
+            let s = r.map_err(dberr)?;
+            evidence_ids.push(
+                Uuid::parse_str(&s)
+                    .map_err(|e| Error::Storage(format!("corrupt id '{s}': {e}")))?,
+            );
+        }
+        return Ok((false, version_id, evidence_ids));
+    }
+    let version_id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO sources (id, logical_id, kind, location, title, content, content_hash, \
+             media_type, size_bytes, ingested_at) \
+         VALUES (?1, ?2, 'file', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            version_id.to_string(),
+            logical.to_string(),
+            file.location,
+            file.title,
+            file.content,
+            file.content_hash,
+            file.media_type,
+            file.size_bytes as i64,
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+    let mut evidence_ids = Vec::with_capacity(file.evidences.len());
+    for d in &file.evidences {
+        let id = Uuid::now_v7();
+        conn.execute(
+            "INSERT INTO evidence (id, source_id, kind, heading_path, start_line, end_line, \
+                 ordinal, content, content_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                id.to_string(),
+                version_id.to_string(),
+                d.kind.as_str(),
+                d.heading_path,
+                d.start_line.map(i64::from),
+                d.end_line.map(i64::from),
+                i64::from(d.ordinal),
+                d.content,
+                d.content_hash,
+            ],
+        )
+        .map_err(dberr)?;
+        evidence_ids.push(id);
+    }
+    Ok((true, version_id, evidence_ids))
+}
+
+fn record_observation_row(
+    conn: &Connection,
+    session_id: Uuid,
+    logical: Uuid,
+    file: &ObservedFile,
+    at: Ts,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO source_observations (session_id, logical_id, location, content_hash, \
+             observed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            session_id.to_string(),
+            logical.to_string(),
+            file.location,
+            file.content_hash,
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+    Ok(())
+}
+
+fn insert_source_event(
+    conn: &Connection,
+    logical: Uuid,
+    kind: SourceEventKind,
+    version_id: Option<Uuid>,
+    session_id: Uuid,
+    at: Ts,
+) -> Result<SourceEvent> {
+    let id = Uuid::now_v7();
+    let (event_kind, from_location, to_location) = match &kind {
+        SourceEventKind::Moved {
+            from_location,
+            to_location,
+        } => ("moved", from_location.clone(), Some(to_location.clone())),
+        SourceEventKind::Disappeared { from_location } => {
+            ("disappeared", from_location.clone(), None)
+        }
+    };
+    conn.execute(
+        "INSERT INTO source_events (id, logical_id, kind, from_location, to_location, \
+             version_id, session_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            id.to_string(),
+            logical.to_string(),
+            event_kind,
+            from_location,
+            to_location,
+            version_id.map(|v| v.to_string()),
+            session_id.to_string(),
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+    Ok(SourceEvent {
+        id,
+        logical_id: logical,
+        kind,
+        version_id,
+        session_id: Some(session_id),
+        created_at: at,
+    })
+}
+
+/// Reconciles the active memory episodes of one logical source against the
+/// fragments of an observed version (docs/memory-model.md section 6).
+/// Identity is per logical source, so a moved-but-unchanged source never
+/// duplicates knowledge; this runs only when content changed.
+fn reconcile_logical(
+    conn: &Connection,
+    logical: Uuid,
+    file: &ObservedFile,
+    evidence_ids: &[Uuid],
+    at: Ts,
+) -> Result<Vec<MemoryAction>> {
+    let mut olds_by_subject: BTreeMap<String, Vec<MemorySummary>> = BTreeMap::new();
+    let olds = load_summaries(
+        conn,
+        "",
+        "m.state = 'active' AND src.logical_id = ?",
+        vec![Value::Text(logical.to_string())],
+    )?;
+    for o in olds {
+        olds_by_subject
+            .entry(o.subject_normalized.clone())
+            .or_default()
+            .push(o);
+    }
+    let mut news_by_subject: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, d) in file.assertions.iter().enumerate() {
+        news_by_subject
+            .entry(d.subject_normalized.clone())
+            .or_default()
+            .push(i);
+    }
+
+    // Requested spaces per fragment index, with names for the report.
+    let mut requested_by_assertion: HashMap<usize, Vec<Uuid>> = HashMap::new();
+    let mut space_names: BTreeMap<Uuid, String> = BTreeMap::new();
+    for spec in &file.memories {
+        let entry = requested_by_assertion
+            .entry(spec.assertion_idx)
+            .or_default();
+        for sid in &spec.spaces {
+            if !entry.contains(sid) {
+                entry.push(*sid);
+            }
+            if !space_names.contains_key(sid) {
+                let name: Option<String> = conn
                     .query_row(
-                        "SELECT id FROM evidence WHERE source_id = ?1 AND kind = ?2 AND ordinal = ?3",
-                        rusqlite::params![
-                            source.id.to_string(),
-                            d.kind.as_str(),
-                            i64::from(d.ordinal),
-                        ],
+                        "SELECT name FROM spaces WHERE id = ?1",
+                        rusqlite::params![sid.to_string()],
                         |r| r.get(0),
                     )
                     .optional()
                     .map_err(dberr)?;
-                existing
-                    .map(|s| {
-                        Uuid::parse_str(&s)
-                            .map_err(|e| Error::Storage(format!("corrupt id '{s}': {e}")))
-                    })
-                    .transpose()?
-                    .ok_or_else(|| {
-                        Error::Storage(format!(
-                            "reused source {} is missing evidence for ordinal {}",
-                            source.id, d.ordinal
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+                space_names.insert(
+                    *sid,
+                    name.ok_or_else(|| Error::SpaceNotFound {
+                        name: sid.to_string(),
+                    })?,
+                );
+            }
+        }
+    }
 
-    // 4. Assertions are the stable interpretations; they are looked up by
-    //    their natural key (evidence, rule, subject, content) and inserted
-    //    only when genuinely new. Belief episodes (memories) reference them,
-    //    possibly several over time. A reused section never produces orphan
-    //    assertion rows, and a recreated belief never duplicates an
-    //    interpretation that already exists.
-    let mut assertion_cache: Vec<Option<Uuid>> = vec![None; bundle.assertions.len()];
+    let mut assertion_cache: Vec<Option<Uuid>> = vec![None; file.assertions.len()];
     let mut get_assertion = |conn: &Connection, idx: usize| -> Result<Uuid> {
         if let Some(id) = assertion_cache[idx] {
             return Ok(id);
         }
-        let d = &bundle.assertions[idx];
-        let evidence_id = fragment_evidence[d.evidence_idx];
+        let d = &file.assertions[idx];
+        let evidence_id = evidence_ids[d.evidence_idx];
         let content_hash = sha256_hex(d.content.as_bytes());
         let existing: Option<String> = conn
             .query_row(
@@ -896,7 +1419,7 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
                         d.content,
                         content_hash,
                         d.extraction,
-                        ingested_at.0,
+                        at.0,
                         evidence_id.to_string(),
                     ],
                 )
@@ -912,63 +1435,6 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         assertion_cache[idx] = Some(id);
         Ok(id)
     };
-
-    // 4. Requested spaces, with names for the action report.
-    let mut requested_by_assertion: HashMap<usize, Vec<Uuid>> = HashMap::new();
-    let mut space_names: BTreeMap<Uuid, String> = BTreeMap::new();
-    for spec in &bundle.memories {
-        let entry = requested_by_assertion
-            .entry(spec.assertion_idx)
-            .or_default();
-        for sid in &spec.spaces {
-            if !entry.contains(sid) {
-                entry.push(*sid);
-            }
-            if !space_names.contains_key(sid) {
-                let name: Option<String> = conn
-                    .query_row(
-                        "SELECT name FROM spaces WHERE id = ?1",
-                        rusqlite::params![sid.to_string()],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(dberr)?;
-                space_names.insert(
-                    *sid,
-                    name.ok_or_else(|| Error::SpaceNotFound {
-                        name: sid.to_string(),
-                    })?,
-                );
-            }
-        }
-    }
-
-    // 5. Reconciliation. Old memories: active memories whose source sits at
-    //    this location, ordered (created_at, id). New memories: fragments of
-    //    the same subject, ordered by evidence ordinal. Pair index-wise.
-    let olds = load_summaries(
-        conn,
-        "",
-        "m.state = 'active' AND src.kind = ? AND src.location = ?",
-        vec![
-            Value::Text(bundle.source.kind.as_str().to_string()),
-            Value::Text(bundle.source.location.clone()),
-        ],
-    )?;
-    let mut olds_by_subject: BTreeMap<String, Vec<MemorySummary>> = BTreeMap::new();
-    for o in olds {
-        olds_by_subject
-            .entry(o.subject_normalized.clone())
-            .or_default()
-            .push(o);
-    }
-    let mut news_by_subject: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (i, d) in bundle.assertions.iter().enumerate() {
-        news_by_subject
-            .entry(d.subject_normalized.clone())
-            .or_default()
-            .push(i);
-    }
 
     let mut actions: Vec<MemoryAction> = Vec::new();
     let mut pending_news: Vec<usize> = Vec::new();
@@ -991,11 +1457,11 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         for i in 0..pairs {
             match (olds.get(i), news.get(i)) {
                 (Some(old), Some(&ai)) => {
-                    let draft = &bundle.assertions[ai];
+                    let draft = &file.assertions[ai];
                     if old.content == draft.content {
                         let requested =
                             requested_by_assertion.get(&ai).cloned().unwrap_or_default();
-                        let added = add_spaces(conn, old.memory_id, &requested, ingested_at)?;
+                        let added = add_spaces(conn, old.memory_id, &requested, at)?;
                         if added.is_empty() {
                             push_action(
                                 conn,
@@ -1020,11 +1486,11 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
                     } else {
                         supersede(
                             conn,
-                            old,
+                            old.memory_id,
+                            &draft.subject,
                             ai,
-                            &bundle,
                             &mut get_assertion,
-                            ingested_at,
+                            at,
                             &requested_by_assertion,
                             &mut actions,
                         )?;
@@ -1041,26 +1507,22 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         }
     }
 
-    // 6. Content that survived a rename or a move keeps its lineage: match
-    //    leftover old and new fragments by identical content and supersede.
-    //    Only propositions that really left the source get retired, and only
-    //    genuinely new propositions get created. Order is deterministic:
-    //    olds (created_at, id) as collected, news in subject/ordinal order.
+    // Content that survived a rename or a move keeps its lineage.
     let mut unmatched_olds: Vec<MemorySummary> = Vec::new();
     for old in pending_olds {
         match pending_news
             .iter()
-            .position(|&ai| bundle.assertions[ai].content == old.content)
+            .position(|&ai| file.assertions[ai].content == old.content)
         {
             Some(pos) => {
                 let ai = pending_news.remove(pos);
                 supersede(
                     conn,
-                    &old,
+                    old.memory_id,
+                    &file.assertions[ai].subject,
                     ai,
-                    &bundle,
                     &mut get_assertion,
-                    ingested_at,
+                    at,
                     &requested_by_assertion,
                     &mut actions,
                 )?;
@@ -1069,16 +1531,15 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         }
     }
     for ai in pending_news {
-        let draft = &bundle.assertions[ai];
         let assertion_id = get_assertion(conn, ai)?;
-        let new_id = create_memory(conn, assertion_id, ingested_at)?;
+        let new_id = create_memory(conn, assertion_id, at)?;
         let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
-        add_spaces(conn, new_id, &requested, ingested_at)?;
+        add_spaces(conn, new_id, &requested, at)?;
         push_action(
             conn,
             &mut actions,
             new_id,
-            &draft.subject,
+            &file.assertions[ai].subject,
             MemoryActionKind::Created,
         )?;
     }
@@ -1086,7 +1547,7 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         retire_conn(
             conn,
             old.memory_id,
-            ingested_at,
+            at,
             "subject no longer present in source at re-ingest",
         )?;
         push_action(
@@ -1098,36 +1559,29 @@ fn record_ingestion_tx(conn: &Connection, bundle: IngestBundle) -> Result<Ingest
         )?;
     }
 
-    Ok(IngestRecord {
-        source,
-        source_reused,
-        evidence_count: bundle.evidences.len(),
-        assertion_count: bundle.assertions.len(),
-        actions,
-    })
+    Ok(actions)
 }
 
-/// Supersedes `old` with a new active memory built from fragment `ai`.
+/// Supersedes one active memory with a new one built from fragment `ai`.
 #[allow(clippy::too_many_arguments)]
 fn supersede(
     conn: &Connection,
-    old: &MemorySummary,
+    old_memory_id: Uuid,
+    subject: &str,
     ai: usize,
-    bundle: &IngestBundle,
     get_assertion: &mut dyn FnMut(&Connection, usize) -> Result<Uuid>,
-    ingested_at: Ts,
+    at: Ts,
     requested_by_assertion: &HashMap<usize, Vec<Uuid>>,
     actions: &mut Vec<MemoryAction>,
 ) -> Result<()> {
-    let draft = &bundle.assertions[ai];
     let assertion_id = get_assertion(conn, ai)?;
-    let new_id = create_memory(conn, assertion_id, ingested_at)?;
+    let new_id = create_memory(conn, assertion_id, at)?;
     let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
-    add_spaces(conn, new_id, &requested, ingested_at)?;
+    add_spaces(conn, new_id, &requested, at)?;
     conn.execute(
         "UPDATE memories SET state = 'superseded', superseded_by = ?1, \
          superseded_at = ?2 WHERE id = ?3 AND state = 'active'",
-        rusqlite::params![new_id.to_string(), ingested_at.0, old.memory_id.to_string(),],
+        rusqlite::params![new_id.to_string(), at.0, old_memory_id.to_string()],
     )
     .map_err(dberr)?;
     let names: Vec<String> = {
@@ -1150,30 +1604,11 @@ fn supersede(
     };
     actions.push(MemoryAction {
         memory_id: new_id,
-        subject: draft.subject.clone(),
-        action: MemoryActionKind::Superseded {
-            old_memory_id: old.memory_id,
-        },
+        subject: subject.to_string(),
+        action: MemoryActionKind::Superseded { old_memory_id },
         spaces: names,
     });
     Ok(())
-}
-
-fn find_source_conn(
-    conn: &Connection,
-    kind: SourceKind,
-    location: &str,
-    content_hash: &str,
-) -> Result<Option<Source>> {
-    conn.query_row(
-        "SELECT id, kind, location, title, content, content_hash, media_type, size_bytes, \
-             ingested_at \
-         FROM sources WHERE kind = ?1 AND location = ?2 AND content_hash = ?3",
-        rusqlite::params![kind.as_str(), location, content_hash],
-        row_source,
-    )
-    .optional()
-    .map_err(dberr)
 }
 
 /// Adds the missing space memberships and returns the ids that were added.
@@ -1345,4 +1780,76 @@ fn load_evidence(conn: &Connection, id: Uuid) -> Result<Evidence> {
         },
     )
     .map_err(dberr)
+}
+// ---------------------------------------------------------------------------
+// Source lifecycle loaders
+// ---------------------------------------------------------------------------
+
+fn row_logical_source(row: &Row) -> rusqlite::Result<LogicalSource> {
+    Ok(LogicalSource {
+        id: uuid_col(row, "id")?,
+        kind: enum_col(row, "kind", SourceKind::parse)?,
+        state: enum_col(row, "state", SourcePresence::parse)?,
+        current_location: row.get("current_location")?,
+        created_at: ts_col(row, "created_at")?,
+    })
+}
+
+fn load_source_lifecycle(conn: &Connection, logical_id: Uuid) -> Result<Option<SourceLifecycle>> {
+    let logical = conn
+        .query_row(
+            "SELECT id, kind, state, current_location, created_at FROM logical_sources \
+             WHERE id = ?1",
+            rusqlite::params![logical_id.to_string()],
+            row_logical_source,
+        )
+        .optional()
+        .map_err(dberr)?;
+    let Some(logical) = logical else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, logical_id, kind, from_location, to_location, version_id, session_id, \
+                 created_at \
+             FROM source_events WHERE logical_id = ?1 ORDER BY created_at, id",
+        )
+        .map_err(dberr)?;
+    let rows = stmt
+        .query_map(rusqlite::params![logical_id.to_string()], |r| {
+            let kind_str: String = r.get("kind")?;
+            let from: Option<String> = r.get("from_location")?;
+            let to: Option<String> = r.get("to_location")?;
+            let kind = match kind_str.as_str() {
+                "moved" => SourceEventKind::Moved {
+                    from_location: from,
+                    to_location: to.expect("moved events carry a destination"),
+                },
+                "disappeared" => SourceEventKind::Disappeared {
+                    from_location: from,
+                },
+                other => {
+                    let _ = other;
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        0,
+                        "kind".to_string(),
+                        Type::Text,
+                    ));
+                }
+            };
+            Ok(SourceEvent {
+                id: uuid_col(r, "id")?,
+                logical_id: uuid_col(r, "logical_id")?,
+                kind,
+                version_id: opt_uuid_col(r, "version_id")?,
+                session_id: opt_uuid_col(r, "session_id")?,
+                created_at: ts_col(r, "created_at")?,
+            })
+        })
+        .map_err(dberr)?;
+    let mut events = Vec::new();
+    for r in rows {
+        events.push(r.map_err(dberr)?);
+    }
+    Ok(Some(SourceLifecycle { logical, events }))
 }

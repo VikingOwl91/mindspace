@@ -70,8 +70,8 @@ fn acceptance_flow_from_clean_clone() {
     // Idempotent re-ingest.
     let (out, _, ok) = mind.run(&["ingest", &example, "--space", "project:owlry"]);
     assert!(ok);
-    assert!(out.contains("reused"), "{out}");
     assert!(out.contains("unchanged"), "{out}");
+    assert!(out.contains("logical"), "{out}");
 
     // Search finds a section directly and explains the space.
     let (out, _, ok) = mind.run(&["search", "SQLite", "--space", "project:owlry", "--json"]);

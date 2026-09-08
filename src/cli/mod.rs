@@ -120,8 +120,8 @@ pub fn execute(cli: &Cli) -> Result<()> {
         }
         Command::Ingest { path, spaces, json } => {
             let store = open(cli)?;
-            let record = ingest::ingest_file(&store, path, spaces)?;
-            render::ingest_record(&record, *json);
+            let report = ingest::ingest_path(&store, path, spaces)?;
+            render::observation_report(&report, *json);
         }
         Command::Space { command } => match command {
             SpaceCommand::Create {

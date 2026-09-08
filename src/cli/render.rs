@@ -2,7 +2,10 @@
 //! the two views can never diverge.
 
 use crate::cli::action_label;
-use crate::core::{ConflictGroup, IngestRecord, Memory, MemoryDetail, MemorySummary, Space};
+use crate::core::{
+    ConflictGroup, IngestScope, Memory, MemoryDetail, MemorySummary, ObservationReport,
+    SourceEventKind, Space,
+};
 
 fn json<T: serde::Serialize>(value: &T) {
     println!(
@@ -11,32 +14,60 @@ fn json<T: serde::Serialize>(value: &T) {
     );
 }
 
-pub fn ingest_record(record: &IngestRecord, as_json: bool) {
+pub fn observation_report(report: &ObservationReport, as_json: bool) {
     if as_json {
-        json(record);
+        json(report);
         return;
     }
-    let state = if record.source_reused {
-        "reused"
-    } else {
-        "new"
+    let scope = match report.scope {
+        IngestScope::Directory => "directory",
+        IngestScope::File => "file",
     };
     println!(
-        "source {} {} ({})",
-        record.source.id, record.source.location, state
+        "session {} root {} ({})",
+        report.session_id, report.root, scope
     );
-    println!(
-        "evidence: {}  assertions: {}",
-        record.evidence_count, record.assertion_count
-    );
-    for action in &record.actions {
+    for file in &report.files {
+        let outcome = match &file.outcome {
+            crate::core::FileOutcome::Unchanged => "unchanged".to_string(),
+            crate::core::FileOutcome::Changed => "changed".to_string(),
+            crate::core::FileOutcome::Created => "created".to_string(),
+            crate::core::FileOutcome::Continued { from_location } => match from_location {
+                Some(from) => format!("continued from {from}"),
+                None => "continued".to_string(),
+            },
+        };
         println!(
-            "  memory {} \"{}\" {} [{}]",
-            action.memory_id,
-            action.subject,
-            action_label(&action.action),
-            action.spaces.join(", ")
+            "  {} logical {} {}",
+            file.location, file.logical_id, outcome
         );
+        for action in &file.actions {
+            println!(
+                "    memory {} \"{}\" {} [{}]",
+                action.memory_id,
+                action.subject,
+                action_label(&action.action),
+                action.spaces.join(", ")
+            );
+        }
+    }
+    for event in &report.events {
+        match &event.kind {
+            SourceEventKind::Moved {
+                from_location,
+                to_location,
+            } => println!(
+                "  moved: logical {} {} -> {}",
+                event.logical_id,
+                from_location.as_deref().unwrap_or("?"),
+                to_location
+            ),
+            SourceEventKind::Disappeared { from_location } => println!(
+                "  disappeared: logical {} (last seen {})",
+                event.logical_id,
+                from_location.as_deref().unwrap_or("?")
+            ),
+        }
     }
 }
 
@@ -204,6 +235,7 @@ pub fn trace(detail: &MemoryDetail, as_json: bool) {
         s.id, s.kind, s.location, s.ingested_at
     );
     println!("  sha256:{}", s.content_hash);
+    render_lifecycle(&detail.source_lifecycle);
     println!(
         "spaces    {}",
         detail
@@ -272,4 +304,33 @@ pub fn retired(memory: &Memory) {
 
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
+}
+
+fn render_lifecycle(lifecycle: &crate::core::SourceLifecycle) {
+    let l = &lifecycle.logical;
+    println!(
+        "logical   {} state={} current={} created={}",
+        l.id,
+        l.state,
+        l.current_location.as_deref().unwrap_or("-"),
+        l.created_at
+    );
+    for event in &lifecycle.events {
+        match &event.kind {
+            crate::core::SourceEventKind::Moved {
+                from_location,
+                to_location,
+            } => println!(
+                "  moved {} -> {} at {}",
+                from_location.as_deref().unwrap_or("?"),
+                to_location,
+                event.created_at
+            ),
+            crate::core::SourceEventKind::Disappeared { from_location } => println!(
+                "  disappeared from {} at {}",
+                from_location.as_deref().unwrap_or("?"),
+                event.created_at
+            ),
+        }
+    }
 }

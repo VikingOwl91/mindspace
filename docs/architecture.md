@@ -34,9 +34,10 @@ src/
   storage/     the Store trait (the storage boundary) and its SQLite
                implementation, schema migrations, FTS index, triggers.
                Depends on: rusqlite. Exposes and accepts only core types.
-  ingest/      deterministic parsing (markdown/text -> evidence drafts),
-               subject/title rules, and the ingest orchestration that calls
-               the store. Pure parsing functions are unit-tested without a DB.
+  ingest/      deterministic observation: file and directory scans,
+               markdown/text parsing into evidence drafts, subject/title
+               rules, and the ingest orchestration that calls the store.
+               Pure parsing functions are unit-tested without a DB.
   retrieval/   search orchestration: query filters, directed space traversal
                (BFS, cycle-safe), hit assembly and explanation.
   cli/         clap definitions and human/JSON rendering. Knows the engine,
@@ -56,7 +57,7 @@ Boundary rules enforced by review and by `use` statements:
 ## 2. The storage boundary
 
 `storage::Store` is a trait whose methods correspond to use cases
-(create/list/link spaces, find sources, `record_ingestion`, `get_memory`,
+(create/list/link spaces, `record_observation`, `get_memory_detail`,
 `search`, `list_conflicts`, `retire_memory`, ...), not to tables. All
 signatures traffic in owned `core` types.
 
@@ -65,14 +66,16 @@ implementation would implement the same trait; nothing else in the codebase
 would change. Two deliberate compromises keep the trait honest without
 speculative machinery:
 
-1. **Multi-invariant operations are single trait methods.** Ingestion must
-   atomically insert the source, evidence, assertions, memories, space
-   memberships, and supersessions/retirements. Rather than exposing
-   transaction handles through the trait (which forces every backend to model
-   interactive transactions), the store method `record_ingestion` owns the
-   transaction. The reconciliation semantics are documented in
-   `docs/memory-model.md` section 6.2 and belong to the contract of that
-   method, whichever engine implements it.
+1. **Multi-invariant operations are single trait methods.** An observation
+   must atomically record the session, per-file observations, source
+   identity and lifecycle decisions (new versions, inferred moves,
+   disappearances), evidence, assertions, memories, space memberships, and
+   supersessions/retirements. Rather than exposing transaction handles
+   through the trait (which forces every backend to model interactive
+   transactions), the store method `record_observation` owns the
+   transaction. The identity, lifecycle, and reconciliation semantics are
+   documented in `docs/memory-model.md` sections 2.1 and 6 and belong to
+   the contract of that method, whichever engine implements it.
 2. **Full-text search is a store capability.** `search` takes a structured
    query (text, space set, state/time filters, limit) and returns hits with
    rank and snippet. SQLite implements it with FTS5; a PostgreSQL backend
@@ -106,8 +109,15 @@ speculative machinery:
 spaces(id, name UNIQUE, description, created_at)
 space_links(from_space -> spaces, to_space -> spaces, created_at,
             PRIMARY KEY (from_space, to_space), CHECK (from_space <> to_space))
-sources(id, kind, location, title, content, content_hash, media_type,
-        size_bytes, ingested_at, UNIQUE (kind, location, content_hash))
+logical_sources(id, kind, state present|absent, current_location, created_at)
+sources(id, logical_id -> logical_sources, kind, location, title, content,
+        content_hash, media_type, size_bytes, ingested_at,
+        UNIQUE (logical_id, content_hash))
+ingest_sessions(id, root, scope directory|file, observed_at)
+source_observations(session_id -> ingest_sessions, logical_id, location,
+        content_hash, observed_at, PRIMARY KEY (session_id, location))
+source_events(id, logical_id, kind moved|disappeared, from_location,
+        to_location, version_id, session_id, created_at)
 evidence(id, source_id -> sources, kind, heading_path, start_line, end_line,
          ordinal, content, content_hash, UNIQUE (source_id, kind, ordinal))
 assertions(id, kind, subject, subject_normalized, predicate, content,

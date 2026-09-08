@@ -222,6 +222,7 @@ The commands implemented in v0:
 ```sh
 mind init
 mind ingest ./notes.md --space coding
+mind ingest ~/Documents --space personal   # directory: full source-lifecycle scan
 mind space list
 mind space create eragon
 mind space link coding linux
@@ -285,8 +286,10 @@ docs/
 
 migrations/
   0001_init.sql
+  0002_source_lifecycle.sql
 tests/
   invariants.rs   domain invariants against real SQLite files
+  lifecycle.rs    source identity and lifecycle scenarios
   cli.rs          end-to-end runs of the mind binary
 ```
 
@@ -314,9 +317,13 @@ temporal state, provenance) is specified in `docs/memory-model.md`, built,
 and tested. What works today:
 
 - deterministic ingest of markdown and plain text into a local SQLite
-  database (bundled, FTS5 full-text search)
+  database (bundled, FTS5 full-text search), for single files or whole
+  directory trees
 - idempotent re-ingestion with exact reconciliation semantics: reuse,
   supersession, retirement, space completion
+- logical source identity with full lifecycle: renames, moves, copies,
+  disappearances, and reappearances are deterministic facts, not new
+  knowledge; historical provenance is never rewritten
 - spaces as first-class domains with directed links, cycle-safe traversal,
   and conflict listing
 - temporal queries (`search --at`) over the stored timeline

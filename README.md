@@ -215,29 +215,36 @@ Additional storage adapters can be considered once the core model is stable.
 
 ## Interfaces
 
-The working project name is **Mindspace** and the intended CLI command is **`mind`**.
+The working project name is **Mindspace** and the CLI command is **`mind`**.
 
-Potential CLI shape:
+The commands implemented in v0:
 
 ```sh
-mind ingest ./repo
-mind ingest book.epub --space eragon
-
-mind recall "why did we choose Slint?"
-mind search "Wayland protocol"
-mind trace <memory>
-mind history <subject>
-mind conflicts
-
+mind init
+mind ingest ./notes.md --space coding
 mind space list
 mind space create eragon
 mind space link coding linux
-mind space use project:owlry
-
-mind serve
+mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-superseded] [--include-retired] [--json]
+mind inspect <memory> [--json]
+mind trace <memory> [--json]
+mind history <subject words...> [--json]
+mind conflicts [--json]
+mind retire <memory> --reason "why"
 ```
 
-These commands document intended UX only; they are not yet a stable CLI specification.
+`--json` on informational commands prints the exact engine structs, so
+scripts and humans see the same data. Every command honors a global `--db`
+flag (or `MINDSPACE_DB`); the default database lives under
+`$XDG_DATA_HOME/mindspace/mind.db`.
+
+Intended but not built yet:
+
+```sh
+mind recall "why did we choose Slint?"
+mind space use project:owlry
+mind serve
+```
 
 Future interfaces may include an HTTP API, SDKs, and MCP. They should remain adapters over the same core rather than defining the memory architecture themselves.
 
@@ -245,35 +252,40 @@ Future interfaces may include an HTTP API, SDKs, and MCP. They should remain ada
 
 Rust is the current implementation choice.
 
-Likely initial components include:
+v0 is built with deliberately boring components:
 
-- Tokio for async runtime needs
-- Axum for the network service
 - clap for the CLI
 - serde for serialization
-- tracing for diagnostics
-- SQLite as the first storage backend
+- rusqlite with bundled SQLite (FTS5 guaranteed, no system dependency)
+- pulldown-cmark for deterministic markdown parsing
+- UUIDv7 ids and RFC 3339 timestamps at the edges
+- no async runtime: nothing in v0 benefits from one; a future server can
+  revisit that decision (ADR-001 in docs/decisions.md)
 
-PostgreSQL support should be considered in architectural boundaries from the beginning, but does not need to be implemented before the memory model is proven.
+PostgreSQL support should be considered in architectural boundaries from the beginning, but does not need to be implemented before the memory model is proven. The `Store` trait is that boundary; v0 ships exactly one SQLite implementation behind it.
 
-The repository should initially stay relatively simple rather than prematurely splitting every subsystem into its own crate. Stable subsystem boundaries can become workspace crates later.
+The repository stays a single crate rather than prematurely splitting every subsystem into its own crate. Stable subsystem boundaries can become workspace crates later.
 
-A possible early layout is:
+The actual layout is:
 
 ```text
 src/
-  core/
-  storage/
-  ingest/
-  retrieval/
-  server/
-  cli/
+  core/        domain types, ids/timestamps/hashes, the error type
+  storage/     the Store trait and the SQLite implementation
+  ingest/      deterministic markdown/text parsing and ingest orchestration
+  retrieval/   search orchestration, directed space traversal
+  cli/         clap definitions and human/JSON rendering
 
 docs/
   architecture.md
   memory-model.md
-  spaces.md
-  storage.md
+  decisions.md
+
+migrations/
+  0001_init.sql
+tests/
+  invariants.rs   domain invariants against real SQLite files
+  cli.rs          end-to-end runs of the mind binary
 ```
 
 ## Non-goals for the first implementation
@@ -293,6 +305,23 @@ The first job is to establish a durable and inspectable memory model that works 
 
 ## Status
 
-**Pre-alpha / architecture phase.**
+**v0 foundation implemented.**
 
-The next major design task is to specify the core data model around sources, evidence, claims, events, relations, memories, spaces, temporal state, and provenance before committing to implementation details that would constrain it.
+The core data model (sources -> evidence -> assertions -> memories, spaces,
+temporal state, provenance) is specified in `docs/memory-model.md`, built,
+and tested. What works today:
+
+- deterministic ingest of markdown and plain text into a local SQLite
+  database (bundled, FTS5 full-text search)
+- idempotent re-ingestion with exact reconciliation semantics: reuse,
+  supersession, retirement, space completion
+- spaces as first-class domains with directed links, cycle-safe traversal,
+  and conflict listing
+- temporal queries (`search --at`) over the stored timeline
+- full provenance chains (`inspect`, `trace`) that never lose history:
+  superseded and retired memories stay inspectable forever
+- a CLI (`mind`) with human and `--json` output
+
+Explicitly deferred: AI extraction, embeddings, sync, auth, remote or hosted
+operation, PostgreSQL implementation, GUI/TUI. See `docs/decisions.md` for
+the reasoning behind each choice.

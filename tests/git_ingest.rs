@@ -423,8 +423,13 @@ fn scenario_h_cherry_pick_is_two_distinct_commits() {
             "user.name=tester",
             "-c",
             "user.email=tester@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
         ])
         .args(["commit", "-q", "-m", "c2"])
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_COMMITTER_DATE", c2_date)
         .output()
         .unwrap();

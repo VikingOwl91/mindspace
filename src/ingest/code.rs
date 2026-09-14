@@ -3,7 +3,7 @@
 
 use crate::core::{
     CodeDerivationDraft, CodeEntityDraft, CodeEntityKind, CodeImportDraft, CodeLanguage,
-    CodeParseStatus, CodeParserIdentity, CodeRange,
+    CodeParseStatus, CodeParserIdentity, CodeRange, CodeRelationshipDraft, CodeRelationshipKind,
 };
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -29,6 +29,7 @@ pub fn parse(language: CodeLanguage, source: &str) -> CodeDerivationDraft {
             error_count: 1,
             entities: vec![],
             imports: vec![],
+            relationships: vec![],
         };
     }
     let mut parser = Parser::new();
@@ -42,6 +43,7 @@ pub fn parse(language: CodeLanguage, source: &str) -> CodeDerivationDraft {
             error_count: 1,
             entities: vec![],
             imports: vec![],
+            relationships: vec![],
         };
     }
     let Some(tree) = parser.parse(source, None) else {
@@ -51,6 +53,7 @@ pub fn parse(language: CodeLanguage, source: &str) -> CodeDerivationDraft {
             error_count: 1,
             entities: vec![],
             imports: vec![],
+            relationships: vec![],
         };
     };
     let mut out = CodeDerivationDraft {
@@ -63,6 +66,7 @@ pub fn parse(language: CodeLanguage, source: &str) -> CodeDerivationDraft {
         error_count: count_errors(tree.root_node()),
         entities: vec![],
         imports: vec![],
+        relationships: vec![],
     };
     walk(tree.root_node(), source, None, None, &mut out);
     out
@@ -102,12 +106,43 @@ fn walk(
     parent_q: Option<String>,
     out: &mut CodeDerivationDraft,
 ) {
+    if n.kind() == "call_expression" {
+        let raw_target = n
+            .child_by_field_name("function")
+            .map(|x| text(x, s))
+            .unwrap_or_default();
+        out.relationships.push(CodeRelationshipDraft {
+            kind: CodeRelationshipKind::Calls,
+            source_syntax_path: parent.clone(),
+            raw_target,
+            range: range(n),
+        });
+    }
     if n.kind() == "impl_item" {
+        let trait_target = n.child_by_field_name("trait").map(|node| text(node, s));
+        let type_target = n.child_by_field_name("type").map(|node| text(node, s));
+        if let Some(target) = trait_target {
+            out.relationships.push(CodeRelationshipDraft {
+                kind: CodeRelationshipKind::ImplementsTrait,
+                source_syntax_path: parent.clone(),
+                raw_target: target,
+                range: range(n),
+            });
+        }
+        if let Some(target) = type_target.clone() {
+            out.relationships.push(CodeRelationshipDraft {
+                kind: CodeRelationshipKind::ImplementsType,
+                source_syntax_path: parent.clone(),
+                raw_target: target,
+                range: range(n),
+            });
+        }
         let mut cursor = n.walk();
         let type_name = n
             .children(&mut cursor)
             .find(|child| matches!(child.kind(), "type_identifier" | "generic_type"))
             .map(|child| text(child, s))
+            .or(type_target)
             .unwrap_or_else(|| "impl".to_string());
         let impl_parent = Some(format!("impl:{type_name}@{}", n.start_byte()));
         let impl_q = Some(
@@ -160,6 +195,12 @@ fn walk(
                 raw: raw.clone(),
                 target: target.clone(),
                 alias: None,
+                range: range(n),
+            });
+            out.relationships.push(CodeRelationshipDraft {
+                kind: CodeRelationshipKind::Imports,
+                source_syntax_path: parent.clone(),
+                raw_target: target,
                 range: range(n),
             });
             out.entities.push(CodeEntityDraft {

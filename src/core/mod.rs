@@ -758,6 +758,7 @@ pub struct CodeDerivationDraft {
     pub error_count: u32,
     pub entities: Vec<CodeEntityDraft>,
     pub imports: Vec<CodeImportDraft>,
+    pub relationships: Vec<CodeRelationshipDraft>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeEntityDraft {
@@ -780,13 +781,65 @@ pub struct CodeImportDraft {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CodeRelationshipKind { Calls, Imports, Implements }
-impl CodeRelationshipKind { pub fn as_str(self)->&'static str {match self {Self::Calls=>"calls",Self::Imports=>"imports",Self::Implements=>"implements"}} pub fn parse(s:&str)->Option<Self>{match s{"calls"=>Some(Self::Calls),"imports"=>Some(Self::Imports),"implements"=>Some(Self::Implements),_=>None}} }
+pub enum CodeRelationshipKind {
+    Calls,
+    Imports,
+    ImplementsTrait,
+    ImplementsType,
+}
+impl CodeRelationshipKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::Imports => "imports",
+            Self::ImplementsTrait => "implements_trait",
+            Self::ImplementsType => "implements_type",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "calls" => Some(Self::Calls),
+            "imports" => Some(Self::Imports),
+            "implements_trait" => Some(Self::ImplementsTrait),
+            "implements_type" => Some(Self::ImplementsType),
+            _ => None,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CodeResolutionState { Resolved, Unresolved, Ambiguous, External }
-impl CodeResolutionState { pub fn as_str(self)->&'static str {match self {Self::Resolved=>"resolved",Self::Unresolved=>"unresolved",Self::Ambiguous=>"ambiguous",Self::External=>"external"}} }
-#[derive(Debug, Clone, PartialEq)] pub struct CodeRelationshipDraft { pub kind:CodeRelationshipKind, pub source_syntax_path:Option<String>, pub raw_target:String, pub range:CodeRange }
+pub enum CodeResolutionState {
+    Resolved,
+    Unresolved,
+    Ambiguous,
+    External,
+}
+impl CodeResolutionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Unresolved => "unresolved",
+            Self::Ambiguous => "ambiguous",
+            Self::External => "external",
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeRelationshipDraft {
+    pub kind: CodeRelationshipKind,
+    pub source_syntax_path: Option<String>,
+    pub raw_target: String,
+    pub range: CodeRange,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CodeResolutionReport {
+    pub derivations_created: u64,
+    pub derivations_reused: u64,
+    pub resolved: u64,
+    pub unresolved: u64,
+    pub ambiguous: u64,
+    pub external: u64,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeObservation {
     pub inputs: Vec<CodeInputDraft>,

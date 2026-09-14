@@ -96,6 +96,7 @@ pub fn ingest_path<S: AsRef<str>>(
                     error_count: 0,
                     entities: vec![],
                     imports: vec![],
+                    relationships: vec![],
                 }
             } else {
                 code::parse(language, &f.content)
@@ -364,6 +365,14 @@ pub fn ingest_git_repository<S: AsRef<str>>(
         report.code = store.record_code_observation(crate::core::CodeObservation {
             inputs: code_inputs,
         })?;
+        for commit in tip_commits {
+            let _ = store.resolve_git_code_relationships(
+                repository_id,
+                &commit,
+                "mind-rust-resolver",
+                "1",
+            )?;
+        }
     }
     Ok(report)
 }
@@ -406,6 +415,7 @@ fn tip_files_to_code_inputs(
                         error_count: 0,
                         entities: vec![],
                         imports: vec![],
+                        relationships: vec![],
                     }
                 } else {
                     code::parse(language, &content)

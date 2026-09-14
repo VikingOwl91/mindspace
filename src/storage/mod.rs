@@ -4,9 +4,9 @@ use uuid::Uuid;
 
 use crate::core::{
     CodeDerivation, CodeLanguage, CodeObservation, CodeObservationReport, CodeParserIdentity,
-    ConflictGroup, GitObservation, GitObservationReport, GitRefObservation, IngestObservation,
-    Memory, MemoryDetail, MemorySummary, ObservationReport, Result, SearchHitRaw, SearchQuery,
-    SourceLifecycle, Space, SpaceLink, Ts,
+    CodeResolutionReport, ConflictGroup, GitObservation, GitObservationReport, GitRefObservation,
+    IngestObservation, Memory, MemoryDetail, MemorySummary, ObservationReport, Result,
+    SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and
@@ -58,6 +58,13 @@ pub trait Store {
         blob_oid: Option<&str>,
         identity: &CodeParserIdentity,
     ) -> Result<bool>;
+    fn resolve_git_code_relationships(
+        &self,
+        repository_id: Uuid,
+        commit_oid: &str,
+        resolver: &str,
+        version: &str,
+    ) -> Result<CodeResolutionReport>;
 
     // -- memory inspection ---------------------------------------------------
 

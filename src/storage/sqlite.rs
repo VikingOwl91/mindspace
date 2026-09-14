@@ -25,7 +25,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (3, include_str!("../../migrations/0003_git_ingest.sql")),
     (4, include_str!("../../migrations/0004_code_structure.sql")),
-    (5, include_str!("../../migrations/0005_code_relationships.sql")),
+    (
+        5,
+        include_str!("../../migrations/0005_code_relationships.sql"),
+    ),
 ];
 
 pub struct SqliteStore {
@@ -603,6 +606,9 @@ impl Store for SqliteStore {
             for i in &d.imports {
                 tx.execute("INSERT INTO code_imports(id,derivation_id,raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),i.raw,i.target,i.alias,i.range.start_byte as i64,i.range.end_byte as i64,i.range.start_line,i.range.start_column,i.range.end_line,i.range.end_column]).map_err(dberr)?;
             }
+            for relationship in &d.relationships {
+                tx.execute("INSERT INTO code_relationship_observations(id,derivation_id,kind,source_syntax_path,raw_target,start_byte,end_byte) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),relationship.kind.as_str(),relationship.source_syntax_path,relationship.raw_target,relationship.range.start_byte as i64,relationship.range.end_byte as i64]).map_err(dberr)?;
+            }
         }
         tx.commit().map_err(dberr)?;
         Ok(report)
@@ -713,6 +719,93 @@ impl Store for SqliteStore {
     ) -> Result<bool> {
         let found:Option<i64>=match (repository_id,blob_oid) { (Some(repo),Some(blob))=>self.conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id=?1 AND i.blob_oid=?2 AND d.extractor=?3 AND d.extractor_version=?4 AND d.grammar=?5 AND d.grammar_version=?6",rusqlite::params![repo.to_string(),blob,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?, _=>self.conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id IS NULL AND i.content_hash=?1 AND d.extractor=?2 AND d.extractor_version=?3 AND d.grammar=?4 AND d.grammar_version=?5",rusqlite::params![content_hash,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?};
         Ok(found.is_some())
+    }
+
+    fn resolve_git_code_relationships(
+        &self,
+        repository_id: Uuid,
+        commit_oid: &str,
+        resolver: &str,
+        version: &str,
+    ) -> Result<crate::core::CodeResolutionReport> {
+        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let existing:Option<String>=tx.query_row("SELECT id FROM code_resolution_derivations WHERE repository_id=?1 AND commit_oid=?2 AND resolver=?3 AND resolver_version=?4",rusqlite::params![repository_id.to_string(),commit_oid,resolver,version],|r|r.get(0)).optional().map_err(dberr)?;
+        if existing.is_some() {
+            tx.commit().map_err(dberr)?;
+            return Ok(crate::core::CodeResolutionReport {
+                derivations_reused: 1,
+                ..Default::default()
+            });
+        };
+        let did = Uuid::now_v7();
+        tx.execute("INSERT INTO code_resolution_derivations(id,repository_id,commit_oid,resolver,resolver_version,created_at) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![did.to_string(),repository_id.to_string(),commit_oid,resolver,version,Ts::now().0]).map_err(dberr)?;
+        let mut report = crate::core::CodeResolutionReport {
+            derivations_created: 1,
+            ..Default::default()
+        };
+        let mut stmt=tx.prepare("SELECT DISTINCT o.id,o.kind,o.raw_target FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 ORDER BY o.id").map_err(dberr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![repository_id.to_string(), commit_oid],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(dberr)?;
+        for row in rows {
+            let (oid, kind, raw) = row.map_err(dberr)?;
+            let internal = raw.starts_with("crate::")
+                || raw.starts_with("self::")
+                || raw.starts_with("super::")
+                || kind == "calls" && !raw.contains('.');
+            if !internal && kind == "imports" {
+                tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,'external',NULL,?4)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),oid,raw]).map_err(dberr)?;
+                report.external += 1;
+                continue;
+            };
+            let local = raw
+                .trim_start_matches("crate::")
+                .trim_start_matches("self::")
+                .trim_start_matches("super::")
+                .split("::")
+                .last()
+                .unwrap_or(&raw);
+            let mut es=tx.prepare("SELECT DISTINCT e.id FROM code_entities e JOIN code_derivations d ON d.id=e.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND e.name=?3 AND e.kind IN ('function','method','struct','trait','enum','type_alias') ORDER BY e.id").map_err(dberr)?;
+            let candidates = es
+                .query_map(
+                    rusqlite::params![repository_id.to_string(), commit_oid, local],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(dberr)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(dberr)?;
+            let state = if candidates.len() == 1 {
+                "resolved"
+            } else if candidates.is_empty() {
+                "unresolved"
+            } else {
+                "ambiguous"
+            };
+            let rid = Uuid::now_v7();
+            tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,?4,?5,NULL)",rusqlite::params![rid.to_string(),did.to_string(),oid,state,if candidates.len()==1{Some(candidates[0].clone())}else{None}]).map_err(dberr)?;
+            if state == "ambiguous" {
+                for c in candidates {
+                    tx.execute("INSERT INTO code_resolution_candidates(resolution_id,entity_id) VALUES(?1,?2)",rusqlite::params![rid.to_string(),c]).map_err(dberr)?;
+                }
+                report.ambiguous += 1
+            } else if state == "resolved" {
+                report.resolved += 1
+            } else {
+                report.unresolved += 1
+            }
+        }
+        drop(stmt);
+        tx.commit().map_err(dberr)?;
+        Ok(report)
     }
 
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {

@@ -5,6 +5,7 @@
 //! the v0.1 defect it corrects: directory ingest observes only the working
 //! tree, so knowledge that exists in committed history was invisible.
 
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -156,6 +157,61 @@ fn committed_knowledge_is_ingested_even_when_absent_from_the_working_tree() {
 // ---------------------------------------------------------------------------
 // A: exact re-ingest is a zero-duplication no-op
 // ---------------------------------------------------------------------------
+
+#[test]
+fn scenario_r_same_caller_blob_has_commit_contextual_resolution() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("src/main.rs", "use crate::target::Thing;\nfn main() {}\n");
+    r.write("src/target.rs", "pub struct Thing;\n");
+    let commit_a = r.commit("one target");
+    let caller_a = git(r.path(), &["rev-parse", "HEAD:src/main.rs"])
+        .trim()
+        .to_string();
+    ingest(&store, &r);
+    r.write(
+        "src/other.rs",
+        "// a distinct declaration\npub struct Thing;\n",
+    );
+    let commit_b = r.commit("second target");
+    let caller_b = git(r.path(), &["rev-parse", "HEAD:src/main.rs"])
+        .trim()
+        .to_string();
+    assert_ne!(commit_a, commit_b);
+    assert_eq!(caller_a, caller_b);
+    ingest(&store, &r);
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let input_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM code_inputs WHERE blob_oid=?1",
+            [caller_a.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(input_count, 1);
+    let derivations:i64=db.query_row("SELECT COUNT(*) FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.blob_oid=?1",[caller_a.as_str()],|r|r.get(0)).unwrap();
+    assert_eq!(derivations, 1);
+    let states: Vec<(String, String)> = {
+        let mut s=db.prepare("SELECT rd.commit_oid, rr.state FROM code_relationship_resolutions rr JOIN code_resolution_derivations rd ON rd.id=rr.resolution_derivation_id JOIN code_relationship_observations o ON o.id=rr.observation_id WHERE o.raw_target='crate::target::Thing' ORDER BY rd.commit_oid").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert!(states.contains(&(commit_a.clone(), "resolved".into())));
+    assert!(states.contains(&(commit_b.clone(), "ambiguous".into())));
+    let contexts: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM code_resolution_derivations WHERE commit_oid IN (?1,?2)",
+            [commit_a.as_str(), commit_b.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(contexts, 2);
+}
 
 #[test]
 fn scenario_a_exact_reingest_is_zero_duplication() {

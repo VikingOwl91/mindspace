@@ -778,6 +778,15 @@ pub struct CodeImportDraft {
     pub alias: Option<String>,
     pub range: CodeRange,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeRelationshipKind { Calls, Imports, Implements }
+impl CodeRelationshipKind { pub fn as_str(self)->&'static str {match self {Self::Calls=>"calls",Self::Imports=>"imports",Self::Implements=>"implements"}} pub fn parse(s:&str)->Option<Self>{match s{"calls"=>Some(Self::Calls),"imports"=>Some(Self::Imports),"implements"=>Some(Self::Implements),_=>None}} }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeResolutionState { Resolved, Unresolved, Ambiguous, External }
+impl CodeResolutionState { pub fn as_str(self)->&'static str {match self {Self::Resolved=>"resolved",Self::Unresolved=>"unresolved",Self::Ambiguous=>"ambiguous",Self::External=>"external"}} }
+#[derive(Debug, Clone, PartialEq)] pub struct CodeRelationshipDraft { pub kind:CodeRelationshipKind, pub source_syntax_path:Option<String>, pub raw_target:String, pub range:CodeRange }
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeObservation {
     pub inputs: Vec<CodeInputDraft>,

@@ -25,6 +25,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (3, include_str!("../../migrations/0003_git_ingest.sql")),
     (4, include_str!("../../migrations/0004_code_structure.sql")),
+    (5, include_str!("../../migrations/0005_code_relationships.sql")),
 ];
 
 pub struct SqliteStore {

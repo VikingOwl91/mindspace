@@ -79,6 +79,20 @@ fn acceptance_flow_from_clean_clone() {
     assert!(out.contains("\"Storage\""), "{out}");
     assert!(out.contains("project:owlry"), "{out}");
 
+    // Recall presents the highest-ranked current memory as an answer while
+    // preserving the same provenance users would see in search.
+    let (out, _, ok) = mind.run(&["recall", "SQLite", "--space", "project:owlry"]);
+    assert!(ok, "recall failed");
+    assert!(out.contains("answer: Storage"), "{out}");
+    assert!(out.contains("single SQLite database file"), "{out}");
+    assert!(out.contains("source:"), "{out}");
+    assert!(out.contains("memory:"), "{out}");
+    let (out, _, ok) = mind.run(&["recall", "SQLite", "--space", "project:owlry", "--json"]);
+    assert!(ok, "recall json failed");
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(json.is_array());
+    assert_eq!(json[0]["subject"], "Storage");
+
     // Traversal: a memory ingested into linux is visible from project:owlry
     // through the directed links, with the path recorded.
     let kernel = mind.db.path().join("kernel.md");
@@ -89,6 +103,38 @@ fn acceptance_flow_from_clean_clone() {
     let (out, _, ok) = mind.run(&["search", "preemptible", "--space", "project:owlry"]);
     assert!(ok);
     assert!(out.contains("via coding -> linux"), "{out}");
+    let (out, _, ok) = mind.run(&["recall", "preemptible", "--space", "project:owlry"]);
+    assert!(ok, "recall via imported space failed");
+    assert!(out.contains("via coding -> linux"), "{out}");
+
+    // Recall defaults to a compact answer plus related evidence, while an
+    // explicit limit can restrict it to the answer alone.
+    for name in ["recall-one.md", "recall-two.md"] {
+        let path = mind.db.path().join(name);
+        std::fs::write(&path, "# Recall\n\nDurable recall marker.\n").unwrap();
+        let path = path.display().to_string();
+        let (_, err, ok) = mind.run(&["ingest", &path, "--space", "linux"]);
+        assert!(ok, "ingest failed: {err}");
+    }
+    let (out, _, ok) = mind.run(&[
+        "recall",
+        "durable recall marker",
+        "--space",
+        "project:owlry",
+    ]);
+    assert!(ok, "recall related results failed");
+    assert!(out.contains("related:"), "{out}");
+    assert!(out.contains("via coding -> linux"), "{out}");
+    let (out, _, ok) = mind.run(&[
+        "recall",
+        "durable recall marker",
+        "--space",
+        "project:owlry",
+        "--limit",
+        "1",
+    ]);
+    assert!(ok, "limited recall failed");
+    assert!(!out.contains("related:"), "{out}");
 
     // Trace the provenance chain of the first search hit.
     let (out, _, ok) = mind.run(&["search", "SQLite", "--space", "project:owlry", "--json"]);
@@ -146,6 +192,9 @@ fn acceptance_flow_from_clean_clone() {
     let (out, _, ok) = mind.run(&["search", "O(1)"]);
     assert!(ok);
     assert!(out.contains("no results"), "{out}");
+    let (out, _, ok) = mind.run(&["recall", "absent-term"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "no results");
     let (out, _, ok) = mind.run(&["inspect", &retire_id]);
     assert!(ok);
     assert!(out.contains("wrong claim"), "{out}");
@@ -182,6 +231,14 @@ fn commands_fail_actionably() {
     let (_, err, ok) = mind.run(&["search", "x", "--space", "nope"]);
     assert!(!ok);
     assert!(err.contains("mind space create nope"), "{err}");
+
+    let (_, err, ok) = mind.run(&["recall", "x", "--space", "nope"]);
+    assert!(!ok);
+    assert!(err.contains("mind space create nope"), "{err}");
+
+    let (_, err, ok) = mind.run(&["recall", ""]);
+    assert!(!ok);
+    assert!(err.contains("empty query"), "{err}");
 
     // Unknown memory id prefix fails with the id hint.
     let (_, err, ok) = mind.run(&["inspect", "zzzz"]);

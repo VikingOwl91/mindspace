@@ -214,6 +214,54 @@ pub fn search_hits(hits: &[crate::core::SearchHit], as_json: bool) {
     }
 }
 
+/// Renders a compact, provenance-preserving answer from deterministic search hits.
+pub fn recall_hits(hits: &[crate::core::SearchHit], as_json: bool) {
+    if as_json {
+        json(&hits);
+        return;
+    }
+    let Some(answer) = hits.first() else {
+        println!("no results");
+        return;
+    };
+
+    println!("answer: {}", answer.subject);
+    for line in answer.content.lines() {
+        println!("  {line}");
+    }
+    println!("source: {} {}", answer.source_title, answer.source_location);
+    println!("spaces: {}", render_spaces(answer));
+    println!("memory: {}", answer.memory_id);
+
+    if hits.len() > 1 {
+        println!("related:");
+        for (index, hit) in hits.iter().enumerate().skip(1) {
+            println!("{}. {}", index + 1, hit.subject);
+            println!("   {}", hit.snippet.replace('\n', " "));
+            println!("   spaces: {}", render_spaces(hit));
+            println!("   source: {} {}", hit.source_title, hit.source_location);
+            println!("   memory: {}", hit.memory_id);
+        }
+    }
+}
+
+fn render_spaces(hit: &crate::core::SearchHit) -> String {
+    let spaces = hit
+        .spaces
+        .iter()
+        .map(|space| match &space.via {
+            Some(via) => format!("{} (via {})", space.name, via),
+            None => space.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if spaces.is_empty() {
+        "-".to_string()
+    } else {
+        spaces
+    }
+}
+
 pub fn inspect(detail: &MemoryDetail, as_json: bool) {
     if as_json {
         json(detail);

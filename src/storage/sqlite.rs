@@ -67,7 +67,11 @@ fn dberr(e: rusqlite::Error) -> Error {
 /// the dedicated user-facing error instead of a generic storage failure.
 fn classify_query_err(e: rusqlite::Error) -> Error {
     let s = e.to_string();
-    if s.contains("fts5:") {
+    // FTS5 reports malformed column-style expressions such as `absent-term`
+    // as "no such column: term" rather than prefixing the error with `fts5:`.
+    // This function is only used for MATCH query execution, so both forms
+    // are syntax errors eligible for the literal-phrase fallback.
+    if s.contains("fts5:") || s.contains("no such column:") {
         Error::QuerySyntax(s)
     } else {
         Error::Storage(s)

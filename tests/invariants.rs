@@ -705,6 +705,10 @@ fn punctuation_queries_fall_back_to_phrase_search() {
     );
     ingest::ingest_file(&store, &path, &["coding"]).unwrap();
     assert_eq!(search(&store, "O(1)", Some("coding")).len(), 1);
+    // A hyphen is parsed as FTS syntax first; malformed input must retry as
+    // a literal phrase and produce an ordinary empty result instead of a SQL
+    // error about a missing column.
+    assert!(search(&store, "absent-term", Some("coding")).is_empty());
 }
 
 #[test]

@@ -58,6 +58,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Recall the most relevant current memories with their provenance
+    Recall {
+        query: String,
+        #[arg(long, value_name = "SPACE")]
+        space: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a memory with its full provenance chain
     Inspect {
         id: String,
@@ -183,6 +193,30 @@ pub fn execute(cli: &Cli) -> Result<()> {
                 },
             )?;
             render::search_hits(&hits, *json);
+        }
+        Command::Recall {
+            query,
+            space,
+            limit,
+            json,
+        } => {
+            let store = open(cli)?;
+            let space_ids = match space {
+                Some(name) => Some(vec![store.get_space(name)?.id]),
+                None => None,
+            };
+            let hits = retrieval::search(
+                &store,
+                SearchQuery {
+                    text: query.clone(),
+                    space_ids,
+                    limit: *limit,
+                    at: None,
+                    include_superseded: false,
+                    include_retired: false,
+                },
+            )?;
+            render::recall_hits(&hits, *json);
         }
         Command::Inspect { id, json } => {
             let store = open(cli)?;

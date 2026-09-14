@@ -1,6 +1,6 @@
 [package]
 name = "mindspace"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local-first memory engine: sources are evidence, memories are interpretations."
 license = "MIT"

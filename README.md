@@ -228,6 +228,7 @@ mind space list
 mind space create eragon
 mind space link coding linux
 mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-superseded] [--include-retired] [--json]
+mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--json]
 mind inspect <memory> [--json]
 mind trace <memory> [--json]
 mind history <subject words...> [--json]
@@ -245,7 +246,6 @@ flag (or `MINDSPACE_DB`); the default database lives under
 Intended but not built yet:
 
 ```sh
-mind recall "why did we choose Slint?"
 mind space use project:owlry
 mind serve
 ```

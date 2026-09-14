@@ -206,6 +206,12 @@ data, not a separate formatting path, so scripts and humans can never diverge.
 
 ## 8. Testing strategy
 
+Code structure is a parallel provenance layer: `ingest/code` owns Tree-sitter
+adapters and normalizes their output before it crosses into `core`. SQLite
+stores immutable code inputs, versioned derivations, entities, imports, and
+path/commit contexts. It does not store Tree-sitter values or raw AST JSON.
+These records never enter Evidence, Assertion, Memory, FTS, or recall.
+
 - **Unit tests** cover deterministic parsing (markdown sectioning, heading
   paths, code fences, setext headings, subject/title rules) and traversal.
 - **Integration tests** run the engine against temporary SQLite databases and

@@ -255,3 +255,38 @@ automatically rebase.
 
 **Revisit when.** Per-branch belief timelines, cross-repository dedup, or
 history-rewrite explanation (rebase detection) become real requirements.
+
+## ADR-016: Deterministic code structure is versioned syntax provenance (2026-09-14)
+
+**Decision.** v0.4 parses Rust (`.rs`) with Tree-sitter, using path extension
+as deterministic language metadata. A derivation is unique for immutable
+input plus `mind-code@1`, `tree-sitter-rust@0.24.2`, and its grammar identity.
+Old derivations are immutable, so a future extractor or grammar version adds
+a sibling derivation instead of rewriting history. Tree-sitter nodes stay in
+`ingest/code`; core and storage use normalized Rust-independent records.
+
+Inputs are content-addressed ordinary-file bytes, or repository-qualified Git
+blobs. Git blob input is parsed once per repository/blob/version tuple while
+`code_contexts` preserves every observed path and commit. The model stores
+module, struct, enum, trait, type alias, function/method, constant, static,
+field, and import observations where syntactically available. Entity identity
+is derivation-local `syntax_path` (kind/name/start byte), never a claim about
+cross-version symbol lineage. Ranges are half-open byte offsets and one-based
+line/columns. Parent syntax paths preserve containment. Imports preserve raw
+specifier text only; no import or type resolution is attempted.
+
+**Why.** Syntax is structural provenance, not an interpretation or belief
+episode. Creating a Memory for every node would corrupt recall and make source
+code churn look like user-facing knowledge churn. Tree-sitter parses bytes as
+data and recovers from malformed syntax without compiling or executing a
+repository.
+
+**Consequences.** A tree containing error nodes is stored as `recovered` with
+an error count; unrelated inputs continue. Unsupported and non-text inputs are
+not guessed or parsed. Same name, path, AST, or line number does not establish
+durable symbol identity. Same blob does not erase its path identity. `mind
+structure` is a narrow inspection surface; lexical Memory search is unchanged.
+
+**Revisit when.** Add further grammars, parameter/signature normalization,
+cross-file resolution, or conservative symbol lineage. Those are additive
+work, not v0.4 semantics.

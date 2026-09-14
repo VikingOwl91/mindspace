@@ -1,3 +1,4 @@
+pub mod code;
 pub mod git;
 pub mod markdown;
 
@@ -71,6 +72,36 @@ pub fn ingest_path<S: AsRef<str>>(
         )
     };
 
+    let mut code_inputs = Vec::new();
+    for f in &files {
+        let Some(language) = code::language_for(Path::new(&f.location)) else {
+            continue;
+        };
+        let identity = code::identity();
+        let known = store.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
+        code_inputs.push(crate::core::CodeInputDraft {
+            language,
+            content_hash: f.content_hash.clone(),
+            content: f.content.clone(),
+            repository_id: None,
+            blob_oid: None,
+            contexts: vec![crate::core::CodeContextDraft {
+                path: f.location.clone(),
+                commit_oid: None,
+            }],
+            derivation: if known {
+                crate::core::CodeDerivationDraft {
+                    identity,
+                    status: crate::core::CodeParseStatus::Complete,
+                    error_count: 0,
+                    entities: vec![],
+                    imports: vec![],
+                }
+            } else {
+                code::parse(language, &f.content)
+            },
+        });
+    }
     let observation = IngestObservation {
         session: SessionDraft {
             root,
@@ -79,7 +110,13 @@ pub fn ingest_path<S: AsRef<str>>(
         },
         files,
     };
-    Ok(IngestOutcome::Files(store.record_observation(observation)?))
+    let report = store.record_observation(observation)?;
+    if !code_inputs.is_empty() {
+        let _ = store.record_code_observation(crate::core::CodeObservation {
+            inputs: code_inputs,
+        })?;
+    }
+    Ok(IngestOutcome::Files(report))
 }
 
 /// Single-file ingest: a partial observation (kept for API compatibility
@@ -182,7 +219,7 @@ pub fn ingest_git_repository<S: AsRef<str>>(
                 // Not a blob, or a symlink: never derived, never traversed.
                 continue;
             }
-            if !is_ingestable(Path::new(&path)) {
+            if !is_ingestable(Path::new(&path)) && code::language_for(Path::new(&path)).is_none() {
                 continue;
             }
             text_blob_oids.insert(oid.clone());
@@ -203,14 +240,22 @@ pub fn ingest_git_repository<S: AsRef<str>>(
             let Some(content) = content_by_oid.get(&blob_oid) else {
                 continue;
             };
-            let media_type = media_type_of(Path::new(&path))
-                .map_err(|_| Error::UnsupportedFormat { path: path.clone() })?;
+            let media_type = media_type_of(Path::new(&path)).unwrap_or("text/rust");
             let stem = Path::new(&path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("untitled")
                 .to_string();
-            let mut parsed = parse_material(&stem, content, media_type, &space_ids);
+            let mut parsed = if media_type == "text/rust" {
+                ParsedMaterial {
+                    title: stem.clone(),
+                    evidences: vec![],
+                    assertions: vec![],
+                    memories: vec![],
+                }
+            } else {
+                parse_material(&stem, content, media_type, &space_ids)
+            };
             // Git derivations carry their own extractor identity: the rule
             // is the same parser, applied to git material.
             for a in &mut parsed.assertions {
@@ -296,6 +341,8 @@ pub fn ingest_git_repository<S: AsRef<str>>(
         }
     }
 
+    let code_inputs =
+        tip_files_to_code_inputs(store, repository_id, &derivations, &content_by_oid)?;
     let observation = GitObservation {
         session: SessionDraft {
             root: repo_path.display().to_string(),
@@ -312,7 +359,65 @@ pub fn ingest_git_repository<S: AsRef<str>>(
         derivations,
         ref_events,
     };
-    store.record_git_observation(observation)
+    let mut report = store.record_git_observation(observation)?;
+    if !code_inputs.is_empty() {
+        report.code = store.record_code_observation(crate::core::CodeObservation {
+            inputs: code_inputs,
+        })?;
+    }
+    Ok(report)
+}
+
+fn tip_files_to_code_inputs(
+    store: &dyn Store,
+    repository_id: Uuid,
+    derivations: &[GitDerivedFile],
+    contents: &std::collections::HashMap<String, String>,
+) -> Result<Vec<crate::core::CodeInputDraft>> {
+    let mut grouped: std::collections::BTreeMap<String, crate::core::CodeInputDraft> =
+        std::collections::BTreeMap::new();
+    for d in derivations {
+        let p = Path::new(&d.path);
+        let Some(language) = code::language_for(p) else {
+            continue;
+        };
+        let entry = grouped.entry(d.blob_oid.clone()).or_insert_with(|| {
+            let content = contents.get(&d.blob_oid).cloned().unwrap_or_default();
+            crate::core::CodeInputDraft {
+                language,
+                content_hash: sha256_hex(content.as_bytes()),
+                content: content.clone(),
+                repository_id: Some(repository_id),
+                blob_oid: Some(d.blob_oid.clone()),
+                contexts: vec![],
+                derivation: if store
+                    .has_code_derivation(
+                        language,
+                        &sha256_hex(content.as_bytes()),
+                        Some(repository_id),
+                        Some(&d.blob_oid),
+                        &code::identity(),
+                    )
+                    .unwrap_or(false)
+                {
+                    crate::core::CodeDerivationDraft {
+                        identity: code::identity(),
+                        status: crate::core::CodeParseStatus::Complete,
+                        error_count: 0,
+                        entities: vec![],
+                        imports: vec![],
+                    }
+                } else {
+                    code::parse(language, &content)
+                },
+            }
+        });
+        entry.contexts.push(crate::core::CodeContextDraft {
+            path: d.path.clone(),
+            commit_oid: Some(d.commit_oid.clone()),
+        });
+    }
+    Ok(grouped.into_values().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +469,7 @@ fn is_ingestable(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
-        Some("md" | "markdown" | "txt")
+        Some("md" | "markdown" | "txt" | "rs")
     )
 }
 
@@ -377,6 +482,7 @@ fn media_type_of(path: &Path) -> Result<&'static str> {
     {
         Some("md" | "markdown") => Ok("text/markdown"),
         Some("txt") => Ok("text/plain"),
+        Some("rs") => Ok("text/rust"),
         _ => Err(Error::UnsupportedFormat {
             path: path.display().to_string(),
         }),
@@ -402,7 +508,16 @@ fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<ObservedFile> {
         .to_string();
 
     let stem = file_stem(path);
-    let parsed = parse_material(&stem, &text, media_type, space_ids);
+    let parsed = if media_type == "text/rust" {
+        ParsedMaterial {
+            title: stem.clone(),
+            evidences: vec![],
+            assertions: vec![],
+            memories: vec![],
+        }
+    } else {
+        parse_material(&stem, &text, media_type, space_ids)
+    };
     Ok(ObservedFile {
         location,
         content: text,

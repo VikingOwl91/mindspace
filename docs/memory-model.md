@@ -599,3 +599,15 @@ Three independent guarantees, all tested:
 3. **Derivation idempotence**: the same immutable input (blob content at
    the same commit and path) with the same extractor produces no new
    evidence, assertions, or memories (`derivations_reused`).
+
+## 13. Code syntax is structural provenance, not Memory
+
+v0.4 adds a separate, immutable syntax layer for supported code. A parser
+derivation belongs to immutable bytes plus extractor and grammar versions;
+entities are derivation-local observations with ranges and containment. A
+parser upgrade therefore creates new facts without altering old ones. Git
+blob reuse avoids reparsing the same repository-qualified blob, while path and
+commit contexts remain separate observations. Syntax equality, names, paths,
+or line numbers do not establish durable symbol identity. Recovered parses
+remain honestly marked as such. This layer creates no Evidence, Assertion, or
+Memory and is deliberately absent from recall until a later retrieval slice.

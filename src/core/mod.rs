@@ -602,6 +602,195 @@ pub struct ObservedFile {
     pub memories: Vec<MemorySpec>,
 }
 
+// Syntax-derived facts deliberately do not enter the Evidence/Assertion/
+// Memory spine. Positions are half-open bytes plus one-based line/columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeLanguage {
+    Rust,
+}
+impl CodeLanguage {
+    pub fn as_str(self) -> &'static str {
+        "rust"
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        (s == "rust").then_some(Self::Rust)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeParseStatus {
+    Complete,
+    Recovered,
+    Failed,
+}
+impl CodeParseStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Recovered => "recovered",
+            Self::Failed => "failed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "complete" => Some(Self::Complete),
+            "recovered" => Some(Self::Recovered),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeEntityKind {
+    Module,
+    Struct,
+    Enum,
+    Trait,
+    TypeAlias,
+    Function,
+    Method,
+    Constant,
+    Static,
+    Field,
+    Import,
+}
+impl CodeEntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Module => "module",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::TypeAlias => "type_alias",
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Constant => "constant",
+            Self::Static => "static",
+            Self::Field => "field",
+            Self::Import => "import",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "module" => Some(Self::Module),
+            "struct" => Some(Self::Struct),
+            "enum" => Some(Self::Enum),
+            "trait" => Some(Self::Trait),
+            "type_alias" => Some(Self::TypeAlias),
+            "function" => Some(Self::Function),
+            "method" => Some(Self::Method),
+            "constant" => Some(Self::Constant),
+            "static" => Some(Self::Static),
+            "field" => Some(Self::Field),
+            "import" => Some(Self::Import),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeRange {
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeParserIdentity {
+    pub extractor: String,
+    pub extractor_version: String,
+    pub grammar: String,
+    pub grammar_version: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeEntity {
+    pub id: Uuid,
+    pub kind: CodeEntityKind,
+    pub name: Option<String>,
+    pub qualified_name: Option<String>,
+    pub syntax_path: String,
+    pub parent_syntax_path: Option<String>,
+    pub range: CodeRange,
+    pub signature: Option<String>,
+    pub visibility: Option<String>,
+    pub is_async: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeImport {
+    pub raw: String,
+    pub target: String,
+    pub alias: Option<String>,
+    pub range: CodeRange,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeDerivation {
+    pub id: Uuid,
+    pub language: CodeLanguage,
+    pub identity: CodeParserIdentity,
+    pub status: CodeParseStatus,
+    pub error_count: u32,
+    pub content_hash: String,
+    pub entities: Vec<CodeEntity>,
+    pub imports: Vec<CodeImport>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeInputDraft {
+    pub language: CodeLanguage,
+    pub content_hash: String,
+    pub content: String,
+    pub repository_id: Option<Uuid>,
+    pub blob_oid: Option<String>,
+    pub contexts: Vec<CodeContextDraft>,
+    pub derivation: CodeDerivationDraft,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeContextDraft {
+    pub path: String,
+    pub commit_oid: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeDerivationDraft {
+    pub identity: CodeParserIdentity,
+    pub status: CodeParseStatus,
+    pub error_count: u32,
+    pub entities: Vec<CodeEntityDraft>,
+    pub imports: Vec<CodeImportDraft>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeEntityDraft {
+    pub kind: CodeEntityKind,
+    pub name: Option<String>,
+    pub qualified_name: Option<String>,
+    pub syntax_path: String,
+    pub parent_syntax_path: Option<String>,
+    pub range: CodeRange,
+    pub signature: Option<String>,
+    pub visibility: Option<String>,
+    pub is_async: bool,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeImportDraft {
+    pub raw: String,
+    pub target: String,
+    pub alias: Option<String>,
+    pub range: CodeRange,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeObservation {
+    pub inputs: Vec<CodeInputDraft>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CodeObservationReport {
+    pub supported_inputs: u64,
+    pub parsed: u64,
+    pub reused: u64,
+    pub entities: u64,
+    pub parse_errors: u64,
+}
+
 /// Everything one ingest operation observed, handed to the store in a
 /// single call. The store owns the transaction, the lifecycle rules, and
 /// the reconciliation rules.
@@ -907,6 +1096,8 @@ pub struct GitObservationReport {
     pub objects_existing: u64,
     pub derivations_new: u64,
     pub derivations_reused: u64,
+    /// Syntax-only structural derivations. These counters never include memories.
+    pub code: CodeObservationReport,
     pub files: Vec<GitFileReport>,
     pub events: Vec<GitRefEventRecord>,
 }

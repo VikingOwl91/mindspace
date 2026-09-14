@@ -3,6 +3,7 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
+    CodeDerivation, CodeLanguage, CodeObservation, CodeObservationReport, CodeParserIdentity,
     ConflictGroup, GitObservation, GitObservationReport, GitRefObservation, IngestObservation,
     Memory, MemoryDetail, MemorySummary, ObservationReport, Result, SearchHitRaw, SearchQuery,
     SourceLifecycle, Space, SpaceLink, Ts,
@@ -44,6 +45,19 @@ pub trait Store {
     fn record_git_observation(&self, observation: GitObservation) -> Result<GitObservationReport>;
     /// Latest observed ref states of one repository, ordered by name.
     fn git_refs_current(&self, repository_id: Uuid) -> Result<Vec<GitRefObservation>>;
+    fn record_code_observation(
+        &self,
+        observation: CodeObservation,
+    ) -> Result<CodeObservationReport>;
+    fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>>;
+    fn has_code_derivation(
+        &self,
+        language: CodeLanguage,
+        content_hash: &str,
+        repository_id: Option<Uuid>,
+        blob_oid: Option<&str>,
+        identity: &CodeParserIdentity,
+    ) -> Result<bool>;
 
     // -- memory inspection ---------------------------------------------------
 

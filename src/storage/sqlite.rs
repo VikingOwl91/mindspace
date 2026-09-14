@@ -6,10 +6,11 @@ use rusqlite::{Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
 use crate::core::{
-    sha256_hex, Assertion, AssertionKind, ConflictGroup, Error, Evidence, EvidenceKind,
-    FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
-    GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
-    IngestScope, LogicalSource, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
+    sha256_hex, Assertion, AssertionKind, CodeDerivation, CodeEntity, CodeImport, CodeObservation,
+    CodeObservationReport, ConflictGroup, Error, Evidence, EvidenceKind, FileObservation,
+    FileOutcome, GitFileOutcome, GitFileReport, GitObservation, GitObservationReport,
+    GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation, IngestScope,
+    LogicalSource, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
     MemorySummary, ObservationReport, ObservedFile, Result, SearchHitRaw, SearchQuery, Source,
     SourceEvent, SourceEventKind, SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink,
     Ts,
@@ -23,6 +24,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../../migrations/0002_source_lifecycle.sql"),
     ),
     (3, include_str!("../../migrations/0003_git_ingest.sql")),
+    (4, include_str!("../../migrations/0004_code_structure.sql")),
 ];
 
 pub struct SqliteStore {
@@ -564,6 +566,152 @@ impl Store for SqliteStore {
             out.push(r.map_err(dberr)?);
         }
         Ok(out)
+    }
+
+    fn record_code_observation(
+        &self,
+        observation: CodeObservation,
+    ) -> Result<CodeObservationReport> {
+        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let mut report = CodeObservationReport::default();
+        for input in observation.inputs {
+            report.supported_inputs += 1;
+            let existing:Option<String>=match (&input.repository_id,&input.blob_oid) { (Some(repo),Some(blob))=>tx.query_row("SELECT id FROM code_inputs WHERE repository_id=?1 AND blob_oid=?2",rusqlite::params![repo.to_string(),blob],|r|r.get(0)).optional().map_err(dberr)?, _=>tx.query_row("SELECT id FROM code_inputs WHERE repository_id IS NULL AND content_hash=?1",rusqlite::params![input.content_hash],|r|r.get(0)).optional().map_err(dberr)? };
+            let is_new = existing.is_none();
+            let input_id = existing.unwrap_or_else(|| Uuid::now_v7().to_string());
+            if is_new {
+                tx.execute("INSERT INTO code_inputs(id,content_hash,repository_id,blob_oid,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![input_id,input.content_hash,input.repository_id.map(|x|x.to_string()),input.blob_oid,Ts::now().0]).map_err(dberr)?;
+            }
+            for context in input.contexts {
+                tx.execute("INSERT OR IGNORE INTO code_contexts(input_id,path,commit_oid) VALUES(?1,?2,?3)",rusqlite::params![input_id,context.path,context.commit_oid]).map_err(dberr)?;
+            }
+            let d = &input.derivation;
+            let derivation_id:Option<String>=tx.query_row("SELECT id FROM code_derivations WHERE input_id=?1 AND extractor=?2 AND extractor_version=?3 AND grammar=?4 AND grammar_version=?5",rusqlite::params![input_id,d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?;
+            if derivation_id.is_some() {
+                report.reused += 1;
+                continue;
+            }
+            let did = Uuid::now_v7();
+            tx.execute("INSERT INTO code_derivations(id,input_id,language,extractor,extractor_version,grammar,grammar_version,status,error_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",rusqlite::params![did.to_string(),input_id,input.language.as_str(),d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version,d.status.as_str(),d.error_count,Ts::now().0]).map_err(dberr)?;
+            report.parsed += 1;
+            report.entities += d.entities.len() as u64;
+            report.parse_errors += u64::from(d.status != crate::core::CodeParseStatus::Complete);
+            for e in &d.entities {
+                tx.execute("INSERT INTO code_entities(id,derivation_id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),e.kind.as_str(),e.name,e.qualified_name,e.syntax_path,e.parent_syntax_path,e.range.start_byte as i64,e.range.end_byte as i64,e.range.start_line,e.range.start_column,e.range.end_line,e.range.end_column,e.signature,e.visibility,e.is_async]).map_err(dberr)?;
+            }
+            for i in &d.imports {
+                tx.execute("INSERT INTO code_imports(id,derivation_id,raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),i.raw,i.target,i.alias,i.range.start_byte as i64,i.range.end_byte as i64,i.range.start_line,i.range.start_column,i.range.end_line,i.range.end_column]).map_err(dberr)?;
+            }
+        }
+        tx.commit().map_err(dberr)?;
+        Ok(report)
+    }
+
+    fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>> {
+        let mut stmt=self.conn.prepare("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path=?1 OR i.blob_oid=?1 ORDER BY d.created_at").map_err(dberr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![target], |r| {
+                Ok((
+                    uuid_col(r, "id")?,
+                    enum_col(r, "language", crate::core::CodeLanguage::parse)?,
+                    r.get::<_, String>("extractor")?,
+                    r.get::<_, String>("extractor_version")?,
+                    r.get::<_, String>("grammar")?,
+                    r.get::<_, String>("grammar_version")?,
+                    enum_col(r, "status", crate::core::CodeParseStatus::parse)?,
+                    r.get::<_, u32>("error_count")?,
+                    r.get::<_, String>("content_hash")?,
+                ))
+            })
+            .map_err(dberr)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                id,
+                language,
+                extractor,
+                extractor_version,
+                grammar,
+                grammar_version,
+                status,
+                error_count,
+                content_hash,
+            ) = row.map_err(dberr)?;
+            let mut es=self.conn.prepare("SELECT id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async FROM code_entities WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
+            let entities = es
+                .query_map(rusqlite::params![id.to_string()], |r| {
+                    Ok(CodeEntity {
+                        id: uuid_col(r, "id")?,
+                        kind: enum_col(r, "kind", crate::core::CodeEntityKind::parse)?,
+                        name: r.get(2)?,
+                        qualified_name: r.get(3)?,
+                        syntax_path: r.get(4)?,
+                        parent_syntax_path: r.get(5)?,
+                        range: crate::core::CodeRange {
+                            start_byte: r.get::<_, i64>(6)? as u64,
+                            end_byte: r.get::<_, i64>(7)? as u64,
+                            start_line: r.get(8)?,
+                            start_column: r.get(9)?,
+                            end_line: r.get(10)?,
+                            end_column: r.get(11)?,
+                        },
+                        signature: r.get(12)?,
+                        visibility: r.get(13)?,
+                        is_async: r.get(14)?,
+                    })
+                })
+                .map_err(dberr)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(dberr)?;
+            let mut is=self.conn.prepare("SELECT raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column FROM code_imports WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
+            let imports = is
+                .query_map(rusqlite::params![id.to_string()], |r| {
+                    Ok(CodeImport {
+                        raw: r.get(0)?,
+                        target: r.get(1)?,
+                        alias: r.get(2)?,
+                        range: crate::core::CodeRange {
+                            start_byte: r.get::<_, i64>(3)? as u64,
+                            end_byte: r.get::<_, i64>(4)? as u64,
+                            start_line: r.get(5)?,
+                            start_column: r.get(6)?,
+                            end_line: r.get(7)?,
+                            end_column: r.get(8)?,
+                        },
+                    })
+                })
+                .map_err(dberr)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(dberr)?;
+            out.push(CodeDerivation {
+                id,
+                language,
+                identity: crate::core::CodeParserIdentity {
+                    extractor,
+                    extractor_version,
+                    grammar,
+                    grammar_version,
+                },
+                status,
+                error_count,
+                content_hash,
+                entities,
+                imports,
+            });
+        }
+        Ok(out)
+    }
+
+    fn has_code_derivation(
+        &self,
+        _language: crate::core::CodeLanguage,
+        content_hash: &str,
+        repository_id: Option<Uuid>,
+        blob_oid: Option<&str>,
+        identity: &crate::core::CodeParserIdentity,
+    ) -> Result<bool> {
+        let found:Option<i64>=match (repository_id,blob_oid) { (Some(repo),Some(blob))=>self.conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id=?1 AND i.blob_oid=?2 AND d.extractor=?3 AND d.extractor_version=?4 AND d.grammar=?5 AND d.grammar_version=?6",rusqlite::params![repo.to_string(),blob,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?, _=>self.conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id IS NULL AND i.content_hash=?1 AND d.extractor=?2 AND d.extractor_version=?3 AND d.grammar=?4 AND d.grammar_version=?5",rusqlite::params![content_hash,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?};
+        Ok(found.is_some())
     }
 
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {
@@ -2223,6 +2371,7 @@ fn record_git_observation_tx(
         objects_existing,
         derivations_new,
         derivations_reused,
+        code: CodeObservationReport::default(),
         files,
         events,
     })

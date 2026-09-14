@@ -213,8 +213,8 @@ fn commands_fail_actionably() {
     assert!(ok);
 
     // Ingest of an unsupported format fails.
-    let bad = mind.db.path().join("bad.rs");
-    std::fs::write(&bad, "fn main() {}").unwrap();
+    let bad = mind.db.path().join("bad.bin");
+    std::fs::write(&bad, "not source").unwrap();
     let bad = bad.display().to_string();
     let (_, err, ok) = mind.run(&["ingest", &bad, "--space", "coding"]);
     assert!(!ok);

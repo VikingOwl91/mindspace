@@ -3,15 +3,48 @@
 
 use crate::cli::action_label;
 use crate::core::{
-    ConflictGroup, GitObservationReport, IngestScope, Memory, MemoryDetail, MemorySummary,
-    ObservationReport, SourceEventKind, Space,
+    CodeDerivation, ConflictGroup, GitObservationReport, IngestScope, Memory, MemoryDetail,
+    MemorySummary, ObservationReport, SourceEventKind, Space,
 };
 
-fn json<T: serde::Serialize>(value: &T) {
+fn json<T: serde::Serialize + ?Sized>(value: &T) {
     println!(
         "{}",
         serde_json::to_string_pretty(value).expect("engine structs serialize")
     );
+}
+
+pub fn code_structure(items: &[CodeDerivation], as_json: bool) {
+    if as_json {
+        json(items);
+        return;
+    }
+    for d in items {
+        println!(
+            "{} {} ({}, {} errors)",
+            d.language.as_str(),
+            d.content_hash,
+            d.status.as_str(),
+            d.error_count
+        );
+        for e in &d.entities {
+            println!(
+                "  {} {} [{}:{}-{}:{}]",
+                e.kind.as_str(),
+                e.qualified_name
+                    .as_deref()
+                    .or(e.name.as_deref())
+                    .unwrap_or("<anonymous>"),
+                e.range.start_line,
+                e.range.start_column,
+                e.range.end_line,
+                e.range.end_column
+            );
+        }
+        for i in &d.imports {
+            println!("  import {}", i.target);
+        }
+    }
 }
 
 pub fn observation_report(report: &ObservationReport, as_json: bool) {
@@ -94,6 +127,14 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
     println!(
         "derivations: {} new, {} reused",
         report.derivations_new, report.derivations_reused
+    );
+    println!(
+        "code: {} supported, {} parsed, {} reused, {} entities, {} parse errors",
+        report.code.supported_inputs,
+        report.code.parsed,
+        report.code.reused,
+        report.code.entities,
+        report.code.parse_errors
     );
     for event in &report.events {
         match event.kind {

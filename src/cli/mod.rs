@@ -74,6 +74,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect deterministic syntax structure by canonical file path or Git blob id
+    Structure {
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the memory -> assertion -> evidence -> source chain
     Trace {
         id: String,
@@ -166,6 +172,13 @@ pub fn execute(cli: &Cli) -> Result<()> {
                 render::space_linked(&from_space, &to_space, *json);
             }
         },
+        Command::Structure { target, json } => {
+            let store = open(cli)?;
+            let target = std::fs::canonicalize(target)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| target.clone());
+            render::code_structure(&store.code_structure(&target)?, *json);
+        }
         Command::Search {
             query,
             space,

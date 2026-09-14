@@ -276,7 +276,7 @@ The actual layout is:
 src/
   core/        domain types, ids/timestamps/hashes, the error type
   storage/     the Store trait and the SQLite implementation
-  ingest/      deterministic markdown/text parsing and ingest orchestration
+  ingest/      deterministic document and Rust syntax parsing, ingest orchestration
   retrieval/   search orchestration, directed space traversal
   cli/         clap definitions and human/JSON rendering
 
@@ -288,10 +288,13 @@ docs/
 migrations/
   0001_init.sql
   0002_source_lifecycle.sql
+  0003_git_ingest.sql
+  0004_code_structure.sql
 tests/
   invariants.rs   domain invariants against real SQLite files
   lifecycle.rs    source identity and lifecycle scenarios
   cli.rs          end-to-end runs of the mind binary
+  git_ingest.rs   Git topology and incremental-ingest scenarios
 ```
 
 ## Non-goals for the first implementation
@@ -311,7 +314,7 @@ The first job is to establish a durable and inspectable memory model that works 
 
 ## Status
 
-**v0 foundation implemented.**
+**v0.4 deterministic code structure implemented.**
 
 The core data model (sources -> evidence -> assertions -> memories, spaces,
 temporal state, provenance) is specified in `docs/memory-model.md`, built,
@@ -333,6 +336,9 @@ and tested. What works today:
 - git repository ingest: committed objects (commits, trees, blobs, tags)
   as immutable graph nodes, refs as a transaction-time journal, text blobs
   at ref tips derived through the normal evidence/assertion pipeline
+- Rust source structure through Tree-sitter: immutable, versioned syntax
+  derivations with entities, containment, ranges, and raw imports. Syntax
+  facts are not Memories; inspect them with `mind structure <path-or-blob>`.
 - a CLI (`mind`) with human and `--json` output
 
 What git ingest observes and what it defers: it reads committed objects and

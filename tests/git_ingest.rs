@@ -130,6 +130,31 @@ fn search(store: &dyn Store, text: &str) -> Vec<mindspace::core::SearchHit> {
     .unwrap()
 }
 
+fn resolution(db: &Connection, raw_target: &str) -> (String, Option<String>, Option<String>) {
+    db.query_row(
+        "SELECT rr.state,rr.target_entity_id,rr.raw_external_target \
+         FROM code_relationship_resolutions rr \
+         JOIN code_relationship_observations o ON o.id=rr.observation_id \
+         WHERE o.raw_target=?1 ORDER BY rr.id LIMIT 1",
+        [raw_target],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
+}
+
+fn entity_at(db: &Connection, path: &str, name: &str, kind: &str) -> String {
+    db.query_row(
+        "SELECT e.id FROM code_entities e \
+         JOIN code_derivations d ON d.id=e.derivation_id \
+         JOIN code_inputs i ON i.id=d.input_id \
+         JOIN code_contexts c ON c.input_id=i.id \
+         WHERE c.path=?1 AND e.name=?2 AND e.kind=?3 ORDER BY e.id LIMIT 1",
+        [path, name, kind],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // The regression: committed knowledge must be ingestable
 // ---------------------------------------------------------------------------
@@ -164,18 +189,18 @@ fn scenario_r_same_caller_blob_has_commit_contextual_resolution() {
     let store = e.open();
     store.create_space("coding", "").unwrap();
     let r = repo();
-    r.write("src/main.rs", "use crate::target::Thing;\nfn main() {}\n");
+    r.write(
+        "src/main.rs",
+        "mod target;\nuse crate::target::Thing;\nfn main() {}\n",
+    );
     r.write("src/target.rs", "pub struct Thing;\n");
     let commit_a = r.commit("one target");
     let caller_a = git(r.path(), &["rev-parse", "HEAD:src/main.rs"])
         .trim()
         .to_string();
     ingest(&store, &r);
-    r.write(
-        "src/other.rs",
-        "// a distinct declaration\npub struct Thing;\n",
-    );
-    let commit_b = r.commit("second target");
+    r.rm("src/target.rs");
+    let commit_b = r.commit("remove target module");
     let caller_b = git(r.path(), &["rev-parse", "HEAD:src/main.rs"])
         .trim()
         .to_string();
@@ -194,15 +219,31 @@ fn scenario_r_same_caller_blob_has_commit_contextual_resolution() {
     assert_eq!(input_count, 1);
     let derivations:i64=db.query_row("SELECT COUNT(*) FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.blob_oid=?1",[caller_a.as_str()],|r|r.get(0)).unwrap();
     assert_eq!(derivations, 1);
-    let states: Vec<(String, String)> = {
-        let mut s=db.prepare("SELECT rd.commit_oid, rr.state FROM code_relationship_resolutions rr JOIN code_resolution_derivations rd ON rd.id=rr.resolution_derivation_id JOIN code_relationship_observations o ON o.id=rr.observation_id WHERE o.raw_target='crate::target::Thing' ORDER BY rd.commit_oid").unwrap();
-        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    let observations: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM code_relationship_observations WHERE raw_target='crate::target::Thing'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        observations, 1,
+        "the immutable import observation is reused"
+    );
+    let states: Vec<(String, String, String)> = {
+        let mut s=db.prepare("SELECT rd.id,rd.commit_oid,rr.state FROM code_relationship_resolutions rr JOIN code_resolution_derivations rd ON rd.id=rr.resolution_derivation_id JOIN code_relationship_observations o ON o.id=rr.observation_id WHERE o.raw_target='crate::target::Thing' ORDER BY rd.commit_oid").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect()
     };
-    assert!(states.contains(&(commit_a.clone(), "resolved".into())));
-    assert!(states.contains(&(commit_b.clone(), "ambiguous".into())));
+    assert!(states
+        .iter()
+        .any(|(_, commit, state)| commit == &commit_a && state == "resolved"));
+    assert!(states
+        .iter()
+        .any(|(_, commit, state)| commit == &commit_b && state == "unresolved"));
+    assert_ne!(states[0].0, states[1].0, "each commit owns its snapshot");
     let contexts: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM code_resolution_derivations WHERE commit_oid IN (?1,?2)",
@@ -211,6 +252,283 @@ fn scenario_r_same_caller_blob_has_commit_contextual_resolution() {
         )
         .unwrap();
     assert_eq!(contexts, 2);
+}
+
+#[test]
+fn rust_qualified_crate_resolution_uses_declared_file_modules() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write(
+        "src/main.rs",
+        "mod foo; mod other; use crate::foo::bar; fn main() {}\n",
+    );
+    r.write("src/foo.rs", "pub fn bar() {}\n");
+    r.write("src/other.rs", "pub fn bar() {}\n");
+    r.commit("module-qualified import");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let (state, target, external) = resolution(&db, "crate::foo::bar");
+    assert_eq!(state, "resolved");
+    assert_eq!(
+        target,
+        Some(entity_at(&db, "src/foo.rs", "bar", "function"))
+    );
+    assert_eq!(external, None);
+}
+
+#[test]
+fn rust_mod_declarations_make_foo_mod_rs_reachable_and_keep_grouped_imports_separate() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write(
+        "src/lib.rs",
+        "mod foo; use crate::foo::{Bar as LocalBar, Baz};\n",
+    );
+    r.write("src/foo/mod.rs", "pub struct Bar; pub struct Baz;\n");
+    r.write("src/unrelated.rs", "pub struct Stowaway;\n");
+    r.commit("declared module directory");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let bar = resolution(&db, "crate::foo::Bar");
+    let baz = resolution(&db, "crate::foo::Baz");
+    assert_eq!(bar.0, "resolved");
+    assert_eq!(
+        bar.1,
+        Some(entity_at(&db, "src/foo/mod.rs", "Bar", "struct"))
+    );
+    assert_eq!(baz.0, "resolved");
+    assert_eq!(
+        baz.1,
+        Some(entity_at(&db, "src/foo/mod.rs", "Baz", "struct"))
+    );
+    let unrelated: i64 = db.query_row(
+        "SELECT COUNT(*) FROM code_relationship_resolutions rr JOIN code_relationship_observations o ON o.id=rr.observation_id JOIN code_entities e ON e.id=rr.target_entity_id WHERE e.name='Stowaway'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(unrelated, 0, "an undeclared .rs file is not a crate module");
+}
+
+#[test]
+fn rust_self_and_super_imports_resolve_from_inline_module_context() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write(
+        "src/main.rs",
+        "mod elsewhere { pub fn helper() {} }\nmod outer { pub fn helper() {} use self::helper; mod inner { use super::helper; } }\n",
+    );
+    r.commit("inline module paths");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let self_resolution = resolution(&db, "self::helper");
+    let super_resolution = resolution(&db, "super::helper");
+    assert_eq!(self_resolution.0, "resolved");
+    assert_eq!(super_resolution.0, "resolved");
+    // There are two helpers in this one parser derivation.  The target selected
+    // for both imports must be the outer helper, never the unrelated sibling.
+    let outer: String = db.query_row(
+        "SELECT e.id FROM code_entities e JOIN code_derivations d ON d.id=e.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path='src/main.rs' AND e.qualified_name='outer::helper'",
+        [], |row| row.get(0),
+    ).unwrap();
+    let elsewhere: String = db.query_row(
+        "SELECT e.id FROM code_entities e JOIN code_derivations d ON d.id=e.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path='src/main.rs' AND e.qualified_name='elsewhere::helper'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_ne!(outer, elsewhere, "fixture has a competing helper");
+    assert_eq!(self_resolution.1, Some(outer.clone()));
+    assert_eq!(super_resolution.1, Some(outer));
+}
+
+#[test]
+fn rust_impl_sides_are_independent_and_method_calls_stay_unknown() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write(
+        "src/main.rs",
+        "trait Loadable {} struct Config; impl Config { fn load(&self) {} } impl Loadable for Config {} fn caller(value: Config) { value.load(); }\n",
+    );
+    r.commit("impl relationships");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let trait_id = entity_at(&db, "src/main.rs", "Loadable", "trait");
+    let config_id = entity_at(&db, "src/main.rs", "Config", "struct");
+    let trait_resolution = resolution(&db, "Loadable");
+    let type_resolutions: Vec<(String, Option<String>)> = {
+        let mut statement = db.prepare("SELECT rr.state,rr.target_entity_id FROM code_relationship_resolutions rr JOIN code_relationship_observations o ON o.id=rr.observation_id WHERE o.kind='implements_type' AND o.raw_target='Config' ORDER BY rr.id").unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(trait_resolution.0, "resolved");
+    assert_eq!(trait_resolution.1, Some(trait_id));
+    assert_eq!(
+        type_resolutions.len(),
+        2,
+        "inherent and trait impl each retain their type side"
+    );
+    assert!(type_resolutions
+        .iter()
+        .all(|row| row == &("resolved".into(), Some(config_id.clone()))));
+    let method = resolution(&db, "value.load");
+    assert_eq!(method.0, "unresolved");
+    let trait_observations: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM code_relationship_observations WHERE kind='implements_trait'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        trait_observations, 1,
+        "inherent impl did not manufacture a trait side"
+    );
+}
+
+#[test]
+fn rust_qualified_trait_impl_resolves_each_side_in_its_own_module() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write(
+        "src/main.rs",
+        "mod traits; mod config; impl crate::traits::Loadable for crate::config::Config {}\n",
+    );
+    r.write("src/traits.rs", "pub trait Loadable {}\n");
+    r.write("src/config.rs", "pub struct Config;\n");
+    r.commit("qualified impl");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let trait_side = resolution(&db, "crate::traits::Loadable");
+    let type_side = resolution(&db, "crate::config::Config");
+    assert_eq!(trait_side.0, "resolved");
+    assert_eq!(
+        trait_side.1,
+        Some(entity_at(&db, "src/traits.rs", "Loadable", "trait"))
+    );
+    assert_eq!(type_side.0, "resolved");
+    assert_eq!(
+        type_side.1,
+        Some(entity_at(&db, "src/config.rs", "Config", "struct"))
+    );
+}
+
+#[test]
+fn rust_external_import_is_never_captured_by_a_local_name() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("src/main.rs", "struct Serialize; use serde::Serialize;\n");
+    r.commit("external import");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let (state, target, external) = resolution(&db, "serde::Serialize");
+    assert_eq!(state, "external");
+    assert_eq!(target, None);
+    assert_eq!(external.as_deref(), Some("serde::Serialize"));
+}
+
+#[test]
+fn rust_local_calls_are_module_scoped_and_each_call_site_is_preserved() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write(
+        "src/main.rs",
+        "fn helper() {} fn caller() { helper(); helper(); }\n",
+    );
+    r.commit("two local calls");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let helper = entity_at(&db, "src/main.rs", "helper", "function");
+    let rows: Vec<(String, Option<String>)> = {
+        let mut statement = db.prepare("SELECT rr.state,rr.target_entity_id FROM code_relationship_resolutions rr JOIN code_relationship_observations o ON o.id=rr.observation_id WHERE o.kind='calls' AND o.raw_target='helper' ORDER BY o.start_byte").unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            ("resolved".into(), Some(helper.clone())),
+            ("resolved".into(), Some(helper))
+        ]
+    );
+}
+
+#[test]
+fn rust_ambiguous_candidates_are_sorted_and_never_promoted_to_a_target() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    // Deliberately malformed as a Rust program, but a recovered Tree-sitter
+    // tree still contains two equally named syntax candidates.  Resolution
+    // must retain that ambiguity rather than pick a row by storage order.
+    r.write(
+        "src/main.rs",
+        "fn helper() {} fn helper() {} fn caller() { helper(); }\n",
+    );
+    r.commit("ambiguous syntax");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    let (state, target, _) = resolution(&db, "helper");
+    assert_eq!(state, "ambiguous");
+    assert_eq!(target, None);
+    let candidates: Vec<String> = {
+        let mut statement = db.prepare("SELECT c.entity_id FROM code_resolution_candidates c JOIN code_relationship_resolutions rr ON rr.id=c.resolution_id JOIN code_relationship_observations o ON o.id=rr.observation_id WHERE o.raw_target='helper' ORDER BY c.entity_id").unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn code_relationships_do_not_create_knowledge_spine_rows() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("src/main.rs", "fn helper() {} fn caller() { helper(); }\n");
+    r.commit("structure only");
+    ingest(&store, &r);
+    let db = Connection::open(&e.db).unwrap();
+    for table in ["evidence", "assertions", "memories"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "structural relationship ingest must not write {table}"
+        );
+    }
+    let relationships: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM code_relationship_resolutions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(relationships > 0);
 }
 
 #[test]

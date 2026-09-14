@@ -65,6 +65,225 @@ impl SqliteStore {
     }
 }
 
+/// A deliberately small, commit-local Rust module view.  It is assembled
+/// solely from persisted parser output and `code_contexts`; it never reads a
+/// repository checkout.  File paths become modules only when a reachable
+/// `mod name;`-shaped structural declaration points at them.
+struct RustModuleIndex {
+    reachable_paths: BTreeSet<String>,
+    file_modules: BTreeMap<String, Vec<String>>,
+    entity_modules: BTreeMap<(String, String), Vec<String>>,
+    entities: BTreeMap<String, Vec<(String, String)>>,
+}
+
+impl RustModuleIndex {
+    fn module_for_observation(&self, path: &str, syntax_path: Option<&str>) -> Option<Vec<String>> {
+        let file = self.file_modules.get(path)?.clone();
+        let Some(syntax_path) = syntax_path else {
+            return Some(file);
+        };
+        self.entity_modules
+            .get(&(path.to_string(), syntax_path.to_string()))
+            .cloned()
+            .or(Some(file))
+    }
+
+    fn candidates(&self, target: &[String], relationship_kind: &str) -> Vec<String> {
+        let key = target.join("::");
+        let allowed: &[&str] = match relationship_kind {
+            "calls" => &["function"],
+            "implements_trait" => &["trait"],
+            "implements_type" => &["struct", "enum", "type_alias"],
+            "imports" => &[
+                "function",
+                "struct",
+                "trait",
+                "enum",
+                "type_alias",
+                "module",
+                "constant",
+                "static",
+            ],
+            _ => &[],
+        };
+        self.entities
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|(_, kind)| allowed.contains(&kind.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+fn is_internal_rust_path(raw: &str) -> bool {
+    raw == "crate"
+        || raw == "self"
+        || raw == "super"
+        || raw.starts_with("crate::")
+        || raw.starts_with("self::")
+        || raw.starts_with("super::")
+}
+
+fn rust_target_path(raw: &str, current_module: &[String]) -> Option<Vec<String>> {
+    let parts: Vec<&str> = raw.split("::").filter(|part| !part.is_empty()).collect();
+    let (mut target, suffix) = match parts.first().copied()? {
+        "crate" => (Vec::new(), &parts[1..]),
+        "self" => (current_module.to_vec(), &parts[1..]),
+        "super" => {
+            let mut base = current_module.to_vec();
+            let mut at = 0;
+            while parts.get(at) == Some(&"super") {
+                base.pop()?;
+                at += 1;
+            }
+            (base, &parts[at..])
+        }
+        // Calls with a bare identifier are the only unqualified form v0.5
+        // attempts.  `foo::bar` needs imports/name resolution and remains
+        // explicitly unknown.
+        _bare if parts.len() == 1 => (current_module.to_vec(), &parts[..]),
+        _ => return None,
+    };
+    target.extend(suffix.iter().map(|part| (*part).to_string()));
+    (!target.is_empty()).then_some(target)
+}
+
+fn rust_file_module(path: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 || parts.first() != Some(&"src") || !path.ends_with(".rs") {
+        return None;
+    }
+    let stem = parts.last()?.strip_suffix(".rs")?;
+    if matches!(stem, "lib" | "main") && parts.len() == 2 {
+        return Some(vec![]);
+    }
+    let mut module: Vec<String> = parts[1..parts.len() - 1]
+        .iter()
+        .map(|part| (*part).to_string())
+        .collect();
+    if stem != "mod" {
+        module.push(stem.to_string());
+    }
+    (!module.is_empty()).then_some(module)
+}
+
+fn append_qualified(base: &[String], relative: Option<&str>) -> Vec<String> {
+    let mut result = base.to_vec();
+    if let Some(relative) = relative {
+        result.extend(
+            relative
+                .split("::")
+                .filter(|part| !part.is_empty())
+                .map(str::to_string),
+        );
+    }
+    result
+}
+
+fn rust_module_index(
+    tx: &rusqlite::Transaction<'_>,
+    repository_id: Uuid,
+    commit_oid: &str,
+) -> Result<RustModuleIndex> {
+    #[derive(Clone)]
+    struct Row {
+        path: String,
+        id: String,
+        kind: String,
+        syntax: String,
+        qualified: Option<String>,
+    }
+    let mut stmt = tx.prepare("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 ORDER BY c.path,e.syntax_path,e.id").map_err(dberr)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![repository_id.to_string(), commit_oid],
+            |r| {
+                Ok(Row {
+                    path: r.get(0)?,
+                    id: r.get(1)?,
+                    kind: r.get(2)?,
+                    syntax: r.get(3)?,
+                    qualified: r.get(4)?,
+                })
+            },
+        )
+        .map_err(dberr)?;
+    let mut by_path: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+    for row in rows {
+        let row = row.map_err(dberr)?;
+        by_path.entry(row.path.clone()).or_default().push(row);
+    }
+    drop(stmt);
+
+    let mut file_modules = BTreeMap::new();
+    let mut reachable_paths = BTreeSet::new();
+    for path in by_path.keys() {
+        if rust_file_module(path).as_deref() == Some(&[]) {
+            file_modules.insert(path.clone(), vec![]);
+            reachable_paths.insert(path.clone());
+        }
+    }
+    // Module declarations in reachable files may make the conventional
+    // `foo.rs` / `foo/mod.rs` context reachable.  Iteration is ordered and
+    // terminates because only finitely many persisted contexts exist.
+    loop {
+        let mut changed = false;
+        let paths: Vec<String> = reachable_paths.iter().cloned().collect();
+        for path in paths {
+            let base = file_modules[&path].clone();
+            for row in &by_path[&path] {
+                if row.kind != "module" {
+                    continue;
+                }
+                let declared = append_qualified(&base, row.qualified.as_deref());
+                for (candidate, candidate_base) in by_path.keys().filter_map(|candidate| {
+                    rust_file_module(candidate).map(|base| (candidate, base))
+                }) {
+                    if candidate_base == declared && reachable_paths.insert(candidate.clone()) {
+                        file_modules.insert(candidate.clone(), candidate_base);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut entity_modules = BTreeMap::new();
+    let mut entities: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for path in &reachable_paths {
+        let base = file_modules[path].clone();
+        for row in &by_path[path] {
+            let canonical = append_qualified(&base, row.qualified.as_deref());
+            let module = if row.kind == "module" {
+                canonical.clone()
+            } else {
+                canonical[..canonical.len().saturating_sub(1)].to_vec()
+            };
+            entity_modules.insert((path.clone(), row.syntax.clone()), module);
+            if row.qualified.is_some() && !canonical.is_empty() {
+                entities
+                    .entry(canonical.join("::"))
+                    .or_default()
+                    .push((row.id.clone(), row.kind.clone()));
+            }
+        }
+    }
+    for values in entities.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+    Ok(RustModuleIndex {
+        reachable_paths,
+        file_modules,
+        entity_modules,
+        entities,
+    })
+}
+
 fn dberr(e: rusqlite::Error) -> Error {
     Error::Storage(e.to_string())
 }
@@ -743,7 +962,8 @@ impl Store for SqliteStore {
             derivations_created: 1,
             ..Default::default()
         };
-        let mut stmt=tx.prepare("SELECT DISTINCT o.id,o.kind,o.raw_target FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 ORDER BY o.id").map_err(dberr)?;
+        let module_index = rust_module_index(&tx, repository_id, commit_oid)?;
+        let mut stmt=tx.prepare("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 ORDER BY o.id,c.path").map_err(dberr)?;
         let rows = stmt
             .query_map(
                 rusqlite::params![repository_id.to_string(), commit_oid],
@@ -752,37 +972,50 @@ impl Store for SqliteStore {
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
                     ))
                 },
             )
             .map_err(dberr)?;
+        // A content-addressed observation can occur under several paths in one
+        // commit.  The v0.5 resolution table has no path key, so resolving one
+        // arbitrarily would create a false edge.  Retain one honest unresolved
+        // observation until a later schema slice adds path-local results.
+        let mut observations: BTreeMap<String, (String, String, Option<String>, Option<String>)> =
+            BTreeMap::new();
         for row in rows {
-            let (oid, kind, raw) = row.map_err(dberr)?;
-            let internal = raw.starts_with("crate::")
-                || raw.starts_with("self::")
-                || raw.starts_with("super::")
-                || kind == "calls" && !raw.contains('.');
-            if !internal && kind == "imports" {
+            let (id, kind, raw, source, path) = row.map_err(dberr)?;
+            if !module_index.reachable_paths.contains(&path) {
+                continue;
+            }
+            match observations.entry(id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((kind, raw, source, Some(path)));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().3.as_deref() != Some(path.as_str()) {
+                        entry.get_mut().3 = None;
+                    }
+                }
+            }
+        }
+        drop(stmt);
+        for (oid, (kind, raw, source, path)) in observations {
+            let current_module = path
+                .as_ref()
+                .and_then(|path| module_index.module_for_observation(path, source.as_deref()));
+            let external = kind == "imports" && !is_internal_rust_path(&raw);
+            if external {
                 tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,'external',NULL,?4)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),oid,raw]).map_err(dberr)?;
                 report.external += 1;
                 continue;
-            };
-            let local = raw
-                .trim_start_matches("crate::")
-                .trim_start_matches("self::")
-                .trim_start_matches("super::")
-                .split("::")
-                .last()
-                .unwrap_or(&raw);
-            let mut es=tx.prepare("SELECT DISTINCT e.id FROM code_entities e JOIN code_derivations d ON d.id=e.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND e.name=?3 AND e.kind IN ('function','method','struct','trait','enum','type_alias') ORDER BY e.id").map_err(dberr)?;
-            let candidates = es
-                .query_map(
-                    rusqlite::params![repository_id.to_string(), commit_oid, local],
-                    |r| r.get::<_, String>(0),
-                )
-                .map_err(dberr)?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(dberr)?;
+            }
+            let candidates = current_module
+                .as_deref()
+                .and_then(|module| rust_target_path(&raw, module))
+                .map(|target| module_index.candidates(&target, &kind))
+                .unwrap_or_default();
             let state = if candidates.len() == 1 {
                 "resolved"
             } else if candidates.is_empty() {
@@ -803,7 +1036,6 @@ impl Store for SqliteStore {
                 report.unresolved += 1
             }
         }
-        drop(stmt);
         tx.commit().map_err(dberr)?;
         Ok(report)
     }

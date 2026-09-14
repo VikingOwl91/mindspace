@@ -184,25 +184,27 @@ fn walk(
     if let Some(k) = kind {
         if k == CodeEntityKind::Import {
             let raw = text(n, s);
-            let target = raw
-                .trim()
-                .trim_start_matches("use")
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .to_string();
-            out.imports.push(CodeImportDraft {
-                raw: raw.clone(),
-                target: target.clone(),
-                alias: None,
-                range: range(n),
-            });
-            out.relationships.push(CodeRelationshipDraft {
-                kind: CodeRelationshipKind::Imports,
-                source_syntax_path: parent.clone(),
-                raw_target: target,
-                range: range(n),
-            });
+            for (target, alias, start, end) in rust_use_targets(&raw) {
+                let mut target_range = range(n);
+                target_range.start_byte += start as u64;
+                target_range.end_byte = target_range.start_byte + (end - start) as u64;
+                // The declaration can be single-line or formatted.  Its full
+                // line/column span remains the honest normalized location;
+                // byte subranges provide distinct immutable identities for a
+                // grouped `use` without pretending to resolve it.
+                out.imports.push(CodeImportDraft {
+                    raw: raw.clone(),
+                    target: target.clone(),
+                    alias,
+                    range: target_range.clone(),
+                });
+                out.relationships.push(CodeRelationshipDraft {
+                    kind: CodeRelationshipKind::Imports,
+                    source_syntax_path: parent.clone(),
+                    raw_target: target,
+                    range: target_range,
+                });
+            }
             out.entities.push(CodeEntityDraft {
                 kind: k,
                 name: None,
@@ -257,6 +259,56 @@ fn walk(
     }
 }
 
+/// Normalizes only the literal Rust `use_declaration` text already selected by
+/// Tree-sitter.  This is deliberately not a source parser: grammar selection
+/// and declaration boundaries come from Tree-sitter; this just splits its
+/// deterministic path-list surface into independently storable facts.
+fn rust_use_targets(raw: &str) -> Vec<(String, Option<String>, usize, usize)> {
+    let declaration = raw.trim();
+    let Some(body) = declaration
+        .strip_prefix("use")
+        .map(str::trim)
+        .and_then(|body| body.strip_suffix(';'))
+        .map(str::trim)
+    else {
+        return vec![];
+    };
+    let base_offset = raw.find(body).unwrap_or(0);
+    let expand = |target: &str, offset: usize| {
+        let target = target.trim();
+        let (target, alias) = target
+            .rsplit_once(" as ")
+            .map_or((target, None), |(path, alias)| {
+                (path.trim(), Some(alias.trim().to_string()))
+            });
+        (!target.is_empty()).then_some((target.to_string(), alias, offset, offset + target.len()))
+    };
+    if let Some((prefix, rest)) = body.split_once("::{") {
+        if let Some(items) = rest.strip_suffix('}') {
+            let prefix = prefix.trim_end_matches("::").trim();
+            let items_offset = body.find('{').unwrap_or(0) + 1;
+            let mut offset = 0;
+            return items
+                .split(',')
+                .filter_map(|raw_item| {
+                    let leading = raw_item.len() - raw_item.trim_start().len();
+                    let item_offset = base_offset + items_offset + offset + leading;
+                    offset += raw_item.len() + 1;
+                    let item = raw_item.trim();
+                    let (item_path, alias) = item
+                        .rsplit_once(" as ")
+                        .map_or((item, None), |(path, alias)| {
+                            (path.trim(), Some(alias.trim().to_string()))
+                        });
+                    let target = format!("{prefix}::{item_path}");
+                    Some((target, alias, item_offset, item_offset + item_path.len()))
+                })
+                .collect();
+        }
+    }
+    expand(body, base_offset).into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +333,53 @@ mod tests {
         assert_eq!(
             parse(CodeLanguage::Rust, "fn broken(").status,
             CodeParseStatus::Recovered
+        );
+    }
+
+    #[test]
+    fn captures_inherent_and_trait_impl_sides_independently() {
+        let parsed = parse(
+            CodeLanguage::Rust,
+            "trait Loadable {} struct Config; impl Config {} impl Loadable for Config {}",
+        );
+        let sides: Vec<_> = parsed
+            .relationships
+            .iter()
+            .filter(|relationship| {
+                matches!(
+                    relationship.kind,
+                    CodeRelationshipKind::ImplementsTrait | CodeRelationshipKind::ImplementsType
+                )
+            })
+            .map(|relationship| (relationship.kind, relationship.raw_target.as_str()))
+            .collect();
+        assert_eq!(
+            sides,
+            vec![
+                (CodeRelationshipKind::ImplementsType, "Config"),
+                (CodeRelationshipKind::ImplementsTrait, "Loadable"),
+                (CodeRelationshipKind::ImplementsType, "Config"),
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_aliased_and_grouped_use_paths_into_distinct_observations() {
+        let parsed = parse(CodeLanguage::Rust, "use crate::foo::{Bar as Renamed, Baz};");
+        assert_eq!(
+            parsed
+                .imports
+                .iter()
+                .map(|import| (import.target.as_str(), import.alias.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("crate::foo::Bar", Some("Renamed")),
+                ("crate::foo::Baz", None),
+            ]
+        );
+        assert_ne!(
+            parsed.relationships[0].range.start_byte,
+            parsed.relationships[1].range.start_byte
         );
     }
 }

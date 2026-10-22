@@ -290,7 +290,7 @@ fn rust_use_targets(raw: &str) -> Vec<(String, Option<String>, usize, usize)> {
             let mut offset = 0;
             return items
                 .split(',')
-                .filter_map(|raw_item| {
+                .map(|raw_item| {
                     let leading = raw_item.len() - raw_item.trim_start().len();
                     let item_offset = base_offset + items_offset + offset + leading;
                     offset += raw_item.len() + 1;
@@ -301,7 +301,7 @@ fn rust_use_targets(raw: &str) -> Vec<(String, Option<String>, usize, usize)> {
                             (path.trim(), Some(alias.trim().to_string()))
                         });
                     let target = format!("{prefix}::{item_path}");
-                    Some((target, alias, item_offset, item_offset + item_path.len()))
+                    (target, alias, item_offset, item_offset + item_path.len())
                 })
                 .collect();
         }

@@ -91,6 +91,9 @@ pub enum Error {
 
     #[error("MCP transport error: {detail}")]
     McpTransport { detail: String },
+
+    #[error("invalid embedding vector: {detail}")]
+    InvalidVector { detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

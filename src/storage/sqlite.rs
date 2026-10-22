@@ -7,14 +7,16 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use uuid::Uuid;
 
 use crate::core::{
-    sha256_hex, Assertion, AssertionDraft, AssertionKind, CodeDerivation, CodeEntity, CodeImport,
-    CodeObservation, CodeObservationReport, ConflictGroup, Error, Evidence, EvidenceDraft,
+    cosine_similarity, decode_f32_le, encode_f32_le, sha256_hex, Assertion, AssertionDraft,
+    AssertionEmbedding, AssertionKind, CodeDerivation, CodeEntity, CodeImport, CodeObservation,
+    CodeObservationReport, ConflictGroup, EmbeddingIndexStatus, Error, Evidence, EvidenceDraft,
     EvidenceKind, FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
     GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
     IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft, ManualMemoryReport, Memory,
     MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
     ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
-    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, Ts, EXTRACTION_MANUAL_WRITE,
+    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, Ts, UnembeddedAssertion,
+    EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
 
@@ -31,6 +33,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../../migrations/0005_code_relationships.sql"),
     ),
     (6, include_str!("../../migrations/0006_manual_writes.sql")),
+    (7, include_str!("../../migrations/0007_embeddings.sql")),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
@@ -305,6 +308,72 @@ fn dberr(e: rusqlite::Error) -> Error {
 
 fn begin_write(conn: &Connection) -> Result<Transaction<'_>> {
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)
+}
+
+/// Shared filter clause for lexical and vector search: temporal `at`,
+/// active/superseded/retired visibility, and space membership. Both search
+/// paths call this so space/temporal/lifecycle semantics stay identical.
+/// Pushes its parameters onto `params` and returns the SQL fragment with
+/// numbered placeholders. The empty-space-list case ("matches nothing") is
+/// handled by callers before this is invoked.
+fn build_search_filters(query: &SearchQuery, params: &mut Vec<Value>) -> String {
+    let mut sql = String::new();
+    if let Some(at) = query.at {
+        let i1 = params.len() + 1;
+        let i2 = i1 + 1;
+        let i3 = i1 + 2;
+        sql.push_str(&format!(
+            " AND m.created_at <= ?{i1} AND (m.superseded_at IS NULL OR m.superseded_at > ?{i2}) \
+             AND (m.retired_at IS NULL OR m.retired_at > ?{i3})"
+        ));
+        params.push(Value::Integer(at.0));
+        params.push(Value::Integer(at.0));
+        params.push(Value::Integer(at.0));
+    } else {
+        let mut states = vec!["active"];
+        if query.include_superseded {
+            states.push("superseded");
+        }
+        if query.include_retired {
+            states.push("retired");
+        }
+        let list = states
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND m.state IN ({list})"));
+    }
+    if let Some(ids) = &query.space_ids {
+        if !ids.is_empty() {
+            let mut id_params = Vec::new();
+            for id in ids {
+                params.push(Value::Text(id.to_string()));
+                id_params.push(format!("?{}", params.len()));
+            }
+            sql.push_str(&format!(
+                " AND m.id IN (SELECT memory_id FROM memory_spaces WHERE space_id IN ({}))",
+                id_params.join(", ")
+            ));
+        }
+    }
+    sql
+}
+
+/// Deterministic content window for non-lexical search hits (semantic/hybrid
+/// vectors that are not also an FTS5 match). Takes the first non-empty line
+/// region, trimmed, up to 160 chars, with a trailing ellipsis when truncated.
+fn content_window(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= 160 {
+        return trimmed.to_string();
+    }
+    let mut out = String::new();
+    for ch in trimmed.chars().take(160) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 /// FTS5 reports bad query syntax through its error message; surface that as
@@ -1237,6 +1306,256 @@ impl Store for SqliteStore {
         Ok(names)
     }
 
+    // -- Phase 2 M1: embeddings / vector index -----------------------------
+
+    fn save_embeddings(&self, embeddings: &[AssertionEmbedding]) -> Result<usize> {
+        if embeddings.is_empty() {
+            return Ok(0);
+        }
+        let tx = begin_write(&self.conn)?;
+        let mut inserted = 0usize;
+        for e in embeddings {
+            // Validate before persisting: dimension must match and the vector
+            // must be finite. Malformed input is a controlled error, never a
+            // panic.
+            if e.embedding.len() != e.dimension as usize {
+                return Err(Error::InvalidVector {
+                    detail: format!(
+                        "embedding dimension mismatch: got {}, declared {}",
+                        e.embedding.len(),
+                        e.dimension
+                    ),
+                });
+            }
+            let blob = encode_f32_le(&e.embedding)?;
+            let changed = tx
+                .execute(
+                    "INSERT INTO assertion_embeddings \
+                     (assertion_id, derivation_key, model, model_version, dimension, embedding, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(assertion_id, derivation_key) DO NOTHING",
+                    rusqlite::params![
+                        e.assertion_id.to_string(),
+                        e.derivation_key,
+                        e.model,
+                        e.model_version,
+                        i64::from(e.dimension),
+                        blob,
+                        Ts::now().0,
+                    ],
+                )
+                .map_err(dberr)?;
+            inserted += changed;
+        }
+        tx.commit().map_err(dberr)?;
+        Ok(inserted)
+    }
+
+    fn list_assertions_needing_embedding(
+        &self,
+        derivation_key: &str,
+        limit: u32,
+    ) -> Result<Vec<UnembeddedAssertion>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id, a.subject, a.content \
+                 FROM assertions a \
+                 LEFT JOIN assertion_embeddings ae \
+                   ON ae.assertion_id = a.id AND ae.derivation_key = ?1 \
+                 WHERE ae.assertion_id IS NULL \
+                 ORDER BY a.created_at ASC, a.id ASC \
+                 LIMIT ?2",
+            )
+            .map_err(dberr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![derivation_key, i64::from(limit)], |r| {
+                Ok(UnembeddedAssertion {
+                    assertion_id: uuid_col(r, "id")?,
+                    subject: r.get("subject")?,
+                    content: r.get("content")?,
+                })
+            })
+            .map_err(dberr)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(dberr)?);
+        }
+        Ok(out)
+    }
+
+    fn embedding_index_status(&self, derivation_key: &str) -> Result<EmbeddingIndexStatus> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM assertions", [], |r| r.get(0))
+            .map_err(dberr)?;
+        let embedded: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM assertion_embeddings WHERE derivation_key = ?1",
+                rusqlite::params![derivation_key],
+                |r| r.get(0),
+            )
+            .map_err(dberr)?;
+        Ok(EmbeddingIndexStatus {
+            derivation_key: derivation_key.to_string(),
+            total_assertions: total as u64,
+            embedded: embedded as u64,
+        })
+    }
+
+    fn clear_embeddings(&self, derivation_key: &str) -> Result<usize> {
+        let tx = begin_write(&self.conn)?;
+        let n = tx
+            .execute(
+                "DELETE FROM assertion_embeddings WHERE derivation_key = ?1",
+                rusqlite::params![derivation_key],
+            )
+            .map_err(dberr)?;
+        tx.commit().map_err(dberr)?;
+        Ok(n)
+    }
+
+    fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM mind_meta WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(dberr)
+    }
+
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let tx = begin_write(&self.conn)?;
+        tx.execute(
+            "INSERT INTO mind_meta (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(dberr)?;
+        tx.commit().map_err(dberr)?;
+        Ok(())
+    }
+
+    fn search_vectors(
+        &self,
+        query_vector: &[f32],
+        query: &SearchQuery,
+        derivation_key: &str,
+    ) -> Result<Vec<SearchHitRaw>> {
+        if query_vector.is_empty() {
+            return Err(Error::InvalidVector {
+                detail: "query vector is empty".to_string(),
+            });
+        }
+        for (i, v) in query_vector.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(Error::InvalidVector {
+                    detail: format!("non-finite value at index {i}: {v}"),
+                });
+            }
+        }
+        // Empty space list means "matches nothing", same as lexical search.
+        if let Some(ids) = &query.space_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        let dim = query_vector.len();
+        let mut params: Vec<Value> = Vec::new();
+        params.push(Value::Text(derivation_key.to_string()));
+        params.push(Value::Integer(dim as i64));
+        let filter_sql = build_search_filters(query, &mut params);
+        // All filter-qualified candidates are evaluated before ranking (F1).
+        // query.limit is applied only after ranking; no silent candidate cap.
+        let mut sql = String::from(
+            "SELECT m.id, a.subject, a.content, ae.embedding, ae.dimension, \
+                    m.state, m.created_at, a.extraction, src.title, src.location \
+             FROM assertion_embeddings ae \
+             JOIN assertions a ON a.id = ae.assertion_id \
+             JOIN memories m ON m.assertion_id = a.id \
+             JOIN evidence e ON e.id = a.evidence_id \
+             JOIN sources src ON src.id = e.source_id \
+             WHERE ae.derivation_key = ?1 AND ae.dimension = ?2",
+        );
+        sql.push_str(&filter_sql);
+
+        // Fetch candidates (no ORDER BY in SQL; ranking happens in Rust).
+        let mut stmt = self.conn.prepare(&sql).map_err(dberr)?;
+        let rows = stmt
+            .query_map(params_from_iter(params), |r| {
+                let memory_id: String = r.get("id")?;
+                let embedding_bytes: Vec<u8> = r.get("embedding")?;
+                let stored_dim: i64 = r.get("dimension")?;
+                Ok((
+                    SearchHitRaw {
+                        memory_id: Uuid::parse_str(&memory_id).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
+                        })?,
+                        subject: r.get("subject")?,
+                        content: r.get("content")?,
+                        snippet: String::new(),
+                        score: 0.0,
+                        state: enum_col(r, "state", MemoryState::parse)?,
+                        created_at: ts_col(r, "created_at")?,
+                        extraction: r.get("extraction")?,
+                        space_names: Vec::new(),
+                        source_title: r.get("title")?,
+                        source_location: r.get("location")?,
+                    },
+                    embedding_bytes,
+                    stored_dim,
+                ))
+            })
+            .map_err(dberr)?;
+
+        let mut candidates: Vec<(f64, SearchHitRaw)> = Vec::new();
+        for row in rows {
+            let (mut hit, bytes, stored_dim) = row.map_err(dberr)?;
+            // Dimension mismatch or malformed blob: exclude with no panic.
+            let stored = match decode_f32_le(&bytes, Some(stored_dim as usize)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if stored.len() != dim {
+                continue;
+            }
+            let sim = cosine_similarity(&stored, query_vector);
+            // Deterministic content-window snippet for non-lexical hits.
+            hit.snippet = content_window(&hit.content);
+            hit.score = sim;
+            candidates.push((sim, hit));
+        }
+
+        // Deterministic ordering: score desc, then memory_id asc.
+        candidates.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.memory_id.cmp(&b.1.memory_id))
+        });
+        let mut hits: Vec<SearchHitRaw> = candidates
+            .into_iter()
+            .take(query.limit as usize)
+            .map(|(_, h)| h)
+            .collect();
+
+        // Fill space_names post-hoc, identical to lexical search.
+        let ids: Vec<String> = hits.iter().map(|h| h.memory_id.to_string()).collect();
+        let names = space_names_by_memory(&self.conn, &ids)?;
+        for h in &mut hits {
+            if let Some(ns) = names.get(&h.memory_id.to_string()) {
+                h.space_names = ns.clone();
+            }
+        }
+        // Assign rank is deferred to retrieval (M4); store returns raw hits.
+        Ok(hits)
+    }
+
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {
         load_summaries(
             &self.conn,
@@ -1305,46 +1624,21 @@ impl Store for SqliteStore {
         );
         let mut params: Vec<Value> = vec![Value::Text(text.to_string())];
 
-        if let Some(at) = query.at {
-            sql.push_str(
-                " AND m.created_at <= ? AND (m.superseded_at IS NULL OR m.superseded_at > ?) \
-                 AND (m.retired_at IS NULL OR m.retired_at > ?)",
-            );
-            params.push(Value::Integer(at.0));
-            params.push(Value::Integer(at.0));
-            params.push(Value::Integer(at.0));
-        } else {
-            let mut states = vec!["active"];
-            if query.include_superseded {
-                states.push("superseded");
-            }
-            if query.include_retired {
-                states.push("retired");
-            }
-            let list = states
-                .iter()
-                .map(|s| format!("'{s}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            sql.push_str(&format!(" AND m.state IN ({list})"));
-        }
-
+        // Empty space list means "matches nothing", same as before.
         if let Some(ids) = &query.space_ids {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut id_params = Vec::new();
-            for id in ids {
-                params.push(Value::Text(id.to_string()));
-                id_params.push(format!("?{}", params.len()));
-            }
-            sql.push_str(&format!(
-                " AND m.id IN (SELECT memory_id FROM memory_spaces WHERE space_id IN ({}))",
-                id_params.join(", ")
-            ));
         }
 
-        sql.push_str(&format!(" ORDER BY score ASC LIMIT ?{}", params.len() + 1));
+        let filter_sql = build_search_filters(query, &mut params);
+        sql.push_str(&filter_sql);
+
+        // Deterministic tie-break: score ASC (bm25, best first), then memory id.
+        sql.push_str(&format!(
+            " ORDER BY score ASC, m.id ASC LIMIT ?{}",
+            params.len() + 1
+        ));
         params.push(Value::Integer(i64::from(query.limit)));
 
         // Deterministic two-step: try the text as an FTS5 match expression;

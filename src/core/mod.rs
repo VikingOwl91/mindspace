@@ -92,6 +92,163 @@ pub fn normalize_subject(s: &str) -> String {
 
 pub const EXTRACTION_MANUAL_WRITE: &str = "manual:write";
 
+// ---------------------------------------------------------------------------
+// Phase 2 M1: vector helpers (pure, no storage dependency). Embeddings are a
+// derived index over assertions; these helpers handle the on-disk BLOB format
+// (little-endian f32) and the similarity math. They are deterministic and never
+// panic on malformed input.
+// ---------------------------------------------------------------------------
+
+/// Encode a slice of f32 as a little-endian byte vector. Rejects non-finite
+/// values (NaN, infinity) so a corrupt vector can never be persisted.
+pub fn encode_f32_le(values: &[f32]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &v in values {
+        if !v.is_finite() {
+            return Err(Error::InvalidVector {
+                detail: format!("non-finite value {v}"),
+            });
+        }
+    }
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Decode a little-endian f32 byte vector. Rejects trailing bytes, non-finite
+/// values, and (when `expected_dim` is Some) dimension mismatches.
+pub fn decode_f32_le(bytes: &[u8], expected_dim: Option<usize>) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::InvalidVector {
+            detail: format!("byte length {} is not a multiple of 4", bytes.len()),
+        });
+    }
+    let dim = bytes.len() / 4;
+    if let Some(expected) = expected_dim {
+        if dim != expected {
+            return Err(Error::InvalidVector {
+                detail: format!("dimension mismatch: stored {dim}, expected {expected}"),
+            });
+        }
+    }
+    let mut out = Vec::with_capacity(dim);
+    for chunk in bytes.chunks(4) {
+        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if !v.is_finite() {
+            return Err(Error::InvalidVector {
+                detail: format!("non-finite value at offset {}", out.len() * 4),
+            });
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Cosine similarity with f64 accumulation for numerical stability.
+/// Returns 0.0 when either vector has zero norm or the dimensions differ,
+/// so ranking never produces NaN.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xf = *x as f64;
+        let yf = *y as f64;
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
+/// A single embedding pipeline descriptor. The `derivation_key` is a hash of
+/// the canonical encoding of every parameter that affects the resulting vector,
+/// so changing any input invalidates previously stored vectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingDerivation {
+    pub model_id: String,
+    pub model_version: String,
+    pub model_sha256: String,
+    pub tokenizer_sha256: String,
+    pub prefix_strategy: String,
+    pub pooling: String,
+    pub normalization: String,
+    pub max_seq_len: u32,
+    pub truncation: String,
+    pub dimension: u32,
+    pub runtime: String,
+    pub runtime_version: String,
+}
+
+impl EmbeddingDerivation {
+    /// Canonical compact JSON (sorted keys) of all inputs, then SHA-256.
+    /// JSON's structural delimiters make the encoding unambiguous: no input
+    /// value can collide with another by delimiter placement.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        use std::collections::BTreeMap;
+        let mut map = BTreeMap::new();
+        map.insert(
+            "dimension",
+            serde_json::Value::Number(self.dimension.into()),
+        );
+        map.insert(
+            "encoding_version",
+            serde_json::Value::String("1".to_string()),
+        );
+        map.insert(
+            "max_seq_len",
+            serde_json::Value::Number(self.max_seq_len.into()),
+        );
+        map.insert("model_id", serde_json::Value::String(self.model_id.clone()));
+        map.insert(
+            "model_sha256",
+            serde_json::Value::String(self.model_sha256.clone()),
+        );
+        map.insert(
+            "model_version",
+            serde_json::Value::String(self.model_version.clone()),
+        );
+        map.insert(
+            "normalization",
+            serde_json::Value::String(self.normalization.clone()),
+        );
+        map.insert("pooling", serde_json::Value::String(self.pooling.clone()));
+        map.insert(
+            "prefix_strategy",
+            serde_json::Value::String(self.prefix_strategy.clone()),
+        );
+        map.insert("runtime", serde_json::Value::String(self.runtime.clone()));
+        map.insert(
+            "runtime_version",
+            serde_json::Value::String(self.runtime_version.clone()),
+        );
+        map.insert(
+            "tokenizer_sha256",
+            serde_json::Value::String(self.tokenizer_sha256.clone()),
+        );
+        map.insert(
+            "truncation",
+            serde_json::Value::String(self.truncation.clone()),
+        );
+        serde_json::to_vec(&map).expect(
+            "serialization of BTreeMap<String, Value> with string/number values is infallible",
+        )
+    }
+
+    pub fn derivation_key(&self) -> String {
+        sha256_hex(&self.canonical_bytes())
+    }
+}
+
 pub fn default_manual_subject(content: &str) -> Option<String> {
     content
         .lines()
@@ -457,6 +614,45 @@ pub struct ManualMemoryReport {
     pub subject: String,
     pub action: MemoryActionKind,
     pub spaces: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 M1: embedding storage contract types. Embeddings are a derived,
+// versioned index over immutable assertions; these types carry no model
+// runtime dependency.
+// ---------------------------------------------------------------------------
+
+/// A derived embedding for one assertion under one complete pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssertionEmbedding {
+    pub assertion_id: Uuid,
+    pub derivation_key: String,
+    pub model: String,
+    pub model_version: String,
+    pub dimension: u32,
+    pub embedding: Vec<f32>,
+}
+
+/// An assertion that has no embedding for a given derivation key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnembeddedAssertion {
+    pub assertion_id: Uuid,
+    pub subject: String,
+    pub content: String,
+}
+
+/// Coverage of one derivation key over the assertion population.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingIndexStatus {
+    pub derivation_key: String,
+    pub total_assertions: u64,
+    pub embedded: u64,
+}
+
+impl EmbeddingIndexStatus {
+    pub fn missing(&self) -> u64 {
+        self.total_assertions.saturating_sub(self.embedded)
+    }
 }
 
 // ---------------------------------------------------------------------------

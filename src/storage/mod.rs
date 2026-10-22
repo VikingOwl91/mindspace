@@ -3,10 +3,11 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    CodeDerivation, CodeLanguage, CodeObservation, CodeObservationReport, CodeParserIdentity,
-    CodeResolutionReport, ConflictGroup, GitObservation, GitObservationReport, GitRefObservation,
-    IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory, MemoryDetail, MemorySummary,
-    ObservationReport, Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts,
+    AssertionEmbedding, CodeDerivation, CodeLanguage, CodeObservation, CodeObservationReport,
+    CodeParserIdentity, CodeResolutionReport, ConflictGroup, EmbeddingIndexStatus, GitObservation,
+    GitObservationReport, GitRefObservation, IngestObservation, ManualMemoryDraft,
+    ManualMemoryReport, Memory, MemoryDetail, MemorySummary, ObservationReport, Result,
+    SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts, UnembeddedAssertion,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and
@@ -72,6 +73,52 @@ pub trait Store {
     /// Adds memberships to an active memory and returns newly added space
     /// names. Existing membership is idempotent.
     fn add_memory_spaces(&self, memory_id: Uuid, space_ids: Vec<Uuid>) -> Result<Vec<String>>;
+
+    // -- embeddings / vector index (Phase 2 M1) -----------------------------
+    // Derived, versioned index over immutable assertions. Storage owns the
+    // BLOB format and similarity computation; it never runs a model. The
+    // derivation key identifies the complete embedding pipeline, so a change
+    // to any pipeline parameter invalidates prior rows (they are ignored, not
+    // deleted, and re-indexed by the caller).
+
+    /// Idempotently store derived embeddings. Rows are keyed by
+    /// (assertion_id, derivation_key); an existing row is left unchanged.
+    /// Returns the number of rows newly inserted.
+    fn save_embeddings(&self, embeddings: &[AssertionEmbedding]) -> Result<usize>;
+
+    /// Assertions that have no embedding for the given derivation key, up to
+    /// `limit`. Ordered by created_at then id for determinism. Used by the
+    /// indexer for incremental backfill; an empty result means full coverage.
+    fn list_assertions_needing_embedding(
+        &self,
+        derivation_key: &str,
+        limit: u32,
+    ) -> Result<Vec<UnembeddedAssertion>>;
+
+    /// Coverage counts for one derivation key over the assertion population.
+    fn embedding_index_status(&self, derivation_key: &str) -> Result<EmbeddingIndexStatus>;
+
+    /// Remove all embeddings for one derivation key (rebuild / model switch).
+    /// Returns the number of rows removed.
+    fn clear_embeddings(&self, derivation_key: &str) -> Result<usize>;
+
+    /// Read a database-level setting.
+    fn get_meta(&self, key: &str) -> Result<Option<String>>;
+    /// Write a database-level setting.
+    fn set_meta(&self, key: &str, value: &str) -> Result<()>;
+
+    /// Vector similarity search over assertions, applying the same space,
+    /// temporal, and lifecycle filters as `search`. Returns hits ranked by
+    /// cosine similarity (higher = better) as SearchHitRaw, with space_names
+    /// filled in post-hoc. All filter-qualified candidates are evaluated
+    /// before ranking; query.limit is applied only after ranking, so the
+    /// top-N is never drawn from an incomplete candidate subset.
+    fn search_vectors(
+        &self,
+        query_vector: &[f32],
+        query: &SearchQuery,
+        derivation_key: &str,
+    ) -> Result<Vec<SearchHitRaw>>;
 
     // -- memory inspection ---------------------------------------------------
 

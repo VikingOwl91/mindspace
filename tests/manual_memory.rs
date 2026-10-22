@@ -418,7 +418,7 @@ fn manually_created_immutable_rows_remain_protected_by_triggers() {
 }
 
 #[test]
-fn migration_six_adds_the_manual_source_identity_index_without_losing_data() {
+fn migration_seven_adds_embedding_tables_to_phase_one_database() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.db");
     let conn = Connection::open(&path).unwrap();
@@ -456,7 +456,7 @@ fn migration_six_adds_the_manual_source_identity_index_without_losing_data() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration, 6);
+    assert_eq!(migration, 7);
     let index: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_logical_sources_manual'",

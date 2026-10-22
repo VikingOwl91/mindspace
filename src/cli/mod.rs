@@ -104,6 +104,16 @@ pub enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Manage trusted embedding models
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    /// Manage embedding functionality
+    Embeddings {
+        #[command(subcommand)]
+        command: EmbeddingsCommand,
+    },
     /// Run the local MCP server over stdio
     Mcp,
 }
@@ -127,6 +137,35 @@ pub enum SpaceCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommand {
+    /// List supported models and installation state
+    List,
+    /// Show metadata for a model
+    Info { id: String },
+    /// Download and install a trusted model
+    Install {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Select an installed model
+    Use { id: String },
+}
+
+#[derive(Subcommand)]
+pub enum EmbeddingsCommand {
+    /// Enable embedding functionality
+    Enable {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Disable embedding functionality (keeps files and vectors)
+    Disable,
+    /// Show embedding status
+    Status,
 }
 
 pub fn execute(cli: &Cli) -> Result<()> {
@@ -269,6 +308,163 @@ pub fn execute(cli: &Cli) -> Result<()> {
             let memory = store.retire_memory(memory_id, reason.clone(), Ts::now())?;
             render::retired(&memory);
         }
+        Command::Model { command } => match command {
+            ModelCommand::List => {
+                for (m, installed) in crate::embeddings::manager::list_models() {
+                    println!(
+                        "{}  v{}  dim={}  installed={}",
+                        m.id, m.version, m.dimension, installed
+                    );
+                }
+            }
+            ModelCommand::Info { id } => {
+                let m = crate::embeddings::manager::model_info(id)?;
+                println!("id: {}", m.id);
+                println!("version: {}", m.version);
+                println!("revision: {}", m.revision);
+                println!("architecture: {}", m.architecture);
+                println!("runtime: {}", m.runtime);
+                println!("runtime_version: {}", m.runtime_version);
+                println!("dimension: {}", m.dimension);
+                println!("max_seq_len: {}", m.max_seq_len);
+                println!("prefix_document: {:?}", m.prefix_document);
+                println!("prefix_query: {:?}", m.prefix_query);
+                println!("pooling: {}", m.pooling);
+                println!("normalization: {}", m.normalization);
+                println!("license: {}", m.license);
+                println!("source: {}", m.source);
+                println!("installed: {}", crate::embeddings::manager::is_installed(m));
+                for a in m.artifacts {
+                    let p = crate::embeddings::manager::model_dir(m.id).join(a.filename);
+                    let verified = crate::embeddings::manager::verify_file(&p, a).is_ok();
+                    println!(
+                        "  artifact {} size={} sha256={} verified={}",
+                        a.filename, a.size, a.sha256, verified
+                    );
+                }
+            }
+            ModelCommand::Install { id, yes } => {
+                let m = crate::embeddings::manager::model_info(id)?;
+                println!(
+                    "Model: {} v{} ({})
+Format: safetensors (FP32)
+Size: {} bytes
+Source: {}
+License: {}",
+                    m.id,
+                    m.version,
+                    m.architecture,
+                    m.artifacts.iter().map(|a| a.size).sum::<u64>(),
+                    m.source,
+                    m.license
+                );
+                let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+                if !*yes {
+                    if !tty {
+                        return Err(Error::Storage(
+                            "noninteractive install requires --yes".to_string(),
+                        ));
+                    }
+                    print!("Download and install? [y/N] ");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                    let mut line = String::new();
+                    std::io::stdin()
+                        .read_line(&mut line)
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                    let ans = line.trim().to_lowercase();
+                    if ans != "y" && ans != "yes" {
+                        println!("cancelled");
+                        return Ok(());
+                    }
+                }
+                crate::embeddings::manager::install_model(m)?;
+                println!("installed {}", m.id);
+            }
+            ModelCommand::Use { id } => {
+                let store = open(cli)?;
+                crate::embeddings::manager::set_selected_model(&store, id)?;
+                println!("selected model: {}", id);
+            }
+        },
+        Command::Embeddings { command } => match command {
+            EmbeddingsCommand::Enable { yes } => {
+                let store = open(cli)?;
+                // install default model if needed
+                let default = crate::embeddings::manifest::default_model();
+                if !crate::embeddings::manager::is_installed(default) {
+                    println!(
+                        "Model: {} v{} ({})
+Format: safetensors (FP32)
+Size: {} bytes
+Source: {}
+License: {}",
+                        default.id,
+                        default.version,
+                        default.architecture,
+                        default.artifacts.iter().map(|a| a.size).sum::<u64>(),
+                        default.source,
+                        default.license
+                    );
+                    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    if !*yes {
+                        if !tty {
+                            return Err(Error::Storage(
+                                "noninteractive enable requires --yes".to_string(),
+                            ));
+                        }
+                        print!("Download and install? [y/N] ");
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                        let mut line = String::new();
+                        std::io::stdin()
+                            .read_line(&mut line)
+                            .map_err(|e| Error::Storage(e.to_string()))?;
+                        let ans = line.trim().to_lowercase();
+                        if ans != "y" && ans != "yes" {
+                            println!("cancelled; embeddings remain disabled");
+                            return Ok(());
+                        }
+                    }
+                    crate::embeddings::manager::install_model(default)?;
+                }
+                // Preserve an existing selected model if it is installed; otherwise select default.
+                let current = crate::embeddings::manager::selected_model(&store);
+                if current
+                    .as_deref()
+                    .map(|id| {
+                        crate::embeddings::manager::is_installed(
+                            crate::embeddings::manifest::find_model(id).unwrap_or(default),
+                        )
+                    })
+                    .unwrap_or(false)
+                {
+                    // keep existing
+                } else {
+                    crate::embeddings::manager::set_selected_model(&store, default.id)?;
+                }
+                crate::embeddings::manager::set_enabled(&store, true)?;
+                let sel = crate::embeddings::manager::selected_model(&store)
+                    .unwrap_or_else(|| default.id.to_string());
+                println!("embeddings enabled (model: {})", sel);
+            }
+            EmbeddingsCommand::Disable => {
+                let store = open(cli)?;
+                crate::embeddings::manager::set_enabled(&store, false)?;
+                println!("embeddings disabled; installed models and vectors preserved");
+            }
+            EmbeddingsCommand::Status => {
+                let store = open(cli)?;
+                let st = crate::embeddings::manager::status(&store);
+                println!("enabled: {}", st.enabled);
+                println!("selected_model: {:?}", st.selected_model);
+                println!("installed: {}", st.installed);
+                println!("verified: {}", st.verified);
+                println!("dimension: {:?}", st.dimension);
+                println!("runtime: {}", st.runtime);
+                println!("indexing_available: {}", st.indexing_available);
+            }
+        },
         Command::Mcp => {
             let store = open(cli)?;
             crate::mcp::serve(&store)?;

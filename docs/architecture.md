@@ -1,6 +1,6 @@
-# Mindspace architecture (v0)
+# Mindspace architecture (v0.5)
 
-This document describes how v0 is actually built: module boundaries, storage
+This document describes how the v0.5 implementation is built: module boundaries, storage
 design, and the seams deliberately left for later growth. The conceptual model
 lives in `docs/memory-model.md`; the reasoning behind individual choices lives
 in `docs/decisions.md`.
@@ -8,7 +8,7 @@ in `docs/decisions.md`.
 ## 1. Shape
 
 ```text
-mind CLI
+mind CLI / mind mcp
    |
    v
 Mindspace engine          (pure domain logic: core, ingest, retrieval)
@@ -20,9 +20,10 @@ Store trait               (the storage boundary)
 SQLite (rusqlite)         (only implementation in v0)
 ```
 
-One crate, one binary (`mind`), no daemon, no network, no runtime dependency
-on anything outside the machine. Everything runs synchronously; there is no
-async runtime because nothing in v0 benefits from one.
+One crate, one binary (`mind`), no daemon or network service, and no runtime
+dependency on anything outside the machine. The optional `mind mcp` child
+process is local stdio only. Everything runs synchronously; there is no async
+runtime because nothing in v0.5 benefits from one.
 
 ### Module map
 
@@ -42,9 +43,11 @@ src/
                object/ref data to the store. Pure parsing functions are
                unit-tested without a DB or a repository.
   retrieval/   search orchestration: query filters, directed space traversal
-               (BFS, cycle-safe), hit assembly and explanation.
+                (BFS, cycle-safe), hit assembly and explanation.
+  mcp/         synchronous JSON-RPC 2.0 / MCP stdio lifecycle and tool adapter.
+                Depends on core, retrieval, and Store; never SQL.
   cli/         clap definitions and human/JSON rendering. Knows the engine,
-               never SQL.
+                never SQL.
   lib.rs       engine assembly: opening a store, running migrations.
   main.rs      CLI entry.
 ```
@@ -53,9 +56,10 @@ Boundary rules enforced by review and by `use` statements:
 
 - `core` never imports `storage`, `ingest`, `retrieval`, or `cli`.
 - Only `storage` knows SQLite. `rusqlite` types do not appear outside it.
-- `ingest` and `retrieval` are the only callers of `Store` besides `cli`.
-- The CLI depends on the engine, not on storage internals; a future
-  `mind serve` would sit at the same seam (section 5).
+- `ingest`, `retrieval`, `mcp`, and `cli` call the `Store` boundary; none
+  depends on SQLite implementation details.
+- The CLI and MCP server are adapters over the same engine and storage
+  contract. MCP tool handlers do not implement persistence themselves.
 
 ## 2. The storage boundary
 
@@ -64,7 +68,7 @@ Boundary rules enforced by review and by `use` statements:
 `search`, `list_conflicts`, `retire_memory`, ...), not to tables. All
 signatures traffic in owned `core` types.
 
-v0 ships one implementation, `storage::sqlite::SqliteStore`. A PostgreSQL
+v0.5 ships one implementation, `storage::sqlite::SqliteStore`. A PostgreSQL
 implementation would implement the same trait; nothing else in the codebase
 would change. Two deliberate compromises keep the trait honest without
 speculative machinery:
@@ -95,8 +99,13 @@ speculative machinery:
 - Foreign keys are enabled on every connection (`PRAGMA foreign_keys = ON`).
 - Migrations are embedded SQL files under `migrations/`, applied in order and
   tracked in `schema_migrations(version)`. Migrations run on every open; they
-  are idempotent by construction (applied versions are skipped). `mind init`
-  additionally creates the database file and parent directories.
+  skip already applied versions. `mind init` additionally creates the database
+  file and parent directories.
+- Connections enable WAL and a five-second SQLite busy timeout. Write
+  transactions use `BEGIN IMMEDIATE`, so lock acquisition happens before
+  dependent reads and multi-row writes stay atomic. SQLite busy/locked errors
+  are surfaced as database-busy errors. There is no application-level retry;
+  this avoids replaying a write whose commit/rollback outcome is uncertain.
 - `BEFORE UPDATE` triggers on `sources`, `evidence`, and `assertions` abort
   any mutation, making immutability a property of the store, not a habit of
   the code (memory-model section 2).
@@ -104,7 +113,11 @@ speculative machinery:
   written once per assertion and never mutated, because assertions are
   immutable. Superseded/retired knowledge stays searchable through explicit
   flags; state filtering happens at query time by joining to `memories`.
-- Every write that spans tables happens in one transaction.
+- Every state-changing store operation is transaction-scoped; multi-table
+  writes commit atomically. `BEGIN IMMEDIATE` serializes writers across
+  processes while WAL permits concurrent readers.
+- Migration `0006_manual_writes.sql` enforces a single manual logical source
+  identity at `manual://writes` without changing existing rows.
 
 ### Schema (migration 0001, abbreviated)
 
@@ -171,20 +184,41 @@ The default database is `$XDG_DATA_HOME/mindspace/mind.db`, falling back to
 Any command other than `init` on a database that has not been initialized
 fails with an actionable error. `mind init` is idempotent.
 
-## 5. Local operation now, remote later
+## 5. Local MCP operation; remote later
 
-v0 is exactly:
+The current process shape is:
 
 ```text
-mind CLI -> engine -> SQLite file
+Codex / OpenCode / other MCP client
+            |
+            | JSON-RPC 2.0, newline-delimited stdio
+            v
+       mind mcp -> engine -> Store -> SQLite file
 ```
 
-The intended future shape is documented in the README: a `mind serve` process
-wrapping the same engine, with CLI/client/API adapters in front. The seam
-already exists: every engine operation is expressed against the `Store`
-trait, and the CLI layer is a thin renderer. What v0 deliberately does *not*
-build: HTTP transport, TLS, authentication, daemonization. No abstraction was
-added "for the server"; the server will need none of them changed.
+`mind mcp` is a synchronous child process using MCP version `2025-06-18`. It
+implements initialization, initialized notification, ping, tool listing and
+calls, then exits on stdin EOF. The stdio transport accepts and emits one
+newline-delimited JSON-RPC message per line; stdout contains only protocol
+messages and diagnostics stay on stderr. Tool success returns both
+`structuredContent` and serialized text for compatibility. Output schemas are
+omitted until every response shape is contractually fixed. Tool execution
+failures return MCP tool results with `isError: true`; malformed requests,
+unknown methods, and unknown tool names are JSON-RPC errors (`-32700`, `-32601`,
+and `-32602` respectively).
+
+The server has no HTTP transport, authentication, daemon mode, or remote
+operation. Anyone able to launch or communicate with the local process can
+invoke its read and write tools. Client permissions and confirmation prompts
+are part of the trust boundary. Space links are retrieval imports, not
+authorization. Future remote interfaces require separate transport and
+security decisions.
+
+The eleven tools are `memory_create`, `memory_update`, `memory_retire`,
+`memory_get`, `memory_search`, `memory_history`, `memory_conflicts`,
+`memory_add_spaces`, `space_create`, `space_list`, and `space_link`. Manual
+creation and update use the same `Store` boundary as the CLI and ingestion;
+details and write restrictions are specified in `docs/memory-model.md`.
 
 ## 6. Error handling
 
@@ -224,5 +258,10 @@ These records never enter Evidence, Assertion, Memory, FTS, or recall.
 - **End-to-end tests** invoke the compiled `mind` binary
   (`CARGO_BIN_EXE_mind`) with an isolated `MINDSPACE_DB`, covering init ->
   spaces -> ingest -> search -> trace exactly as a user would.
+- **MCP tests** invoke the real `mind mcp` binary over piped stdio for
+  initialization, discovery, tool lifecycle, malformed input, request/tool
+  errors, notifications, stdout purity, EOF shutdown, and uninitialized DB
+  behavior. Independent server processes exercise idempotent concurrent
+  writes and bounded lock contention against one SQLite file.
 
 Tests assert behavior through public engine/CLI surfaces, not table layouts.

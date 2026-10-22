@@ -65,6 +65,32 @@ pub enum Error {
 
     #[error("space name cannot be empty")]
     EmptyName,
+
+    #[error("memory content cannot be empty")]
+    EmptyContent,
+
+    #[error("memory subject cannot be empty")]
+    EmptySubject,
+
+    #[error("at least one existing space is required for a manual memory")]
+    SpacesRequired,
+
+    #[error("space id {id} does not exist")]
+    SpaceIdNotFound { id: String },
+
+    #[error("memory {id} is {state}; only active memories can be superseded or assigned spaces")]
+    MemoryNotActive { id: String, state: String },
+
+    #[error(
+        "memory {id} was not created manually; document-derived memories cannot be updated here"
+    )]
+    ManualUpdateNotAllowed { id: String },
+
+    #[error("database is busy: {detail}")]
+    DatabaseBusy { detail: String },
+
+    #[error("MCP transport error: {detail}")]
+    McpTransport { detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -6,7 +6,7 @@ Mindspace is an early-stage memory system built around a simple idea: durable me
 
 It should preserve where knowledge came from, distinguish evidence from interpretation, understand that knowledge changes over time, keep different knowledge domains separate without turning them into isolated silos, and remain useful without requiring an AI model.
 
-The project is currently in the architecture and experimentation phase. The design below is intentionally a starting point rather than a compatibility promise.
+The current repository version is 0.5.0. Interfaces and serialized output remain pre-alpha and may change as the memory model develops.
 
 ## Design principles
 
@@ -14,7 +14,7 @@ The project is currently in the architecture and experimentation phase. The desi
 
 A useful Mindspace should work on one machine with minimal setup. SQLite is the intended default store and the core system should not require a cloud service.
 
-The same engine should also be able to run as a network service and be accessed through a configured URL or IP address. Remote deployment must be an extension of the local model, not a separate product architecture.
+The same engine may later run as a network service and be accessed through a configured URL or IP address. Remote deployment should extend the local model, not become a separate product architecture.
 
 ### AI is optional
 
@@ -69,7 +69,7 @@ project:tyto
 
 Spaces can be linked. A project space may be allowed to use knowledge from `coding`, which in turn may use `linux`, without automatically making every project memory visible from a generic Linux context.
 
-Links may eventually support directionality, explicit import/export behavior, and configurable transitivity.
+Links are directed imports and traversal is transitive and cycle-safe. Permissions are separate from space links; links are not access-control boundaries.
 
 A single piece of knowledge may belong to multiple spaces; spaces should not require duplicating the underlying memory.
 
@@ -173,7 +173,7 @@ The intended architecture uses the same memory engine in both modes:
 ```text
                  clients
              /      |      \
-           CLI     API     future MCP
+            CLI     MCP     future API
              \      |      /
               connection
               /        \
@@ -234,6 +234,7 @@ mind trace <memory> [--json]
 mind history <subject words...> [--json]
 mind conflicts [--json]
 mind retire <memory> --reason "why"
+mind mcp                                      # local MCP server over stdio
 ```
 
 `--json` on informational commands prints the exact engine structs, so
@@ -243,6 +244,66 @@ Every command honors a global `--db`
 flag (or `MINDSPACE_DB`); the default database lives under
 `$XDG_DATA_HOME/mindspace/mind.db`.
 
+The MCP server exposes explicit memory writes. It does not automatically extract memories from conversations or documents.
+
+### MCP server
+
+Initialize the database once with `mind init`, create the spaces you need, then run `mind mcp`. The server uses newline-delimited JSON-RPC over stdin/stdout and the MCP protocol version `2025-06-18`. Diagnostics go to stderr; stdout is reserved for protocol messages. EOF on stdin shuts the process down cleanly.
+
+The server exposes eleven tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `memory_create` | Create an explicit manual memory. Requires existing spaces; the optional subject defaults to the first non-empty content line. |
+| `memory_update` | Supersede an active manually created memory. Document-derived memories are rejected. |
+| `memory_retire` | Retire an active memory without deleting its history. |
+| `memory_get` | Read a memory and its assertion, evidence, source, spaces, and lifecycle. |
+| `memory_search` | Search with SQLite FTS5, optional directed space traversal, and transaction-time filtering. |
+| `memory_history` | List episodes for a normalized subject. |
+| `memory_conflicts` | List active same-subject memories sharing a space. |
+| `memory_add_spaces` | Add existing spaces to an active memory. |
+| `space_create` | Create a space. |
+| `space_list` | List spaces and active-memory counts. |
+| `space_link` | Add a directed space import link. |
+
+Manual content is stored as a `manual` source at `manual://writes`, with an immutable evidence row and a `manual:write` assertion extraction marker. The chain remains source -> evidence -> assertion -> memory, and the source kind distinguishes these writes from files. Exact duplicate subject/content writes reuse the assertion and active episode; they only add newly requested spaces. Recreating a retired manual memory makes a new episode on the existing assertion. Updates create or reuse a successor and set the old episode's supersession link. An unchanged subject/content update is a no-op apart from requested missing spaces.
+
+Updates are restricted in storage to active memories whose source and extraction provenance are manual. `memory_update` does not rewrite an ingested file or its provenance. Change a document at its source and re-ingest it instead. If a document-derived memory is retired while its source still contains the claim, re-ingesting that unchanged source can recreate the memory.
+
+Writes use SQLite WAL, a five-second busy timeout, and immediate transactions. Lock contention is returned as an error after the timeout; Mindspace does not blindly retry writes. SQLite transactions keep each multi-row write atomic.
+
+The server is local-only: it has no HTTP transport or authentication. Anyone who can start or communicate with the configured process can call its tools, including persistent write tools. Review client permissions and confirmations accordingly. Space links organize retrieval; they do not enforce confidentiality. Manual content is an explicit user-authored assertion, not an independently verified fact. No confidence score is inferred.
+
+#### Codex configuration
+
+Codex reads MCP servers from `~/.codex/config.toml`. This local stdio example uses the documented `[mcp_servers.<name>]` table:
+
+```toml
+[mcp_servers.mindspace]
+command = "mind"
+args = ["--db", "/absolute/path/to/mind.db", "mcp"]
+enabled = true
+```
+
+#### OpenCode configuration
+
+OpenCode supports local MCP servers in `opencode.json` (or `opencode.jsonc`) with a `type` of `local` and an argument-array `command`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "mindspace": {
+      "type": "local",
+      "command": ["mind", "--db", "/absolute/path/to/mind.db", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+These examples use an explicit database path. Mindspace also honors `MINDSPACE_DB` and otherwise uses `$XDG_DATA_HOME/mindspace/mind.db` (falling back to `$HOME/.local/share/mindspace/mind.db`). Configuration syntax was checked against the [Codex MCP guide](https://developers.openai.com/codex/extend/mcp/) and [OpenCode MCP server guide](https://opencode.ai/docs/mcp-servers/).
+
 Intended but not built yet:
 
 ```sh
@@ -250,7 +311,7 @@ mind space use project:owlry
 mind serve
 ```
 
-Future interfaces may include an HTTP API, SDKs, and MCP. They should remain adapters over the same core rather than defining the memory architecture themselves.
+Future interfaces may include an HTTP API and SDKs. They should remain adapters over the same core rather than defining the memory architecture themselves.
 
 ## Implementation direction
 
@@ -278,6 +339,7 @@ src/
   storage/     the Store trait and the SQLite implementation
   ingest/      deterministic document and Rust syntax parsing, ingest orchestration
   retrieval/   search orchestration, directed space traversal
+  mcp/         synchronous JSON-RPC MCP protocol and tool adapter
   cli/         clap definitions and human/JSON rendering
 
 docs/
@@ -290,11 +352,15 @@ migrations/
   0002_source_lifecycle.sql
   0003_git_ingest.sql
   0004_code_structure.sql
+  0005_code_relationships.sql
+  0006_manual_writes.sql
 tests/
   invariants.rs   domain invariants against real SQLite files
   lifecycle.rs    source identity and lifecycle scenarios
   cli.rs          end-to-end runs of the mind binary
   git_ingest.rs   Git topology and incremental-ingest scenarios
+  manual_memory.rs manual provenance, deduplication, and lifecycle scenarios
+  mcp.rs          real-binary protocol and process-concurrency scenarios
 ```
 
 ## Non-goals for the first implementation
@@ -304,7 +370,7 @@ The first implementation does not need to:
 - support every database
 - require or bundle an LLM
 - require embeddings
-- implement MCP immediately
+- expose a network or authenticated MCP transport
 - solve every document format
 - automatically infer every relationship
 - become a hosted cloud product
@@ -314,7 +380,7 @@ The first job is to establish a durable and inspectable memory model that works 
 
 ## Status
 
-**v0.4 deterministic code structure implemented.**
+**v0.5.0 explicit manual memories and local MCP server implemented.**
 
 The core data model (sources -> evidence -> assertions -> memories, spaces,
 temporal state, provenance) is specified in `docs/memory-model.md`, built,
@@ -340,6 +406,9 @@ and tested. What works today:
   derivations with entities, containment, ranges, and raw imports. Syntax
   facts are not Memories; inspect them with `mind structure <path-or-blob>`.
 - a CLI (`mind`) with human and `--json` output
+- explicit manual memory creation, updates, retirement, retrieval, and space membership through the MCP tools; document-derived memory updates are rejected
+- an eleven-tool MCP server over stdio with real-binary protocol tests
+- SQLite WAL, five-second busy timeout, and `BEGIN IMMEDIATE` write transactions, with no automatic retry
 
 What git ingest observes and what it defers: it reads committed objects and
 refs only. Uncommitted working-tree content belongs to no ref and is not
@@ -350,6 +419,6 @@ guessing rebase or force-push. Same blob at two paths or two branches is one
 object with separate derivations; two clones stay two repositories, qualified
 by their own identity markers. See `docs/memory-model.md` section 12.
 
-Explicitly deferred: AI extraction, embeddings, sync, auth, remote or hosted
-operation, PostgreSQL implementation, GUI/TUI. See `docs/decisions.md` for
-the reasoning behind each choice.
+Explicitly deferred: AI extraction, embeddings, sync, authentication, HTTP or
+hosted operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only.
+See `docs/decisions.md` for the reasoning behind each choice.

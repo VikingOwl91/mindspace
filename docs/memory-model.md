@@ -1,4 +1,4 @@
-# The Mindspace memory model (v0)
+# The Mindspace memory model (v0.5)
 
 This document defines the conceptual model that v0 implements. It is the
 authoritative description of what objects exist, how they relate, what is
@@ -73,7 +73,7 @@ Superseding a memory creates a *new* memory (section 7).
 
 ### 2.1 Source identity, versions, and lifecycle
 
-Source identity is split into two concepts:
+File and Git source identity is split into two concepts:
 
 - **Logical source** (`logical_sources`): the stable identity of the
   document across moves and renames. Mutable lifecycle state only:
@@ -90,6 +90,10 @@ Source identity is split into two concepts:
   are one version, however often they are re-observed or relocated. A
   flip-flop (content X -> Y -> X) therefore reuses the first X version
   and, through it, the original evidence and assertion.
+- **Manual source** is the separate, explicit-write adapter. All manual
+  entries share the logical identity `manual://writes`; each distinct
+  submitted content value is an immutable source version. The source kind is
+  `manual`, and it is never treated as a file or as a document observation.
 
 Move and disappearance are lifecycle facts recorded in a journal
 (`source_events`), against an ingest root:
@@ -144,7 +148,9 @@ as additional adapters without schema reinterpretation.
 Evidence is the normalized material an interpretation is derived from, with an
 anchor that says where inside the source it came from:
 
-- `kind`: `document` (whole file) or `section` (heading-delimited slice).
+- `kind`: `document` (whole source payload) or `section` (heading-delimited
+  slice). A manual write uses `document` because its evidence is the complete
+  submitted text, not because it came from a file.
 - `heading_path`: ancestor headings joined with ` > ` (e.g. `Setup > SQLite`);
   `NULL` for `document` evidence and for text before the first heading.
 - `start_line` / `end_line`: 1-based, inclusive line range inside the source.
@@ -172,9 +178,9 @@ explicit, named, deterministic rule:
 - `content`: what is asserted (in v0, the evidence text).
 - `content_hash`: SHA-256 over `content`; part of the assertion's identity.
 - `extraction`: the rule identifier, e.g. `markdown:section-heading`,
-  `markdown:preamble`, `markdown:document`, or `text:document`. This is the
-  provenance of *how* the interpretation was produced, not just where the
-  material came from.
+  `markdown:preamble`, `markdown:document`, `text:document`, or
+  `manual:write`. This is the provenance of *how* the interpretation was
+  produced, not just where the material came from.
 - `created_at`: transaction time the interpretation was extracted. Stable
   across belief episodes: re-extracting the same interpretation finds the
   existing assertion instead of duplicating it.
@@ -265,8 +271,11 @@ Memory (id, created_at, state)
         -> Source (kind, location, title, content hash, ingested_at)
 ```
 
-Plus the derivation context: which spaces were requested at ingest time, and
-whether the memory was created fresh, reused, or superseded an older one.
+Plus the derivation context: which spaces were requested at ingest time or
+manual write time, and whether the memory was created fresh, reused, or
+superseded an older one. Manual entries are not independently verified facts;
+they are user-authored assertions with traceable authorship mode, but no
+confidence or authority score.
 
 The four standing questions map to v0 capabilities like this:
 
@@ -277,6 +286,10 @@ The four standing questions map to v0 capabilities like this:
 | What superseded this?             | `mind inspect` / `mind trace` follow `superseded_by`; `mind history` shows the chain |
 | What contradicts this?            | `mind conflicts` lists (space, subject) groups with multiple active memories |
 | Where do you know this from?      | `mind trace <id>` renders the full provenance chain |
+
+The same provenance is available through the MCP `memory_get` tool. Manual
+records report source kind `manual`, location `manual://writes`, and extraction
+rule `manual:write`.
 
 ## 4. Temporal state
 
@@ -435,7 +448,9 @@ level), or the file stem if there is no heading (or for plain text).
 
 `--space` is required and may be repeated. Requested spaces must already
 exist; the error names the missing space and the command that creates it.
-This keeps ingest side-effect-free with respect to the space taxonomy.
+This keeps ingest side-effect-free with respect to the space taxonomy. Manual
+writes also require at least one existing space; they never create a space
+implicitly.
 
 ## 7. Supersession
 
@@ -444,10 +459,28 @@ Supersession is a relation between two memories: `old.superseded_by = new`,
 deleted, and stays fully traceable (`mind inspect <old-id>` keeps working; the
 default search excludes it, `--include-superseded` includes it).
 
-v0 creates supersessions in exactly one place: the reconciliation rule of
-section 6.2, in two shapes: same subject with changed content, and identical
-content under a changed subject (rename/move). Manual `mind supersedes <a>
-<b>` is a natural future command; the schema already supports it.
+Ingestion creates supersessions through the reconciliation rules in section
+6.2. Explicit manual `memory_update` writes create or reuse an immutable
+successor assertion and episode, then set the old memory's `superseded_by` and
+`superseded_at`. The old assertion, evidence, and source are not rewritten.
+
+`memory_update` accepts only an active manual memory whose joined source kind,
+logical source kind, evidence kind, and extraction marker all identify the
+manual-write path. This restriction lives in the storage boundary, not just in
+the MCP handler. Updating a document-derived memory is rejected with guidance
+to edit its source and re-ingest. The tool never claims to change the
+underlying file. If an unchanged document is re-ingested after its memory was
+retired, the existing ingestion semantics can create a new episode from that
+source again; changing the source and re-ingesting is the durable correction.
+
+For a manual update with unchanged normalized subject and identical content,
+the existing active episode is returned as an explicit no-op. Requested
+missing spaces may still be added. If a different active manual episode
+already has the requested assertion, that episode is reused as the successor
+rather than creating self-supersession or a duplicate episode. Repeated
+identical manual creates are idempotent; they reuse the assertion and active
+episode and add only missing requested spaces. Recreating a retired manual
+belief reuses its assertion but creates a new memory episode.
 
 Many old memories may point at one new memory (e.g. after duplicate-subject
 fragments collapsed); a memory is superseded by at most one successor.
@@ -517,8 +550,8 @@ defined here.
 - Confidence, authority, trust weighting.
 - A first-class Scope object.
 - Space link labels, exclusions, configurable transitivity.
-- Manual supersession commands.
 - Un-retiring memories.
+- Updating document-derived memories through the manual-write path.
 - Source-level lineage pointers and source removal semantics.
 - Any AI-assisted extraction (the extraction column is designed to carry
   model-assisted rule identifiers when that day comes, without schema or
@@ -611,3 +644,35 @@ commit contexts remain separate observations. Syntax equality, names, paths,
 or line numbers do not establish durable symbol identity. Recovered parses
 remain honestly marked as such. This layer creates no Evidence, Assertion, or
 Memory and is deliberately absent from recall until a later retrieval slice.
+
+## 14. Explicit manual writes (v0.5)
+
+`memory_create` and `memory_update` use the same provenance graph and immutable
+rows as deterministic ingestion, but take their source text directly from the
+caller:
+
+```text
+manual://writes (SourceKind::Manual, LogicalKind::Manual)
+  -> whole-write Evidence (kind=document)
+  -> Assertion (extraction=manual:write)
+  -> Memory episode
+```
+
+The optional subject defaults to the first non-empty line of the content.
+At least one existing space is required. Manual source versions are keyed by
+the exact submitted content hash; assertion identity additionally includes
+the extraction marker and normalized subject. A duplicate create of an active
+assertion reuses its episode and can only add requested memberships. The same
+assertion can have a later episode after retirement.
+
+Updates are restricted to active manual memories at the storage boundary.
+Changed content produces an inspectable supersession link. An unchanged
+normalized subject and content is an explicit no-op except for missing space
+memberships. If the intended successor already exists as another active
+episode, the old episode points to it rather than generating a duplicate or a
+self-link. Document-derived memories must be corrected at the source and
+re-ingested; an unchanged source can recreate an episode after retirement.
+
+SQLite writes run in WAL mode with a five-second busy timeout and immediate,
+atomic write transactions. Lock contention is surfaced to the caller after the
+timeout. The implementation does not automatically retry a failed write.

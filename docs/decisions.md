@@ -290,3 +290,67 @@ structure` is a narrow inspection surface; lexical Memory search is unchanged.
 **Revisit when.** Add further grammars, parameter/signature normalization,
 cross-file resolution, or conservative symbol lineage. Those are additive
 work, not v0.4 semantics.
+
+## ADR-017: Explicit manual memories use their own provenance and cannot rewrite documents (2026-10-22)
+
+**Decision.** Manual writes use `SourceKind::Manual`, `LogicalKind::Manual`,
+the stable source location `manual://writes`, and extraction rule
+`manual:write`. They flow through the same immutable Source -> Evidence ->
+Assertion -> Memory model. An update may supersede only an active manual
+memory; the storage layer verifies source kind, logical kind, evidence kind,
+and extraction marker. Document-derived updates are rejected with direction to
+edit and re-ingest the document.
+
+Exact duplicate subject/content writes reuse their assertion and active
+episode, adding only missing spaces. Recreating a retired belief may open a new
+episode on the existing assertion. An unchanged normalized subject and
+content update is a no-op apart from requested space additions. If the
+successor already exists as another active manual episode, it is reused to
+avoid duplicate episodes and self-supersession.
+
+**Why.** Agent-authored corrections must not masquerade as edits to the source
+that originally established a document-derived memory. Manual provenance is
+explicit and inspectable, while immutable rows preserve what was actually
+written. Restricting updates in storage prevents non-MCP callers from bypassing
+the trust boundary.
+
+**Consequences.** A document must be corrected at its source and re-ingested.
+If an unchanged document is re-ingested after retirement, its memory can be
+recreated under existing ingestion semantics. Manual spaces must already
+exist; an explicit manual write requires at least one space.
+
+## ADR-018: Small synchronous MCP stdio adapter (2026-10-22)
+
+**Decision.** Add `mind mcp` as a synchronous, newline-delimited JSON-RPC 2.0
+stdio server implementing MCP `2025-06-18`. The server exposes eleven
+memory/space tools over the existing `Store` and retrieval interfaces. It
+returns serialized text plus `structuredContent` for successful tool calls
+and omits output schemas until response shapes are fixed.
+
+**Why.** Local coding clients need a standard tool interface, but this slice
+does not need HTTP, authentication, an async runtime, or a heavyweight MCP
+dependency. The small protocol adapter is testable against the compiled
+binary and keeps persistence in the storage boundary.
+
+**Consequences.** The process is local-only and has no authentication; users
+must configure trusted clients and their tool approvals. Tool execution
+failures use MCP error results; protocol errors such as invalid requests,
+unknown methods, and unknown tool names use JSON-RPC errors. EOF is the
+stdio shutdown signal. Network transport remains deferred.
+
+## ADR-019: Immediate SQLite write transactions with bounded lock wait (2026-10-22)
+
+**Decision.** Use WAL, a five-second busy timeout, and `BEGIN IMMEDIATE` for
+write transactions. Map SQLite busy/locked failures to an actionable storage
+error. Do not retry writes at the application layer.
+
+**Why.** Immediate transactions acquire the writer reservation before
+read-modify-write logic and keep multi-row writes atomic across independent
+processes. A bounded SQLite wait provides a chance for short transactions to
+finish without an unbounded stall. Blind replay can duplicate or partially
+repeat side effects when commit or rollback outcome is uncertain, so callers
+receive the error instead.
+
+**Consequences.** Readers can continue during WAL writes, but only one writer
+can hold the reservation. A writer that cannot acquire it within five seconds
+fails explicitly; callers decide whether and when to make a new request.

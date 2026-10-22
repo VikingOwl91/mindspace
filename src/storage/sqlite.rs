@@ -1,19 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::types::{Type, Value};
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::core::{
-    sha256_hex, Assertion, AssertionKind, CodeDerivation, CodeEntity, CodeImport, CodeObservation,
-    CodeObservationReport, ConflictGroup, Error, Evidence, EvidenceKind, FileObservation,
-    FileOutcome, GitFileOutcome, GitFileReport, GitObservation, GitObservationReport,
-    GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation, IngestScope,
-    LogicalSource, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
-    MemorySummary, ObservationReport, ObservedFile, Result, SearchHitRaw, SearchQuery, Source,
-    SourceEvent, SourceEventKind, SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink,
-    Ts,
+    sha256_hex, Assertion, AssertionDraft, AssertionKind, CodeDerivation, CodeEntity, CodeImport,
+    CodeObservation, CodeObservationReport, ConflictGroup, Error, Evidence, EvidenceDraft,
+    EvidenceKind, FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
+    GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
+    IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft, ManualMemoryReport, Memory,
+    MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
+    ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
+    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, Ts, EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
 
@@ -29,7 +30,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         5,
         include_str!("../../migrations/0005_code_relationships.sql"),
     ),
+    (6, include_str!("../../migrations/0006_manual_writes.sql")),
 ];
+
+const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
 
 pub struct SqliteStore {
     conn: Connection,
@@ -56,6 +60,7 @@ impl SqliteStore {
     }
 
     fn init_conn(conn: Connection) -> Result<Self> {
+        conn.busy_timeout(Duration::from_secs(5)).map_err(dberr)?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
             .map_err(dberr)?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -285,7 +290,21 @@ fn rust_module_index(
 }
 
 fn dberr(e: rusqlite::Error) -> Error {
+    if let rusqlite::Error::SqliteFailure(code, _) = &e {
+        if matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ) {
+            return Error::DatabaseBusy {
+                detail: e.to_string(),
+            };
+        }
+    }
     Error::Storage(e.to_string())
+}
+
+fn begin_write(conn: &Connection) -> Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)
 }
 
 /// FTS5 reports bad query syntax through its error message; surface that as
@@ -304,34 +323,65 @@ fn classify_query_err(e: rusqlite::Error) -> Error {
 }
 
 fn run_migrations(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-             version    INTEGER PRIMARY KEY,
-             applied_at INTEGER NOT NULL
-         )",
-    )
-    .map_err(dberr)?;
-    let mut applied: HashSet<i64> = HashSet::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT version FROM schema_migrations")
-            .map_err(dberr)?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).map_err(dberr)?;
-        for v in rows {
-            applied.insert(v.map_err(dberr)?);
-        }
-    }
     // Migrations run with foreign keys disabled: table rebuilds (the
     // documented SQLite way to change constraints) drop referenced tables.
     // The setting is a no-op inside a transaction, so it is toggled at the
     // connection level around the migration batch and restored after.
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(dberr)?;
+    let has_migration_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(dberr)?
+        .is_some();
+    if !has_migration_table {
+        let tx = begin_write(conn)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 version    INTEGER PRIMARY KEY,
+                 applied_at INTEGER NOT NULL
+             )",
+        )
+        .map_err(dberr)?;
+        tx.commit().map_err(dberr)?;
+    }
+
+    let mut applied: HashSet<i64> = HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migrations")
+            .map_err(dberr)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(dberr)?;
+        for version in rows {
+            applied.insert(version.map_err(dberr)?);
+        }
+    }
+
     for (version, sql) in MIGRATIONS {
         if applied.contains(version) {
             continue;
         }
-        let tx = conn.unchecked_transaction().map_err(dberr)?;
+        let tx = begin_write(conn)?;
+        let already_applied: bool = tx
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                rusqlite::params![version],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(dberr)?
+            .is_some();
+        if already_applied {
+            tx.commit().map_err(dberr)?;
+            applied.insert(*version);
+            continue;
+        }
         tx.execute_batch(sql).map_err(dberr)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -339,6 +389,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )
         .map_err(dberr)?;
         tx.commit().map_err(dberr)?;
+        applied.insert(*version);
     }
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(dberr)?;
@@ -507,8 +558,8 @@ impl Store for SqliteStore {
         if name.is_empty() {
             return Err(Error::EmptyName);
         }
-        let exists: bool = self
-            .conn
+        let tx = begin_write(&self.conn)?;
+        let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM spaces WHERE name = ?1",
                 rusqlite::params![name],
@@ -524,12 +575,12 @@ impl Store for SqliteStore {
         }
         let id = Uuid::now_v7();
         let created_at = Ts::now();
-        self.conn
-            .execute(
-                "INSERT INTO spaces (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![id.to_string(), name, description, created_at.0],
-            )
-            .map_err(dberr)?;
+        tx.execute(
+            "INSERT INTO spaces (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id.to_string(), name, description, created_at.0],
+        )
+        .map_err(dberr)?;
+        tx.commit().map_err(dberr)?;
         Ok(Space {
             id,
             name: name.to_string(),
@@ -611,8 +662,8 @@ impl Store for SqliteStore {
     }
 
     fn link_spaces(&self, from: Uuid, to: Uuid) -> Result<SpaceLink> {
-        let from_space = self
-            .conn
+        let tx = begin_write(&self.conn)?;
+        let from_space = tx
             .query_row(
                 "SELECT id, name, description, created_at FROM spaces WHERE id = ?1",
                 rusqlite::params![from.to_string()],
@@ -623,8 +674,7 @@ impl Store for SqliteStore {
             .ok_or_else(|| Error::SpaceNotFound {
                 name: from.to_string(),
             })?;
-        let to_space = self
-            .conn
+        let to_space = tx
             .query_row(
                 "SELECT id, name, description, created_at FROM spaces WHERE id = ?1",
                 rusqlite::params![to.to_string()],
@@ -640,8 +690,7 @@ impl Store for SqliteStore {
                 name: from_space.name,
             });
         }
-        let exists: bool = self
-            .conn
+        let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM space_links WHERE from_space = ?1 AND to_space = ?2",
                 rusqlite::params![from.to_string(), to.to_string()],
@@ -657,12 +706,12 @@ impl Store for SqliteStore {
             });
         }
         let created_at = Ts::now();
-        self.conn
-            .execute(
-                "INSERT INTO space_links (from_space, to_space, created_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![from.to_string(), to.to_string(), created_at.0],
-            )
-            .map_err(dberr)?;
+        tx.execute(
+            "INSERT INTO space_links (from_space, to_space, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![from.to_string(), to.to_string(), created_at.0],
+        )
+        .map_err(dberr)?;
+        tx.commit().map_err(dberr)?;
         Ok(SpaceLink {
             from_space: from,
             to_space: to,
@@ -671,7 +720,7 @@ impl Store for SqliteStore {
     }
 
     fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport> {
-        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let tx = begin_write(&self.conn)?;
         let report = record_observation_tx(&tx, observation)?;
         tx.commit().map_err(dberr)?;
         Ok(report)
@@ -760,7 +809,7 @@ impl Store for SqliteStore {
         &self,
         observation: crate::core::GitObservation,
     ) -> Result<GitObservationReport> {
-        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let tx = begin_write(&self.conn)?;
         let report = record_git_observation_tx(&tx, &observation)?;
         tx.commit().map_err(dberr)?;
         Ok(report)
@@ -795,7 +844,7 @@ impl Store for SqliteStore {
         &self,
         observation: CodeObservation,
     ) -> Result<CodeObservationReport> {
-        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let tx = begin_write(&self.conn)?;
         let mut report = CodeObservationReport::default();
         for input in observation.inputs {
             report.supported_inputs += 1;
@@ -947,7 +996,7 @@ impl Store for SqliteStore {
         resolver: &str,
         version: &str,
     ) -> Result<crate::core::CodeResolutionReport> {
-        let tx = self.conn.unchecked_transaction().map_err(dberr)?;
+        let tx = begin_write(&self.conn)?;
         let existing:Option<String>=tx.query_row("SELECT id FROM code_resolution_derivations WHERE repository_id=?1 AND commit_oid=?2 AND resolver=?3 AND resolver_version=?4",rusqlite::params![repository_id.to_string(),commit_oid,resolver,version],|r|r.get(0)).optional().map_err(dberr)?;
         if existing.is_some() {
             tx.commit().map_err(dberr)?;
@@ -1038,6 +1087,154 @@ impl Store for SqliteStore {
         }
         tx.commit().map_err(dberr)?;
         Ok(report)
+    }
+
+    fn record_manual_write(&self, draft: ManualMemoryDraft) -> Result<ManualMemoryReport> {
+        let tx = begin_write(&self.conn)?;
+        let at = Ts::now();
+        if draft.content.trim().is_empty() {
+            return Err(Error::EmptyContent);
+        }
+
+        let subject = draft
+            .subject
+            .or_else(|| crate::core::default_manual_subject(&draft.content))
+            .ok_or(Error::EmptyContent)?;
+        let subject_normalized = crate::core::normalize_subject(&subject);
+        if subject_normalized.is_empty() {
+            return Err(Error::EmptySubject);
+        }
+
+        if draft.spaces.is_empty() {
+            return Err(Error::SpacesRequired);
+        }
+        let spaces = validate_space_ids(&tx, &draft.spaces)?;
+        if let Some(old_id) = draft.supersedes {
+            validate_manual_update_target(&tx, old_id)?;
+        }
+
+        let logical_id = ensure_manual_logical_source(&tx, at)?;
+        let content_hash = sha256_hex(draft.content.as_bytes());
+        let observed = ObservedFile {
+            location: MANUAL_SOURCE_LOCATION.to_string(),
+            content: draft.content.clone(),
+            content_hash,
+            title: subject.clone(),
+            media_type: "text/plain".to_string(),
+            size_bytes: draft.content.len() as u64,
+            evidences: vec![EvidenceDraft {
+                kind: EvidenceKind::Document,
+                heading_path: None,
+                start_line: None,
+                end_line: None,
+                ordinal: 0,
+                content: draft.content.clone(),
+                content_hash: sha256_hex(draft.content.as_bytes()),
+            }],
+            assertions: Vec::new(),
+            memories: Vec::new(),
+        };
+        let (_, _, evidence_ids) =
+            ensure_version(&tx, logical_id, SourceKind::Manual, &observed, at)?;
+        let assertion_draft = AssertionDraft {
+            evidence_idx: 0,
+            kind: AssertionKind::Claim,
+            subject: subject.clone(),
+            subject_normalized,
+            predicate: None,
+            content: draft.content,
+            extraction: EXTRACTION_MANUAL_WRITE.to_string(),
+        };
+        let assertion_id = get_or_create_assertion(&tx, evidence_ids[0], &assertion_draft, at)?;
+        let persisted_subject: String = tx
+            .query_row(
+                "SELECT subject FROM assertions WHERE id = ?1",
+                rusqlite::params![assertion_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(dberr)?;
+        let active_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM memories WHERE assertion_id = ?1 AND state = 'active'",
+                rusqlite::params![assertion_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(dberr)?;
+
+        let (memory_id, action) = match (draft.supersedes, active_id) {
+            (Some(old_id), Some(active_id)) => {
+                let active_id = uuid_from_storage(&active_id)?;
+                if active_id == old_id {
+                    let added = add_spaces(&tx, old_id, &spaces, at)?;
+                    let action = if added.is_empty() {
+                        MemoryActionKind::Unchanged
+                    } else {
+                        MemoryActionKind::Reused {
+                            spaces_added: names_for_space_ids(&tx, &added)?,
+                        }
+                    };
+                    (old_id, action)
+                } else {
+                    let added = add_spaces(&tx, active_id, &spaces, at)?;
+                    supersede_existing_memory(&tx, old_id, active_id, at)?;
+                    let _ = added;
+                    (
+                        active_id,
+                        MemoryActionKind::Superseded {
+                            old_memory_id: old_id,
+                        },
+                    )
+                }
+            }
+            (Some(old_id), None) => {
+                let new_id = create_memory(&tx, assertion_id, at)?;
+                add_spaces(&tx, new_id, &spaces, at)?;
+                supersede_existing_memory(&tx, old_id, new_id, at)?;
+                (
+                    new_id,
+                    MemoryActionKind::Superseded {
+                        old_memory_id: old_id,
+                    },
+                )
+            }
+            (None, Some(active_id)) => {
+                let active_id = uuid_from_storage(&active_id)?;
+                let added = add_spaces(&tx, active_id, &spaces, at)?;
+                let action = if added.is_empty() {
+                    MemoryActionKind::Unchanged
+                } else {
+                    MemoryActionKind::Reused {
+                        spaces_added: names_for_space_ids(&tx, &added)?,
+                    }
+                };
+                (active_id, action)
+            }
+            (None, None) => {
+                let new_id = create_memory(&tx, assertion_id, at)?;
+                add_spaces(&tx, new_id, &spaces, at)?;
+                (new_id, MemoryActionKind::Created)
+            }
+        };
+        let space_names = memory_space_names(&tx, memory_id)?;
+        tx.commit().map_err(dberr)?;
+        Ok(ManualMemoryReport {
+            memory_id,
+            assertion_id,
+            subject: persisted_subject,
+            action,
+            spaces: space_names,
+        })
+    }
+
+    fn add_memory_spaces(&self, memory_id: Uuid, space_ids: Vec<Uuid>) -> Result<Vec<String>> {
+        let tx = begin_write(&self.conn)?;
+        validate_active_memory(&tx, memory_id)?;
+        let spaces = validate_space_ids(&tx, &space_ids)?;
+        let added = add_spaces(&tx, memory_id, &spaces, Ts::now())?;
+        let names = names_for_space_ids(&tx, &added)?;
+        tx.commit().map_err(dberr)?;
+        Ok(names)
     }
 
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {
@@ -1210,10 +1407,10 @@ impl Store for SqliteStore {
     }
 
     fn retire_memory(&self, id: Uuid, reason: Option<String>, at: Ts) -> Result<Memory> {
+        let tx = begin_write(&self.conn)?;
         // The state check and the transition are one conditional statement,
         // so only an active memory can be retired, atomically.
-        let changed = self
-            .conn
+        let changed = tx
             .execute(
                 "UPDATE memories SET state = 'retired', retired_at = ?1, retire_reason = ?2 \
                  WHERE id = ?3 AND state = 'active'",
@@ -1221,8 +1418,7 @@ impl Store for SqliteStore {
             )
             .map_err(dberr)?;
         if changed == 0 {
-            let state: Option<String> = self
-                .conn
+            let state: Option<String> = tx
                 .query_row(
                     "SELECT state FROM memories WHERE id = ?1",
                     rusqlite::params![id.to_string()],
@@ -1242,7 +1438,7 @@ impl Store for SqliteStore {
                 }),
             };
         }
-        self.conn
+        let memory = tx
             .query_row(
                 "SELECT id, assertion_id, state, created_at, superseded_by, superseded_at, \
                         retired_at, retire_reason \
@@ -1250,7 +1446,9 @@ impl Store for SqliteStore {
                 rusqlite::params![id.to_string()],
                 row_memory,
             )
-            .map_err(dberr)
+            .map_err(dberr)?;
+        tx.commit().map_err(dberr)?;
+        Ok(memory)
     }
 }
 
@@ -1782,6 +1980,183 @@ fn ensure_version(
     Ok((true, version_id, evidence_ids))
 }
 
+fn ensure_manual_logical_source(conn: &Connection, at: Ts) -> Result<Uuid> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM logical_sources WHERE kind = 'manual' AND current_location = ?1",
+            rusqlite::params![MANUAL_SOURCE_LOCATION],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(dberr)?;
+    if let Some(id) = existing {
+        return uuid_from_storage(&id);
+    }
+
+    let id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO logical_sources (id, kind, state, current_location, created_at) \
+         VALUES (?1, ?2, 'present', ?3, ?4)",
+        rusqlite::params![
+            id.to_string(),
+            LogicalKind::Manual.as_str(),
+            MANUAL_SOURCE_LOCATION,
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+    Ok(id)
+}
+
+fn validate_space_ids(conn: &Connection, space_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for id in space_ids {
+        if !seen.insert(*id) {
+            continue;
+        }
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM spaces WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(dberr)?
+            .is_some();
+        if !exists {
+            return Err(Error::SpaceIdNotFound { id: id.to_string() });
+        }
+        unique.push(*id);
+    }
+    Ok(unique)
+}
+
+fn names_for_space_ids(conn: &Connection, space_ids: &[Uuid]) -> Result<Vec<String>> {
+    space_ids
+        .iter()
+        .map(|id| {
+            conn.query_row(
+                "SELECT name FROM spaces WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(dberr)?
+            .ok_or_else(|| Error::SpaceIdNotFound { id: id.to_string() })
+        })
+        .collect()
+}
+
+fn memory_space_names(conn: &Connection, memory_id: Uuid) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.name FROM memory_spaces ms JOIN spaces s ON s.id = ms.space_id \
+             WHERE ms.memory_id = ?1 ORDER BY s.name",
+        )
+        .map_err(dberr)?;
+    let rows = stmt
+        .query_map(rusqlite::params![memory_id.to_string()], |row| row.get(0))
+        .map_err(dberr)?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row.map_err(dberr)?);
+    }
+    Ok(names)
+}
+
+fn validate_active_memory(conn: &Connection, memory_id: Uuid) -> Result<()> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(dberr)?;
+    match state {
+        None => Err(Error::MemoryNotFound {
+            prefix: memory_id.to_string(),
+        }),
+        Some(state) if state == MemoryState::Active.as_str() => Ok(()),
+        Some(state) => Err(Error::MemoryNotActive {
+            id: memory_id.to_string(),
+            state,
+        }),
+    }
+}
+
+fn validate_manual_update_target(conn: &Connection, memory_id: Uuid) -> Result<()> {
+    let target: Option<(String, String, String, String, String)> = conn
+        .query_row(
+            "SELECT m.state, src.kind, ls.kind, a.extraction, e.kind FROM memories m \
+             JOIN assertions a ON a.id = m.assertion_id \
+             JOIN evidence e ON e.id = a.evidence_id \
+             JOIN sources src ON src.id = e.source_id \
+             JOIN logical_sources ls ON ls.id = src.logical_id WHERE m.id = ?1",
+            rusqlite::params![memory_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(dberr)?;
+    let Some((state, source_kind, logical_kind, extraction, evidence_kind)) = target else {
+        return Err(Error::MemoryNotFound {
+            prefix: memory_id.to_string(),
+        });
+    };
+    if source_kind != SourceKind::Manual.as_str()
+        || logical_kind != LogicalKind::Manual.as_str()
+        || extraction != EXTRACTION_MANUAL_WRITE
+        || evidence_kind != EvidenceKind::Document.as_str()
+    {
+        return Err(Error::ManualUpdateNotAllowed {
+            id: memory_id.to_string(),
+        });
+    }
+    if state != MemoryState::Active.as_str() {
+        return Err(Error::MemoryNotActive {
+            id: memory_id.to_string(),
+            state,
+        });
+    }
+    Ok(())
+}
+
+fn supersede_existing_memory(conn: &Connection, old_id: Uuid, new_id: Uuid, at: Ts) -> Result<()> {
+    if old_id == new_id {
+        return Err(Error::MemoryNotActive {
+            id: old_id.to_string(),
+            state: "cannot supersede itself".to_string(),
+        });
+    }
+    let changed = conn
+        .execute(
+            "UPDATE memories SET state = 'superseded', superseded_by = ?1, \
+             superseded_at = ?2 WHERE id = ?3 AND state = 'active'",
+            rusqlite::params![new_id.to_string(), at.0, old_id.to_string()],
+        )
+        .map_err(dberr)?;
+    if changed != 1 {
+        validate_active_memory(conn, old_id)?;
+        return Err(Error::Storage(format!(
+            "memory {old_id} could not be superseded"
+        )));
+    }
+    Ok(())
+}
+
+fn uuid_from_storage(id: &str) -> Result<Uuid> {
+    Uuid::parse_str(id).map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")))
+}
+
 fn record_observation_row(
     conn: &Connection,
     session_id: Uuid,
@@ -1917,53 +2292,7 @@ fn reconcile_logical(
         }
         let d = &file.assertions[idx];
         let evidence_id = evidence_ids[d.evidence_idx];
-        let content_hash = sha256_hex(d.content.as_bytes());
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM assertions WHERE evidence_id = ?1 AND extraction = ?2 \
-                 AND subject_normalized = ?3 AND content_hash = ?4",
-                rusqlite::params![
-                    evidence_id.to_string(),
-                    d.extraction,
-                    d.subject_normalized,
-                    content_hash,
-                ],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(dberr)?;
-        let id = match existing {
-            Some(s) => {
-                Uuid::parse_str(&s).map_err(|e| Error::Storage(format!("corrupt id '{s}': {e}")))?
-            }
-            None => {
-                let id = Uuid::now_v7();
-                conn.execute(
-                    "INSERT INTO assertions (id, kind, subject, subject_normalized, predicate, \
-                         content, content_hash, extraction, created_at, evidence_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    rusqlite::params![
-                        id.to_string(),
-                        d.kind.as_str(),
-                        d.subject,
-                        d.subject_normalized,
-                        d.predicate,
-                        d.content,
-                        content_hash,
-                        d.extraction,
-                        at.0,
-                        evidence_id.to_string(),
-                    ],
-                )
-                .map_err(dberr)?;
-                conn.execute(
-                    "INSERT INTO assertion_fts (assertion_id, subject, content) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![id.to_string(), d.subject, d.content],
-                )
-                .map_err(dberr)?;
-                id
-            }
-        };
+        let id = get_or_create_assertion(conn, evidence_id, d, at)?;
         assertion_cache[idx] = Some(id);
         Ok(id)
     };
@@ -2094,6 +2423,58 @@ fn reconcile_logical(
     Ok(actions)
 }
 
+fn get_or_create_assertion(
+    conn: &Connection,
+    evidence_id: Uuid,
+    draft: &AssertionDraft,
+    at: Ts,
+) -> Result<Uuid> {
+    let content_hash = sha256_hex(draft.content.as_bytes());
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM assertions WHERE evidence_id = ?1 AND extraction = ?2 \
+             AND subject_normalized = ?3 AND content_hash = ?4",
+            rusqlite::params![
+                evidence_id.to_string(),
+                draft.extraction,
+                draft.subject_normalized,
+                content_hash,
+            ],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(dberr)?;
+    if let Some(id) = existing {
+        return Uuid::parse_str(&id).map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")));
+    }
+
+    let id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO assertions (id, kind, subject, subject_normalized, predicate, \
+             content, content_hash, extraction, created_at, evidence_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            id.to_string(),
+            draft.kind.as_str(),
+            draft.subject,
+            draft.subject_normalized,
+            draft.predicate,
+            draft.content,
+            content_hash,
+            draft.extraction,
+            at.0,
+            evidence_id.to_string(),
+        ],
+    )
+    .map_err(dberr)?;
+    conn.execute(
+        "INSERT INTO assertion_fts (assertion_id, subject, content) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id.to_string(), draft.subject, draft.content],
+    )
+    .map_err(dberr)?;
+    Ok(id)
+}
+
 /// Supersedes one active memory with a new one built from fragment `ai`.
 #[allow(clippy::too_many_arguments)]
 fn supersede(
@@ -2145,7 +2526,7 @@ fn supersede(
 
 /// Adds the missing space memberships and returns the ids that were added.
 fn add_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) -> Result<Vec<Uuid>> {
-    let existing: HashSet<String> = {
+    let mut existing: HashSet<String> = {
         let mut stmt = conn
             .prepare("SELECT space_id FROM memory_spaces WHERE memory_id = ?1")
             .map_err(dberr)?;
@@ -2171,6 +2552,7 @@ fn add_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) ->
         )
         .map_err(dberr)?;
         added.push(*sid);
+        existing.insert(sid.to_string());
     }
     Ok(added)
 }

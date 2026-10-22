@@ -5,15 +5,14 @@ use uuid::Uuid;
 use crate::core::{
     CodeDerivation, CodeLanguage, CodeObservation, CodeObservationReport, CodeParserIdentity,
     CodeResolutionReport, ConflictGroup, GitObservation, GitObservationReport, GitRefObservation,
-    IngestObservation, Memory, MemoryDetail, MemorySummary, ObservationReport, Result,
-    SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts,
+    IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory, MemoryDetail, MemorySummary,
+    ObservationReport, Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and
-/// traffic exclusively in `core` types. Multi-invariant operations are
-/// single methods that own their transaction (`record_observation`); a
-/// future PostgreSQL backend would implement this trait without any other
-/// change.
+/// traffic exclusively in `core` types. Each state-changing method owns its
+/// transaction; a future PostgreSQL backend would implement this trait
+/// without exposing transaction handles to callers.
 pub trait Store {
     // -- spaces -------------------------------------------------------------
 
@@ -65,6 +64,14 @@ pub trait Store {
         resolver: &str,
         version: &str,
     ) -> Result<CodeResolutionReport>;
+
+    /// Atomically creates or reuses an explicitly written memory. Manual
+    /// writes receive their own source/evidence provenance and never claim
+    /// to originate from an ingested document.
+    fn record_manual_write(&self, draft: ManualMemoryDraft) -> Result<ManualMemoryReport>;
+    /// Adds memberships to an active memory and returns newly added space
+    /// names. Existing membership is idempotent.
+    fn add_memory_spaces(&self, memory_id: Uuid, space_ids: Vec<Uuid>) -> Result<Vec<String>>;
 
     // -- memory inspection ---------------------------------------------------
 

@@ -104,6 +104,8 @@ pub enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Run the local MCP server over stdio
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -266,6 +268,10 @@ pub fn execute(cli: &Cli) -> Result<()> {
             let memory_id = resolve_memory_id(&store, id)?;
             let memory = store.retire_memory(memory_id, reason.clone(), Ts::now())?;
             render::retired(&memory);
+        }
+        Command::Mcp => {
+            let store = open(cli)?;
+            crate::mcp::serve(&store)?;
         }
     }
     Ok(())

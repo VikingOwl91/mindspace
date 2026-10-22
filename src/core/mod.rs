@@ -90,11 +90,22 @@ pub fn normalize_subject(s: &str) -> String {
         .to_lowercase()
 }
 
+pub const EXTRACTION_MANUAL_WRITE: &str = "manual:write";
+
+pub fn default_manual_subject(content: &str) -> Option<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     File,
     GitBlob,
+    Manual,
 }
 
 impl SourceKind {
@@ -102,6 +113,7 @@ impl SourceKind {
         match self {
             SourceKind::File => "file",
             SourceKind::GitBlob => "git_blob",
+            SourceKind::Manual => "manual",
         }
     }
 
@@ -109,6 +121,7 @@ impl SourceKind {
         match s {
             "file" => Some(SourceKind::File),
             "git_blob" => Some(SourceKind::GitBlob),
+            "manual" => Some(SourceKind::Manual),
             _ => None,
         }
     }
@@ -298,6 +311,7 @@ impl fmt::Display for SourcePresence {
 pub enum LogicalKind {
     File,
     GitPath,
+    Manual,
 }
 
 impl LogicalKind {
@@ -305,6 +319,7 @@ impl LogicalKind {
         match self {
             LogicalKind::File => "file",
             LogicalKind::GitPath => "git_path",
+            LogicalKind::Manual => "manual",
         }
     }
 
@@ -312,6 +327,7 @@ impl LogicalKind {
         match s {
             "file" => Some(LogicalKind::File),
             "git_path" => Some(LogicalKind::GitPath),
+            "manual" => Some(LogicalKind::Manual),
             _ => None,
         }
     }
@@ -422,6 +438,25 @@ pub struct Memory {
     pub superseded_at: Option<Ts>,
     pub retired_at: Option<Ts>,
     pub retire_reason: Option<String>,
+}
+
+/// An explicit memory write. Its source and evidence are created by the
+/// storage layer with a manual provenance marker, never as a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualMemoryDraft {
+    pub subject: Option<String>,
+    pub content: String,
+    pub spaces: Vec<Uuid>,
+    pub supersedes: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManualMemoryReport {
+    pub memory_id: Uuid,
+    pub assertion_id: Uuid,
+    pub subject: String,
+    pub action: MemoryActionKind,
+    pub spaces: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

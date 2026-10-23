@@ -12,7 +12,8 @@
 -- than silently reused. Model weights are never stored in SQLite.
 --
 -- mind_meta is a small generic key/value store for database-level settings,
--- notably the active embedding model binding (embedding.derivation_key, ...).
+-- notably the active embedding model binding (embedding.model,
+-- embedding.enabled).
 CREATE TABLE assertion_embeddings (
     assertion_id   TEXT NOT NULL REFERENCES assertions(id),
     derivation_key TEXT NOT NULL,

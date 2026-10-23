@@ -94,6 +94,9 @@ pub enum Error {
 
     #[error("invalid embedding vector: {detail}")]
     InvalidVector { detail: String },
+
+    #[error("requested retrieval mode unavailable: {reason}")]
+    SemanticUnavailable { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -268,17 +268,23 @@ pub fn remove_model(id: &str) -> Result<()> {
 
 // ---- persistence via mind_meta ----
 
+/// Fallible read of the enable flag. A storage failure is an error here, so it
+/// cannot look like "disabled". `is_enabled` swallows errors for display only.
+pub fn read_enabled(store: &dyn Store) -> Result<bool> {
+    Ok(store.get_meta(ENABLED_KEY)?.is_some_and(|v| v == "true"))
+}
+
 pub fn is_enabled(store: &dyn Store) -> bool {
-    store
-        .get_meta(ENABLED_KEY)
-        .ok()
-        .flatten()
-        .map(|v| v == "true")
-        .unwrap_or(false)
+    read_enabled(store).unwrap_or(false)
+}
+
+/// Fallible read of the selected model id.
+pub fn read_selected_model(store: &dyn Store) -> Result<Option<String>> {
+    store.get_meta(MODEL_KEY)
 }
 
 pub fn selected_model(store: &dyn Store) -> Option<String> {
-    store.get_meta(MODEL_KEY).ok().flatten()
+    read_selected_model(store).ok().flatten()
 }
 
 pub fn set_enabled(store: &dyn Store, enabled: bool) -> Result<()> {
@@ -328,14 +334,22 @@ pub fn status_in(base: &Path, store: &dyn Store) -> EmbeddingsStatus {
         }
         None => (false, false, None),
     };
+    #[cfg(feature = "embeddings")]
+    let indexing_available = enabled && installed;
+    #[cfg(not(feature = "embeddings"))]
+    let indexing_available = false;
+    #[cfg(feature = "embeddings")]
+    let runtime = "candle (cpu)";
+    #[cfg(not(feature = "embeddings"))]
+    let runtime = "none (build without embeddings)";
     EmbeddingsStatus {
         enabled,
         selected_model: selected,
         installed,
         verified,
         dimension,
-        runtime: "candle (cpu)",
-        indexing_available: false, // M3 not yet implemented
+        runtime,
+        indexing_available,
     }
 }
 
@@ -350,9 +364,12 @@ pub fn list_models() -> Vec<(&'static ModelManifestEntry, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "embeddings")]
     use std::net::TcpListener;
+    #[cfg(feature = "embeddings")]
     use std::thread;
 
+    #[cfg(feature = "embeddings")]
     fn mock_server(
         status: u16,
         body: Vec<u8>,
@@ -415,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embeddings")]
     fn download_rejects_oversized() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("x.tmp");
@@ -427,6 +445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embeddings")]
     fn download_rejects_http_url_via_https_only() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("x.tmp");
@@ -438,6 +457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embeddings")]
     fn install_atomic_no_partial_on_wrong_checksum() {
         let entry = crate::embeddings::manifest::find_model("nomic-embed-text-v1.5").unwrap();
         let base_tmp = tempfile::tempdir().unwrap();
@@ -464,6 +484,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embeddings")]
     fn download_network_failure_cleans_tmp() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -482,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embeddings")]
     fn concurrency_two_installers() {
         let entry = crate::embeddings::manifest::find_model("nomic-embed-text-v1.5").unwrap();
         let base_tmp = tempfile::tempdir().unwrap();

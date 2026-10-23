@@ -76,8 +76,14 @@ duplication because different fragments (different evidence ids) still yield
 different assertions.
 
 **Consequences.** Search may return several episodes of one assertion when
-history flags are widened; that is intended (episodes are the results).
-Consolidation of several assertions into one memory remains an additive
+history flags are widened; that is intended for legacy lexical and Semantic
+results. M4 Hybrid and Auto fusion instead deduplicate each already-filtered
+candidate pool by assertion identity, keeping its first ranked eligible memory
+episode as the representative. Fusion ranks, scores, and candidate counts are
+per assertion; the returned hit metadata describes the selected episode. The
+pool limit is applied before deduplication. If the semantic branch returns no
+eligible candidates, the reported lexical fallback preserves episode-level
+results. Consolidation of several assertions into one memory remains an additive
 future join and is not implied by this ADR.
 
 **Revisit when.** Consolidation arrives, or assertion extraction becomes
@@ -134,6 +140,12 @@ exposed as a lexical relevance metric only.
 **Why.** Deterministic extraction cannot grade trust; fake precision is worse
 than none. The model leaves room (additive columns on assertions/sources)
 without reinterpretation. Reasoning in `docs/memory-model.md` section 8.
+
+**M4 retrieval amendment.** The additive mode-aware retrieval API exposes a
+numeric value only with a mandatory score kind: lexical relevance, cosine
+similarity, or reciprocal-rank-fusion score. These are retrieval signals, not
+confidence or authority. They must not be compared across kinds. The existing
+lexical `SearchHit` contract is unchanged.
 
 ## ADR-009: UUIDv7 identities, epoch-microsecond timestamps (2026-09-08)
 

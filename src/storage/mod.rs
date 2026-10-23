@@ -77,9 +77,10 @@ pub trait Store {
     // -- embeddings / vector index (Phase 2 M1) -----------------------------
     // Derived, versioned index over immutable assertions. Storage owns the
     // BLOB format and similarity computation; it never runs a model. The
-    // derivation key identifies the complete embedding pipeline, so a change
-    // to any pipeline parameter invalidates prior rows (they are ignored, not
-    // deleted, and re-indexed by the caller).
+    // derivation key identifies the document pipeline, so a change to any of
+    // its parameters invalidates prior rows (they are ignored, not deleted,
+    // and re-indexed by the caller). The query prefix is not part of the key:
+    // the runtime applies it at query time, and the manifest entry pins it.
 
     /// Idempotently store derived embeddings. Rows are keyed by
     /// (assertion_id, derivation_key); an existing row is left unchanged.

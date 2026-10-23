@@ -1,8 +1,8 @@
 //! Embedding runtime, trusted model registry, and model management (M2).
 //!
-//! Everything here is feature-gated on `embeddings`. With the feature
-//! disabled, only the manifest and pure-data types are available and the
-//! runtime returns a controlled "not available" error.
+//! The manifest, the model manager, and the runtime trait compile in every
+//! build. Only the Candle runtime is gated on `embeddings`. Without the feature,
+//! `CandleRuntime::load` returns a controlled "not available" error.
 
 pub mod manager;
 pub mod manifest;

@@ -1,6 +1,6 @@
 //! Candle-backed embedding runtime (feature = "embeddings").
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
@@ -11,6 +11,7 @@ use crate::embeddings::EmbeddingRuntime;
 
 pub struct CandleRuntime {
     model_id: String,
+    model_dir: PathBuf,
     dimension: usize,
     prefix_document: String,
     prefix_query: String,
@@ -24,9 +25,21 @@ struct Loaded {
 }
 
 impl CandleRuntime {
+    /// Lazily loaded runtime for the default data directory. Construction
+    /// touches no files; artifacts are read on first use.
     pub fn new(entry: &crate::embeddings::manifest::ModelManifestEntry) -> Self {
+        Self::new_in(entry, crate::embeddings::manager::model_dir(entry.id))
+    }
+
+    /// Lazily loaded runtime that reads artifacts from `model_dir`. A caller
+    /// that verified a directory passes that same directory here.
+    pub fn new_in(
+        entry: &crate::embeddings::manifest::ModelManifestEntry,
+        model_dir: PathBuf,
+    ) -> Self {
         Self {
             model_id: entry.id.to_string(),
+            model_dir,
             dimension: entry.dimension as usize,
             prefix_document: entry.prefix_document.to_string(),
             prefix_query: entry.prefix_query.to_string(),
@@ -45,7 +58,7 @@ impl CandleRuntime {
         let entry = crate::embeddings::manifest::find_model(id)
             .copied()
             .unwrap_or(crate::embeddings::manifest::NOMIC_V1_5);
-        let rt = Self::new(&entry);
+        let rt = Self::new_in(&entry, model_dir.to_path_buf());
         // eager-load to validate artifacts now
         rt.ensure_loaded(model_dir)?;
         Ok(rt)
@@ -97,10 +110,18 @@ impl CandleRuntime {
         Ok(())
     }
 
+    /// The input the model sees: the manifest prefix for the path, then the text.
+    fn prefixed(&self, text: &str, is_query: bool) -> String {
+        let prefix = if is_query {
+            &self.prefix_query
+        } else {
+            &self.prefix_document
+        };
+        format!("{prefix}{text}")
+    }
+
     fn encode(&self, text: &str, is_query: bool) -> Result<Vec<f32>> {
-        // model_dir is not stored; re-derive from id
-        let model_dir = crate::embeddings::manager::model_dir(&self.model_id);
-        self.ensure_loaded(&model_dir)?;
+        self.ensure_loaded(&self.model_dir)?;
         let guard = self
             .inner
             .lock()
@@ -108,12 +129,7 @@ impl CandleRuntime {
         let loaded = guard
             .as_ref()
             .ok_or_else(|| Error::Storage("model not loaded".to_string()))?;
-        let prefix = if is_query {
-            &self.prefix_query
-        } else {
-            &self.prefix_document
-        };
-        let full = format!("{prefix}{text}");
+        let full = self.prefixed(text, is_query);
         let encoding = loaded
             .tokenizer
             .encode(full.as_str(), true)
@@ -199,5 +215,27 @@ mod tests {
         let rt = CandleRuntime::new(&crate::embeddings::manifest::NOMIC_V1_5);
         assert_eq!(rt.dimension(), 768);
         assert_eq!(rt.model_id(), "nomic-embed-text-v1.5");
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn inputs_get_the_manifest_prefix_for_their_path() {
+        let rt = CandleRuntime::new(&crate::embeddings::manifest::NOMIC_V1_5);
+        assert_eq!(
+            rt.prefixed("rust borrow rules", true),
+            "search_query: rust borrow rules"
+        );
+        assert_eq!(
+            rt.prefixed("rust borrow rules", false),
+            "search_document: rust borrow rules"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn new_in_reads_from_the_directory_it_was_given() {
+        let dir = PathBuf::from("/nonexistent/verified-model-dir");
+        let rt = CandleRuntime::new_in(&crate::embeddings::manifest::NOMIC_V1_5, dir.clone());
+        assert_eq!(rt.model_dir, dir);
     }
 }

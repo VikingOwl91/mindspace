@@ -735,11 +735,14 @@ pub struct SearchHit {
     pub source_location: String,
 }
 
-/// A raw search hit as the store returns it: rank and snippet come from the
-/// store's lexical index; spaces are plain names, decorated by retrieval.
+/// A raw search hit as the store returns it, including its stable assertion
+/// identity. Lexical hits carry the FTS5 snippet and a higher-is-better score
+/// (negated BM25). Vector hits carry a content-window snippet and cosine
+/// similarity. Spaces are plain names, decorated by retrieval.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHitRaw {
     pub memory_id: Uuid,
+    pub assertion_id: Uuid,
     pub subject: String,
     pub content: String,
     pub snippet: String,

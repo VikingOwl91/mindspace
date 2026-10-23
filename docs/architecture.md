@@ -40,10 +40,14 @@ src/
                rules, and the ingest orchestration that calls the store.
                `ingest/git.rs` reads git repositories through the system
                git binary (plumbing only; ADR-014) and hands normalized
-               object/ref data to the store. Pure parsing functions are
-               unit-tested without a DB or a repository.
-  retrieval/   search orchestration: query filters, directed space traversal
-                (BFS, cycle-safe), hit assembly and explanation.
+                object/ref data to the store. Pure parsing functions are
+                unit-tested without a DB or a repository.
+  embeddings/  trusted manifest and model management; the Candle CPU runtime
+                is optional behind the `embeddings` Cargo feature.
+  indexing/    bounded, incremental backfill of assertion embeddings through
+                the embedding runtime and Store boundary.
+  retrieval/   lexical search orchestration, directed space traversal (BFS,
+                cycle-safe), and the mode-aware semantic/hybrid retrieval API.
   mcp/         synchronous JSON-RPC 2.0 / MCP stdio lifecycle and tool adapter.
                 Depends on core, retrieval, and Store; never SQL.
   cli/         clap definitions and human/JSON rendering. Knows the engine,
@@ -91,6 +95,57 @@ speculative machinery:
    the same text is retried as a literal quoted phrase. Both attempts are
    deterministic, so plain text containing punctuation ("O(1)") searches
    fine while FTS5 operators stay available.
+
+### Retrieval modes
+
+`retrieval::search_with_mode` takes one of four modes. `Lexical` is the default
+and is what `retrieval::search` runs. It never touches embeddings.
+
+These modes are an internal/library API in M4. Existing CLI and MCP search
+callers still use `retrieval::search`; adding user-facing mode selection is
+deferred to M5.
+
+- `Lexical`: FTS5 ranking, unchanged.
+- `Semantic`: the query goes through the runtime's query path and is matched
+  against vectors under the active derivation key. Fails when unavailable.
+- `Hybrid`: both branches run over one expanded scope and are fused with
+  reciprocal rank fusion, `score = sum(1 / (k + rank))`, with k = 60 by default.
+  Ranks are positions in each assertion-deduplicated candidate pool. Fails when
+  unavailable; if no semantic candidate survives the query filters, it reports
+  lexical results and a `NoSemanticCandidates` fallback.
+- `Auto`: `Hybrid` when the capability is ready and the vector branch returns
+  candidates. Otherwise `Lexical`, with the reason in `fallback`.
+
+The outcome names the mode that served the results (`effective`) and why a
+requested `Auto` or `Hybrid` search was served lexically (`fallback`). A hit's
+`score` is comparable only within its `score_kind`. BM25, cosine similarity, and
+fused values are never compared with each other. A zero limit returns
+`EffectiveMode::NotRun` without running a retrieval branch.
+Candidate counts describe branch inputs, not final hits. Fusion counts
+assertions after deduplication; a `NoSemanticCandidates` lexical fallback counts
+the memory episodes fetched from the candidate pool, which may exceed `limit`.
+
+Search never downloads, installs, or indexes. Capability resolution reads
+metadata, checks the model files, verifies them with a full SHA-256 pass before
+the runtime is built, and requires vectors under the active derivation key. Each
+resolution re-verifies, so resolve once per process and reuse the capability.
+Both branches apply the same space, lifecycle, and temporal filters because they
+share one expanded query. Candidate pools default to
+`max(limit, clamp(4 * limit, 20, 200))`.
+
+The query prefix (`search_query: `) is applied by the runtime and pinned by the
+manifest entry. It is not part of the derivation key. Changing it therefore needs
+a manifest change that alters a key input, such as the version, followed by a
+re-index.
+
+Known limits: the vector branch has no approximate index and scans every
+filter-qualified vector. Malformed stored vectors are skipped silently, as before.
+Legacy lexical and Semantic results remain episode-level. Hybrid and Auto fusion
+deduplicate each filtered candidate pool by assertion identity and retain the
+first ranked eligible episode as the representative. If the semantic pool is
+empty, the lexical fallback stays episode-level. The SQL pool limit is applied
+before fusion deduplication, so repeated historical episodes can reduce the
+number of distinct assertions available to fusion.
 
 ## 3. SQLite specifics
 

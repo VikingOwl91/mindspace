@@ -85,6 +85,18 @@ fn status_reports_not_installed_when_absent() {
     assert!(!st.indexing_available);
 }
 
+#[cfg(not(feature = "embeddings"))]
+#[test]
+fn status_reports_no_runtime_without_embedding_support() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mind.db");
+    SqliteStore::open(&path).unwrap();
+    let store = SqliteStore::open(&path).unwrap();
+    let status = manager::status(&store);
+    assert_eq!(status.runtime, "none (build without embeddings)");
+    assert!(!status.indexing_available);
+}
+
 #[test]
 fn no_network_during_status() {
     // Status must not perform network access; just call it.

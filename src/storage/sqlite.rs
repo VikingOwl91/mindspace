@@ -1498,7 +1498,7 @@ impl Store for SqliteStore {
         // All filter-qualified candidates are evaluated before ranking (F1).
         // query.limit is applied only after ranking; no silent candidate cap.
         let mut sql = String::from(
-            "SELECT m.id, a.subject, a.content, ae.embedding, ae.dimension, \
+            "SELECT m.id, a.id AS assertion_id, a.subject, a.content, ae.embedding, ae.dimension, \
                     m.state, m.created_at, a.extraction, src.title, src.location \
              FROM assertion_embeddings ae \
              JOIN assertions a ON a.id = ae.assertion_id \
@@ -1514,11 +1514,15 @@ impl Store for SqliteStore {
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 let memory_id: String = r.get("id")?;
+                let assertion_id: String = r.get("assertion_id")?;
                 let embedding_bytes: Vec<u8> = r.get("embedding")?;
                 let stored_dim: i64 = r.get("dimension")?;
                 Ok((
                     SearchHitRaw {
                         memory_id: Uuid::parse_str(&memory_id).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
+                        })?,
+                        assertion_id: Uuid::parse_str(&assertion_id).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
                         })?,
                         subject: r.get("subject")?,
@@ -1635,7 +1639,7 @@ impl Store for SqliteStore {
         }
 
         let mut sql = String::from(
-            "SELECT m.id, a.subject, a.content, \
+            "SELECT m.id, a.id AS assertion_id, a.subject, a.content, \
                     snippet(assertion_fts, 2, '[', ']', '…', 12) AS snip, \
                     bm25(assertion_fts) AS score, m.state, m.created_at, a.extraction, \
                     src.title, src.location \
@@ -2938,6 +2942,7 @@ fn run_search_sql(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<Ve
         .query_map(params_from_iter(params), |r| {
             Ok(SearchHitRaw {
                 memory_id: uuid_col(r, "id")?,
+                assertion_id: uuid_col(r, "assertion_id")?,
                 subject: r.get("subject")?,
                 content: r.get("content")?,
                 snippet: r.get("snip")?,

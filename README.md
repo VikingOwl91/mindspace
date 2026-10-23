@@ -230,10 +230,20 @@ mind space link coding linux
 mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-superseded] [--include-retired] [--json]
 mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--json]
 mind inspect <memory> [--json]
+mind structure <path-or-blob> [--json]
 mind trace <memory> [--json]
 mind history <subject words...> [--json]
 mind conflicts [--json]
-mind retire <memory> --reason "why"
+mind retire <memory> [--reason "why"]
+mind model list
+mind model info <id>
+mind model install <id> [--yes]
+mind model use <id>
+mind embeddings enable [--yes]
+mind embeddings disable
+mind embeddings status
+mind index run [--batch-size 32] [--limit <count>]
+mind index status
 mind mcp                                      # local MCP server over stdio
 ```
 
@@ -337,8 +347,10 @@ The actual layout is:
 src/
   core/        domain types, ids/timestamps/hashes, the error type
   storage/     the Store trait and the SQLite implementation
+  embeddings/  trusted model manifest and management; optional Candle CPU runtime
+  indexing/    incremental backfill of assertion embeddings
   ingest/      deterministic document and Rust syntax parsing, ingest orchestration
-  retrieval/   search orchestration, directed space traversal
+  retrieval/   lexical and mode-aware search orchestration, directed space traversal
   mcp/         synchronous JSON-RPC MCP protocol and tool adapter
   cli/         clap definitions and human/JSON rendering
 
@@ -346,6 +358,10 @@ docs/
   architecture.md
   memory-model.md
   decisions.md
+  v0.5-relationship-design.md
+  future-export-and-composition.md
+  reviews/
+    v0-architecture-review.md  historical adversarial review
 
 migrations/
   0001_init.sql
@@ -354,13 +370,22 @@ migrations/
   0004_code_structure.sql
   0005_code_relationships.sql
   0006_manual_writes.sql
+  0007_embeddings.sql
 tests/
   invariants.rs   domain invariants against real SQLite files
   lifecycle.rs    source identity and lifecycle scenarios
   cli.rs          end-to-end runs of the mind binary
+  code_structure.rs deterministic syntax structure scenarios
+  embeddings.rs   embedding derivation and storage behavior
+  indexing.rs     incremental assertion embedding indexing
   git_ingest.rs   Git topology and incremental-ingest scenarios
   manual_memory.rs manual provenance, deduplication, and lifecycle scenarios
+  models.rs       manifest, model status, and artifact verification
   mcp.rs          real-binary protocol and process-concurrency scenarios
+  retrieval.rs    retrieval modes, RRF fusion, and fallback scenarios
+
+examples/
+  example.md      sample Markdown source
 ```
 
 ## Non-goals for the first implementation
@@ -419,6 +444,11 @@ guessing rebase or force-push. Same blob at two paths or two branches is one
 object with separate derivations; two clones stay two repositories, qualified
 by their own identity markers. See `docs/memory-model.md` section 12.
 
-Explicitly deferred: AI extraction, embeddings, sync, authentication, HTTP or
-hosted operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only.
-See `docs/decisions.md` for the reasoning behind each choice.
+Embeddings have a trusted local model manifest, optional Candle CPU runtime,
+explicit installation/selection, and manual incremental indexing. The M4
+mode-aware semantic and hybrid retrieval API is library-only; CLI and MCP
+search remain lexical until M5.
+
+Explicitly deferred: AI extraction, sync, authentication, HTTP or hosted
+operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only. See
+`docs/decisions.md` for the reasoning behind each choice.

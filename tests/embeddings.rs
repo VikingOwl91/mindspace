@@ -292,14 +292,14 @@ fn derivation_key_isolates_embeddings() {
 
     // Under a different derivation key the assertion still needs embedding.
     let needing = store
-        .list_assertions_needing_embedding("key-b", 10)
+        .list_assertions_needing_embedding("key-b", None, 10)
         .unwrap();
     assert_eq!(needing.len(), 1);
     assert_eq!(needing[0].assertion_id, assertion_id);
 
     // Under the original key it does not.
     let needing = store
-        .list_assertions_needing_embedding("key-a", 10)
+        .list_assertions_needing_embedding("key-a", None, 10)
         .unwrap();
     assert!(needing.is_empty());
 }
@@ -1013,9 +1013,13 @@ fn list_assertions_needing_embedding_respects_limit() {
             })
             .unwrap();
     }
-    let needing = store.list_assertions_needing_embedding("k", 2).unwrap();
+    let needing = store
+        .list_assertions_needing_embedding("k", None, 2)
+        .unwrap();
     assert_eq!(needing.len(), 2);
-    let needing_all = store.list_assertions_needing_embedding("k", 100).unwrap();
+    let needing_all = store
+        .list_assertions_needing_embedding("k", None, 100)
+        .unwrap();
     assert_eq!(needing_all.len(), 5);
 }
 

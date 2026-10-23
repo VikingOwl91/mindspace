@@ -70,3 +70,32 @@ pub fn find_model(id: &str) -> Option<&'static ModelManifestEntry> {
 pub fn default_model() -> &'static ModelManifestEntry {
     &NOMIC_V1_5
 }
+
+pub fn derivation_from_manifest(entry: &ModelManifestEntry) -> crate::core::EmbeddingDerivation {
+    let model_sha = entry
+        .artifacts
+        .iter()
+        .find(|a| a.filename == "model.safetensors")
+        .map(|a| a.sha256.to_string())
+        .unwrap_or_default();
+    let tok_sha = entry
+        .artifacts
+        .iter()
+        .find(|a| a.filename == "tokenizer.json")
+        .map(|a| a.sha256.to_string())
+        .unwrap_or_default();
+    crate::core::EmbeddingDerivation {
+        model_id: entry.id.to_string(),
+        model_version: entry.version.to_string(),
+        model_sha256: model_sha,
+        tokenizer_sha256: tok_sha,
+        prefix_strategy: entry.prefix_document.to_string(),
+        pooling: entry.pooling.to_string(),
+        normalization: entry.normalization.to_string(),
+        max_seq_len: entry.max_seq_len,
+        truncation: entry.truncation.to_string(),
+        dimension: entry.dimension,
+        runtime: entry.runtime.to_string(),
+        runtime_version: entry.runtime_version.to_string(),
+    }
+}

@@ -114,6 +114,11 @@ pub enum Command {
         #[command(subcommand)]
         command: EmbeddingsCommand,
     },
+    /// Index embeddings for stored assertions
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
     /// Run the local MCP server over stdio
     Mcp,
 }
@@ -165,6 +170,19 @@ pub enum EmbeddingsCommand {
     /// Disable embedding functionality (keeps files and vectors)
     Disable,
     /// Show embedding status
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum IndexCommand {
+    /// Run incremental embedding indexing
+    Run {
+        #[arg(long, default_value_t = 32)]
+        batch_size: u32,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show indexing status
     Status,
 }
 
@@ -463,6 +481,81 @@ License: {}",
                 println!("dimension: {:?}", st.dimension);
                 println!("runtime: {}", st.runtime);
                 println!("indexing_available: {}", st.indexing_available);
+            }
+        },
+        Command::Index { command } => match command {
+            IndexCommand::Run { batch_size, limit } => {
+                let store = open(cli)?;
+                if !crate::embeddings::manager::is_enabled(&store) {
+                    return Err(Error::Storage(
+                        "embeddings disabled; run: mind embeddings enable".to_string(),
+                    ));
+                }
+                let selected =
+                    crate::embeddings::manager::selected_model(&store).ok_or_else(|| {
+                        Error::Storage("no model selected; run: mind model use <id>".to_string())
+                    })?;
+                let entry = crate::embeddings::manifest::find_model(&selected)
+                    .ok_or_else(|| Error::Storage(format!("unknown model: {selected}")))?;
+                if !crate::embeddings::manager::is_installed(entry) {
+                    return Err(Error::Storage(format!(
+                        "model '{}' not installed; run: mind model install {}",
+                        selected, selected
+                    )));
+                }
+                #[cfg(feature = "embeddings")]
+                {
+                    let dir = crate::embeddings::manager::model_dir(&selected);
+                    let rt = crate::embeddings::CandleRuntime::load(&dir)?;
+                    let deriv = crate::embeddings::manifest::derivation_from_manifest(entry);
+                    let report = crate::indexing::index_assertions(
+                        &store,
+                        &rt,
+                        &deriv,
+                        *batch_size,
+                        *limit,
+                    )?;
+                    println!("derivation_key: {}", report.derivation_key);
+                    println!("eligible: {}", report.eligible);
+                    println!("already_indexed: {}", report.already_indexed);
+                    println!("indexed: {}", report.indexed);
+                    println!("failed: {}", report.failed);
+                    println!("remaining: {}", report.remaining);
+                    for f in &report.failures {
+                        eprintln!("  failed {}: {}", f.assertion_id, f.error);
+                    }
+                }
+                #[cfg(not(feature = "embeddings"))]
+                {
+                    let _ = (batch_size, limit);
+                    return Err(Error::Storage(
+                        "embeddings feature disabled; rebuild with --features embeddings"
+                            .to_string(),
+                    ));
+                }
+            }
+            IndexCommand::Status => {
+                let store = open(cli)?;
+                let enabled = crate::embeddings::manager::is_enabled(&store);
+                let selected = crate::embeddings::manager::selected_model(&store);
+                println!("enabled: {}", enabled);
+                println!("selected_model: {:?}", selected);
+                if let Some(id) = &selected {
+                    if let Some(entry) = crate::embeddings::manifest::find_model(id) {
+                        let deriv = crate::embeddings::manifest::derivation_from_manifest(entry);
+                        let key = deriv.derivation_key();
+                        let st = store.embedding_index_status(&key)?;
+                        println!("eligible: {}", st.total_assertions);
+                        println!("indexed: {}", st.embedded);
+                        println!("missing: {}", st.missing());
+                        println!("dimension: {}", entry.dimension);
+                    }
+                } else {
+                    println!("eligible: 0");
+                    println!("indexed: 0");
+                    println!("missing: 0");
+                }
+                println!("indexing_available: {}", enabled && selected.is_some());
             }
         },
         Command::Mcp => {

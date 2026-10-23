@@ -92,6 +92,7 @@ pub trait Store {
     fn list_assertions_needing_embedding(
         &self,
         derivation_key: &str,
+        after: Option<(Ts, Uuid)>,
         limit: u32,
     ) -> Result<Vec<UnembeddedAssertion>>;
 

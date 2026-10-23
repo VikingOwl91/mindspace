@@ -211,3 +211,31 @@ fn cli_model_install_cancel_on_n() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn cli_index_run_disabled_rejected() {
+    use std::process::Command;
+    let bin = env!("CARGO_BIN_EXE_mind");
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("mind.db");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let _ = Command::new(bin)
+        .args(["init", "--db", db.to_str().unwrap()])
+        .status();
+    let out = Command::new(bin)
+        .args(["--db", db.to_str().unwrap(), "index", "run"])
+        .env("XDG_DATA_HOME", &data)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "index run must fail when disabled");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{}{}", stdout, stderr);
+    assert!(
+        combined.contains("disabled") || combined.contains("embeddings"),
+        "expected disabled-embeddings error, got: {}",
+        combined
+    );
+}

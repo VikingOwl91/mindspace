@@ -1354,29 +1354,53 @@ impl Store for SqliteStore {
     fn list_assertions_needing_embedding(
         &self,
         derivation_key: &str,
+        after: Option<(Ts, Uuid)>,
         limit: u32,
     ) -> Result<Vec<UnembeddedAssertion>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT a.id, a.subject, a.content \
+        let (sql, params): (String, Vec<Value>) = match after {
+            None => (
+                "SELECT a.id, a.subject, a.content, a.created_at \
                  FROM assertions a \
                  LEFT JOIN assertion_embeddings ae \
                    ON ae.assertion_id = a.id AND ae.derivation_key = ?1 \
                  WHERE ae.assertion_id IS NULL \
                  ORDER BY a.created_at ASC, a.id ASC \
-                 LIMIT ?2",
-            )
-            .map_err(dberr)?;
+                 LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Value::Text(derivation_key.to_string()),
+                    Value::Integer(limit as i64),
+                ],
+            ),
+            Some((ts, id)) => (
+                "SELECT a.id, a.subject, a.content, a.created_at \
+                 FROM assertions a \
+                 LEFT JOIN assertion_embeddings ae \
+                   ON ae.assertion_id = a.id AND ae.derivation_key = ?1 \
+                 WHERE ae.assertion_id IS NULL \
+                   AND (a.created_at > ?3 OR (a.created_at = ?3 AND a.id > ?4)) \
+                 ORDER BY a.created_at ASC, a.id ASC \
+                 LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Value::Text(derivation_key.to_string()),
+                    Value::Integer(limit as i64),
+                    Value::Integer(ts.0),
+                    Value::Text(id.to_string()),
+                ],
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql).map_err(dberr)?;
         let rows = stmt
-            .query_map(rusqlite::params![derivation_key, i64::from(limit)], |r| {
+            .query_map(params_from_iter(params), |r| {
                 Ok(UnembeddedAssertion {
                     assertion_id: uuid_col(r, "id")?,
                     subject: r.get("subject")?,
                     content: r.get("content")?,
+                    created_at: ts_col(r, "created_at")?,
                 })
             })
             .map_err(dberr)?;

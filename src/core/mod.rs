@@ -639,6 +639,7 @@ pub struct UnembeddedAssertion {
     pub assertion_id: Uuid,
     pub subject: String,
     pub content: String,
+    pub created_at: Ts,
 }
 
 /// Coverage of one derivation key over the assertion population.

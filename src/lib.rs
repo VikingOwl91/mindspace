@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod core;
 pub mod embeddings;
+pub mod indexing;
 pub mod ingest;
 pub mod mcp;
 pub mod retrieval;

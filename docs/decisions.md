@@ -147,6 +147,12 @@ similarity, or reciprocal-rank-fusion score. These are retrieval signals, not
 confidence or authority. They must not be compared across kinds. The existing
 lexical `SearchHit` contract is unchanged.
 
+**M5 interface amendment.** Explicit CLI and MCP mode requests serialize the
+mode-aware outcome with stable lowercase mode and score-kind names, tagged
+fallback reasons, and per-branch provenance. Omitting mode selection preserves
+the legacy CLI array and MCP `{ "hits": [...] }` response. The new wire shape
+does not change score meaning or the legacy `SearchHit` fields.
+
 ## ADR-009: UUIDv7 identities, epoch-microsecond timestamps (2026-09-08)
 
 **Decision.** All object ids are UUIDv7. Timestamps are UTC Unix epoch

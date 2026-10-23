@@ -1495,6 +1495,43 @@ fn auto_falls_back_to_lexical_with_a_reason_and_hybrid_when_ready() {
 }
 
 #[test]
+fn auto_and_hybrid_report_candidate_fallback_when_both_branches_are_empty() {
+    let f = Fixture::new();
+    f.enable_with_files();
+    let indexed_space = space(&f.store, "indexed");
+    let filtered_space = space(&f.store, "filtered");
+    let indexed = write(
+        &f.store,
+        "indexed note",
+        "content outside the requested space",
+        &[indexed_space],
+        None,
+    );
+    index(
+        &f.store,
+        &fake_key(),
+        indexed.assertion_id,
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let calls = Arc::new(Calls::default());
+    let capability = f.resolve(Some(vec![1.0, 0.0, 0.0, 0.0]), &calls);
+
+    let scoped = query("no lexical match", Some(vec![filtered_space]), 5);
+    for mode in [SearchMode::Hybrid, SearchMode::Auto] {
+        let outcome = run(&f.store, scoped.clone(), mode, &capability).unwrap();
+        assert_eq!(outcome.requested, mode);
+        assert_eq!(outcome.effective, EffectiveMode::Lexical);
+        assert_eq!(outcome.fallback, Some(FallbackReason::NoSemanticCandidates));
+        assert_eq!(outcome.lexical_candidates, 0);
+        assert_eq!(outcome.semantic_candidates, 0);
+        assert!(outcome.hits.is_empty());
+        let wire = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(wire["fallback"]["kind"], "no_semantic_candidates");
+        assert_eq!(wire["hits"], serde_json::json!([]));
+    }
+}
+
+#[test]
 fn explicit_semantic_modes_fail_with_actionable_errors() {
     let f = Fixture::new();
     f.enable_with_files();
@@ -1698,4 +1735,161 @@ fn options_control_the_fusion_constant_and_candidate_pool() {
         "{}",
         outcome.hits[0].hit.score
     );
+}
+
+#[test]
+fn mode_aware_outcomes_serialize_stable_modes_scores_and_provenance() {
+    let modes = [
+        (SearchMode::Lexical, "lexical"),
+        (SearchMode::Semantic, "semantic"),
+        (SearchMode::Hybrid, "hybrid"),
+        (SearchMode::Auto, "auto"),
+    ];
+    for (mode, wire) in modes {
+        assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+    }
+    assert_eq!(
+        serde_json::to_value(EffectiveMode::NotRun).unwrap(),
+        "not_run"
+    );
+    for (kind, wire) in [
+        (ScoreKind::Lexical, "lexical"),
+        (ScoreKind::Semantic, "semantic"),
+        (ScoreKind::Fused, "fused"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+    }
+
+    let fallback_cases = [
+        (
+            FallbackReason::EmbeddingsDisabled,
+            serde_json::json!({"kind":"embeddings_disabled"}),
+        ),
+        (
+            FallbackReason::UnknownModel {
+                id: "unknown-model".to_string(),
+            },
+            serde_json::json!({"kind":"unknown_model","id":"unknown-model"}),
+        ),
+        (
+            FallbackReason::ModelFilesInvalid {
+                model: "test-model".to_string(),
+                detail: "digest mismatch".to_string(),
+            },
+            serde_json::json!({"kind":"model_files_invalid","model":"test-model","detail":"digest mismatch"}),
+        ),
+        (
+            FallbackReason::NoSemanticCandidates,
+            serde_json::json!({"kind":"no_semantic_candidates"}),
+        ),
+    ];
+    for (reason, wire) in fallback_cases {
+        assert_eq!(serde_json::to_value(reason).unwrap(), wire);
+    }
+
+    let f = Fixture::new();
+    f.enable_with_files();
+    let coding = space(&f.store, "coding");
+    let note = write(
+        &f.store,
+        "wire contract",
+        "retrieval wire contract",
+        &[coding],
+        None,
+    );
+    index(
+        &f.store,
+        &fake_key(),
+        note.assertion_id,
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+
+    let lexical = run(
+        &f.store,
+        query("retrieval wire", None, 5),
+        SearchMode::Lexical,
+        &unavailable(FallbackReason::EmbeddingsDisabled),
+    )
+    .unwrap();
+    let lexical_wire = serde_json::to_value(&lexical).unwrap();
+    assert_eq!(lexical_wire["requested"], "lexical");
+    assert_eq!(lexical_wire["effective"], "lexical");
+    assert_eq!(lexical_wire["fallback"], serde_json::Value::Null);
+    assert_eq!(lexical_wire["hits"][0]["score_kind"], "lexical");
+    assert_eq!(lexical_wire["hits"][0]["provenance"]["lexical_rank"], 1);
+    assert_eq!(
+        lexical_wire["hits"][0]["provenance"]["semantic_score"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        lexical_wire["hits"][0]["hit"]["score"],
+        lexical_wire["hits"][0]["provenance"]["lexical_score"]
+    );
+
+    let calls = Arc::new(Calls::default());
+    let capability = f.resolve(Some(vec![1.0, 0.0, 0.0, 0.0]), &calls);
+    let semantic = run(
+        &f.store,
+        query("retrieval wire", None, 5),
+        SearchMode::Semantic,
+        &capability,
+    )
+    .unwrap();
+    let semantic_wire = serde_json::to_value(&semantic).unwrap();
+    assert_eq!(semantic_wire["effective"], "semantic");
+    assert_eq!(semantic_wire["hits"][0]["score_kind"], "semantic");
+    assert_eq!(
+        semantic_wire["hits"][0]["provenance"]["lexical_rank"],
+        serde_json::Value::Null
+    );
+    assert_eq!(semantic_wire["hits"][0]["provenance"]["semantic_rank"], 1);
+
+    let hybrid = run(
+        &f.store,
+        query("retrieval wire", None, 5),
+        SearchMode::Hybrid,
+        &capability,
+    )
+    .unwrap();
+    let hybrid_wire = serde_json::to_value(&hybrid).unwrap();
+    assert_eq!(hybrid_wire["effective"], "hybrid");
+    assert_eq!(hybrid_wire["hits"][0]["score_kind"], "fused");
+    assert_eq!(hybrid_wire["hits"][0]["provenance"]["lexical_rank"], 1);
+    assert_eq!(hybrid_wire["hits"][0]["provenance"]["semantic_rank"], 1);
+    assert!(hybrid_wire["hits"][0]["provenance"]["lexical_score"].is_number());
+    assert!(hybrid_wire["hits"][0]["provenance"]["semantic_score"].is_number());
+}
+
+#[test]
+fn resolved_mode_adapter_searches_without_mutating_storage() {
+    let f = Fixture::new();
+    let coding = space(&f.store, "coding");
+    write(
+        &f.store,
+        "adapter",
+        "resolved adapter marker",
+        &[coding],
+        None,
+    );
+    let before = snapshot_db(&f.db);
+
+    let lexical = retrieval::search_with_mode_resolving_capability(
+        &f.store,
+        query("resolved adapter", None, 5),
+        SearchMode::Lexical,
+    )
+    .unwrap();
+    assert_eq!(lexical.effective, EffectiveMode::Lexical);
+    assert_eq!(lexical.hits.len(), 1);
+
+    let auto = retrieval::search_with_mode_resolving_capability(
+        &f.store,
+        query("resolved adapter", None, 5),
+        SearchMode::Auto,
+    )
+    .unwrap();
+    assert_eq!(auto.effective, EffectiveMode::Lexical);
+    assert_eq!(auto.hits.len(), 1);
+    assert!(auto.fallback.is_some());
+    assert_eq!(snapshot_db(&f.db), before);
 }

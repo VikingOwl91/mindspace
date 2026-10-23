@@ -255,6 +255,35 @@ pub fn search_hits(hits: &[crate::core::SearchHit], as_json: bool) {
     }
 }
 
+pub fn search_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) {
+    if as_json {
+        json(outcome);
+        return;
+    }
+    print_retrieval_summary(outcome);
+    if outcome.hits.is_empty() {
+        println!("no results");
+        return;
+    }
+    for (index, result) in outcome.hits.iter().enumerate() {
+        let hit = &result.hit;
+        println!(
+            "{}. [{} {:.6}] {} ({})",
+            index + 1,
+            result.score_kind.as_str(),
+            hit.score,
+            hit.subject,
+            hit.state
+        );
+        println!("   {}", hit.snippet.replace('\n', " "));
+        println!("   score provenance: {}", render_score_provenance(result));
+        let spaces = render_spaces(hit);
+        println!("   spaces: {spaces}");
+        println!("   source: {} {}", hit.source_title, hit.source_location);
+        println!("   memory: {}", hit.memory_id);
+    }
+}
+
 /// Renders a compact, provenance-preserving answer from deterministic search hits.
 pub fn recall_hits(hits: &[crate::core::SearchHit], as_json: bool) {
     if as_json {
@@ -283,6 +312,94 @@ pub fn recall_hits(hits: &[crate::core::SearchHit], as_json: bool) {
             println!("   source: {} {}", hit.source_title, hit.source_location);
             println!("   memory: {}", hit.memory_id);
         }
+    }
+}
+
+pub fn recall_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) {
+    if as_json {
+        json(outcome);
+        return;
+    }
+    print_retrieval_summary(outcome);
+    let Some(answer) = outcome.hits.first() else {
+        println!("no results");
+        return;
+    };
+
+    println!("answer: {}", answer.hit.subject);
+    for line in answer.hit.content.lines() {
+        println!("  {line}");
+    }
+    println!(
+        "score: [{} {:.6}]",
+        answer.score_kind.as_str(),
+        answer.hit.score
+    );
+    println!("score provenance: {}", render_score_provenance(answer));
+    println!(
+        "source: {} {}",
+        answer.hit.source_title, answer.hit.source_location
+    );
+    println!("spaces: {}", render_spaces(&answer.hit));
+    println!("memory: {}", answer.hit.memory_id);
+
+    if outcome.hits.len() > 1 {
+        println!("related:");
+        for (index, result) in outcome.hits.iter().enumerate().skip(1) {
+            println!("{}. {}", index + 1, result.hit.subject);
+            println!("   {}", result.hit.snippet.replace('\n', " "));
+            println!(
+                "   score: [{} {:.6}] ({})",
+                result.score_kind.as_str(),
+                result.hit.score,
+                render_score_provenance(result)
+            );
+            println!("   spaces: {}", render_spaces(&result.hit));
+            println!(
+                "   source: {} {}",
+                result.hit.source_title, result.hit.source_location
+            );
+            println!("   memory: {}", result.hit.memory_id);
+        }
+    }
+}
+
+fn print_retrieval_summary(outcome: &crate::retrieval::SearchOutcome) {
+    println!(
+        "retrieval: requested {}, effective {}",
+        outcome.requested.as_str(),
+        outcome.effective.as_str()
+    );
+    if let Some(fallback) = &outcome.fallback {
+        println!("fallback: {fallback}");
+    }
+    println!(
+        "candidates: lexical {}, semantic {}",
+        outcome.lexical_candidates, outcome.semantic_candidates
+    );
+}
+
+fn render_score_provenance(result: &crate::retrieval::RetrievalHit) -> String {
+    let provenance = result.provenance;
+    let mut branches = Vec::new();
+    if let Some(rank) = provenance.lexical_rank {
+        let score = provenance
+            .lexical_score
+            .map(|score| format!(", score {score:.6}"))
+            .unwrap_or_default();
+        branches.push(format!("lexical rank {rank}{score}"));
+    }
+    if let Some(rank) = provenance.semantic_rank {
+        let score = provenance
+            .semantic_score
+            .map(|score| format!(", score {score:.6}"))
+            .unwrap_or_default();
+        branches.push(format!("semantic rank {rank}{score}"));
+    }
+    if branches.is_empty() {
+        "no retrieval branch ran".to_string()
+    } else {
+        branches.join("; ")
     }
 }
 

@@ -227,8 +227,8 @@ mind ingest ~/src/owlry --space coding     # git repo: committed objects + ref j
 mind space list
 mind space create eragon
 mind space link coding linux
-mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-superseded] [--include-retired] [--json]
-mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--json]
+mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-superseded] [--include-retired] [--mode lexical|semantic|hybrid|auto] [--json]
+mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--mode lexical|semantic|hybrid|auto] [--json]
 mind inspect <memory> [--json]
 mind structure <path-or-blob> [--json]
 mind trace <memory> [--json]
@@ -445,9 +445,56 @@ object with separate derivations; two clones stay two repositories, qualified
 by their own identity markers. See `docs/memory-model.md` section 12.
 
 Embeddings have a trusted local model manifest, optional Candle CPU runtime,
-explicit installation/selection, and manual incremental indexing. The M4
-mode-aware semantic and hybrid retrieval API is library-only; CLI and MCP
-search remain lexical until M5.
+explicit installation/selection, and manual incremental indexing. CLI search
+and recall, and MCP `memory_search`, accept `--mode` / `mode` with `lexical`,
+`semantic`, `hybrid`, or `auto`:
+
+```bash
+mind search "SQLite" --mode lexical
+mind search "borrow checking" --mode semantic --json
+mind search "local storage" --mode hybrid
+mind recall "deployment notes" --mode auto
+```
+
+Recall remains ranked retrieval: it presents the top stored memory and related
+evidence, not generated text.
+
+Omitting the option preserves the legacy lexical path and output: CLI `--json`
+remains an array, and MCP returns `{ "hits": [...] }`. Explicit modes return a
+mode-aware outcome with `requested`, `effective`, `fallback`, lexical and
+semantic candidate counts, and hits. Each hit wraps the existing hit fields in
+`hit`, names the score with `score_kind` (`lexical`, `semantic`, or `fused`),
+and records branch ranks and scores in `provenance`. Mode and score-kind values
+are stable lowercase strings. Fallback is `null` or a tagged object such as
+`{"kind":"no_semantic_candidates"}`. The CLI JSON output is this outcome
+object; MCP puts the same object in `structuredContent` and its JSON text
+content.
+
+Scores are retrieval signals, not confidence or authority, and values of
+different kinds must not be compared. `auto` uses hybrid when semantic search is
+ready and returns candidates. Otherwise it uses lexical and reports the reason,
+including when a positive-limit search has no hits. Explicit `semantic` and
+`hybrid` requests fail with an actionable error when embeddings are unavailable.
+Hybrid and Auto preserve ADR-012 behavior: after query filters, each branch
+deduplicates by assertion and uses the first-ranked eligible memory episode as
+its representative. Legacy lexical and Semantic results remain episode-level;
+the lexical fallback for no semantic candidates also remains episode-level.
+
+Semantic and Hybrid require embeddings to be enabled, a supported local model
+selected and installed, and vectors indexed for its derivation key (`mind
+embeddings enable`, `mind model install`, `mind model use`, then `mind index
+run`). Search never downloads, installs, indexes, or writes metadata. Lexical
+mode requires no model. Without default features, lexical retrieval still works;
+semantic and hybrid are unavailable, while Auto visibly falls back to lexical.
+
+Semantic, Hybrid, and Auto resolve capability once per request so model
+selection and enablement changes are seen by the next MCP call. When a selected
+model has a compatible index, resolution hashes every manifest artifact in
+full. The current Nomic artifacts total 547,649,564 bytes, so this verification
+repeats for each eligible non-lexical request. Candle runtime construction is
+lazy, but its first query embedding loads model weights and tokenizer for that
+request. This costs latency, especially in long-lived MCP sessions; integrity
+checks are not weakened and capability/runtime caching is not used.
 
 Explicitly deferred: AI extraction, sync, authentication, HTTP or hosted
 operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only. See

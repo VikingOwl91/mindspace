@@ -7,8 +7,8 @@
 //! [`search_with_mode`] adds explicit retrieval modes. It reports the mode that
 //! served the results, fuses the lexical and semantic branches with reciprocal
 //! rank fusion (see [`fusion`]), and never compares score kinds. The semantic
-//! capability comes from [`semantic`], which reads metadata and checks files but
-//! never loads a model, downloads, or indexes.
+//! capability comes from [`semantic`], which reads metadata, verifies local
+//! artifacts, and constructs a lazy runtime but never downloads or indexes.
 //!
 //! Traversal follows `from -> to` links only ("project:owlry -> coding" never
 //! implies "coding -> project:owlry") and is cycle-safe through a visited set.
@@ -21,6 +21,9 @@ pub mod semantic;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroU32;
+use std::str::FromStr;
+
+use serde::Serialize;
 
 use crate::core::{
     Error, Result, SearchHit, SearchHitRaw, SearchQuery, Space, SpaceLink, SpaceMatch, Uuid,
@@ -36,7 +39,8 @@ const POOL_MIN: u32 = 20;
 const POOL_MAX: u32 = 200;
 
 /// The retrieval mode a caller requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Deterministic full-text search. The default. Never touches embeddings.
     #[default]
@@ -50,8 +54,36 @@ pub enum SearchMode {
     Auto,
 }
 
+impl SearchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl FromStr for SearchMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "lexical" => Ok(Self::Lexical),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            "auto" => Ok(Self::Auto),
+            _ => Err(format!(
+                "unknown retrieval mode '{value}'; expected lexical, semantic, hybrid, or auto"
+            )),
+        }
+    }
+}
+
 /// The mode whose results an outcome carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectiveMode {
     Lexical,
     Semantic,
@@ -60,9 +92,21 @@ pub enum EffectiveMode {
     NotRun,
 }
 
+impl EffectiveMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+            Self::NotRun => "not_run",
+        }
+    }
+}
+
 /// What a hit's `score` measures. Values of different kinds are never
 /// comparable, so read a score only together with its kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScoreKind {
     /// Negated BM25 from the lexical index. Higher is better.
     Lexical,
@@ -73,9 +117,20 @@ pub enum ScoreKind {
     Fused,
 }
 
+impl ScoreKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Fused => "fused",
+        }
+    }
+}
+
 /// Why a requested capability was not used. The display text names the
 /// command that fixes the problem where one exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FallbackReason {
     EmbeddingsDisabled,
     NoModelSelected,
@@ -95,9 +150,10 @@ impl fmt::Display for FallbackReason {
             Self::EmbeddingsDisabled => {
                 write!(f, "embeddings are disabled; run: mind embeddings enable")
             }
-            Self::NoModelSelected => {
-                write!(f, "no embedding model is selected; run: mind embeddings enable")
-            }
+            Self::NoModelSelected => write!(
+                f,
+                "no embedding model is selected; install one with: mind model install <id>, select it with: mind model use <id> (models: mind model list)"
+            ),
             Self::UnknownModel { id } => write!(
                 f,
                 "selected embedding model '{id}' is not a supported model; run: mind model list"
@@ -133,7 +189,7 @@ impl fmt::Display for FallbackReason {
 
 /// One hit from [`search_with_mode`]. `hit.score` holds the value named by
 /// `score_kind`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RetrievalHit {
     pub hit: SearchHit,
     pub score_kind: ScoreKind,
@@ -142,7 +198,7 @@ pub struct RetrievalHit {
 
 /// How a hit was found. In Hybrid, ranks and branch scores describe the first
 /// ranked eligible episode representing the assertion in each branch.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Provenance {
     pub lexical_rank: Option<u32>,
     pub semantic_rank: Option<u32>,
@@ -155,7 +211,7 @@ pub struct Provenance {
 /// The result of [`search_with_mode`]. `requested` is what the caller asked
 /// for and `effective` is what produced `hits`; `NotRun` means no branch ran.
 /// `fallback` says why an Auto or Hybrid request was served lexically.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchOutcome {
     pub requested: SearchMode,
     pub effective: EffectiveMode,
@@ -214,6 +270,34 @@ pub fn search(store: &dyn Store, query: SearchQuery) -> Result<Vec<SearchHit>> {
             decorate(hit, traversal.as_ref(), score)
         })
         .collect())
+}
+
+/// Resolves the current semantic capability once for an explicit mode request,
+/// then delegates to [`search_with_mode`]. Lexical requests never inspect model
+/// metadata or artifacts. Blank queries fail before capability resolution.
+pub fn search_with_mode_resolving_capability(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+) -> Result<SearchOutcome> {
+    search_with_mode_and_resolver(store, query, mode, semantic::resolve)
+}
+
+fn search_with_mode_and_resolver(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+    resolver: impl FnOnce(&dyn Store) -> Result<SemanticCapability>,
+) -> Result<SearchOutcome> {
+    if query.text.trim().is_empty() {
+        return Err(Error::EmptyQuery);
+    }
+    let capability = if mode == SearchMode::Lexical {
+        SemanticCapability::Unavailable(FallbackReason::EmbeddingsDisabled)
+    } else {
+        resolver(store)?
+    };
+    search_with_mode(store, query, mode, &capability, RetrievalOptions::default())
 }
 
 /// Runs `query` in `mode`.
@@ -657,6 +741,19 @@ fn path_from_root(
 mod tests {
     use super::*;
     use crate::core::Ts;
+    use crate::storage::sqlite::SqliteStore;
+    use std::cell::Cell;
+
+    fn query(text: &str, limit: u32) -> SearchQuery {
+        SearchQuery {
+            text: text.to_string(),
+            space_ids: None,
+            limit,
+            at: None,
+            include_superseded: false,
+            include_retired: false,
+        }
+    }
 
     fn link(from: Uuid, to: Uuid) -> SpaceLink {
         SpaceLink {
@@ -763,5 +860,59 @@ mod tests {
         assert_eq!(RRF_K_DEFAULT.get(), 60);
         assert_eq!(RetrievalOptions::default().rrf_k.get(), 60);
         assert_eq!(SearchMode::default(), SearchMode::Lexical);
+    }
+
+    #[test]
+    fn mode_adapter_resolves_only_non_lexical_requests() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let resolutions = Cell::new(0);
+
+        let lexical =
+            search_with_mode_and_resolver(&store, query("missing", 0), SearchMode::Lexical, |_| {
+                resolutions.set(resolutions.get() + 1);
+                Ok(SemanticCapability::Unavailable(
+                    FallbackReason::EmbeddingsDisabled,
+                ))
+            })
+            .unwrap();
+        assert_eq!(lexical.effective, EffectiveMode::NotRun);
+        assert_eq!(resolutions.get(), 0);
+
+        let modes = [SearchMode::Semantic, SearchMode::Hybrid, SearchMode::Auto];
+        for (index, mode) in modes.into_iter().enumerate() {
+            let result = search_with_mode_and_resolver(&store, query("missing", 0), mode, |_| {
+                resolutions.set(resolutions.get() + 1);
+                Ok(SemanticCapability::Unavailable(
+                    FallbackReason::EmbeddingsDisabled,
+                ))
+            });
+            assert_eq!(resolutions.get(), index + 1);
+            match mode {
+                SearchMode::Semantic | SearchMode::Hybrid => {
+                    assert!(matches!(result, Err(Error::SemanticUnavailable { .. })));
+                }
+                SearchMode::Auto => {
+                    let outcome = result.unwrap();
+                    assert_eq!(outcome.effective, EffectiveMode::NotRun);
+                    assert_eq!(outcome.fallback, None);
+                }
+                SearchMode::Lexical => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn mode_adapter_rejects_blank_queries_before_capability_resolution() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let resolutions = Cell::new(0);
+        let result =
+            search_with_mode_and_resolver(&store, query("   ", 0), SearchMode::Auto, |_| {
+                resolutions.set(resolutions.get() + 1);
+                Ok(SemanticCapability::Unavailable(
+                    FallbackReason::EmbeddingsDisabled,
+                ))
+            });
+        assert!(matches!(result, Err(Error::EmptyQuery)));
+        assert_eq!(resolutions.get(), 0);
     }
 }

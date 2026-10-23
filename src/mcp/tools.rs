@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::str::FromStr;
 
 use crate::core::{normalize_subject, Error, ManualMemoryDraft, Result, SearchQuery, Ts, Uuid};
 use crate::resolve_memory_id;
@@ -61,7 +62,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "memory_search",
-            "Search active memories with SQLite FTS5. Optional spaces use directed space traversal; at replaces current-state filtering with the transaction-time view.",
+            "Search memories. Omit mode for legacy lexical results; select lexical, semantic, hybrid, or auto for a mode-aware outcome. Semantic modes use only an installed and indexed local model. Optional spaces use directed space traversal; at replaces current-state filtering with the transaction-time view.",
             json!({
                 "type": "object",
                 "properties": {
@@ -70,7 +71,12 @@ pub fn definitions() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "at": { "type": "string", "format": "date-time" },
                     "include_superseded": { "type": "boolean", "default": false },
-                    "include_retired": { "type": "boolean", "default": false }
+                    "include_retired": { "type": "boolean", "default": false },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["lexical", "semantic", "hybrid", "auto"],
+                        "description": "Optional retrieval mode. Omit to preserve the legacy response and lexical search."
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -238,18 +244,26 @@ fn call_tool(store: &dyn Store, name: &str, args: &Value) -> std::result::Result
                 None => None,
             };
             let at = optional_string(obj, "at")?.map(Ts::parse).transpose()?;
-            let hits = retrieval::search(
-                store,
-                SearchQuery {
-                    text: string(obj, "query")?.to_string(),
-                    space_ids: spaces,
-                    limit: optional_u32(obj, "limit")?.unwrap_or(20),
-                    at,
-                    include_superseded: optional_bool(obj, "include_superseded")?.unwrap_or(false),
-                    include_retired: optional_bool(obj, "include_retired")?.unwrap_or(false),
-                },
-            )?;
-            Ok(json!({ "hits": hits }))
+            let query = SearchQuery {
+                text: string(obj, "query")?.to_string(),
+                space_ids: spaces,
+                limit: optional_u32(obj, "limit")?.unwrap_or(20),
+                at,
+                include_superseded: optional_bool(obj, "include_superseded")?.unwrap_or(false),
+                include_retired: optional_bool(obj, "include_retired")?.unwrap_or(false),
+            };
+            match optional_string(obj, "mode")? {
+                None => {
+                    let hits = retrieval::search(store, query)?;
+                    Ok(json!({ "hits": hits }))
+                }
+                Some(value) => {
+                    let mode = retrieval::SearchMode::from_str(value).map_err(Error::Storage)?;
+                    let outcome =
+                        retrieval::search_with_mode_resolving_capability(store, query, mode)?;
+                    serde_json::to_value(outcome).map_err(|e| Error::Storage(e.to_string()))
+                }
+            }
         }
         "memory_history" => {
             let subject = normalize_subject(string(obj, "subject")?);
@@ -315,6 +329,7 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
                 "at",
                 "include_superseded",
                 "include_retired",
+                "mode",
             ],
             &["query"],
         ),
@@ -351,6 +366,13 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
                 return Err("argument 'id' must be at least 4 characters".to_string());
             }
         }
+    }
+    if let Some(value) = obj.get("mode") {
+        let Some(value) = value.as_str() else {
+            return Err("argument 'mode' must be a string".to_string());
+        };
+        retrieval::SearchMode::from_str(value)
+            .map_err(|error| format!("argument 'mode' {error}"))?;
     }
     if let Some(value) = obj.get("description") {
         if !value.is_string() {

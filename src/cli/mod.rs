@@ -41,7 +41,7 @@ pub enum Command {
         #[command(subcommand)]
         command: SpaceCommand,
     },
-    /// Full-text search over active memories
+    /// Search memories with lexical, semantic, hybrid, or automatic retrieval
     Search {
         query: String,
         #[arg(long, value_name = "SPACE")]
@@ -57,6 +57,9 @@ pub enum Command {
         include_retired: bool,
         #[arg(long)]
         json: bool,
+        /// Retrieval mode; omitted mode preserves legacy lexical search
+        #[arg(long, value_enum)]
+        mode: Option<SearchModeArg>,
     },
     /// Recall the most relevant current memories with their provenance
     Recall {
@@ -67,6 +70,9 @@ pub enum Command {
         limit: u32,
         #[arg(long)]
         json: bool,
+        /// Retrieval mode; omitted mode preserves legacy lexical search
+        #[arg(long, value_enum)]
+        mode: Option<SearchModeArg>,
     },
     /// Show a memory with its full provenance chain
     Inspect {
@@ -186,6 +192,44 @@ pub enum IndexCommand {
     Status,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SearchModeArg {
+    Lexical,
+    Semantic,
+    Hybrid,
+    Auto,
+}
+
+impl From<SearchModeArg> for retrieval::SearchMode {
+    fn from(mode: SearchModeArg) -> Self {
+        match mode {
+            SearchModeArg::Lexical => Self::Lexical,
+            SearchModeArg::Semantic => Self::Semantic,
+            SearchModeArg::Hybrid => Self::Hybrid,
+            SearchModeArg::Auto => Self::Auto,
+        }
+    }
+}
+
+enum SearchResults {
+    Legacy(Vec<crate::core::SearchHit>),
+    Mode(retrieval::SearchOutcome),
+}
+
+fn search_for_cli(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: Option<retrieval::SearchMode>,
+) -> Result<SearchResults> {
+    match mode {
+        Some(mode) => Ok(SearchResults::Mode(
+            retrieval::search_with_mode_resolving_capability(store, query, mode)?,
+        )),
+        None => Ok(SearchResults::Legacy(retrieval::search(store, query)?)),
+    }
+}
+
 pub fn execute(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Init => {
@@ -246,6 +290,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
             include_superseded,
             include_retired,
             json,
+            mode,
         } => {
             let store = open(cli)?;
             let space_ids = match space {
@@ -253,7 +298,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
                 None => None,
             };
             let at = at.as_deref().map(Ts::parse).transpose()?;
-            let hits = retrieval::search(
+            let results = search_for_cli(
                 &store,
                 SearchQuery {
                     text: query.clone(),
@@ -263,21 +308,26 @@ pub fn execute(cli: &Cli) -> Result<()> {
                     include_superseded: *include_superseded,
                     include_retired: *include_retired,
                 },
+                mode.map(Into::into),
             )?;
-            render::search_hits(&hits, *json);
+            match results {
+                SearchResults::Legacy(hits) => render::search_hits(&hits, *json),
+                SearchResults::Mode(outcome) => render::search_outcome(&outcome, *json),
+            }
         }
         Command::Recall {
             query,
             space,
             limit,
             json,
+            mode,
         } => {
             let store = open(cli)?;
             let space_ids = match space {
                 Some(name) => Some(vec![store.get_space(name)?.id]),
                 None => None,
             };
-            let hits = retrieval::search(
+            let results = search_for_cli(
                 &store,
                 SearchQuery {
                     text: query.clone(),
@@ -287,8 +337,12 @@ pub fn execute(cli: &Cli) -> Result<()> {
                     include_superseded: false,
                     include_retired: false,
                 },
+                mode.map(Into::into),
             )?;
-            render::recall_hits(&hits, *json);
+            match results {
+                SearchResults::Legacy(hits) => render::recall_hits(&hits, *json),
+                SearchResults::Mode(outcome) => render::recall_outcome(&outcome, *json),
+            }
         }
         Command::Inspect { id, json } => {
             let store = open(cli)?;

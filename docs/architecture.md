@@ -101,9 +101,13 @@ speculative machinery:
 `retrieval::search_with_mode` takes one of four modes. `Lexical` is the default
 and is what `retrieval::search` runs. It never touches embeddings.
 
-These modes are an internal/library API in M4. Existing CLI and MCP search
-callers still use `retrieval::search`; adding user-facing mode selection is
-deferred to M5.
+The library API remains available through `retrieval::search_with_mode`. The
+CLI `search` and `recall` commands and MCP `memory_search` also accept an
+optional mode. If the option is omitted, each adapter calls the original
+`retrieval::search` path and preserves its existing output shape. Explicit
+`lexical` uses the mode-aware outcome but does not resolve semantic
+capability. Explicit `semantic`, `hybrid`, and `auto` resolve the current
+capability once per request.
 
 - `Lexical`: FTS5 ranking, unchanged.
 - `Semantic`: the query goes through the runtime's query path and is matched
@@ -116,19 +120,59 @@ deferred to M5.
 - `Auto`: `Hybrid` when the capability is ready and the vector branch returns
   candidates. Otherwise `Lexical`, with the reason in `fallback`.
 
+Mode-aware JSON uses the same structured outcome in the CLI and MCP:
+`requested`, `effective`, `fallback`, `lexical_candidates`,
+`semantic_candidates`, and `hits`. Mode and score-kind names are stable
+lowercase strings. A fallback is `null` or an object tagged by `kind`, with
+variant details such as `model` or `detail` where relevant. Each hit contains
+the existing serialized hit as `hit`, its `score_kind`, and branch `provenance`
+(ranks and branch scores; absent values serialize as `null`). The MCP
+`structuredContent` contains this outcome directly. The CLI `--json` value is
+the outcome object. Without an explicit mode the CLI JSON remains the original
+array and MCP remains `{ "hits": [...] }`.
+Recall still displays the highest-ranked stored memory and related evidence;
+it does not generate an answer.
+
 The outcome names the mode that served the results (`effective`) and why a
 requested `Auto` or `Hybrid` search was served lexically (`fallback`). A hit's
-`score` is comparable only within its `score_kind`. BM25, cosine similarity, and
-fused values are never compared with each other. A zero limit returns
-`EffectiveMode::NotRun` without running a retrieval branch.
+`score` is meaningful only with its `score_kind`. Lexical relevance, cosine
+similarity, and fused values are never compared with each other. After mode
+planning succeeds, a zero limit returns `EffectiveMode::NotRun` without running
+a retrieval branch or reporting a fallback. The CLI and MCP still resolve
+capability once for an explicit non-lexical request before calling the mode
+planner, including Auto with a zero limit. Unavailable Semantic and Hybrid
+requests fail during planning even with a zero limit. Positive-limit Auto
+requests report capability or candidate fallback reasons even when no lexical
+hits were found. Auto with a zero limit still pays the capability-resolution
+cost although its `NotRun` outcome does not use the result; skipping that work
+would revise the approved per-request resolution policy and needs an explicit
+decision.
 Candidate counts describe branch inputs, not final hits. Fusion counts
 assertions after deduplication; a `NoSemanticCandidates` lexical fallback counts
 the memory episodes fetched from the candidate pool, which may exceed `limit`.
 
 Search never downloads, installs, or indexes. Capability resolution reads
-metadata, checks the model files, verifies them with a full SHA-256 pass before
-the runtime is built, and requires vectors under the active derivation key. Each
-resolution re-verifies, so resolve once per process and reuse the capability.
+metadata, checks for vectors under the active derivation key, verifies each
+manifest artifact with a full SHA-256 pass, and constructs a lazy runtime. The
+current Nomic manifest artifacts total 547,649,564 bytes (546,938,168-byte
+weights file and 711,396-byte tokenizer); an eligible semantic, hybrid, or auto
+request hashes both files again. Missing enablement, model selection, or a
+compatible index returns before hashing. The CLI and MCP intentionally resolve
+once per non-lexical request so state changes are visible between requests;
+they do not cache capability or runtime state. Consequently this full file
+verification is repeated in a long-lived MCP session. Candle runtime
+construction is lazy, but the first query embedding on each newly constructed
+runtime loads the local weights and tokenizer. This can add substantial latency
+to semantic requests; do not weaken integrity checks to avoid it. A local
+measurement on a Ryzen 7 3700X with the installed Nomic artifacts timed seven
+complete `semantic::resolve` calls after indexing one compatible vector. The
+median was 14,975 ms (range 14,901–15,052 ms) per call in the unoptimized test
+profile; release-profile resolution was not measured. The measurement includes
+metadata/index readiness checks, hashing both files, and lazy runtime
+construction, but not query embedding or model-weight loading. This makes the
+approved per-request policy a material latency cost. Any future optimization
+needs an explicit integrity and invalidation design; it must not assume that a
+previously verified file remains unchanged.
 Both branches apply the same space, lifecycle, and temporal filters because they
 share one expanded query. Candidate pools default to
 `max(limit, clamp(4 * limit, 20, 200))`.

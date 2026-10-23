@@ -4,9 +4,10 @@
 //! Resolution is offline. It reads metadata, checks that the model files are
 //! present and well formed, confirms that vectors exist for the active
 //! derivation key, and verifies the artifacts against the trusted manifest with
-//! a full SHA-256 pass before the runtime is built. It never downloads, installs,
-//! or indexes. Each `resolve_with` call re-verifies, so a caller that answers
-//! many queries should resolve once and reuse the capability.
+//! a full SHA-256 pass before the lazy runtime is built. It never downloads,
+//! installs, or indexes. Each `resolve_with` call re-verifies; the user-facing
+//! adapters do this per non-lexical request so changes to model selection and
+//! enablement are visible between requests.
 
 use std::fmt;
 use std::fs;

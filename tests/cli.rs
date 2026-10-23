@@ -28,6 +28,33 @@ impl Mind {
     }
 }
 
+fn seed_search_fixture(mind: &Mind) {
+    let (_, stderr, ok) = mind.run(&["init"]);
+    assert!(ok, "init failed: {stderr}");
+    for space in ["coding", "personal"] {
+        let (_, stderr, ok) = mind.run(&["space", "create", space]);
+        assert!(ok, "space create failed: {stderr}");
+    }
+    for (name, space, content) in [
+        (
+            "coding.md",
+            "coding",
+            "# Coding note\n\nMode contract marker for retrieval.\n",
+        ),
+        (
+            "personal.md",
+            "personal",
+            "# Personal note\n\nMode contract marker for private retrieval.\n",
+        ),
+    ] {
+        let path = mind.db.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        let path = path.display().to_string();
+        let (_, stderr, ok) = mind.run(&["ingest", &path, "--space", space]);
+        assert!(ok, "ingest failed: {stderr}");
+    }
+}
+
 fn example_path() -> String {
     // CARGO_MANIFEST_DIR is the crate root; the example lives in examples/.
     format!("{}/examples/example.md", env!("CARGO_MANIFEST_DIR"))
@@ -192,6 +219,16 @@ fn acceptance_flow_from_clean_clone() {
     let (out, _, ok) = mind.run(&["search", "O(1)"]);
     assert!(ok);
     assert!(out.contains("no results"), "{out}");
+
+    let (recall_out, stderr, ok) =
+        mind.run(&["recall", "no such retrieval marker", "--mode", "auto"]);
+    assert!(ok, "auto recall failed: {stderr}");
+    assert!(
+        recall_out.contains("retrieval: requested auto, effective lexical"),
+        "{recall_out}"
+    );
+    assert!(recall_out.contains("fallback:"), "{recall_out}");
+    assert!(recall_out.contains("no results"), "{recall_out}");
     let (out, _, ok) = mind.run(&["recall", "absent-term"]);
     assert!(ok);
     assert_eq!(out.trim(), "no results");
@@ -249,4 +286,193 @@ fn commands_fail_actionably() {
     let (_, err, ok) = mind.run(&["space", "create", "   "]);
     assert!(!ok);
     assert!(err.contains("empty"), "{err}");
+}
+
+#[test]
+fn explicit_retrieval_modes_preserve_legacy_cli_output_and_filters() {
+    let mind = Mind::new();
+    seed_search_fixture(&mind);
+
+    let (legacy_out, stderr, ok) = mind.run(&[
+        "search",
+        "mode contract marker",
+        "--space",
+        "coding",
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert!(ok, "legacy search failed: {stderr}");
+    let legacy: serde_json::Value = serde_json::from_str(&legacy_out).unwrap();
+    assert!(legacy.is_array());
+    assert_eq!(legacy.as_array().unwrap().len(), 1);
+
+    let (mode_out, stderr, ok) = mind.run(&[
+        "search",
+        "mode contract marker",
+        "--space",
+        "coding",
+        "--limit",
+        "1",
+        "--mode",
+        "lexical",
+        "--json",
+    ]);
+    assert!(ok, "explicit lexical search failed: {stderr}");
+    let mode: serde_json::Value = serde_json::from_str(&mode_out).unwrap();
+    assert_eq!(mode["requested"], "lexical");
+    assert_eq!(mode["effective"], "lexical");
+    assert_eq!(mode["fallback"], serde_json::Value::Null);
+    assert_eq!(mode["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(mode["hits"][0]["hit"]["memory_id"], legacy[0]["memory_id"]);
+    assert_eq!(mode["hits"][0]["hit"]["score"], legacy[0]["score"]);
+    assert_eq!(mode["hits"][0]["score_kind"], "lexical");
+    assert_eq!(mode["hits"][0]["provenance"]["lexical_rank"], 1);
+    assert_eq!(
+        mode["hits"][0]["provenance"]["semantic_rank"],
+        serde_json::Value::Null
+    );
+    assert_eq!(mode["lexical_candidates"], 1);
+    assert_eq!(mode["semantic_candidates"], 0);
+
+    let (recall_out, stderr, ok) = mind.run(&[
+        "recall",
+        "mode contract marker",
+        "--space",
+        "coding",
+        "--limit",
+        "1",
+        "--mode",
+        "lexical",
+    ]);
+    assert!(ok, "explicit lexical recall failed: {stderr}");
+    assert!(recall_out.contains("retrieval: requested lexical, effective lexical"));
+    assert!(recall_out.contains("answer: Coding note"));
+    assert!(recall_out.contains("score: [lexical "));
+
+    let (recall_json, stderr, ok) = mind.run(&[
+        "recall",
+        "mode contract marker",
+        "--space",
+        "coding",
+        "--limit",
+        "1",
+        "--mode",
+        "lexical",
+        "--json",
+    ]);
+    assert!(ok, "explicit lexical recall JSON failed: {stderr}");
+    let recall: serde_json::Value = serde_json::from_str(&recall_json).unwrap();
+    assert_eq!(recall["requested"], "lexical");
+    assert_eq!(recall["hits"][0]["hit"]["subject"], "Coding note");
+}
+
+#[test]
+fn explicit_mode_fallback_errors_zero_limit_and_validation_are_visible() {
+    let mind = Mind::new();
+    seed_search_fixture(&mind);
+
+    let (out, stderr, ok) = mind.run(&[
+        "search",
+        "no such retrieval marker",
+        "--mode",
+        "auto",
+        "--json",
+    ]);
+    assert!(ok, "auto search failed: {stderr}");
+    let auto: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(auto["requested"], "auto");
+    assert_eq!(auto["effective"], "lexical");
+    assert_eq!(auto["hits"], serde_json::json!([]));
+    assert_eq!(auto["fallback"]["kind"], expected_unavailable_reason());
+
+    let (out, stderr, ok) = mind.run(&["search", "no such retrieval marker", "--mode", "auto"]);
+    assert!(ok, "auto human search failed: {stderr}");
+    assert!(out.contains("retrieval: requested auto, effective lexical"));
+    assert!(out.contains("fallback:"), "{out}");
+    assert!(out.contains("no results"), "{out}");
+
+    let (out, stderr, ok) = mind.run(&[
+        "search", "anything", "--mode", "lexical", "--limit", "0", "--json",
+    ]);
+    assert!(ok, "zero-limit explicit lexical failed: {stderr}");
+    let not_run: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(not_run["effective"], "not_run");
+    assert_eq!(not_run["lexical_candidates"], 0);
+    assert_eq!(not_run["hits"], serde_json::json!([]));
+
+    let (out, stderr, ok) = mind.run(&[
+        "search", "anything", "--mode", "auto", "--limit", "0", "--json",
+    ]);
+    assert!(ok, "zero-limit auto failed: {stderr}");
+    let not_run: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(not_run["effective"], "not_run");
+    assert_eq!(not_run["fallback"], serde_json::Value::Null);
+    assert_eq!(not_run["hits"], serde_json::json!([]));
+
+    for mode in ["semantic", "hybrid"] {
+        let (out, stderr, ok) = mind.run(&["search", "anything", "--mode", mode, "--limit", "0"]);
+        assert!(!ok, "zero-limit {mode} unexpectedly succeeded: {out}");
+        assert!(out.is_empty());
+        assert!(
+            stderr.contains("requested retrieval mode unavailable"),
+            "{mode}: {stderr}"
+        );
+    }
+
+    let (out, stderr, ok) = mind.run(&["search", "", "--mode", "auto"]);
+    assert!(!ok);
+    assert!(out.is_empty());
+    assert!(stderr.contains("empty query"), "{stderr}");
+
+    for mode in ["semantic", "hybrid"] {
+        let (out, stderr, ok) = mind.run(&["search", "anything", "--mode", mode]);
+        assert!(!ok, "{mode} unexpectedly succeeded: {out}");
+        assert!(out.is_empty(), "{mode} printed a partial result: {out}");
+        assert!(
+            stderr.contains("requested retrieval mode unavailable"),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains("mind embeddings enable") || stderr.contains("--features embeddings"),
+            "{mode}: {stderr}"
+        );
+    }
+
+    let (out, stderr, ok) = mind.run(&["search", "anything", "--mode", "semanticish"]);
+    assert!(!ok);
+    assert!(out.is_empty());
+    assert!(stderr.contains("possible values"), "{stderr}");
+    assert!(stderr.contains("semantic"), "{stderr}");
+
+    let (out, stderr, ok) = mind.run(&["recall", "anything", "--mode", "LEXICAL"]);
+    assert!(!ok);
+    assert!(out.is_empty());
+    assert!(stderr.contains("possible values"), "{stderr}");
+
+    #[cfg(feature = "embeddings")]
+    {
+        let store = mindspace::SqliteStore::open(&mind.db.path().join("mind.db")).unwrap();
+        mindspace::embeddings::manager::set_enabled(&store, true).unwrap();
+        let (out, stderr, ok) = mind.run(&["search", "anything", "--mode", "semantic"]);
+        assert!(!ok);
+        assert!(out.is_empty());
+        assert!(
+            stderr.contains("no embedding model is selected"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("mind model install <id>"), "{stderr}");
+        assert!(stderr.contains("mind model use <id>"), "{stderr}");
+    }
+}
+
+fn expected_unavailable_reason() -> &'static str {
+    #[cfg(feature = "embeddings")]
+    {
+        "embeddings_disabled"
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        "feature_disabled"
+    }
 }

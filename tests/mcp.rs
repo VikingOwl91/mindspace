@@ -118,6 +118,21 @@ fn success_content(response: &Value) -> Value {
     structured
 }
 
+fn tool_error_text(response: &Value) -> &str {
+    assert_eq!(response["jsonrpc"], "2.0", "{response}");
+    assert!(
+        response.get("error").is_none(),
+        "tool errors stay in result: {response}"
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(
+        response["result"]["content"][0]["type"], "text",
+        "{response}"
+    );
+    assert!(response["result"].get("structuredContent").is_none());
+    response["result"]["content"][0]["text"].as_str().unwrap()
+}
+
 #[test]
 fn real_binary_exposes_all_eleven_tools_and_runs_the_memory_lifecycle() {
     let (_dir, db) = database();
@@ -246,6 +261,207 @@ fn real_binary_exposes_all_eleven_tools_and_runs_the_memory_lifecycle() {
     assert_eq!(spaces["spaces"].as_array().unwrap().len(), 2);
 
     assert!(process.shutdown().success());
+}
+
+#[test]
+fn memory_search_mode_is_optional_and_explicit_lexical_returns_an_outcome() {
+    let (_dir, db) = database();
+    let mut process = McpProcess::spawn(&db);
+
+    let list = process.request(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
+    let search_tool = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "memory_search")
+        .unwrap();
+    let schema = &search_tool["inputSchema"];
+    assert_eq!(schema["properties"]["mode"]["type"], "string");
+    assert_eq!(
+        schema["properties"]["mode"]["enum"],
+        json!(["lexical", "semantic", "hybrid", "auto"])
+    );
+    assert_eq!(schema["required"], json!(["query"]));
+
+    let created = success_content(&process.call(
+        3,
+        "memory_create",
+        json!({
+            "subject": "MCP search modes",
+            "content": "MCP search modes preserve lexical compatibility.",
+            "spaces": ["coding"]
+        }),
+    ));
+    let memory_id = created["memory_id"].clone();
+    success_content(&process.call(6, "space_create", json!({"name":"personal"})));
+    success_content(&process.call(
+        7,
+        "memory_create",
+        json!({
+            "subject": "MCP search modes elsewhere",
+            "content": "MCP search modes preserve lexical compatibility.",
+            "spaces": ["personal"]
+        }),
+    ));
+
+    let legacy = success_content(&process.call(
+        4,
+        "memory_search",
+        json!({ "query": "search modes preserve lexical compatibility" }),
+    ));
+    assert_eq!(legacy.as_object().unwrap().len(), 1);
+    assert_eq!(legacy["hits"][0]["memory_id"], memory_id);
+
+    let explicit = success_content(&process.call(
+        5,
+        "memory_search",
+        json!({
+            "query": "search modes preserve lexical compatibility",
+            "spaces": ["coding"],
+            "limit": 1,
+            "mode": "lexical"
+        }),
+    ));
+    assert_eq!(explicit["requested"], "lexical");
+    assert_eq!(explicit["effective"], "lexical");
+    assert_eq!(explicit["fallback"], Value::Null);
+    assert_eq!(explicit["hits"][0]["hit"]["memory_id"], memory_id);
+    assert_eq!(explicit["hits"][0]["score_kind"], "lexical");
+    assert_eq!(explicit["lexical_candidates"], 1);
+
+    assert!(process.shutdown().success());
+}
+
+#[test]
+fn memory_search_rejects_invalid_modes_as_mcp_tool_errors() {
+    let (_dir, db) = database();
+    let mut process = McpProcess::spawn(&db);
+
+    let invalid = process.call(
+        20,
+        "memory_search",
+        json!({ "query": "a search", "mode": "lexcial" }),
+    );
+    assert_eq!(invalid["id"], 20);
+    assert!(tool_error_text(&invalid).contains("unknown retrieval mode 'lexcial'"));
+
+    let non_string = process.call(
+        21,
+        "memory_search",
+        json!({ "query": "a search", "mode": null }),
+    );
+    assert_eq!(non_string["id"], 21);
+    assert!(tool_error_text(&non_string).contains("argument 'mode' must be a string"));
+
+    let uppercase = process.call(
+        22,
+        "memory_search",
+        json!({ "query": "a search", "mode": "LEXICAL" }),
+    );
+    assert!(tool_error_text(&uppercase).contains("unknown retrieval mode 'LEXICAL'"));
+
+    assert!(process.shutdown().success());
+}
+
+#[test]
+fn unavailable_semantic_modes_are_actionable_and_auto_exposes_empty_fallback() {
+    let (_dir, db) = database();
+    let mut process = McpProcess::spawn(&db);
+
+    let semantic = process.call(
+        30,
+        "memory_search",
+        json!({ "query": "no lexical matches", "mode": "semantic" }),
+    );
+    let hybrid = process.call(
+        31,
+        "memory_search",
+        json!({ "query": "no lexical matches", "mode": "hybrid" }),
+    );
+    for response in [&semantic, &hybrid] {
+        let text = tool_error_text(response);
+        assert!(
+            text.contains("requested retrieval mode unavailable"),
+            "{text}"
+        );
+        #[cfg(feature = "embeddings")]
+        assert!(text.contains("run: mind embeddings enable"), "{text}");
+        #[cfg(not(feature = "embeddings"))]
+        assert!(
+            text.contains("rebuild with --features embeddings"),
+            "{text}"
+        );
+    }
+
+    let auto = success_content(&process.call(
+        32,
+        "memory_search",
+        json!({ "query": "no lexical matches", "mode": "auto" }),
+    ));
+    assert_eq!(auto["requested"], "auto");
+    assert_eq!(auto["effective"], "lexical");
+    assert_eq!(auto["fallback"]["kind"], expected_unavailable_reason());
+    assert_eq!(auto["hits"], json!([]));
+
+    assert!(process.shutdown().success());
+}
+
+#[cfg(feature = "embeddings")]
+#[test]
+fn memory_search_resolves_embedding_capability_again_between_requests() {
+    let (_dir, db) = database();
+    let mut process = McpProcess::spawn(&db);
+
+    let initially_disabled = success_content(&process.call(
+        40,
+        "memory_search",
+        json!({ "query": "nothing found", "mode": "auto" }),
+    ));
+    assert_eq!(
+        initially_disabled["fallback"]["kind"],
+        "embeddings_disabled"
+    );
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO mind_meta (key, value) VALUES ('embedding.enabled', 'true') \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let enabled_without_model = success_content(&process.call(
+        41,
+        "memory_search",
+        json!({ "query": "nothing found", "mode": "auto" }),
+    ));
+    assert_eq!(
+        enabled_without_model["fallback"]["kind"],
+        "no_model_selected"
+    );
+
+    let semantic = process.call(
+        42,
+        "memory_search",
+        json!({ "query": "nothing found", "mode": "semantic" }),
+    );
+    let text = tool_error_text(&semantic);
+    assert!(text.contains("mind model install <id>"), "{text}");
+    assert!(text.contains("mind model use <id>"), "{text}");
+
+    assert!(process.shutdown().success());
+}
+
+fn expected_unavailable_reason() -> &'static str {
+    #[cfg(feature = "embeddings")]
+    {
+        "embeddings_disabled"
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        "feature_disabled"
+    }
 }
 
 #[test]

@@ -372,3 +372,44 @@ receive the error instead.
 **Consequences.** Readers can continue during WAL writes, but only one writer
 can hold the reservation. A writer that cannot acquire it within five seconds
 fails explicitly; callers decide whether and when to make a new request.
+
+## ADR-020: Session-owned verified retrieval runtime (2026-10-23)
+
+**Decision.** The synchronous MCP session may retain one verified, loaded
+semantic runtime. Every non-lexical request still rereads model selection,
+enablement, index readiness and structural artifact checks. CLI invocations
+and explicit library resolution remain uncached. First use always verifies
+every artifact against the compiled-in SHA-256 manifest.
+
+Verification reuse is limited to Linux/local btrfs. The complete manifest and
+directory path identify a runtime. Device, inode, mode, size, nanosecond mtime
+and ctime for artifacts and checked directories detect changes after SHA
+verification. Artifact ctimes must be at least two seconds old before the
+prehash snapshot, and identities must match after the successful query.
+Recent artifacts require another full verification before becoming cacheable.
+Unknown filesystem semantics, invalid/future timestamps and observable clock
+rollback prevent reuse. No verification record persists across processes.
+
+**Why.** Release measurements separate repeated verification (~291 ms) and
+loading (~190 ms) from warm inference (~85 ms) and a 100-vector scan (~0.6 ms).
+Keeping the existing per-request runtime wastes most of a warm MCP request.
+Session ownership bounds memory and avoids a global registry or background
+watcher. Full manifest equality also covers runtime inputs absent from the
+derivation key, including the query prefix.
+
+**Consequences.** Metadata is a change detector, not a substitute for the
+initial digest check. Unavailability, changed artifacts and resolution/search
+errors evict; Auto's embedding-error fallback also evicts. Post-search changes
+discard semantic results without retrying semantic work. A verified runtime
+owns its weights, so a later file write cannot mutate them. Freshness is
+observed at request boundaries, not instantaneously. The existing nonhostile
+single-user filesystem assumption remains; privileged ctime manipulation,
+filesystem rollback and concealed clock changes are outside that boundary.
+Other filesystems/platforms remain uncached. See
+[retrieval-performance.md](retrieval-performance.md) for the full policy and
+measurements.
+
+**Revisit when.** Qualifying another filesystem, coordinating concurrent
+writers, changing to mmap-backed weights, adding persistent verification state,
+or changing the synchronous MCP execution model requires a new integrity
+decision. None is part of this optimization.

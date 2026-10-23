@@ -1,7 +1,7 @@
 //! Compiled-in trusted model manifest. No remote manifest execution or
 //! trust-on-first-use: every entry is baked into the binary.
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Artifact {
     pub filename: &'static str,
     pub url: &'static str,
@@ -9,7 +9,7 @@ pub struct Artifact {
     pub size: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelManifestEntry {
     pub id: &'static str,
     pub version: &'static str,

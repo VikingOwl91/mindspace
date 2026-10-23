@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use serde_json::{json, Map, Value};
 
 use crate::core::{Error, Result};
+use crate::retrieval::semantic::SemanticCache;
 use crate::storage::Store;
 
 use super::tools;
@@ -31,6 +32,7 @@ fn serve_with_io<R: BufRead, W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     let mut phase = Phase::AwaitInitialize;
+    let mut semantic = SemanticCache::default();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -53,7 +55,7 @@ fn serve_with_io<R: BufRead, W: Write>(
         }
 
         let response = match serde_json::from_slice::<Value>(&line) {
-            Ok(message) => handle_message(store, &mut phase, message),
+            Ok(message) => handle_message(store, &mut semantic, &mut phase, message),
             Err(error) => Some(json_rpc_error(
                 Value::Null,
                 -32700,
@@ -74,7 +76,12 @@ fn serve_with_io<R: BufRead, W: Write>(
     }
 }
 
-fn handle_message(store: &dyn Store, phase: &mut Phase, message: Value) -> Option<Value> {
+fn handle_message(
+    store: &dyn Store,
+    semantic: &mut SemanticCache,
+    phase: &mut Phase,
+    message: Value,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(json_rpc_error(
             Value::Null,
@@ -275,7 +282,7 @@ fn handle_message(store: &dyn Store, phase: &mut Phase, message: Value) -> Optio
             };
             Some(json_rpc_result(
                 id,
-                tools::call_result(store, name, &arguments),
+                tools::call_result(store, semantic, name, &arguments),
             ))
         }
         _ => Some(json_rpc_error(

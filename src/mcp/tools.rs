@@ -4,6 +4,7 @@ use std::str::FromStr;
 use crate::core::{normalize_subject, Error, ManualMemoryDraft, Result, SearchQuery, Ts, Uuid};
 use crate::resolve_memory_id;
 use crate::retrieval;
+use crate::retrieval::semantic::SemanticCache;
 use crate::storage::Store;
 
 pub fn definitions() -> Vec<Value> {
@@ -162,8 +163,13 @@ fn empty_object_schema() -> Value {
     json!({ "type": "object", "properties": {}, "additionalProperties": false })
 }
 
-pub fn call_result(store: &dyn Store, name: &str, arguments: &Value) -> Value {
-    match call_tool(store, name, arguments) {
+pub fn call_result(
+    store: &dyn Store,
+    semantic: &mut SemanticCache,
+    name: &str,
+    arguments: &Value,
+) -> Value {
+    match call_tool(store, semantic, name, arguments) {
         Ok(structured) => {
             let text = serde_json::to_string(&structured)
                 .unwrap_or_else(|error| format!("cannot serialize result: {error}"));
@@ -180,7 +186,12 @@ pub fn call_result(store: &dyn Store, name: &str, arguments: &Value) -> Value {
     }
 }
 
-fn call_tool(store: &dyn Store, name: &str, args: &Value) -> std::result::Result<Value, String> {
+fn call_tool(
+    store: &dyn Store,
+    semantic: &mut SemanticCache,
+    name: &str,
+    args: &Value,
+) -> std::result::Result<Value, String> {
     validate_arguments(name, args)?;
     let obj = args.as_object().ok_or("arguments must be an object")?;
     let result: Result<Value> = (|| match name {
@@ -259,8 +270,7 @@ fn call_tool(store: &dyn Store, name: &str, args: &Value) -> std::result::Result
                 }
                 Some(value) => {
                     let mode = retrieval::SearchMode::from_str(value).map_err(Error::Storage)?;
-                    let outcome =
-                        retrieval::search_with_mode_resolving_capability(store, query, mode)?;
+                    let outcome = semantic.search(store, query, mode)?;
                     serde_json::to_value(outcome).map_err(|e| Error::Storage(e.to_string()))
                 }
             }
@@ -497,7 +507,12 @@ mod tests {
     #[test]
     fn tool_error_is_returned_as_mcp_tool_result() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let result = call_result(&store, "memory_create", &json!({"content":"x"}));
+        let result = call_result(
+            &store,
+            &mut SemanticCache::default(),
+            "memory_create",
+            &json!({"content":"x"}),
+        );
         assert_eq!(result["isError"], true);
         assert!(result["content"][0]["text"]
             .as_str()

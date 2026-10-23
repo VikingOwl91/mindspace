@@ -487,14 +487,16 @@ run`). Search never downloads, installs, indexes, or writes metadata. Lexical
 mode requires no model. Without default features, lexical retrieval still works;
 semantic and hybrid are unavailable, while Auto visibly falls back to lexical.
 
-Semantic, Hybrid, and Auto resolve capability once per request so model
-selection and enablement changes are seen by the next MCP call. When a selected
-model has a compatible index, resolution hashes every manifest artifact in
-full. The current Nomic artifacts total 547,649,564 bytes, so this verification
-repeats for each eligible non-lexical request. Candle runtime construction is
-lazy, but its first query embedding loads model weights and tokenizer for that
-request. This costs latency, especially in long-lived MCP sessions; integrity
-checks are not weakened and capability/runtime caching is not used.
+Semantic, Hybrid, and Auto check current model selection, enablement and index
+readiness on every request. CLI searches verify artifacts independently. An
+MCP session can retain one SHA-verified, loaded runtime on Linux/btrfs when
+artifact and directory identities remain unchanged. First use still hashes
+all 547,649,564 bytes of the current Nomic artifacts. Changes or uncertainty
+invalidate reuse; other filesystems and platforms use the uncached path.
+Metadata detects changes after verification, never proves integrity by size or
+mtime alone. Warm requests still embed queries and scan vectors, and retaining
+weights costs resident memory. See [the lifecycle and performance notes](docs/retrieval-performance.md)
+for the timestamp gate, freshness tradeoff and release measurements.
 
 Explicitly deferred: AI extraction, sync, authentication, HTTP or hosted
 operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only. See

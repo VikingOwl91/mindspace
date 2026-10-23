@@ -5,14 +5,13 @@
 //! present and well formed, confirms that vectors exist for the active
 //! derivation key, and verifies the artifacts against the trusted manifest with
 //! a full SHA-256 pass before the lazy runtime is built. It never downloads,
-//! installs, or indexes. Each `resolve_with` call re-verifies; the user-facing
-//! adapters do this per non-lexical request so changes to model selection and
-//! enablement are visible between requests.
+//! installs, or indexes. Each `resolve_with` call re-verifies. MCP may retain
+//! one verified runtime per session, with live readiness and change checks.
 
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::{Error, Result};
 use crate::embeddings::manager;
@@ -20,6 +19,27 @@ use crate::embeddings::manifest::{self, ModelManifestEntry};
 use crate::embeddings::EmbeddingRuntime;
 use crate::retrieval::FallbackReason;
 use crate::storage::Store;
+
+#[cfg(all(target_os = "linux", feature = "embeddings"))]
+mod cache;
+#[cfg(all(target_os = "linux", feature = "embeddings"))]
+pub(crate) use cache::SemanticCache;
+
+#[cfg(not(all(target_os = "linux", feature = "embeddings")))]
+#[derive(Default)]
+pub(crate) struct SemanticCache {}
+
+#[cfg(not(all(target_os = "linux", feature = "embeddings")))]
+impl SemanticCache {
+    pub(crate) fn search(
+        &mut self,
+        store: &dyn Store,
+        query: crate::core::SearchQuery,
+        mode: crate::retrieval::SearchMode,
+    ) -> Result<crate::retrieval::SearchOutcome> {
+        crate::retrieval::search_with_mode_resolving_capability(store, query, mode)
+    }
+}
 
 /// Maps a stored model id to its trusted manifest entry.
 pub type ModelLookup = fn(&str) -> Option<&'static ModelManifestEntry>;
@@ -109,32 +129,54 @@ pub fn resolve_with(
     lookup: ModelLookup,
     factory: RuntimeFactory<'_>,
 ) -> Result<SemanticCapability> {
+    match readiness(store, base, lookup)? {
+        Readiness::Ready(model) => resolve_ready(&model, factory),
+        Readiness::Unavailable(reason) => Ok(SemanticCapability::Unavailable(reason)),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct ReadyModel {
+    entry: &'static ModelManifestEntry,
+    dir: PathBuf,
+    derivation_key: String,
+}
+
+enum Readiness {
+    Ready(ReadyModel),
+    Unavailable(FallbackReason),
+}
+
+fn readiness(store: &dyn Store, base: &Path, lookup: ModelLookup) -> Result<Readiness> {
     if !manager::read_enabled(store)? {
-        return Ok(SemanticCapability::Unavailable(
-            FallbackReason::EmbeddingsDisabled,
-        ));
+        return Ok(Readiness::Unavailable(FallbackReason::EmbeddingsDisabled));
     }
     let Some(selected) = manager::read_selected_model(store)? else {
-        return Ok(SemanticCapability::Unavailable(
-            FallbackReason::NoModelSelected,
-        ));
+        return Ok(Readiness::Unavailable(FallbackReason::NoModelSelected));
     };
     let Some(entry) = lookup(&selected) else {
-        return Ok(SemanticCapability::Unavailable(
-            FallbackReason::UnknownModel { id: selected },
-        ));
+        return Ok(Readiness::Unavailable(FallbackReason::UnknownModel {
+            id: selected,
+        }));
     };
     let dir = manager::model_dir_in(base, entry.id);
     if let Some(reason) = artifacts_present(base, &dir, entry) {
-        return Ok(SemanticCapability::Unavailable(reason));
+        return Ok(Readiness::Unavailable(reason));
     }
     let derivation_key = manifest::derivation_from_manifest(entry).derivation_key();
     if store.embedding_index_status(&derivation_key)?.embedded == 0 {
-        return Ok(SemanticCapability::Unavailable(
-            FallbackReason::NoCompatibleIndex,
-        ));
+        return Ok(Readiness::Unavailable(FallbackReason::NoCompatibleIndex));
     }
-    if let Err(detail) = verify_artifacts(&dir, entry) {
+    Ok(Readiness::Ready(ReadyModel {
+        entry,
+        dir,
+        derivation_key,
+    }))
+}
+
+fn resolve_ready(model: &ReadyModel, factory: RuntimeFactory<'_>) -> Result<SemanticCapability> {
+    let entry = model.entry;
+    if let Err(detail) = verify_artifacts(&model.dir, entry) {
         return Ok(SemanticCapability::Unavailable(
             FallbackReason::ModelFilesInvalid {
                 model: entry.id.to_string(),
@@ -142,7 +184,7 @@ pub fn resolve_with(
             },
         ));
     }
-    let runtime = match factory(entry, &dir) {
+    let runtime = match factory(entry, &model.dir) {
         Ok(runtime) => runtime,
         Err(e) => {
             return Ok(SemanticCapability::Unavailable(
@@ -175,7 +217,7 @@ pub fn resolve_with(
         ));
     }
     Ok(SemanticCapability::Ready(SemanticSource {
-        derivation_key,
+        derivation_key: model.derivation_key.clone(),
         model_id: entry.id.to_string(),
         dimension: entry.dimension as usize,
         runtime,

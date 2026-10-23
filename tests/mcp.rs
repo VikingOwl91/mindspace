@@ -464,6 +464,91 @@ fn expected_unavailable_reason() -> &'static str {
     }
 }
 
+#[cfg(all(feature = "embeddings", target_os = "linux"))]
+#[test]
+#[ignore = "requires installed Nomic artifacts; reads models, uses only a disposable database"]
+fn repeated_real_model_requests_preserve_results_and_observe_enablement() {
+    use mindspace::core::{AssertionEmbedding, ManualMemoryDraft};
+    use mindspace::embeddings::{manager, manifest};
+
+    let (_dir, db) = database();
+    let store = SqliteStore::open(&db).unwrap();
+    let entry = manifest::default_model();
+    assert!(
+        manager::is_installed(entry),
+        "install the model explicitly before this opt-in test"
+    );
+    let note = store
+        .record_manual_write(ManualMemoryDraft {
+            subject: Some("retrieval fixture".into()),
+            content: "synthetic benchmark retrieval".into(),
+            spaces: vec![store.get_space("coding").unwrap().id],
+            supersedes: None,
+        })
+        .unwrap();
+    let mut vector = vec![0.0; entry.dimension as usize];
+    vector[0] = 1.0;
+    store
+        .save_embeddings(&[AssertionEmbedding {
+            assertion_id: note.assertion_id,
+            derivation_key: manifest::derivation_from_manifest(entry).derivation_key(),
+            model: entry.id.into(),
+            model_version: entry.version.into(),
+            dimension: entry.dimension,
+            embedding: vector,
+        }])
+        .unwrap();
+    store.set_meta("embedding.enabled", "true").unwrap();
+    store.set_meta("embedding.model", entry.id).unwrap();
+    let mut process = McpProcess::spawn(&db);
+    let first = success_content(&process.call(
+        100,
+        "memory_search",
+        json!({"query":"synthetic benchmark retrieval", "mode":"semantic"}),
+    ));
+    for (id, mode, effective) in [
+        (101, "semantic", "semantic"),
+        (102, "hybrid", "hybrid"),
+        (103, "auto", "hybrid"),
+    ] {
+        let result = success_content(&process.call(
+            id,
+            "memory_search",
+            json!({"query":"synthetic benchmark retrieval", "mode":mode}),
+        ));
+        assert_eq!(result["effective"], effective);
+        assert_eq!(
+            result["hits"][0]["hit"]["memory_id"],
+            first["hits"][0]["hit"]["memory_id"]
+        );
+        if mode == "semantic" {
+            assert_eq!(result, first);
+        }
+    }
+    store.set_meta("embedding.enabled", "false").unwrap();
+    let disabled = success_content(&process.call(
+        104,
+        "memory_search",
+        json!({"query":"synthetic benchmark retrieval", "mode":"auto"}),
+    ));
+    assert_eq!(disabled["fallback"]["kind"], "embeddings_disabled");
+    store.set_meta("embedding.enabled", "true").unwrap();
+    let restored = success_content(&process.call(
+        105,
+        "memory_search",
+        json!({"query":"synthetic benchmark retrieval", "mode":"semantic"}),
+    ));
+    assert_eq!(restored, first);
+    assert!(process.shutdown().success());
+    assert_eq!(
+        store
+            .embedding_index_status(&manifest::derivation_from_manifest(entry).derivation_key())
+            .unwrap()
+            .embedded,
+        1
+    );
+}
+
 #[test]
 fn real_binary_reports_protocol_errors_and_tool_errors_separately() {
     let (_dir, db) = database();

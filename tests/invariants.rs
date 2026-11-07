@@ -506,6 +506,7 @@ fn search_at_time_sees_the_past() {
             scope: IngestScope::File,
             observed_at: ts,
         },
+        spaces: vec![],
         files: vec![ObservedFile {
             location: "/tmp/facts.md".into(),
             content: fact.to_string(),

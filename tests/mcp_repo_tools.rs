@@ -177,6 +177,13 @@ fn outline_then_scoped_ingest_then_search() {
     assert_eq!(skipped["structuredContent"]["hits"].as_array().unwrap().len(), 0);
     let code = s.call("code_search", json!({"query": "alpha_symbol"}));
     assert_eq!(code["structuredContent"]["hits"].as_array().unwrap().len(), 1);
+    // The ingest attached the directory to space `p`; code_search can scope by it.
+    let scoped = s.call("code_search", json!({"query": "alpha_symbol", "spaces": ["p"]}));
+    let hits = scoped["structuredContent"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["spaces"], json!(["p"]));
+    let other = s.call("code_search", json!({"query": "alpha_symbol", "spaces": ["nope"]}));
+    assert_eq!(other["isError"], true, "unknown space is an error");
 
     // Unknown space and escaping selection are errors, not writes.
     let bad_space = s.call("repo_ingest", json!({"path": p, "spaces": ["nope"]}));

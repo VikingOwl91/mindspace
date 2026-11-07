@@ -43,10 +43,19 @@ const MIGRATIONS: &[(i64, &str)] = &[
         8,
         include_str!("../../migrations/0008_temporal_recording.sql"),
     ),
+    (
+        9,
+        include_str!("../../migrations/0009_scopes_and_views.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
+/// The migration that creates the M6 baseline and installs the write fence.
+/// Those steps run exactly once, when this migration is applied, and not for
+/// whichever migration happens to be latest. Later migrations add tables
+/// outside the fence's inventory.
+const M6_VERSION: i64 = 8;
 const FILE_PRODUCER_FAMILY: &str = "file:legacy";
 const GIT_PRODUCER_FAMILY: &str = "git:legacy";
 const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
@@ -733,7 +742,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 continue;
             }
             tx.execute_batch(sql).map_err(dberr)?;
-            if *version == CURRENT_SCHEMA_VERSION {
+            if *version == M6_VERSION {
                 apply_m6_baseline(&tx)?;
             }
             tx.execute(
@@ -741,7 +750,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 rusqlite::params![version, Ts::now().0],
             )
             .map_err(dberr)?;
-            if *version == CURRENT_SCHEMA_VERSION {
+            if *version == M6_VERSION {
                 install_m6_write_fence(&tx)?;
                 validate_fence_inventory(&tx)?;
             }
@@ -1990,9 +1999,8 @@ impl Store for SqliteStore {
                ELSE 6 END)"
         );
         let current = "(CASE WHEN i.repository_id IS NOT NULL THEN \
-               EXISTS (SELECT 1 FROM mind_meta m \
-                        WHERE m.key = 'git_views:' || i.repository_id \
-                          AND instr(char(10) || m.value || char(10), char(10) || c.commit_oid || char(10)) > 0) \
+               EXISTS (SELECT 1 FROM git_views v \
+                        WHERE v.repository_id = i.repository_id AND v.commit_oid = c.commit_oid) \
              ELSE \
                EXISTS (SELECT 1 FROM logical_sources ls \
                         WHERE ls.current_location = c.path AND ls.state = 'present' AND ls.kind = 'file' \
@@ -2025,7 +2033,26 @@ impl Store for SqliteStore {
             let n = push(&mut params, &repo);
             wheres.push(format!(
                 "(instr(lower(coalesce(r.current_path,'')), ?{n}) > 0 \
-                  OR substr(lower(coalesce(i.repository_id,'')),1,length(?{n})) = ?{n})"
+                  OR substr(lower(coalesce(i.repository_id,'')),1,length(?{n})) = ?{n} \
+                  OR EXISTS (SELECT 1 FROM repository_remotes rr \
+                              WHERE rr.repository_id = i.repository_id AND instr(rr.slug_key, ?{n}) > 0))"
+            ));
+        }
+        if let Some(ids) = &query.space_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let marks: Vec<String> = ids
+                .iter()
+                .map(|id| format!("?{}", push(&mut params, &id.to_string())))
+                .collect();
+            wheres.push(format!(
+                "EXISTS (SELECT 1 FROM scope_spaces ss JOIN scopes sc ON sc.id = ss.scope_id \
+                          WHERE ss.space_id IN ({}) \
+                            AND ((sc.repository_id IS NOT NULL AND sc.repository_id = i.repository_id) \
+                              OR (sc.root IS NOT NULL AND i.repository_id IS NULL \
+                                  AND (c.path = sc.root OR substr(c.path,1,length(sc.root)+1) = sc.root || '/'))))",
+                marks.join(",")
             ));
         }
         if let Some(prefix) = query.path_prefix.as_deref() {
@@ -2084,6 +2111,8 @@ impl Store for SqliteStore {
                     end_line: r.get(10)?,
                     repository_id: repo.and_then(|s| Uuid::parse_str(&s).ok()),
                     repository_path: r.get(12)?,
+                    repository_slug: None,
+                    spaces: Vec::new(),
                     commit_oid: r.get(13)?,
                     blob_oid: r.get(14)?,
                     content_hash: r.get(15)?,
@@ -2092,7 +2121,68 @@ impl Store for SqliteStore {
                 })
             })
             .map_err(dberr)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(dberr)
+        let mut hits = rows.collect::<std::result::Result<Vec<_>, _>>().map_err(dberr)?;
+
+        // Where each definition lives: attached spaces and the repository's
+        // primary slug, looked up once per repository or file.
+        let mut scope_cache: HashMap<String, (Vec<String>, Option<String>)> = HashMap::new();
+        for h in &mut hits {
+            let key = match h.repository_id {
+                Some(id) => format!("r:{id}"),
+                None => format!("f:{}", h.path),
+            };
+            if !scope_cache.contains_key(&key) {
+                let (sql, arg) = match h.repository_id {
+                    Some(id) => (
+                        "SELECT DISTINCT s.name FROM scope_spaces ss \
+                         JOIN scopes sc ON sc.id = ss.scope_id JOIN spaces s ON s.id = ss.space_id \
+                         WHERE sc.repository_id = ?1 ORDER BY s.name",
+                        id.to_string(),
+                    ),
+                    None => (
+                        "SELECT DISTINCT s.name FROM scope_spaces ss \
+                         JOIN scopes sc ON sc.id = ss.scope_id JOIN spaces s ON s.id = ss.space_id \
+                         WHERE sc.root IS NOT NULL \
+                           AND (?1 = sc.root OR substr(?1,1,length(sc.root)+1) = sc.root || '/') \
+                         ORDER BY s.name",
+                        h.path.clone(),
+                    ),
+                };
+                let mut stmt = conn.prepare(sql).map_err(dberr)?;
+                let names = stmt
+                    .query_map(rusqlite::params![arg], |r| r.get::<_, String>(0))
+                    .map_err(dberr)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(dberr)?;
+                let slug = match h.repository_id {
+                    Some(id) => {
+                        let mut stmt = conn
+                            .prepare(
+                                "SELECT name, slug_key, slug FROM repository_remotes \
+                                 WHERE repository_id = ?1 AND is_current = 1 ORDER BY name",
+                            )
+                            .map_err(dberr)?;
+                        let remotes = stmt
+                            .query_map(rusqlite::params![id.to_string()], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
+                            })
+                            .map_err(dberr)?
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .map_err(dberr)?;
+                        match crate::core::choose_primary_slug(&remotes) {
+                            crate::core::PrimarySlug::Chosen { short, .. } => Some(short),
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                };
+                scope_cache.insert(key.clone(), (names, slug));
+            }
+            let (names, slug) = &scope_cache[&key];
+            h.spaces = names.clone();
+            h.repository_slug = slug.clone();
+        }
+        Ok(hits)
     }
 
     fn has_code_derivation(
@@ -2998,7 +3088,11 @@ fn record_observation_tx(
     conn: &Connection,
     observation: IngestObservation,
 ) -> Result<ObservationReport> {
-    let IngestObservation { session, mut files } = observation;
+    let IngestObservation {
+        session,
+        mut files,
+        spaces,
+    } = observation;
     let at = session.observed_at;
     let full = session.scope == IngestScope::Directory;
     let root = session.root.clone();
@@ -3014,6 +3108,7 @@ fn record_observation_tx(
         ],
     )
     .map_err(dberr)?;
+    upsert_scope(conn, None, Some(&session.root), &spaces, at)?;
 
     // Deterministic processing order.
     files.sort_by(|a, b| a.location.cmp(&b.location));
@@ -4105,6 +4200,61 @@ fn create_memory(
     Ok(id)
 }
 
+/// Finds or creates the scope of a repository or an ingest root and attaches
+/// it to `spaces`. Attaching is add-only and idempotent.
+fn upsert_scope(
+    conn: &Connection,
+    repository_id: Option<Uuid>,
+    root: Option<&str>,
+    spaces: &[Uuid],
+    at: Ts,
+) -> Result<()> {
+    let existing: Option<String> = match (repository_id, root) {
+        (Some(repo), _) => conn
+            .query_row(
+                "SELECT id FROM scopes WHERE repository_id = ?1",
+                rusqlite::params![repo.to_string()],
+                |r| r.get(0),
+            )
+            .optional(),
+        (None, Some(root)) => conn
+            .query_row(
+                "SELECT id FROM scopes WHERE root = ?1",
+                rusqlite::params![root],
+                |r| r.get(0),
+            )
+            .optional(),
+        (None, None) => return Ok(()),
+    }
+    .map_err(dberr)?;
+    let scope_id = match existing {
+        Some(id) => id,
+        None => {
+            let id = Uuid::now_v7().to_string();
+            conn.execute(
+                "INSERT INTO scopes (id, kind, repository_id, root, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    id,
+                    if repository_id.is_some() { "repository" } else { "directory" },
+                    repository_id.map(|r| r.to_string()),
+                    if repository_id.is_some() { None } else { root },
+                    at.0
+                ],
+            )
+            .map_err(dberr)?;
+            id
+        }
+    };
+    for space in spaces {
+        conn.execute(
+            "INSERT OR IGNORE INTO scope_spaces (scope_id, space_id, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![scope_id, space.to_string(), at.0],
+        )
+        .map_err(dberr)?;
+    }
+    Ok(())
+}
+
 fn retire_conn(conn: &Connection, id: Uuid, at: Ts, reason: &str) -> Result<()> {
     conn.execute(
         "UPDATE memories SET state = 'retired', retired_at = ?1, retire_reason = ?2 \
@@ -4342,6 +4492,33 @@ fn record_git_observation_tx(
         ],
     )
     .map_err(dberr)?;
+    upsert_scope(conn, Some(observation.repository_id), None, &observation.spaces, at)?;
+    // Remotes as observed: the latest observation is current, earlier rows
+    // keep their first/last observation times.
+    conn.execute(
+        "UPDATE repository_remotes SET is_current = 0 WHERE repository_id = ?1",
+        rusqlite::params![observation.repository_id.to_string()],
+    )
+    .map_err(dberr)?;
+    for r in &observation.remotes {
+        conn.execute(
+            "INSERT INTO repository_remotes \
+                 (repository_id, name, url, slug_key, slug, first_observed_at, last_observed_at, is_current) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1) \
+             ON CONFLICT(repository_id, name, url) DO UPDATE SET \
+                 slug_key = excluded.slug_key, slug = excluded.slug, \
+                 last_observed_at = excluded.last_observed_at, is_current = 1",
+            rusqlite::params![
+                observation.repository_id.to_string(),
+                r.name,
+                r.url,
+                r.slug_key,
+                r.slug,
+                at.0
+            ],
+        )
+        .map_err(dberr)?;
+    }
 
     // 3. Objects: immutable, keyed (repository, oid). Existing ones are
     //    reused; only new ones are written. Objects are never deleted, so
@@ -4663,14 +4840,17 @@ fn record_git_observation_tx(
     // 6b. Current code views of this repository, replaced wholesale. Syntax
     //     facts are immutable, so currency is recorded here, not on them.
     conn.execute(
-        "INSERT INTO mind_meta (key, value) VALUES (?1, ?2) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![
-            format!("git_views:{}", observation.repository_id),
-            observation.view_commits.join("\n")
-        ],
+        "DELETE FROM git_views WHERE repository_id = ?1",
+        rusqlite::params![observation.repository_id.to_string()],
     )
     .map_err(dberr)?;
+    for commit in &observation.view_commits {
+        conn.execute(
+            "INSERT OR IGNORE INTO git_views (repository_id, commit_oid, observed_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![observation.repository_id.to_string(), commit, at.0],
+        )
+        .map_err(dberr)?;
+    }
 
     // 7. Releases follow their tag refs, not the views: a deleted or moved
     //    tag retires its release memory.

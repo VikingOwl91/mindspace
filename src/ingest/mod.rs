@@ -139,6 +139,7 @@ pub fn ingest_path<S: AsRef<str>>(
             observed_at: Ts::now(),
         },
         files,
+        spaces: space_ids.clone(),
     };
     let report = store.record_observation(observation)?;
     if !code_inputs.is_empty() {
@@ -566,6 +567,20 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
         ref_events,
         current_tags,
         view_commits: tip_commits.iter().cloned().collect(),
+        spaces: space_ids.clone(),
+        remotes: reader
+            .remotes()?
+            .into_iter()
+            .map(|(name, raw)| {
+                let parsed = remote::parse(&raw);
+                crate::core::GitRemoteDraft {
+                    name,
+                    url: parsed.url,
+                    slug_key: parsed.slug.as_ref().map(|s| s.key()),
+                    slug: parsed.slug.as_ref().map(|s| s.short()),
+                }
+            })
+            .collect(),
         current_commits: (scope != GitScope::History)
             .then(|| tip_commits.iter().cloned().collect()),
     };

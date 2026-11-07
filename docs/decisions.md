@@ -519,6 +519,8 @@ optional and explicitly invoked.
 
 ## ADR-025: Code retrieval is a separate symbol search, not memories (2026-11-07)
 
+*Superseded in part by ADR-028: the `mind_meta` view storage and the "no spaces" limit.*
+
 **Decision.** The code-structure layer (ADR-016) becomes searchable through
 its own surface: `mind symbols <query>` and the MCP tool `code_search`. It is
 the "later retrieval slice" ADR-016 anticipated. Code definitions stay
@@ -641,3 +643,42 @@ credentials) is wanted instead.
 **Consequences.** Nothing is persisted yet; slugs are computed per call. Storing
 remote observations and attaching repositories to spaces (a Scope object,
 separate from Space) follows with the next migration.
+
+## ADR-028: Scopes attach code to spaces; views and remotes become tables (2026-11-07)
+
+**Decision.** Migration 0009 introduces a minimal **Scope**: where ingested
+material came from, kept separate from **Space**, the knowledge domain (README,
+memory-model section 10). A scope is a git repository (keyed by its Mindspace
+identity) or an ingest root (a directory, or a single file). `scope_spaces`
+attaches scopes to spaces; every ingest adds the requested spaces, never removes
+any, like `memory_spaces`. Spaces stay free-form (`project:owlenshell`); a
+repository's `owner/name` is not encoded in a space name.
+
+Code definitions reach spaces only through their scope: a git definition through
+its repository, a file definition through the ingest root that contains its
+path. `mind symbols --space X` and MCP `code_search` `spaces` follow directed
+space links exactly like memory search. Hits report their `spaces` and the
+repository's primary `Owner/Name` slug.
+
+`repository_remotes` stores remotes as observed: credential-free URL, slug key
+and display slug, first and last observation, and `is_current` for the latest
+observation; older rows keep their history. `--repo` matches any observed
+slug, a path substring, or an id prefix. `git_views` replaces the interim
+`mind_meta` entries as the record of a repository's current views (ADR-025);
+nothing is backfilled, so re-ingesting attaches scopes and views to old data.
+
+**M6.** The baseline and write fence now run when the M6 migration (version 8)
+is applied, via `M6_VERSION`, not when the latest migration is. The new tables
+are current-state associations and observations, outside the fence inventory
+and history; the CodeStructure temporal dimension stays unsupported. An older
+binary refuses the database by version, so the fence is not needed to protect
+them.
+
+**Limits.** A single-file root and a directory root that contains it are
+separate scopes; a definition matches any scope whose root contains its path.
+Scopes are not removed when a repository moves or an ingest root disappears.
+Upstream and fork hints remain undecided (ADR-027).
+
+**Revisit when.** Scope-level operations are needed (detach a space, forget a
+repository), memories should derive their spaces from scopes, or scope history
+must be queryable.

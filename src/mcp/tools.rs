@@ -96,7 +96,8 @@ pub fn definitions() -> Vec<Value> {
                         "type": "array",
                         "items": { "type": "string", "enum": ["module","struct","enum","trait","type_alias","function","method","constant","static","field","import"] }
                     },
-                    "repository": { "type": "string", "minLength": 1, "description": "Repository path substring or id prefix." },
+                    "spaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Only code attached to these spaces or spaces they import." },
+                    "repository": { "type": "string", "minLength": 1, "description": "owner/name slug, repository path substring, or id prefix." },
                     "path": { "type": "string", "minLength": 1, "description": "Path prefix, repository-relative for git sources." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "all_versions": { "type": "boolean", "default": false }
@@ -342,6 +343,10 @@ fn call_tool(
                     kinds: retrieval::parse_code_kinds(&kinds)?,
                     repository: optional_string(obj, "repository")?.map(str::to_string),
                     path_prefix: optional_string(obj, "path")?.map(str::to_string),
+                    space_ids: match obj.get("spaces") {
+                        Some(_) => Some(resolve_spaces(store, string_array(obj, "spaces")?)?),
+                        None => None,
+                    },
                     limit: optional_u32(obj, "limit")?.unwrap_or(20),
                     all_versions: optional_bool(obj, "all_versions")?.unwrap_or(false),
                 },
@@ -419,7 +424,7 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             &["query"],
         ),
         "code_search" => (
-            &["query", "kinds", "repository", "path", "limit", "all_versions"],
+            &["query", "kinds", "spaces", "repository", "path", "limit", "all_versions"],
             &["query"],
         ),
         "repo_outline" => (&["path", "depth"], &["path"]),

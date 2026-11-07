@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::core::{Error, GitObjectKind, Result};
+use crate::core::{choose_primary_slug, Error, GitObjectKind, PrimarySlug, Result};
 
 use super::git::{self, GitReader};
 use super::remote;
@@ -87,29 +87,20 @@ pub fn repo_info(path: &Path) -> Result<RepoInfo> {
 
     // Primary slug: the `origin` remote when it has one; otherwise the single
     // slug all remotes agree on. Anything else stays ambiguous and unnamed.
-    let mut slug = None;
-    let mut slug_key = None;
-    let mut slug_source = None;
-    let mut slug_candidates = Vec::new();
-    if let Some(o) = remotes.iter().find(|r| r.name == "origin" && r.slug.is_some()) {
-        slug = o.slug.clone();
-        slug_key = o.slug_key.clone();
-        slug_source = Some("remote 'origin'".to_string());
-    } else {
-        let mut keys: Vec<&RemoteInfo> = remotes.iter().filter(|r| r.slug_key.is_some()).collect();
-        keys.sort_by(|a, b| a.slug_key.cmp(&b.slug_key));
-        keys.dedup_by(|a, b| a.slug_key == b.slug_key);
-        match keys.as_slice() {
-            [] => {}
-            [only] => {
-                slug = only.slug.clone();
-                slug_key = only.slug_key.clone();
-                slug_source = Some(format!("remote '{}'", only.name));
-            }
-            many => {
-                slug_candidates = many.iter().filter_map(|r| r.slug_key.clone()).collect();
-            }
+    let triples: Vec<(String, Option<String>, Option<String>)> = remotes
+        .iter()
+        .map(|r| (r.name.clone(), r.slug_key.clone(), r.slug.clone()))
+        .collect();
+    let (mut slug, mut slug_key, mut slug_source, mut slug_candidates) =
+        (None, None, None, Vec::new());
+    match choose_primary_slug(&triples) {
+        PrimarySlug::Chosen { key, short, source } => {
+            slug = Some(short);
+            slug_key = Some(key);
+            slug_source = Some(source);
         }
+        PrimarySlug::Ambiguous(keys) => slug_candidates = keys,
+        PrimarySlug::None => {}
     }
 
     let head = reader

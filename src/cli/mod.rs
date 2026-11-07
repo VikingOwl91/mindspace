@@ -95,7 +95,11 @@ pub enum Command {
         /// trait, type, const, static, mod, field, use
         #[arg(long = "kind", value_name = "KIND")]
         kinds: Vec<String>,
-        /// Restrict to a repository (path substring or id prefix)
+        /// Restrict to code attached to this space or any space it imports
+        /// (repeatable)
+        #[arg(long = "space", value_name = "SPACE")]
+        spaces: Vec<String>,
+        /// Restrict to a repository: owner/name slug, path substring, or id prefix
         #[arg(long, value_name = "REPO")]
         repo: Option<String>,
         /// Restrict to a path prefix (repository-relative for git sources)
@@ -400,6 +404,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
         Command::Symbols {
             query,
             kinds,
+            spaces,
             repo,
             path,
             limit,
@@ -407,6 +412,16 @@ pub fn execute(cli: &Cli) -> Result<()> {
             json,
         } => {
             let store = open(cli)?;
+            let space_ids = if spaces.is_empty() {
+                None
+            } else {
+                Some(
+                    spaces
+                        .iter()
+                        .map(|name| store.get_space(name).map(|s| s.id))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            };
             let hits = retrieval::search_code(
                 &store,
                 crate::core::CodeSearchQuery {
@@ -414,6 +429,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
                     kinds: retrieval::parse_code_kinds(kinds)?,
                     repository: repo.clone(),
                     path_prefix: path.clone(),
+                    space_ids,
                     limit: *limit,
                     all_versions: *all_versions,
                 },

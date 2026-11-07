@@ -127,11 +127,18 @@ pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
         if let Some(sig) = &h.signature {
             println!("   {}", first_line(sig).trim());
         }
-        let at = match (&h.commit_oid, &h.repository_path) {
+        let place = h
+            .repository_slug
+            .clone()
+            .or_else(|| h.repository_path.clone());
+        let at = match (&h.commit_oid, place) {
             (Some(c), Some(r)) => format!("  @ {} in {r}", &c[..c.len().min(12)]),
             _ => String::new(),
         };
         println!("   {}:{}-{}{at}", h.path, h.start_line, h.end_line);
+        if !h.spaces.is_empty() {
+            println!("   spaces: {}", h.spaces.join(", "));
+        }
     }
 }
 

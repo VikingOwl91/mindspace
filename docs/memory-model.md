@@ -533,8 +533,9 @@ Three invalidation words must never collapse into one mechanism:
 Kept separate, as the README requires:
 
 - **Space** (implemented): which knowledge domain a memory is useful in.
-- **Scope** (deferred): where information originated or applies (repository,
-  session, document, project).
+- **Scope** (minimal, for code since ADR-028): where information originated:
+  a git repository or an ingest root, attached to spaces through `scope_spaces`.
+  A fuller Scope (sessions, documents, projects) remains deferred.
 
 v0 does not need a first-class Scope object because provenance already
 records origin concretely: source kind, canonical location, title, and

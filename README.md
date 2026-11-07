@@ -237,7 +237,7 @@ mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-supers
 mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--mode lexical|semantic|hybrid|auto] [--json]
 mind inspect <memory> [--json]
 mind structure <path-or-blob> [--json]
-mind symbols <name or words> [--kind fn|struct|...] [--repo R] [--path P] [--all-versions] [--json]
+mind symbols <name or words> [--space S] [--kind fn|struct|...] [--repo owner/name] [--path P] [--all-versions] [--json]
 mind trace <memory> [--json]
 mind history <subject words...> [--json]
 mind conflicts [--json]
@@ -276,7 +276,7 @@ The server exposes fourteen tools:
 | `memory_retire` | Retire an active memory without deleting its history. |
 | `memory_get` | Read a memory and its assertion, evidence, source, spaces, and lifecycle. |
 | `memory_search` | Search with SQLite FTS5, optional directed space traversal, and transaction-time filtering. |
-| `code_search` | Find definitions (functions, structs, ...) in ingested Rust code by name, signature, or path. Returns locations, not memories; current definitions only unless `all_versions`. |
+| `code_search` | Find definitions (functions, structs, ...) in ingested Rust code by name, signature, or path, optionally scoped to `spaces` or a `repository` (owner/name slug). Returns locations, not memories; current definitions only unless `all_versions`. |
 | `repo_outline` | Outline a directory or git repository (HEAD) without ingesting: files, bytes, kinds per directory, plus repository facts (slug, remotes, worktrees) for git. Allowlisted paths only. |
 | `repo_ingest` | Ingest a directory or repository, optionally only chosen `paths`, into existing spaces. Allowlisted paths only; unscoped ingest of very large trees is refused. |
 | `memory_history` | List episodes for a normalized subject. |

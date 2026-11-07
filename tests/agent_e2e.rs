@@ -249,8 +249,10 @@ fn agent_flow(
     let mut opener = Opener { repo: &repo, cache: HashMap::new() };
     let mut hits_opened = 0;
     for (symbol, files) in required {
-        let hits = hits_of(&s.ok("code_search", json!({"query": symbol, "kinds": ["function","method"], "limit": 100})));
+        // Scoped to the space the agent ingested into, as a real agent would.
+        let hits = hits_of(&s.ok("code_search", json!({"query": symbol, "spaces": ["project"], "kinds": ["function","method"], "limit": 100})));
         for file in files {
+            assert!(hits.iter().all(|h| h["spaces"] == json!(["project"])));
             let h = hits
                 .iter()
                 .find(|h| h["path"] == *file && h["name"] == *symbol)

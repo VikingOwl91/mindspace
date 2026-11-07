@@ -932,6 +932,18 @@ pub fn search_code(
         return Ok(Vec::new());
     }
     query.limit = query.limit.min(100);
+    // Space filters follow directed links, exactly like memory search.
+    if let Some(roots) = query.space_ids.clone().filter(|r| !r.is_empty()) {
+        let probe = SearchQuery {
+            text: String::new(),
+            space_ids: Some(roots),
+            limit: 1,
+            at: None,
+            include_superseded: false,
+            include_retired: false,
+        };
+        query.space_ids = expand_scope(store, probe)?.0.space_ids;
+    }
     store.search_code(&query)
 }
 

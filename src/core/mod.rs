@@ -1053,6 +1053,9 @@ pub struct CodeSearchQuery {
     pub repository: Option<String>,
     /// Path prefix (component-wise); repository-relative for git sources.
     pub path_prefix: Option<String>,
+    /// Restrict to scopes attached to these spaces (already expanded along
+    /// directed links). `Some(empty)` matches nothing; `None` is unfiltered.
+    pub space_ids: Option<Vec<Uuid>>,
     pub limit: u32,
     /// Include definitions that are no longer part of a current view.
     pub all_versions: bool,
@@ -1074,6 +1077,10 @@ pub struct CodeHit {
     pub end_line: u32,
     pub repository_id: Option<Uuid>,
     pub repository_path: Option<String>,
+    /// `Owner/Name` of the repository's primary slug, when it has one.
+    pub repository_slug: Option<String>,
+    /// Spaces the definition's scope is attached to.
+    pub spaces: Vec<String>,
     pub commit_oid: Option<String>,
     pub blob_oid: Option<String>,
     pub content_hash: String,
@@ -1227,6 +1234,8 @@ pub struct CodeObservationReport {
 pub struct IngestObservation {
     pub session: SessionDraft,
     pub files: Vec<ObservedFile>,
+    /// Spaces the session root's scope is attached to (add-only).
+    pub spaces: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1495,6 +1504,58 @@ pub struct GitObservation {
     /// Every commit this observation derived at. Stored as the repository's
     /// current code views, so symbol search can tell current from stale.
     pub view_commits: Vec<String>,
+    /// Spaces the repository's scope is attached to (add-only).
+    pub spaces: Vec<Uuid>,
+    /// Configured remotes as observed, credential-free.
+    pub remotes: Vec<GitRemoteDraft>,
+}
+
+/// One configured remote of a repository. `url` never contains credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRemoteDraft {
+    pub name: String,
+    pub url: String,
+    pub slug_key: Option<String>,
+    pub slug: Option<String>,
+}
+
+/// The primary slug of a repository, chosen from its current remotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimarySlug {
+    Chosen {
+        key: String,
+        short: String,
+        source: String,
+    },
+    /// Remotes disagree and there is no `origin`; the keys are listed.
+    Ambiguous(Vec<String>),
+    None,
+}
+
+/// `(remote name, slug key, display slug)` for each remote. The `origin`
+/// remote's slug wins; otherwise the single slug all remotes agree on;
+/// otherwise the choice stays open. Makes no fork or mirror claim.
+pub fn choose_primary_slug(remotes: &[(String, Option<String>, Option<String>)]) -> PrimarySlug {
+    if let Some((_, Some(key), Some(short))) = remotes.iter().find(|(n, k, s)| n == "origin" && k.is_some() && s.is_some()) {
+        return PrimarySlug::Chosen {
+            key: key.clone(),
+            short: short.clone(),
+            source: "remote 'origin'".to_string(),
+        };
+    }
+    let mut keyed: Vec<&(String, Option<String>, Option<String>)> =
+        remotes.iter().filter(|(_, k, s)| k.is_some() && s.is_some()).collect();
+    keyed.sort_by(|a, b| a.1.cmp(&b.1));
+    keyed.dedup_by(|a, b| a.1 == b.1);
+    match keyed.as_slice() {
+        [] => PrimarySlug::None,
+        [(name, Some(key), Some(short))] => PrimarySlug::Chosen {
+            key: key.clone(),
+            short: short.clone(),
+            source: format!("remote '{name}'"),
+        },
+        many => PrimarySlug::Ambiguous(many.iter().filter_map(|(_, k, _)| k.clone()).collect()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

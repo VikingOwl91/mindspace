@@ -55,14 +55,27 @@ impl Mind {
 
 fn names(hits: &[serde_json::Value]) -> Vec<String> {
     hits.iter()
-        .map(|h| h["qualified_name"].as_str().or(h["name"].as_str()).unwrap_or("").to_string())
+        .map(|h| {
+            h["qualified_name"]
+                .as_str()
+                .or(h["name"].as_str())
+                .unwrap_or("")
+                .to_string()
+        })
         .collect()
 }
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .current_dir(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .output()
         .unwrap();
@@ -85,7 +98,10 @@ fn finds_definitions_ranked_with_locations() {
     m.ingest(dir.path(), &[]);
 
     let hits = m.symbols(&["record_manual_write"]);
-    assert_eq!(hits[0]["name"], "record_manual_write", "exact name ranks first");
+    assert_eq!(
+        hits[0]["name"], "record_manual_write",
+        "exact name ranks first"
+    );
     assert_eq!(hits[0]["kind"], "method");
     assert_eq!(hits[0]["match_rank"], 0);
     assert_eq!(hits[0]["start_line"], 4);
@@ -96,7 +112,14 @@ fn finds_definitions_ranked_with_locations() {
     // Every term must match; kind and path filters narrow.
     assert_eq!(m.symbols(&["manual", "write", "--kind", "fn"]).len(), 1);
     assert_eq!(m.symbols(&["record", "--kind", "method"]).len(), 1);
-    let only_other = m.symbols(&["record", "--path", &format!("{}/src/other.rs", dir.path().canonicalize().unwrap().display())]);
+    let only_other = m.symbols(&[
+        "record",
+        "--path",
+        &format!(
+            "{}/src/other.rs",
+            dir.path().canonicalize().unwrap().display()
+        ),
+    ]);
     assert_eq!(names(&only_other), vec!["record_manual_write_all"]);
     assert!(m.symbols(&["no_such_symbol"]).is_empty());
 
@@ -115,7 +138,10 @@ fn file_edits_make_old_definitions_not_current() {
 
     std::fs::write(&file, "pub fn new_name() {}\n").unwrap();
     m.ingest(dir.path(), &[]);
-    assert!(m.symbols(&["old_name"]).is_empty(), "stale hidden by default");
+    assert!(
+        m.symbols(&["old_name"]).is_empty(),
+        "stale hidden by default"
+    );
     assert_eq!(m.symbols(&["new_name"]).len(), 1);
 
     let all = m.symbols(&["old_name", "--all-versions"]);
@@ -129,7 +155,11 @@ fn git_head_moves_make_old_definitions_not_current() {
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(repo.path().join("crates/a")).unwrap();
-    std::fs::write(repo.path().join("crates/a/lib.rs"), "pub fn first_impl() {}\n").unwrap();
+    std::fs::write(
+        repo.path().join("crates/a/lib.rs"),
+        "pub fn first_impl() {}\n",
+    )
+    .unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-q", "-m", "one"]);
     m.ingest(repo.path(), &[]);
@@ -140,7 +170,11 @@ fn git_head_moves_make_old_definitions_not_current() {
     assert!(hits[0]["commit_oid"].as_str().unwrap().len() >= 40);
     assert!(hits[0]["repository_path"].is_string());
 
-    std::fs::write(repo.path().join("crates/a/lib.rs"), "pub fn second_impl() {}\n").unwrap();
+    std::fs::write(
+        repo.path().join("crates/a/lib.rs"),
+        "pub fn second_impl() {}\n",
+    )
+    .unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-q", "-m", "two"]);
     m.ingest(repo.path(), &[]);
@@ -153,9 +187,16 @@ fn git_head_moves_make_old_definitions_not_current() {
     // Repository and path filters.
     assert_eq!(m.symbols(&["second_impl", "--path", "crates/a"]).len(), 1);
     assert!(m.symbols(&["second_impl", "--path", "crates/b"]).is_empty());
-    let dir_name = repo.path().file_name().unwrap().to_string_lossy().to_string();
+    let dir_name = repo
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     assert_eq!(m.symbols(&["second_impl", "--repo", &dir_name]).len(), 1);
-    assert!(m.symbols(&["second_impl", "--repo", "definitely-not-a-repo"]).is_empty());
+    assert!(m
+        .symbols(&["second_impl", "--repo", "definitely-not-a-repo"])
+        .is_empty());
 }
 
 #[test]
@@ -169,7 +210,10 @@ fn linked_worktrees_are_current_for_code_too() {
     git(repo.path(), &["branch", "feature"]);
     let parent = tempfile::tempdir().unwrap();
     let wt = parent.path().join("wt");
-    git(repo.path(), &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"]);
+    git(
+        repo.path(),
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"],
+    );
     std::fs::write(wt.join("feat.rs"), "pub fn on_feature() {}\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-q", "-m", "feat"]);
@@ -215,15 +259,29 @@ fn mcp_code_search_tool_returns_hits_and_rejects_bad_input() {
     let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
         "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}});
     rpc(&mut stdin, &mut out, init);
-    writeln!(stdin, "{}", serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
     let mut call = |id: u64, args: serde_json::Value| {
-        rpc(&mut stdin, &mut out, serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
-            "params":{"name":"code_search","arguments":args}}))
+        rpc(
+            &mut stdin,
+            &mut out,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"code_search","arguments":args}}),
+        )
     };
 
-    let ok = call(2, serde_json::json!({"query":"record_manual_write","kinds":["method"]}));
+    let ok = call(
+        2,
+        serde_json::json!({"query":"record_manual_write","kinds":["method"]}),
+    );
     assert_eq!(ok["result"]["isError"], false);
-    let hits = ok["result"]["structuredContent"]["hits"].as_array().unwrap();
+    let hits = ok["result"]["structuredContent"]["hits"]
+        .as_array()
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["name"], "record_manual_write");
 

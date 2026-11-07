@@ -113,7 +113,11 @@ fn slug_from(host: &str, path: &str) -> Option<RepoSlug> {
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let segments: Vec<&str> = path.split('/').collect();
-    if segments.len() < 2 || segments.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
         return None;
     }
     let (name, owner) = segments.split_last()?;
@@ -161,8 +165,13 @@ mod tests {
 
     #[test]
     fn nested_groups_keep_their_path() {
-        let s = parse("https://gitlab.com/group/sub/team/proj.git").slug.unwrap();
-        assert_eq!((s.owner.as_str(), s.name.as_str()), ("group/sub/team", "proj"));
+        let s = parse("https://gitlab.com/group/sub/team/proj.git")
+            .slug
+            .unwrap();
+        assert_eq!(
+            (s.owner.as_str(), s.name.as_str()),
+            ("group/sub/team", "proj")
+        );
         assert_eq!(s.key(), "gitlab.com/group/sub/team/proj");
     }
 
@@ -208,6 +217,9 @@ mod tests {
             "git.example.com/o/r"
         );
         assert_eq!(slug("ssh://git@[::1]:2222/o/r.git").unwrap().0, "::1/o/r");
-        assert_eq!(parse("https://git.example.com:8443/o/r.git").url, "https://git.example.com:8443/o/r.git");
+        assert_eq!(
+            parse("https://git.example.com:8443/o/r.git").url,
+            "https://git.example.com:8443/o/r.git"
+        );
     }
 }

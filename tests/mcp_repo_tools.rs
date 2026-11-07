@@ -31,7 +31,9 @@ fn db() -> (tempfile::TempDir, PathBuf) {
 impl Server {
     fn start(db: &Path, roots: &[&Path]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mind"));
-        cmd.env("MINDSPACE_DB", db).env_remove("MINDSPACE_MCP_ALLOW_ROOTS").arg("mcp");
+        cmd.env("MINDSPACE_DB", db)
+            .env_remove("MINDSPACE_MCP_ALLOW_ROOTS")
+            .arg("mcp");
         for r in roots {
             cmd.arg("--allow-root").arg(r);
         }
@@ -43,16 +45,34 @@ impl Server {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let out = BufReader::new(child.stdout.take().unwrap());
-        let mut s = Self { child, stdin, out, next_id: 1 };
-        s.rpc("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},
-            "clientInfo":{"name":"t","version":"0"}}));
-        writeln!(s.stdin, "{}", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap();
+        let mut s = Self {
+            child,
+            stdin,
+            out,
+            next_id: 1,
+        };
+        s.rpc(
+            "initialize",
+            json!({"protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"t","version":"0"}}),
+        );
+        writeln!(
+            s.stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
         s
     }
 
     fn rpc(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
-        writeln!(self.stdin, "{}", json!({"jsonrpc":"2.0","id":self.next_id,"method":method,"params":params})).unwrap();
+        writeln!(
+            self.stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":self.next_id,"method":method,"params":params})
+        )
+        .unwrap();
         let mut line = String::new();
         self.out.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
@@ -71,7 +91,10 @@ impl Drop for Server {
 }
 
 fn text(result: &Value) -> String {
-    result["content"][0]["text"].as_str().unwrap_or("").to_string()
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn write(root: &Path, rel: &str, content: &str) {
@@ -124,19 +147,30 @@ fn allowlist_cannot_be_escaped() {
     assert!(a.contains("outside the allowed roots"));
     // Relative path, `..` traversal out of the root, symlink out of the root.
     assert!(denied(&mut s, "docs".into()).contains("absolute"));
-    let traversal = format!("{}/../{}", root.display(), outside.path().file_name().unwrap().to_string_lossy());
+    let traversal = format!(
+        "{}/../{}",
+        root.display(),
+        outside.path().file_name().unwrap().to_string_lossy()
+    );
     assert!(denied(&mut s, traversal).contains("outside the allowed roots"));
     std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
-    assert!(denied(&mut s, root.join("escape").display().to_string()).contains("outside the allowed roots"));
+    assert!(denied(&mut s, root.join("escape").display().to_string())
+        .contains("outside the allowed roots"));
     // `.git` internals and plain files.
     std::fs::create_dir_all(root.join("sub/.git")).unwrap();
     assert!(denied(&mut s, root.join("sub/.git").display().to_string()).contains(".git"));
     assert!(denied(&mut s, root.join("src/lib.rs").display().to_string()).contains("directory"));
     // Ingest obeys the same gate and writes nothing when denied.
-    let r = s.call("repo_ingest", json!({"path": outside.path().display().to_string(), "spaces": ["p"]}));
+    let r = s.call(
+        "repo_ingest",
+        json!({"path": outside.path().display().to_string(), "spaces": ["p"]}),
+    );
     assert_eq!(r["isError"], true);
     let hits = s.call("memory_search", json!({"query": "notesmarker"}));
-    assert_eq!(hits["structuredContent"]["hits"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        hits["structuredContent"]["hits"].as_array().unwrap().len(),
+        0
+    );
 }
 
 #[test]
@@ -164,31 +198,57 @@ fn outline_then_scoped_ingest_then_search() {
 
     let o = s.call("repo_outline", json!({"path": p, "depth": 1}));
     assert_eq!(o["isError"], false, "{}", text(&o));
-    let nodes = o["structuredContent"]["outline"]["nodes"].as_array().unwrap();
+    let nodes = o["structuredContent"]["outline"]["nodes"]
+        .as_array()
+        .unwrap();
     let dirs: Vec<&str> = nodes.iter().map(|n| n["path"].as_str().unwrap()).collect();
     assert!(dirs.contains(&"docs") && dirs.contains(&"src") && dirs.contains(&"other"));
 
     // Ingest only docs and src (what the outline pointed at).
-    let r = s.call("repo_ingest", json!({"path": p, "spaces": ["p"], "paths": ["docs", "src"]}));
+    let r = s.call(
+        "repo_ingest",
+        json!({"path": p, "spaces": ["p"], "paths": ["docs", "src"]}),
+    );
     assert_eq!(r["isError"], false, "{}", text(&r));
     let found = s.call("memory_search", json!({"query": "guidemarker"}));
-    assert_eq!(found["structuredContent"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        found["structuredContent"]["hits"].as_array().unwrap().len(),
+        1
+    );
     let skipped = s.call("memory_search", json!({"query": "notesmarker"}));
-    assert_eq!(skipped["structuredContent"]["hits"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        skipped["structuredContent"]["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
     let code = s.call("code_search", json!({"query": "alpha_symbol"}));
-    assert_eq!(code["structuredContent"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        code["structuredContent"]["hits"].as_array().unwrap().len(),
+        1
+    );
     // The ingest attached the directory to space `p`; code_search can scope by it.
-    let scoped = s.call("code_search", json!({"query": "alpha_symbol", "spaces": ["p"]}));
+    let scoped = s.call(
+        "code_search",
+        json!({"query": "alpha_symbol", "spaces": ["p"]}),
+    );
     let hits = scoped["structuredContent"]["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["spaces"], json!(["p"]));
-    let other = s.call("code_search", json!({"query": "alpha_symbol", "spaces": ["nope"]}));
+    let other = s.call(
+        "code_search",
+        json!({"query": "alpha_symbol", "spaces": ["nope"]}),
+    );
     assert_eq!(other["isError"], true, "unknown space is an error");
 
     // Unknown space and escaping selection are errors, not writes.
     let bad_space = s.call("repo_ingest", json!({"path": p, "spaces": ["nope"]}));
     assert_eq!(bad_space["isError"], true);
-    let bad_sel = s.call("repo_ingest", json!({"path": p, "spaces": ["p"], "paths": ["../x"]}));
+    let bad_sel = s.call(
+        "repo_ingest",
+        json!({"path": p, "spaces": ["p"], "paths": ["../x"]}),
+    );
     assert_eq!(bad_sel["isError"], true);
 }
 
@@ -207,6 +267,9 @@ fn unscoped_ingest_of_a_huge_tree_is_refused() {
     let r = s.call("repo_ingest", json!({"path": p, "spaces": ["p"]}));
     assert_eq!(r["isError"], true);
     assert!(text(&r).contains("repo_outline"), "{}", text(&r));
-    let ok = s.call("repo_ingest", json!({"path": p, "spaces": ["p"], "paths": ["small"]}));
+    let ok = s.call(
+        "repo_ingest",
+        json!({"path": p, "spaces": ["p"], "paths": ["small"]}),
+    );
     assert_eq!(ok["isError"], false, "{}", text(&ok));
 }

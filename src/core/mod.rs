@@ -1536,15 +1536,20 @@ pub enum PrimarySlug {
 /// remote's slug wins; otherwise the single slug all remotes agree on;
 /// otherwise the choice stays open. Makes no fork or mirror claim.
 pub fn choose_primary_slug(remotes: &[(String, Option<String>, Option<String>)]) -> PrimarySlug {
-    if let Some((_, Some(key), Some(short))) = remotes.iter().find(|(n, k, s)| n == "origin" && k.is_some() && s.is_some()) {
+    if let Some((_, Some(key), Some(short))) = remotes
+        .iter()
+        .find(|(n, k, s)| n == "origin" && k.is_some() && s.is_some())
+    {
         return PrimarySlug::Chosen {
             key: key.clone(),
             short: short.clone(),
             source: "remote 'origin'".to_string(),
         };
     }
-    let mut keyed: Vec<&(String, Option<String>, Option<String>)> =
-        remotes.iter().filter(|(_, k, s)| k.is_some() && s.is_some()).collect();
+    let mut keyed: Vec<&(String, Option<String>, Option<String>)> = remotes
+        .iter()
+        .filter(|(_, k, s)| k.is_some() && s.is_some())
+        .collect();
     keyed.sort_by(|a, b| a.1.cmp(&b.1));
     keyed.dedup_by(|a, b| a.1 == b.1);
     match keyed.as_slice() {

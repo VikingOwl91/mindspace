@@ -1966,7 +1966,10 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    fn search_code(&self, query: &crate::core::CodeSearchQuery) -> Result<Vec<crate::core::CodeHit>> {
+    fn search_code(
+        &self,
+        query: &crate::core::CodeSearchQuery,
+    ) -> Result<Vec<crate::core::CodeHit>> {
         let conn = self.connection()?;
         let terms: Vec<String> = query
             .text
@@ -2121,7 +2124,9 @@ impl Store for SqliteStore {
                 })
             })
             .map_err(dberr)?;
-        let mut hits = rows.collect::<std::result::Result<Vec<_>, _>>().map_err(dberr)?;
+        let mut hits = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(dberr)?;
 
         // Where each definition lives: attached spaces and the repository's
         // primary slug, looked up once per repository or file.
@@ -2164,7 +2169,11 @@ impl Store for SqliteStore {
                             .map_err(dberr)?;
                         let remotes = stmt
                             .query_map(rusqlite::params![id.to_string()], |r| {
-                                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, Option<String>>(1)?,
+                                    r.get::<_, Option<String>>(2)?,
+                                ))
                             })
                             .map_err(dberr)?
                             .collect::<std::result::Result<Vec<_>, _>>()
@@ -4492,7 +4501,13 @@ fn record_git_observation_tx(
         ],
     )
     .map_err(dberr)?;
-    upsert_scope(conn, Some(observation.repository_id), None, &observation.spaces, at)?;
+    upsert_scope(
+        conn,
+        Some(observation.repository_id),
+        None,
+        &observation.spaces,
+        at,
+    )?;
     // Remotes as observed: the latest observation is current, earlier rows
     // keep their first/last observation times.
     conn.execute(
@@ -4810,9 +4825,10 @@ fn record_git_observation_tx(
                 )
                 .map_err(dberr)?;
             let rows = stmt
-                .query_map(rusqlite::params![observation.repository_id.to_string()], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
+                .query_map(
+                    rusqlite::params![observation.repository_id.to_string()],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
                 .map_err(dberr)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(dberr)?;
@@ -4830,7 +4846,11 @@ fn record_git_observation_tx(
                 "derived at {}, which is no longer a current view (current: {}{})",
                 short(&commit),
                 shown.join(", "),
-                if more > 0 { format!(" +{more}") } else { String::new() }
+                if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                }
             );
             retire_conn(conn, id, at, &reason)?;
             stale_retired += 1;
@@ -4872,13 +4892,16 @@ fn record_git_observation_tx(
                 )
                 .map_err(dberr)?;
             let rows = stmt
-                .query_map(rusqlite::params![observation.repository_id.to_string()], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })
+                .query_map(
+                    rusqlite::params![observation.repository_id.to_string()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
                 .map_err(dberr)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(dberr)?;

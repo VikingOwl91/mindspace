@@ -28,7 +28,10 @@ pub fn repo_info(info: &crate::ingest::repo_info::RepoInfo, as_json: bool) {
         Some(h) => println!(
             "head:     {}{}",
             &h.commit[..h.commit.len().min(12)],
-            h.branch.as_ref().map(|b| format!(" on {b}")).unwrap_or_else(|| " (detached)".into())
+            h.branch
+                .as_ref()
+                .map(|b| format!(" on {b}"))
+                .unwrap_or_else(|| " (detached)".into())
         ),
         None => println!("head:     none (no commits yet)"),
     }
@@ -60,7 +63,10 @@ pub fn repo_info(info: &crate::ingest::repo_info::RepoInfo, as_json: bool) {
             "  {} {}  {}{}{}",
             if w.is_main { "*" } else { " " },
             w.path.as_deref().unwrap_or("<outside allowed roots>"),
-            w.head.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("-"),
+            w.head
+                .as_deref()
+                .map(|h| &h[..h.len().min(12)])
+                .unwrap_or("-"),
             match (&w.branch, w.detached) {
                 (Some(b), _) => format!(" [{b}]"),
                 (None, true) => " (detached)".to_string(),
@@ -77,7 +83,12 @@ pub fn outline(outline: &crate::ingest::outline::Outline, as_json: bool) {
         return;
     }
     match &outline.commit {
-        Some(c) => println!("{} ({} @ {})", outline.root, outline.source, &c[..c.len().min(12)]),
+        Some(c) => println!(
+            "{} ({} @ {})",
+            outline.root,
+            outline.source,
+            &c[..c.len().min(12)]
+        ),
         None => println!("{} ({})", outline.root, outline.source),
     }
     println!(

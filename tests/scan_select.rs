@@ -112,7 +112,11 @@ fn directory_ingest_selection_is_scoped_and_ignore_aware() {
     // Ignore rules apply to a full directory ingest.
     let (_, err, ok) = m.run(&["ingest", &r, "--space", "p"]);
     assert!(ok, "{err}");
-    assert_eq!(m.search_count("notesmarker"), 0, ".gitignore excludes notes/");
+    assert_eq!(
+        m.search_count("notesmarker"),
+        0,
+        ".gitignore excludes notes/"
+    );
 }
 
 #[test]

@@ -424,12 +424,22 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             &["query"],
         ),
         "code_search" => (
-            &["query", "kinds", "spaces", "repository", "path", "limit", "all_versions"],
+            &[
+                "query",
+                "kinds",
+                "spaces",
+                "repository",
+                "path",
+                "limit",
+                "all_versions",
+            ],
             &["query"],
         ),
         "repo_outline" => (&["path", "depth"], &["path"]),
         "repo_ingest" => (
-            &["path", "spaces", "paths", "history", "branches", "remotes", "tags"],
+            &[
+                "path", "spaces", "paths", "history", "branches", "remotes", "tags",
+            ],
             &["path", "spaces"],
         ),
         "memory_history" => (&["subject"], &["subject"]),
@@ -455,9 +465,10 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
         }
     }
     if let Some(value) = obj.get("paths") {
-        let ok = value
-            .as_array()
-            .is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())));
+        let ok = value.as_array().is_some_and(|a| {
+            a.iter()
+                .all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+        });
         if !ok {
             return Err("argument 'paths' must be an array of non-empty strings".to_string());
         }

@@ -3,12 +3,12 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation, CodeObservationReport,
-    CodeParserIdentity, CodeResolutionReport, CodeSearchQuery, ConflictGroup, EmbeddingIndexStatus, GitObservation,
-    GitObservationReport, GitRefObservation, IngestObservation, ManualMemoryDraft,
-    ManualMemoryReport, Memory, MemoryDetail, MemorySummary, ObservationReport, Result,
-    SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, TemporalDimension,
-    TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
+    AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation,
+    CodeObservationReport, CodeParserIdentity, CodeResolutionReport, CodeSearchQuery,
+    ConflictGroup, EmbeddingIndexStatus, GitObservation, GitObservationReport, GitRefObservation,
+    IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory, MemoryDetail, MemorySummary,
+    ObservationReport, Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink,
+    TemporalDimension, TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and

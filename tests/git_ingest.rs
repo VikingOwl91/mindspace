@@ -112,11 +112,7 @@ fn ingest(store: &dyn Store, repo: &Repo) -> GitObservationReport {
     ingest_scoped(store, repo, ingest::GitScope::History)
 }
 
-fn ingest_scoped(
-    store: &dyn Store,
-    repo: &Repo,
-    scope: ingest::GitScope,
-) -> GitObservationReport {
+fn ingest_scoped(store: &dyn Store, repo: &Repo, scope: ingest::GitScope) -> GitObservationReport {
     let sel = ingest::outline::PathSelection::all();
     match ingest::ingest_paths(store, repo.path(), &sel, scope, &["coding"])
         .unwrap()
@@ -1208,7 +1204,10 @@ fn head_scope_derives_only_head_and_still_journals_every_ref() {
         0,
         "a non-HEAD branch is not interpreted"
     );
-    assert!(report.refs_observed >= 3, "both branches and HEAD journaled");
+    assert!(
+        report.refs_observed >= 3,
+        "both branches and HEAD journaled"
+    );
     assert_eq!(report.stale_retired, 0);
 
     // History scope adds the other tip without retiring anything.
@@ -1241,7 +1240,11 @@ fn head_move_retires_memories_derived_at_the_previous_commit() {
     assert!(report.stale_retired >= 1);
 
     assert_eq!(search(&store, "slint").len(), 1, "new HEAD is current");
-    assert_eq!(search(&store, "iced").len(), 0, "old HEAD is no longer current");
+    assert_eq!(
+        search(&store, "iced").len(),
+        0,
+        "old HEAD is no longer current"
+    );
 
     // The stale memory stays inspectable, with a reason naming both commits.
     let hits = store
@@ -1258,7 +1261,10 @@ fn head_move_retires_memories_derived_at_the_previous_commit() {
     let detail = store.get_memory_detail(hits[0].memory_id).unwrap().unwrap();
     assert_eq!(detail.memory.state, MemoryState::Retired);
     let reason = detail.memory.retire_reason.unwrap();
-    assert!(reason.contains(&second[..12]) && reason.contains(&first[..12]), "{reason}");
+    assert!(
+        reason.contains(&second[..12]) && reason.contains(&first[..12]),
+        "{reason}"
+    );
 }
 
 #[test]
@@ -1302,7 +1308,10 @@ fn repo_with_worktree() -> (Repo, tempfile::TempDir, PathBuf) {
     git(r.path(), &["branch", "feature"]);
     let wt_parent = tempfile::tempdir().unwrap();
     let wt = wt_parent.path().join("wt");
-    git(r.path(), &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"]);
+    git(
+        r.path(),
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"],
+    );
     std::fs::write(wt.join("b.md"), "# B\n\nfeatmarker\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-q", "-m", "feature work"]);
@@ -1340,7 +1349,10 @@ fn removed_worktree_stops_being_a_current_view() {
     ingest_at(&store, r.path(), ingest::GitScope::Head);
     assert_eq!(search(&store, "featmarker").len(), 1);
 
-    git(r.path(), &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+    git(
+        r.path(),
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
     let report = ingest_at(&store, r.path(), ingest::GitScope::Head);
     assert!(report.stale_retired >= 1);
     assert_eq!(search(&store, "featmarker").len(), 0);
@@ -1377,7 +1389,11 @@ fn branches_remotes_and_tags_are_opt_in_views() {
     }
 
     let only = |branches, remotes, tags| {
-        ingest::GitScope::Views(ingest::GitViews { branches, remotes, tags })
+        ingest::GitScope::Views(ingest::GitViews {
+            branches,
+            remotes,
+            tags,
+        })
     };
     ingest_at(&store, r.path(), only(true, false, false));
     assert_eq!(search(&store, "branchmarker").len(), 1);
@@ -1386,7 +1402,11 @@ fn branches_remotes_and_tags_are_opt_in_views() {
     ingest_at(&store, r.path(), only(true, true, true));
     assert_eq!(search(&store, "branchmarker").len(), 1);
     assert_eq!(search(&store, "remotemarker").len(), 1);
-    assert_eq!(search(&store, "tagmarker").len(), 1, "annotated tag is peeled");
+    assert_eq!(
+        search(&store, "tagmarker").len(),
+        1,
+        "annotated tag is peeled"
+    );
 
     // Dropping the views retires what they alone made current.
     let back = ingest_at(&store, r.path(), ingest::GitScope::Head);
@@ -1404,7 +1424,17 @@ fn release_repo() -> Repo {
     let r = repo();
     r.write("a.md", "# A\n\nplain doc\n");
     r.commit("first");
-    git(r.path(), &["tag", "-a", "v1.0", "-m", "First stable release. Adds frobnication.", "HEAD"]);
+    git(
+        r.path(),
+        &[
+            "tag",
+            "-a",
+            "v1.0",
+            "-m",
+            "First stable release. Adds frobnication.",
+            "HEAD",
+        ],
+    );
     r.write("a.md", "# A\n\nplain doc, second revision\n");
     r.commit("second");
     git(r.path(), &["tag", "v1.1"]); // lightweight
@@ -1427,7 +1457,10 @@ fn tags_become_release_memories_independent_of_current_views() {
     assert_eq!(annotated[0].subject, "Release v1.0");
     // Lightweight tags use the tagged commit's message and author.
     let light = search(&store, "second");
-    assert!(light.iter().any(|h| h.subject == "Release v1.1"), "{light:?}");
+    assert!(
+        light.iter().any(|h| h.subject == "Release v1.1"),
+        "{light:?}"
+    );
 
     // Full provenance chain loads (needs the tagged commit row).
     let raw = store
@@ -1444,7 +1477,10 @@ fn tags_become_release_memories_independent_of_current_views() {
     let g = detail.git.expect("git provenance");
     assert_eq!(g.path, "/refs/tags/v1.0");
     assert_eq!(detail.assertion.extraction, "git:tag:release");
-    assert!(detail.assertion.content.contains("Tagger: tester <tester@example.com>"));
+    assert!(detail
+        .assertion
+        .content
+        .contains("Tagger: tester <tester@example.com>"));
     assert!(detail.assertion.content.contains("(annotated)"));
 }
 
@@ -1476,10 +1512,23 @@ fn deleted_or_moved_tag_retires_its_release() {
     git(r.path(), &["tag", "-d", "v1.1"]);
     let report = ingest_scoped(&store, &r, ingest::GitScope::Head);
     assert_eq!(report.stale_retired, 1);
-    assert!(!search(&store, "second").iter().any(|h| h.subject == "Release v1.1"));
+    assert!(!search(&store, "second")
+        .iter()
+        .any(|h| h.subject == "Release v1.1"));
 
     // Moving an annotated tag: new release version, old one retired.
-    git(r.path(), &["tag", "-f", "-a", "v1.0", "-m", "Retagged: now includes refrobnication.", "HEAD"]);
+    git(
+        r.path(),
+        &[
+            "tag",
+            "-f",
+            "-a",
+            "v1.0",
+            "-m",
+            "Retagged: now includes refrobnication.",
+            "HEAD",
+        ],
+    );
     ingest_scoped(&store, &r, ingest::GitScope::Head);
     assert_eq!(search(&store, "refrobnication").len(), 1);
     assert_eq!(search(&store, "frobnication").len(), 0);
@@ -1515,10 +1564,18 @@ fn tag_retirement_requires_an_authoritative_tag_inventory() {
     let out = ingest::ingest_paths(&store, r.path(), &sel, ingest::GitScope::Head, &["coding"])
         .unwrap()
         .remove(0);
-    let mindspace::core::IngestOutcome::Git(partial) = out else { panic!() };
+    let mindspace::core::IngestOutcome::Git(partial) = out else {
+        panic!()
+    };
     assert_eq!(partial.stale_retired, 0, "partial ingest retired something");
-    assert!(partial.files.iter().all(|f| !f.path.starts_with("/refs/tags/")));
-    assert!(release_active("Release v1.1"), "partial ingest hid a release");
+    assert!(partial
+        .files
+        .iter()
+        .all(|f| !f.path.starts_with("/refs/tags/")));
+    assert!(
+        release_active("Release v1.1"),
+        "partial ingest hid a release"
+    );
     assert!(release_active("Release v1.0"));
 
     // A full ingest is authoritative: now the deleted tag retires, the

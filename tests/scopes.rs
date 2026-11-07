@@ -13,7 +13,9 @@ struct Mind {
 
 impl Mind {
     fn new(spaces: &[&str]) -> Self {
-        let m = Self { dir: tempfile::tempdir().unwrap() };
+        let m = Self {
+            dir: tempfile::tempdir().unwrap(),
+        };
         assert!(m.run(&["init"]).2);
         for s in spaces {
             assert!(m.run(&["space", "create", s]).2);
@@ -54,12 +56,19 @@ impl Mind {
         a.push("--json");
         let (out, err, ok) = self.run(&a);
         assert!(ok, "symbols failed: {err}");
-        serde_json::from_str::<serde_json::Value>(&out).unwrap().as_array().unwrap().clone()
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
     }
 }
 
 fn names(hits: &[serde_json::Value]) -> Vec<String> {
-    let mut n: Vec<String> = hits.iter().map(|h| h["name"].as_str().unwrap().to_string()).collect();
+    let mut n: Vec<String> = hits
+        .iter()
+        .map(|h| h["name"].as_str().unwrap().to_string())
+        .collect();
     n.sort();
     n
 }
@@ -68,17 +77,32 @@ fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn repo(function: &str, origin: Option<&str>) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     git(d.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(d.path().join("lib.rs"), format!("pub fn {function}() {{}}\n")).unwrap();
+    std::fs::write(
+        d.path().join("lib.rs"),
+        format!("pub fn {function}() {{}}\n"),
+    )
+    .unwrap();
     git(d.path(), &["add", "-A"]);
     git(d.path(), &["commit", "-q", "-m", "init"]);
     if let Some(url) = origin {
@@ -96,9 +120,18 @@ fn space_filter_scopes_code_follows_links_and_reports_where_it_lives() {
     m.ingest(b.path(), &["beta"]);
 
     // Unfiltered sees both; a space sees only its own.
-    assert_eq!(names(&m.symbols(&["_only_fn"])), vec!["alpha_only_fn", "beta_only_fn"]);
-    assert_eq!(names(&m.symbols(&["_only_fn", "--space", "alpha"])), vec!["alpha_only_fn"]);
-    assert_eq!(names(&m.symbols(&["_only_fn", "--space", "beta"])), vec!["beta_only_fn"]);
+    assert_eq!(
+        names(&m.symbols(&["_only_fn"])),
+        vec!["alpha_only_fn", "beta_only_fn"]
+    );
+    assert_eq!(
+        names(&m.symbols(&["_only_fn", "--space", "alpha"])),
+        vec!["alpha_only_fn"]
+    );
+    assert_eq!(
+        names(&m.symbols(&["_only_fn", "--space", "beta"])),
+        vec!["beta_only_fn"]
+    );
     assert_eq!(
         names(&m.symbols(&["_only_fn", "--space", "alpha", "--space", "beta"])),
         vec!["alpha_only_fn", "beta_only_fn"]
@@ -107,8 +140,14 @@ fn space_filter_scopes_code_follows_links_and_reports_where_it_lives() {
     // Directed links: umbrella imports alpha, so it sees alpha's code only.
     assert!(m.symbols(&["_only_fn", "--space", "umbrella"]).is_empty());
     assert!(m.run(&["space", "link", "umbrella", "alpha"]).2);
-    assert_eq!(names(&m.symbols(&["_only_fn", "--space", "umbrella"])), vec!["alpha_only_fn"]);
-    assert!(m.symbols(&["_only_fn", "--space", "alpha"]).iter().all(|h| h["spaces"] == serde_json::json!(["alpha"])));
+    assert_eq!(
+        names(&m.symbols(&["_only_fn", "--space", "umbrella"])),
+        vec!["alpha_only_fn"]
+    );
+    assert!(m
+        .symbols(&["_only_fn", "--space", "alpha"])
+        .iter()
+        .all(|h| h["spaces"] == serde_json::json!(["alpha"])));
 
     // Hits say where they live.
     let hit = &m.symbols(&["alpha_only_fn"])[0];
@@ -139,7 +178,10 @@ fn attaching_a_second_space_adds_and_never_replaces() {
     m.ingest(a.path(), &["beta"]);
     assert_eq!(m.symbols(&["shared_fn", "--space", "alpha"]).len(), 1);
     assert_eq!(m.symbols(&["shared_fn", "--space", "beta"]).len(), 1);
-    assert_eq!(m.symbols(&["shared_fn"])[0]["spaces"], serde_json::json!(["alpha", "beta"]));
+    assert_eq!(
+        m.symbols(&["shared_fn"])[0]["spaces"],
+        serde_json::json!(["alpha", "beta"])
+    );
 }
 
 #[test]
@@ -151,21 +193,35 @@ fn directory_and_file_ingests_are_scoped_by_their_root() {
     std::fs::write(db.path().join("b.rs"), "pub fn dir_beta_fn() {}\n").unwrap();
     m.ingest(da.path(), &["alpha"]);
     m.ingest(db.path(), &["beta"]);
-    assert_eq!(names(&m.symbols(&["dir_", "--space", "alpha"])), vec!["dir_alpha_fn"]);
-    assert_eq!(names(&m.symbols(&["dir_", "--space", "beta"])), vec!["dir_beta_fn"]);
+    assert_eq!(
+        names(&m.symbols(&["dir_", "--space", "alpha"])),
+        vec!["dir_alpha_fn"]
+    );
+    assert_eq!(
+        names(&m.symbols(&["dir_", "--space", "beta"])),
+        vec!["dir_beta_fn"]
+    );
 
     // A single file is its own root.
     let single = tempfile::tempdir().unwrap();
     std::fs::write(single.path().join("one.rs"), "pub fn single_file_fn() {}\n").unwrap();
     m.ingest(&single.path().join("one.rs"), &["beta"]);
-    assert_eq!(names(&m.symbols(&["single_file_fn", "--space", "beta"])), vec!["single_file_fn"]);
-    assert!(m.symbols(&["single_file_fn", "--space", "alpha"]).is_empty());
+    assert_eq!(
+        names(&m.symbols(&["single_file_fn", "--space", "beta"])),
+        vec!["single_file_fn"]
+    );
+    assert!(m
+        .symbols(&["single_file_fn", "--space", "alpha"])
+        .is_empty());
 }
 
 #[test]
 fn remotes_are_stored_without_credentials_and_follow_the_latest_observation() {
     let m = Mind::new(&["alpha"]);
-    let a = repo("remote_fn", Some("https://ci:SECRETTOKEN123@github.com/Acme/Old.git"));
+    let a = repo(
+        "remote_fn",
+        Some("https://ci:SECRETTOKEN123@github.com/Acme/Old.git"),
+    );
     m.ingest(a.path(), &["alpha"]);
 
     let conn = Connection::open(m.db()).unwrap();
@@ -177,15 +233,26 @@ fn remotes_are_stored_without_credentials_and_follow_the_latest_observation() {
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(all.len(), 1);
-    assert!(!all[0].contains("SECRETTOKEN123") && !all[0].contains("ci:"), "{}", all[0]);
+    assert!(
+        !all[0].contains("SECRETTOKEN123") && !all[0].contains("ci:"),
+        "{}",
+        all[0]
+    );
     assert!(all[0].contains("github.com/acme/old"));
 
     // The remote moves: the new slug is current, the old row keeps its history.
-    git(a.path(), &["remote", "set-url", "origin", "git@github.com:Acme/New.git"]);
+    git(
+        a.path(),
+        &["remote", "set-url", "origin", "git@github.com:Acme/New.git"],
+    );
     m.ingest(a.path(), &["alpha"]);
     assert_eq!(m.symbols(&["remote_fn"])[0]["repository_slug"], "Acme/New");
     let (current, total): (i64, i64) = conn
-        .query_row("SELECT SUM(is_current), COUNT(*) FROM repository_remotes", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row(
+            "SELECT SUM(is_current), COUNT(*) FROM repository_remotes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     assert_eq!((current, total), (1, 2));
 }
@@ -200,13 +267,24 @@ fn current_views_live_in_a_table_and_are_replaced_on_each_ingest() {
     git(a.path(), &["commit", "-q", "-m", "two"]);
     m.ingest(a.path(), &["alpha"]);
     let conn = Connection::open(m.db()).unwrap();
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM git_views", [], |r| r.get(0)).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM git_views", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n, 1, "only the latest ingest's views are kept");
     let mind_meta_views: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mind_meta WHERE key LIKE 'git_views:%'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM mind_meta WHERE key LIKE 'git_views:%'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(mind_meta_views, 0, "mind_meta is no longer used for views");
-    assert!(m.symbols(&["view_fn_v2"]).len() == 1 && m.symbols(&["view_fn", "--kind", "fn"]).iter().all(|h| h["name"] == "view_fn_v2"));
+    assert!(
+        m.symbols(&["view_fn_v2"]).len() == 1
+            && m.symbols(&["view_fn", "--kind", "fn"])
+                .iter()
+                .all(|h| h["name"] == "view_fn_v2")
+    );
 }
 
 #[test]
@@ -218,10 +296,13 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
         for t in ["scope_spaces", "scopes", "repository_remotes", "git_views"] {
             conn.execute_batch(&format!("DROP TABLE {t};")).unwrap();
         }
-        conn.execute("DELETE FROM schema_migrations WHERE version = 9", []).unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version = 9", [])
+            .unwrap();
         (
-            conn.query_row("SELECT COUNT(*) FROM m6_revisions", [], |r| r.get(0)).unwrap(),
-            conn.query_row("SELECT COUNT(*) FROM m6_history_coverage", [], |r| r.get(0)).unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM m6_revisions", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM m6_history_coverage", [], |r| r.get(0))
+                .unwrap(),
         )
     };
 
@@ -229,19 +310,33 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
     let (_, err, ok) = m.run(&["space", "list"]);
     assert!(ok, "{err}");
     let conn = Connection::open(m.db()).unwrap();
-    let version: i64 = conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0)).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     assert_eq!(version, 9);
     for t in ["scopes", "scope_spaces", "repository_remotes", "git_views"] {
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [t], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [t],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1, "{t} missing");
     }
     // Baseline and coverage were not recreated; the open itself was not a
     // knowledge write, so no revision was allocated for the migration.
     let after: (i64, i64) = (
-        conn.query_row("SELECT COUNT(*) FROM m6_revisions WHERE kind = 'baseline'", [], |r| r.get(0)).unwrap(),
-        conn.query_row("SELECT COUNT(*) FROM m6_history_coverage", [], |r| r.get(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM m6_revisions WHERE kind = 'baseline'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap(),
+        conn.query_row("SELECT COUNT(*) FROM m6_history_coverage", [], |r| r.get(0))
+            .unwrap(),
     );
     assert_eq!(after.0, 1, "exactly one baseline revision");
     assert_eq!(after.1, before.1);

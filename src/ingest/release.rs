@@ -121,7 +121,11 @@ pub fn derive(
         }
         content.push_str(&format!(
             "\nTag: {name} ({})\n{who_label}: {who_name} <{who_email}>\nDate: {date}\nCommit: {}\n",
-            if outer.is_some() { "annotated" } else { "lightweight" },
+            if outer.is_some() {
+                "annotated"
+            } else {
+                "lightweight"
+            },
             commit.oid
         ));
         if outer.is_some() {

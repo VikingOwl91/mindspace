@@ -20,7 +20,7 @@ embeddings = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "de
 [dependencies]
 clap = { version = "4.6.6", features = ["derive", "env"] }
 ignore = "0.4.34"
-pulldown-cmark = "0.13.4"
+pulldown-cmark = "0.13.6"
 rusqlite = { version = "0.40.2", features = ["bundled", "functions", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,7 +33,7 @@ tree-sitter-rust = "0.24.2"
 candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 candle-transformers = { version = "0.11.0", optional = true }
-tokenizers = { version = "0.21", optional = true }
+tokenizers = { version = "0.23", optional = true }
 ureq = { version = "2", optional = true, features = ["tls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

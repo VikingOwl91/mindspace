@@ -4,9 +4,26 @@
 //! machine-readable plumbing formats (`for-each-ref --format`, `cat-file
 //! --batch`, `rev-list --objects --no-object-names`, `ls-tree -z`,
 //! `merge-base --is-ancestor`). Localized human output is never parsed.
-//! All commands are read-only; no hook, script, or working-tree state is
-//! involved. Repository contents are untrusted input: only the object
-//! database is read, never the working tree.
+//! Repository contents are untrusted input: only the object database is read,
+//! never the working tree.
+//!
+//! Hardening (MIND-2, ADR-014 addendum): every invocation goes through
+//! [`git_command`], which pins the execution context instead of trusting the
+//! caller's environment or the repository's configuration:
+//!
+//! - All inherited `GIT_*` variables are removed. `GIT_DIR` would redirect
+//!   reads to another repository; `GIT_CONFIG_*`, `GIT_EXTERNAL_DIFF`,
+//!   `GIT_SSH_COMMAND` and friends inject behavior.
+//! - User and system config are not read, so a user's `safe.directory = *`
+//!   cannot lift Git's ownership check for an untrusted directory.
+//! - `GIT_NO_REPLACE_OBJECTS=1`: `refs/replace/*` would make Git return bytes
+//!   that do not hash to the recorded object id.
+//! - Hooks, fsmonitor, alternate-refs commands, pagers and all network
+//!   protocols are switched off, and optional locks are not taken.
+//!
+//! Residual risk: the repository's own `.git/config` is still read (Git has no
+//! way around that), and commit-graph, alternates and shallow files are
+//! honored as written.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -454,8 +471,7 @@ impl GitReader {
     /// Deterministic ancestor check: is `old` an ancestor of `new`?
     /// Exit code 0 means provably yes; exit 1 means provably no.
     pub fn is_ancestor(&self, old: &str, new: &str) -> Result<bool> {
-        let out = Command::new("git")
-            .current_dir(&self.path)
+        let out = git_command(&self.path)
             .args(["merge-base", "--is-ancestor", old, new])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -478,6 +494,51 @@ impl GitReader {
     }
 }
 
+/// Environment variables that must never reach git: every `GIT_*` entry of the
+/// caller is dropped, then the pinned values below are set.
+const PINNED_ENV: &[(&str, &str)] = &[
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_PROTOCOL_FROM_USER", "0"),
+    ("GIT_ATTR_NOSYSTEM", "1"),
+];
+
+/// `-c` overrides that disable the known config-driven ways for a read-only plumbing
+/// command to run a program or touch the network.
+const PINNED_CONFIG: &[&str] = &[
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    "core.alternateRefsCommand=",
+    "core.pager=cat",
+    "core.askPass=",
+    "protocol.allow=never",
+    "gc.auto=0",
+    "maintenance.auto=false",
+];
+
+/// The single place a `git` process is created. `dir` becomes the working
+/// directory; discovery of the repository is therefore based on it alone.
+fn git_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(key);
+        }
+    }
+    for (k, v) in PINNED_ENV {
+        cmd.env(k, v);
+    }
+    for c in PINNED_CONFIG {
+        cmd.arg("-c").arg(c);
+    }
+    cmd.current_dir(dir);
+    cmd
+}
+
 fn run(path: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
     run_codes(path, args, stdin, &[0])
 }
@@ -490,9 +551,8 @@ fn run_codes(
     stdin: Option<&[u8]>,
     ok_codes: &[i32],
 ) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(path)
-        .args(args)
+    let mut cmd = git_command(path);
+    cmd.args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {

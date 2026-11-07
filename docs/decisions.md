@@ -243,6 +243,54 @@ swap behind the same reader shape if the subprocess becomes a bottleneck.
 **Revisit when.** Very large repositories make the subprocess count or
 output size a real problem, or a no-system-dependency build is required.
 
+**ADR-014 addendum (2026-11-07): the execution context is pinned (MIND-2).**
+"Read-only plumbing" was an assumption. Testing it found that no
+config-driven program execution is reachable from the commands Mindspace runs
+(13 exec-capable config keys, hooks, includes, filters: none fired; `git
+status` does fire them, so the test oracle is not vacuous). It also found two
+defects the claim did not cover, both reproduced before fixing:
+
+- An inherited `GIT_DIR` overrode the working directory, so ingesting repo A
+  while `GIT_DIR` named repo B recorded B's code under A's identity.
+- `refs/replace/*` made `git cat-file --batch` return bytes that do not hash to
+  the recorded object id, breaking the evidence chain.
+
+Decision: all git processes are created by one builder (`git_command`) that
+removes every inherited `GIT_*` variable, ignores user and system config, sets
+`GIT_NO_REPLACE_OBJECTS=1`, and disables hooks, fsmonitor, alternate-refs
+commands, pagers, network protocols, optional locks and auto-gc.
+
+**Consequences (behavior changes).**
+
+- Inherited `GIT_*` variables are ignored on purpose. Anyone who relied on
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`, `GIT_CONFIG_*`,
+  `GIT_SSH_COMMAND` or similar to steer Mindspace will no longer get that
+  effect: the repository is always the one named on the command line. Running
+  `mind` from inside a git hook or `git rebase -x` now works as expected
+  because those variables no longer leak in.
+- User and system Git configuration is not read. Settings such as
+  `url.<base>.insteadOf` therefore do not rewrite remote URLs (remotes are
+  observed as stored in the repository), and a global `safe.directory` entry
+  no longer applies.
+- **Not tested:** the `safe.directory` / foreign-owner case. Reasoned only:
+  with global config ignored, a repository owned by another user should fail
+  with Git's ownership error instead of being read. This was not run, because
+  no second user was available; it is unknown whether every Git version
+  reports it as an error that Mindspace surfaces cleanly.
+- `refs/replace/*` is deliberately not honored: Mindspace records what hashes
+  to each object id, never a substituted view.
+
+**Residual risk (not mitigated, not demonstrated).** The repository's own
+`.git/config` is still read (Git offers no way around that), and commit-graph,
+multi-pack-index, `objects/info/alternates` and shallow files are honored as
+written. A hostile repository could use them to misreport reachability or
+supply objects from another store. No exploit was built; the risk is reasoned
+from Git's documented behavior. Mitigation, if needed, belongs in a separate
+decision (for example disabling the commit-graph at a measured cost).
+
+The identity marker `.git/mindspace-repository-id` remains the only write
+into a target repository. Regression tests: `tests/git_hardening.rs`.
+
 ## ADR-015: Git history is a graph of immutable objects plus a transaction-time ref journal (2026-09-08)
 
 **Decision.** Commits, trees, blobs, and annotated tag objects are stored as

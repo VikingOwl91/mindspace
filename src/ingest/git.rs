@@ -29,6 +29,20 @@ pub fn looks_like_git_repository(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
 }
 
+/// One worktree as listed by `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+    /// Its directory is gone; git would remove the entry with `worktree prune`.
+    pub prunable: bool,
+    pub locked: bool,
+    pub is_main: bool,
+}
+
 pub struct GitReader {
     /// The path git commands run in (working tree or bare repository).
     path: PathBuf,
@@ -314,26 +328,103 @@ impl GitReader {
     /// and linked ones), sorted. Bare entries, prunable worktrees whose
     /// directory is gone, and unborn HEADs are skipped. One git call.
     pub fn worktree_heads(&self) -> Result<Vec<String>> {
-        let out = run(&self.path, &["worktree", "list", "--porcelain"], None)?;
-        let text = String::from_utf8_lossy(&out);
         let mut heads = std::collections::BTreeSet::new();
-        for block in text.split("\n\n") {
-            let mut head: Option<&str> = None;
-            let mut skip = false;
-            for line in block.lines() {
-                if let Some(h) = line.strip_prefix("HEAD ") {
-                    head = Some(h.trim());
-                } else if line == "bare" || line.starts_with("prunable") {
-                    skip = true;
-                }
+        for w in self.worktrees()? {
+            if w.bare || w.prunable {
+                continue;
             }
-            if let (false, Some(h)) = (skip, head) {
-                if h.chars().any(|c| c != '0') {
-                    heads.insert(h.to_string());
-                }
+            if let Some(h) = w.head.filter(|h| h.chars().any(|c| c != '0')) {
+                heads.insert(h);
             }
         }
         Ok(heads.into_iter().collect())
+    }
+
+    /// Every worktree of this repository as git lists them; the first entry
+    /// is the main worktree. One git call.
+    pub fn worktrees(&self) -> Result<Vec<Worktree>> {
+        let out = run(&self.path, &["worktree", "list", "--porcelain"], None)?;
+        let text = String::from_utf8_lossy(&out);
+        let mut result = Vec::new();
+        for (i, block) in text.split("\n\n").enumerate() {
+            let mut w = Worktree {
+                path: String::new(),
+                head: None,
+                branch: None,
+                detached: false,
+                bare: false,
+                prunable: false,
+                locked: false,
+                is_main: i == 0,
+            };
+            for line in block.lines() {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    w.path = p.to_string();
+                } else if let Some(h) = line.strip_prefix("HEAD ") {
+                    w.head = Some(h.trim().to_string());
+                } else if let Some(b) = line.strip_prefix("branch ") {
+                    w.branch = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+                } else if line == "detached" {
+                    w.detached = true;
+                } else if line == "bare" {
+                    w.bare = true;
+                } else if line.starts_with("prunable") {
+                    w.prunable = true;
+                } else if line.starts_with("locked") {
+                    w.locked = true;
+                }
+            }
+            if !w.path.is_empty() {
+                result.push(w);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Configured remotes as `(name, raw url)`, sorted. The raw URL may
+    /// contain credentials: callers must pass it through
+    /// `ingest::remote::parse` before storing or showing it.
+    pub fn remotes(&self) -> Result<Vec<(String, String)>> {
+        let out = run_codes(
+            &self.path,
+            &["config", "--null", "--get-regexp", r"^remote\..*\.url$"],
+            None,
+            &[0, 1],
+        )?;
+        let mut remotes = Vec::new();
+        for record in String::from_utf8_lossy(&out).split('\0') {
+            let Some((key, value)) = record.split_once('\n') else {
+                continue;
+            };
+            let Some(name) = key
+                .strip_prefix("remote.")
+                .and_then(|k| k.strip_suffix(".url"))
+            else {
+                continue;
+            };
+            remotes.push((name.to_string(), value.to_string()));
+        }
+        remotes.sort();
+        remotes.dedup();
+        Ok(remotes)
+    }
+
+    /// The repository identity if a marker already exists; never creates one.
+    pub fn existing_repository_id(&self) -> Result<Option<Uuid>> {
+        let marker = self.common_dir.join("mindspace-repository-id");
+        match std::fs::read_to_string(&marker) {
+            Ok(s) => Uuid::parse_str(s.trim())
+                .map(Some)
+                .map_err(|_| Error::RepositoryIdentity {
+                    path: marker.display().to_string(),
+                    reason: "marker exists but is not a UUID".into(),
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::RepositoryIdentity {
+                path: marker.display().to_string(),
+                reason: format!("cannot read marker: {e}"),
+            }),
+        }
     }
 
     /// Blob entries of one commit's tree as `(path, size)`, symlinks and
@@ -388,6 +479,17 @@ impl GitReader {
 }
 
 fn run(path: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+    run_codes(path, args, stdin, &[0])
+}
+
+/// Like [`run`], but exit codes in `ok_codes` count as success (for commands
+/// such as `git config --get-regexp`, which exit 1 when nothing matches).
+fn run_codes(
+    path: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    ok_codes: &[i32],
+) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
     cmd.current_dir(path)
         .args(args)
@@ -423,7 +525,7 @@ fn run(path: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
     .map_err(|e| Error::GitUnavailable {
         detail: format!("cannot read git output: {e}"),
     })?;
-    if !out.status.success() {
+    if !out.status.code().is_some_and(|c| ok_codes.contains(&c)) {
         return Err(Error::GitCommand {
             command: format!("git {}", args.join(" ")),
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),

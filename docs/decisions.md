@@ -603,3 +603,32 @@ repositories only, with the read-only plumbing of ADR-014.
 
 **Revisit when.** Read-only versus ingest roots need to differ, ingest must run
 asynchronously, or HTTP transport and real authentication arrive.
+
+## ADR-027: Repository slugs are observations from remotes; no fork claims (2026-11-07)
+
+**Decision.** `mind repo info <path>` (and a `repository` block in MCP
+`repo_outline`) describes a git repository read-only: identity (only if a marker
+already exists; it is never created), HEAD, configured remotes, a primary slug,
+and worktrees. A slug is `host/owner/name`, lowercased as the comparison key and
+`Owner/Name` as written for display; nested groups keep their path.
+
+The slug comes from a configured remote URL, never from the repository's
+identity (ADR-015): remotes are added, renamed, and mirrored, and two clones of
+one project share a slug but are different repositories. The primary slug is the
+`origin` remote's; without `origin` it is the one slug all remotes agree on;
+otherwise it stays unnamed and the candidates are listed. Hosts are kept as
+observed (`ssh.example.dev` is not guessed to be `example.dev`), so matching by
+`owner/name` is host-independent.
+
+Remote URLs can embed credentials. `ingest::remote::parse` is the only reader
+of a raw URL; its result never contains userinfo (including the scp-style `git@`),
+so no downstream code can store or show a secret. In MCP, worktree paths outside
+the allowed roots are redacted.
+
+**No fork or mirror claims.** Git cannot prove that a repository is a fork, and
+remote names (`upstream`, `mirror`, `origin-github`) are conventions. Mindspace
+lists remotes and says nothing about their relationship.
+
+**Consequences.** Nothing is persisted yet; slugs are computed per call. Storing
+remote observations and attaching repositories to spaces (a Scope object,
+separate from Space) follows with the next migration.

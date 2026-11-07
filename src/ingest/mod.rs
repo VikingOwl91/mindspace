@@ -3,6 +3,8 @@ pub mod git;
 pub mod markdown;
 pub mod outline;
 pub mod release;
+pub mod remote;
+pub mod repo_info;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

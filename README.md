@@ -228,6 +228,7 @@ mind ingest ~/src/owlry --space coding --branches --remotes --tags   # more curr
 mind ingest ~/src/owlry --space coding --history   # every ref tip, no stale retirement
 # tags always become "Release <name>" memories (ADR-024)
 mind scan ~/src/owlry [--depth 2]          # read-only outline, no database
+mind repo info ~/src/owlry [--json]        # identity, HEAD, remotes + slug, worktrees (read-only)
 mind ingest ~/src/owlry --space coding --path crates/core --path docs   # targeted
 mind space list
 mind space create eragon
@@ -276,7 +277,7 @@ The server exposes fourteen tools:
 | `memory_get` | Read a memory and its assertion, evidence, source, spaces, and lifecycle. |
 | `memory_search` | Search with SQLite FTS5, optional directed space traversal, and transaction-time filtering. |
 | `code_search` | Find definitions (functions, structs, ...) in ingested Rust code by name, signature, or path. Returns locations, not memories; current definitions only unless `all_versions`. |
-| `repo_outline` | Outline a directory or git repository (HEAD) without ingesting: files, bytes, kinds per directory. Allowlisted paths only. |
+| `repo_outline` | Outline a directory or git repository (HEAD) without ingesting: files, bytes, kinds per directory, plus repository facts (slug, remotes, worktrees) for git. Allowlisted paths only. |
 | `repo_ingest` | Ingest a directory or repository, optionally only chosen `paths`, into existing spaces. Allowlisted paths only; unscoped ingest of very large trees is refused. |
 | `memory_history` | List episodes for a normalized subject. |
 | `memory_conflicts` | List active same-subject memories sharing a space. |

@@ -14,6 +14,63 @@ fn json<T: serde::Serialize + ?Sized>(value: &T) {
     );
 }
 
+pub fn repo_info(info: &crate::ingest::repo_info::RepoInfo, as_json: bool) {
+    if as_json {
+        json(info);
+        return;
+    }
+    println!("{} (git)", info.root);
+    match info.identity {
+        Some(id) => println!("identity: {id}"),
+        None => println!("identity: none yet (assigned on first ingest)"),
+    }
+    match &info.head {
+        Some(h) => println!(
+            "head:     {}{}",
+            &h.commit[..h.commit.len().min(12)],
+            h.branch.as_ref().map(|b| format!(" on {b}")).unwrap_or_else(|| " (detached)".into())
+        ),
+        None => println!("head:     none (no commits yet)"),
+    }
+    match (&info.slug, &info.slug_key, &info.slug_source) {
+        (Some(short), Some(key), Some(src)) => println!("slug:     {short}  ({key}, from {src})"),
+        _ if !info.slug_candidates.is_empty() => println!(
+            "slug:     ambiguous, no origin; candidates: {}",
+            info.slug_candidates.join(", ")
+        ),
+        _ => println!("slug:     none (no remote with owner/name)"),
+    }
+    println!("remotes:");
+    if info.remotes.is_empty() {
+        println!("  (none)");
+    }
+    for r in &info.remotes {
+        println!("  {:<14} {}", r.name, r.url);
+    }
+    println!("worktrees:");
+    for w in &info.worktrees {
+        let state = if w.prunable {
+            " prunable"
+        } else if w.bare {
+            " bare"
+        } else {
+            ""
+        };
+        println!(
+            "  {} {}  {}{}{}",
+            if w.is_main { "*" } else { " " },
+            w.path.as_deref().unwrap_or("<outside allowed roots>"),
+            w.head.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("-"),
+            match (&w.branch, w.detached) {
+                (Some(b), _) => format!(" [{b}]"),
+                (None, true) => " (detached)".to_string(),
+                _ => String::new(),
+            },
+            state
+        );
+    }
+}
+
 pub fn outline(outline: &crate::ingest::outline::Outline, as_json: bool) {
     if as_json {
         json(outline);

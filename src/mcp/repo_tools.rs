@@ -71,6 +71,12 @@ impl McpConfig {
         &self.allow_roots
     }
 
+    /// Lexical check that a path string lies inside an allowed root, used to
+    /// redact paths in responses (it does not touch the filesystem).
+    pub fn is_inside(&self, path: &str) -> bool {
+        self.allow_roots.iter().any(|r| Path::new(path).starts_with(r))
+    }
+
     /// Resolves a requested path to a canonical directory inside an allowed
     /// root, or explains the refusal without disclosing what exists.
     pub fn authorize(&self, raw: &str) -> std::result::Result<PathBuf, String> {
@@ -127,8 +133,22 @@ pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Resu
             .nodes
             .sort_by(|a, b| (a.depth != 0, &a.path).cmp(&(b.depth != 0, &b.path)));
     }
+    // Repository facts for choosing a space; worktree paths outside the
+    // allowed roots are redacted so the tool cannot be used to learn them.
+    let repository = (outline.source == "git")
+        .then(|| ingest::repo_info::repo_info(&path).ok())
+        .flatten()
+        .map(|mut info| {
+            for w in &mut info.worktrees {
+                if w.path.as_deref().is_some_and(|p| !config.is_inside(p)) {
+                    w.path = None;
+                }
+            }
+            info
+        });
     Ok(json!({
         "outline": outline,
+        "repository": repository,
         "node_count": total,
         "truncated": truncated,
         "hint": "Pick directories with ingestable_files > 0 and pass them as `paths` to repo_ingest."

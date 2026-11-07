@@ -173,6 +173,11 @@ pub enum Command {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Inspect a git repository: identity, HEAD, remotes with slugs, worktrees
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// Run the local MCP server over stdio
     Mcp {
         /// Directory the repo_outline and repo_ingest tools may read and
@@ -185,6 +190,16 @@ pub enum Command {
             value_delimiter = ':'
         )]
         allow_roots: Vec<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RepoCommand {
+    /// Show identity, HEAD, remotes with slugs, and worktrees (read-only)
+    Info {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -347,6 +362,11 @@ pub fn execute(cli: &Cli) -> Result<()> {
                 }
             }
         }
+        Command::Repo { command } => match command {
+            RepoCommand::Info { path, json } => {
+                render::repo_info(&ingest::repo_info::repo_info(path)?, *json);
+            }
+        },
         Command::Scan { path, depth, json } => {
             render::outline(&ingest::scan_path(path, *depth)?, *json);
         }

@@ -1,4 +1,5 @@
 pub mod code;
+pub mod deadline;
 pub mod git;
 pub mod markdown;
 pub mod outline;
@@ -16,6 +17,7 @@ use crate::core::{
     Result, SessionDraft, Ts, Uuid,
 };
 use crate::storage::Store;
+use deadline::Deadline;
 
 /// Which ref classes beyond HEAD and worktrees are interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,6 +61,19 @@ pub fn ingest_path<S: AsRef<str>>(
     path: &Path,
     space_names: &[S],
 ) -> Result<IngestOutcome> {
+    ingest_path_with_deadline(store, path, space_names, &Deadline::none())
+}
+
+/// Like [`ingest_path`], but stops cleanly with [`Error::IngestTimeout`] when
+/// `deadline` expires before the first database write. Once writing has
+/// started it always runs to its end (see [`deadline`]).
+pub fn ingest_path_with_deadline<S: AsRef<str>>(
+    store: &dyn Store,
+    path: &Path,
+    space_names: &[S],
+    deadline: &Deadline,
+) -> Result<IngestOutcome> {
+    deadline.check("starting")?;
     let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
         source: e,
@@ -71,11 +86,16 @@ pub fn ingest_path<S: AsRef<str>>(
     // A git repository wins over directory ingest: committed history is
     // what it observes, not the working tree.
     if metadata.is_dir() && git::looks_like_git_repository(&canonical) {
-        return Ok(IngestOutcome::Git(ingest_git_repository(
-            store,
-            &canonical,
-            space_names,
-        )?));
+        return Ok(IngestOutcome::Git(
+            ingest_git_repository_selected_with_deadline(
+                store,
+                &canonical,
+                space_names,
+                &outline::PathSelection::all(),
+                GitScope::Head,
+                deadline,
+            )?,
+        ));
     }
 
     // A single file must fail on its format before spaces are resolved.
@@ -90,7 +110,7 @@ pub fn ingest_path<S: AsRef<str>>(
         (
             canonical.display().to_string(),
             IngestScope::Directory,
-            observe_directory(&canonical, &space_ids)?,
+            observe_directory(&canonical, &space_ids, deadline)?,
         )
     } else {
         let file = observe_file(&canonical, &space_ids)?;
@@ -106,6 +126,7 @@ pub fn ingest_path<S: AsRef<str>>(
         let Some(language) = code::language_for(Path::new(&f.location)) else {
             continue;
         };
+        deadline.check("parsing source files")?;
         let identity = code::identity();
         let known = store.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
         code_inputs.push(crate::core::CodeInputDraft {
@@ -141,6 +162,8 @@ pub fn ingest_path<S: AsRef<str>>(
         files,
         spaces: space_ids.clone(),
     };
+    // The last point where the limit can stop the ingest cleanly.
+    deadline.check("preparing to write")?;
     let report = store.record_observation(observation)?;
     if !code_inputs.is_empty() {
         let _ = store.record_code_observation(crate::core::CodeObservation {
@@ -166,11 +189,39 @@ pub fn ingest_paths<S: AsRef<str>>(
     scope: GitScope,
     space_names: &[S],
 ) -> Result<Vec<IngestOutcome>> {
+    ingest_paths_with_deadline(
+        store,
+        path,
+        selection,
+        scope,
+        space_names,
+        &Deadline::none(),
+    )
+}
+
+/// Like [`ingest_paths`], with a time limit (see [`ingest_path_with_deadline`]).
+/// For a plain directory every selected sub-path is its own ingest root; when
+/// the limit expires between roots, the finished ones are kept and the error
+/// says how many.
+pub fn ingest_paths_with_deadline<S: AsRef<str>>(
+    store: &dyn Store,
+    path: &Path,
+    selection: &outline::PathSelection,
+    scope: GitScope,
+    space_names: &[S],
+    deadline: &Deadline,
+) -> Result<Vec<IngestOutcome>> {
+    deadline.check("starting")?;
     let canonical_is_git = std::fs::canonicalize(path)
         .map(|c| c.is_dir() && git::looks_like_git_repository(&c))
         .unwrap_or(false);
     if selection.is_all() && !(canonical_is_git && scope != GitScope::Head) {
-        return Ok(vec![ingest_path(store, path, space_names)?]);
+        return Ok(vec![ingest_path_with_deadline(
+            store,
+            path,
+            space_names,
+            deadline,
+        )?]);
     }
     let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
@@ -183,16 +234,32 @@ pub fn ingest_paths<S: AsRef<str>>(
         });
     }
     if git::looks_like_git_repository(&canonical) {
-        return Ok(vec![IngestOutcome::Git(ingest_git_repository_selected(
-            store,
-            &canonical,
-            space_names,
-            selection,
-            scope,
-        )?)]);
+        return Ok(vec![IngestOutcome::Git(
+            ingest_git_repository_selected_with_deadline(
+                store,
+                &canonical,
+                space_names,
+                selection,
+                scope,
+                deadline,
+            )?,
+        )]);
     }
     let mut outcomes = Vec::new();
+    let total = selection.prefixes().len();
     for prefix in selection.prefixes() {
+        let kept = outcomes.len();
+        if kept == 0 {
+            deadline.check("starting")?;
+        } else {
+            deadline.check_with(
+                "ingesting selected paths",
+                &format!(
+                    "{kept} of {total} selected paths were ingested and kept; repeating the call \
+                     continues with the rest and is idempotent"
+                ),
+            )?;
+        }
         let target = std::fs::canonicalize(canonical.join(prefix)).map_err(|e| Error::Io {
             path: canonical.join(prefix).display().to_string(),
             source: e,
@@ -203,7 +270,12 @@ pub fn ingest_paths<S: AsRef<str>>(
                 reason: "resolves outside the ingest root".into(),
             });
         }
-        outcomes.push(ingest_path(store, &target, space_names)?);
+        outcomes.push(ingest_path_with_deadline(
+            store,
+            &target,
+            space_names,
+            deadline,
+        )?);
     }
     Ok(outcomes)
 }
@@ -211,6 +283,15 @@ pub fn ingest_paths<S: AsRef<str>>(
 /// Read-only outline of a git repository (at HEAD) or directory, down to
 /// `depth` directory levels. Opens no database and writes nothing.
 pub fn scan_path(path: &Path, depth: u32) -> Result<outline::Outline> {
+    scan_path_with_deadline(path, depth, &Deadline::none())
+}
+
+/// Like [`scan_path`]; git is killed when `deadline` expires.
+pub fn scan_path_with_deadline(
+    path: &Path,
+    depth: u32,
+    deadline: &Deadline,
+) -> Result<outline::Outline> {
     let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
         source: e,
@@ -223,7 +304,7 @@ pub fn scan_path(path: &Path, depth: u32) -> Result<outline::Outline> {
     }
     let root = canonical.display().to_string();
     if git::looks_like_git_repository(&canonical) {
-        let reader = git::GitReader::open(&canonical)?;
+        let reader = git::GitReader::open_with_deadline(&canonical, *deadline)?;
         let commit = reader.head_commit()?;
         let files = reader.commit_blob_sizes(&commit)?;
         return Ok(outline::Outline {
@@ -236,6 +317,7 @@ pub fn scan_path(path: &Path, depth: u32) -> Result<outline::Outline> {
     }
     let mut files = Vec::new();
     for file in outline::walk_files(&canonical)? {
+        deadline.check("measuring the directory")?;
         let rel = file
             .strip_prefix(&canonical)
             .unwrap_or(&file)
@@ -310,7 +392,30 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
     selection: &outline::PathSelection,
     scope: GitScope,
 ) -> Result<GitObservationReport> {
-    let reader = git::GitReader::open(repo_path)?;
+    ingest_git_repository_selected_with_deadline(
+        store,
+        repo_path,
+        space_names,
+        selection,
+        scope,
+        &Deadline::none(),
+    )
+}
+
+/// Like [`ingest_git_repository_selected`], with a time limit. The limit is
+/// checked through the whole preparation (git processes, parsing, deriving)
+/// and once more right before the database write. The write itself, the code
+/// structure and the relationship resolution that follow it are not
+/// interrupted: they complete as one unit, or the ingest stopped before them.
+pub fn ingest_git_repository_selected_with_deadline<S: AsRef<str>>(
+    store: &dyn Store,
+    repo_path: &Path,
+    space_names: &[S],
+    selection: &outline::PathSelection,
+    scope: GitScope,
+    deadline: &Deadline,
+) -> Result<GitObservationReport> {
+    let reader = git::GitReader::open_with_deadline(repo_path, *deadline)?;
     let repository_id = reader.repository_id()?;
     let space_ids = resolve_spaces(store, space_names)?;
 
@@ -348,7 +453,9 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
             stderr: "HEAD does not resolve to a commit; use --history to observe all refs".into(),
         });
     }
+    deadline.check("discovering git objects")?;
     let reachable = reader.reachable_oids(&tips)?;
+    deadline.check("checking git objects")?;
     let checked = reader.batch_check(&reachable)?;
     let mut structural: Vec<String> = Vec::new();
     let mut blob_sizes: Vec<(String, u64)> = Vec::new();
@@ -359,6 +466,7 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
             structural.push(oid);
         }
     }
+    deadline.check("reading git objects")?;
     let (mut commits, trees, tags) = reader.objects(&reachable)?;
     let blob_datas: Vec<crate::core::GitBlobData> = blob_sizes
         .into_iter()
@@ -398,6 +506,7 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
     let mut tip_files: Vec<(String, Vec<(String, String)>)> = Vec::new();
     let mut text_blob_oids: BTreeSet<String> = BTreeSet::new();
     for commit in &tip_commits {
+        deadline.check("listing files")?;
         let mut files: Vec<(String, String)> = Vec::new();
         for (mode, kind, oid, path) in reader.commit_files(commit)? {
             if kind != "blob" || mode.starts_with("12") {
@@ -416,6 +525,7 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
         tip_files.push((commit.clone(), files));
     }
     let text_oids: Vec<String> = text_blob_oids.into_iter().collect();
+    deadline.check("reading file contents")?;
     let contents = reader.blob_contents(&text_oids)?;
     let content_by_oid: std::collections::HashMap<String, String> = contents
         .into_iter()
@@ -425,6 +535,7 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
     let mut derivations: Vec<GitDerivedFile> = Vec::new();
     for (commit, files) in tip_files {
         for (blob_oid, path) in files {
+            deadline.check("deriving memories")?;
             let Some(content) = content_by_oid.get(&blob_oid) else {
                 continue;
             };
@@ -530,8 +641,13 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
         }
     }
 
-    let code_inputs =
-        tip_files_to_code_inputs(store, repository_id, &derivations, &content_by_oid)?;
+    let code_inputs = tip_files_to_code_inputs(
+        store,
+        repository_id,
+        &derivations,
+        &content_by_oid,
+        deadline,
+    )?;
 
     // Releases: every tag ref is a document-shaped memory, independent of
     // which commits are current views. A targeted (`--path`) ingest skips
@@ -584,6 +700,8 @@ pub fn ingest_git_repository_selected<S: AsRef<str>>(
         current_commits: (scope != GitScope::History)
             .then(|| tip_commits.iter().cloned().collect()),
     };
+    // The last point where the limit can stop the ingest cleanly.
+    deadline.check("preparing to write")?;
     let mut report = store.record_git_observation(observation)?;
     if !code_inputs.is_empty() {
         report.code = store.record_code_observation(crate::core::CodeObservation {
@@ -606,6 +724,7 @@ fn tip_files_to_code_inputs(
     repository_id: Uuid,
     derivations: &[GitDerivedFile],
     contents: &std::collections::HashMap<String, String>,
+    deadline: &Deadline,
 ) -> Result<Vec<crate::core::CodeInputDraft>> {
     let mut grouped: std::collections::BTreeMap<String, crate::core::CodeInputDraft> =
         std::collections::BTreeMap::new();
@@ -614,6 +733,7 @@ fn tip_files_to_code_inputs(
         let Some(language) = code::language_for(p) else {
             continue;
         };
+        deadline.check("parsing source files")?;
         let entry = grouped.entry(d.blob_oid.clone()).or_insert_with(|| {
             let content = contents.get(&d.blob_oid).cloned().unwrap_or_default();
             crate::core::CodeInputDraft {
@@ -661,13 +781,23 @@ fn tip_files_to_code_inputs(
 /// Walks one directory deterministically (see [`outline::walk_files`]):
 /// project-local ignore files apply, symlinks are skipped, and only
 /// `.md`, `.markdown`, `.txt`, and `.rs` files take part in the observed set.
-fn observe_directory(root: &Path, space_ids: &[Uuid]) -> Result<Vec<ObservedFile>> {
+fn observe_directory(
+    root: &Path,
+    space_ids: &[Uuid],
+    deadline: &Deadline,
+) -> Result<Vec<ObservedFile>> {
     let mut paths: Vec<PathBuf> = outline::walk_files(root)?
         .into_iter()
         .filter(|p| is_ingestable(p))
         .collect();
     paths.sort();
-    paths.iter().map(|p| observe_file(p, space_ids)).collect()
+    paths
+        .iter()
+        .map(|p| {
+            deadline.check("reading files")?;
+            observe_file(p, space_ids)
+        })
+        .collect()
 }
 
 fn is_ingestable(path: &Path) -> bool {
@@ -794,5 +924,139 @@ fn parse_material(stem: &str, text: &str, media_type: &str, space_ids: &[Uuid]) 
         evidences,
         assertions,
         memories,
+    }
+}
+
+#[cfg(test)]
+mod deadline_checkpoints {
+    //! Every checkpoint of the ingest pipeline, exercised one by one: the limit
+    //! expires exactly at that phase, and the ingest must fail with a timeout
+    //! naming the phase and leave every table of the database untouched. A
+    //! checkpoint that is removed (or never reached by the fixture) makes the
+    //! ingest succeed and fails the test.
+
+    use super::*;
+    use crate::SqliteStore;
+    use std::collections::BTreeMap;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    fn fixture(dir: &Path, with_git: bool) {
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/a.md"), "# A\n\nalpha\n").unwrap();
+        std::fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        if with_git {
+            git(dir, &["init", "-q", "-b", "main"]);
+            git(dir, &["add", "-A"]);
+            git(dir, &["commit", "-q", "-m", "i"]);
+        }
+    }
+
+    fn snapshot(db: &Path) -> BTreeMap<String, i64> {
+        let c = rusqlite::Connection::open(db).unwrap();
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        tables
+            .into_iter()
+            .map(|t| {
+                let n = c
+                    .query_row(&format!("SELECT count(*) FROM \"{t}\""), [], |r| r.get(0))
+                    .unwrap();
+                (t, n)
+            })
+            .collect()
+    }
+
+    fn run(phases: &[&'static str], with_git: bool) {
+        for phase in phases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            fixture(&root, with_git);
+            let db = tmp.path().join("m.db");
+            let store = SqliteStore::open(&db).unwrap();
+            store.create_space("s", "").unwrap();
+            let before = snapshot(&db);
+
+            let result = ingest_paths_with_deadline(
+                &store,
+                &root,
+                &outline::PathSelection::all(),
+                GitScope::Head,
+                &["s"],
+                &Deadline::expiring_at(phase),
+            );
+            match result {
+                Err(Error::IngestTimeout { message }) => {
+                    assert!(
+                        message.contains(phase),
+                        "phase `{phase}` not named: {message}"
+                    );
+                    assert!(
+                        message.contains("database was not changed"),
+                        "`{phase}`: {message}"
+                    );
+                }
+                Err(e) => panic!("phase `{phase}`: wrong error: {e}"),
+                Ok(_) => panic!("phase `{phase}` was never checked: the ingest succeeded"),
+            }
+            assert_eq!(
+                snapshot(&db),
+                before,
+                "database changed when aborting at `{phase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn git_pipeline_aborts_cleanly_at_every_checkpoint() {
+        run(
+            &[
+                "starting",
+                "discovering git objects",
+                "checking git objects",
+                "reading git objects",
+                "listing files",
+                "reading file contents",
+                "deriving memories",
+                "parsing source files",
+                "preparing to write",
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    fn directory_pipeline_aborts_cleanly_at_every_checkpoint() {
+        run(
+            &[
+                "starting",
+                "reading files",
+                "parsing source files",
+                "preparing to write",
+            ],
+            false,
+        );
     }
 }

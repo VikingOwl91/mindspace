@@ -25,11 +25,14 @@
 //! way around that), and commit-graph, alternates and shallow files are
 //! honored as written.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 use uuid::Uuid;
+
+use super::deadline::Deadline;
 
 use crate::core::{
     Error, GitBlobData, GitCommitData, GitObjectKind, GitRefObservation, GitTagData, GitTreeData,
@@ -65,11 +68,19 @@ pub struct GitReader {
     path: PathBuf,
     /// Canonical common dir; holds the repository identity marker.
     common_dir: PathBuf,
+    /// Time limit for every git process this reader starts.
+    deadline: Deadline,
 }
 
 impl GitReader {
     pub fn open(path: &Path) -> Result<Self> {
-        let out = run(path, &["rev-parse", "--git-common-dir"], None)?;
+        Self::open_with_deadline(path, Deadline::none())
+    }
+
+    /// Like [`open`](Self::open); every git process of the reader is killed
+    /// when `deadline` expires.
+    pub fn open_with_deadline(path: &Path, deadline: Deadline) -> Result<Self> {
+        let out = run(path, &deadline, &["rev-parse", "--git-common-dir"], None)?;
         let raw = String::from_utf8_lossy(&out).trim().to_string();
         if raw.is_empty() {
             return Err(Error::GitCommand {
@@ -90,6 +101,7 @@ impl GitReader {
         Ok(Self {
             path: path.to_path_buf(),
             common_dir,
+            deadline,
         })
     }
 
@@ -129,6 +141,7 @@ impl GitReader {
     pub fn refs(&self) -> Result<Vec<GitRefObservation>> {
         let out = run(
             &self.path,
+            &self.deadline,
             &[
                 "for-each-ref",
                 "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(symref)",
@@ -163,9 +176,14 @@ impl GitReader {
         }
 
         // HEAD: resolved target, plus the symbolic branch when attached.
-        if let Ok(head_oid) = run(&self.path, &["rev-parse", "HEAD"], None) {
+        if let Ok(head_oid) = run(&self.path, &self.deadline, &["rev-parse", "HEAD"], None) {
             let oid = String::from_utf8_lossy(&head_oid).trim().to_string();
-            let symbolic_target = match run(&self.path, &["symbolic-ref", "-q", "HEAD"], None) {
+            let symbolic_target = match run(
+                &self.path,
+                &self.deadline,
+                &["symbolic-ref", "-q", "HEAD"],
+                None,
+            ) {
                 Ok(s) => {
                     let t = String::from_utf8_lossy(&s).trim().to_string();
                     if t.is_empty() {
@@ -209,7 +227,7 @@ impl GitReader {
         }
         let mut args: Vec<&str> = vec!["rev-list", "--objects", "--no-object-names"];
         args.extend(tips.iter().map(|s| s.as_str()));
-        let out = run(&self.path, &args, None)?;
+        let out = run(&self.path, &self.deadline, &args, None)?;
         let text = String::from_utf8_lossy(&out);
         let mut set = std::collections::BTreeSet::new();
         for line in text.lines() {
@@ -227,7 +245,12 @@ impl GitReader {
             return Ok(Vec::new());
         }
         let input: Vec<u8> = oids.join("\n").into_bytes();
-        let out = run(&self.path, &["cat-file", "--batch-check"], Some(&input))?;
+        let out = run(
+            &self.path,
+            &self.deadline,
+            &["cat-file", "--batch-check"],
+            Some(&input),
+        )?;
         let text = String::from_utf8_lossy(&out);
         let mut result = Vec::with_capacity(oids.len());
         for line in text.lines() {
@@ -263,7 +286,12 @@ impl GitReader {
             return Ok(Vec::new());
         }
         let input: Vec<u8> = oids.join("\n").into_bytes();
-        let out = run(&self.path, &["cat-file", "--batch"], Some(&input))?;
+        let out = run(
+            &self.path,
+            &self.deadline,
+            &["cat-file", "--batch"],
+            Some(&input),
+        )?;
         parse_batch_stream(&out)
     }
 
@@ -316,7 +344,12 @@ impl GitReader {
     /// Symlinks and gitlinks are returned with their true modes so callers
     /// can exclude them.
     pub fn commit_files(&self, commit: &str) -> Result<Vec<(String, String, String, String)>> {
-        let out = run(&self.path, &["ls-tree", "-r", "-z", commit], None)?;
+        let out = run(
+            &self.path,
+            &self.deadline,
+            &["ls-tree", "-r", "-z", commit],
+            None,
+        )?;
         let mut result = Vec::new();
         for record in String::from_utf8_lossy(&out).split('\0') {
             if record.is_empty() {
@@ -337,7 +370,12 @@ impl GitReader {
 
     /// The commit HEAD resolves to. Errors for an unborn branch.
     pub fn head_commit(&self) -> Result<String> {
-        let out = run(&self.path, &["rev-parse", "--verify", "HEAD^{commit}"], None)?;
+        let out = run(
+            &self.path,
+            &self.deadline,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            None,
+        )?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
@@ -360,7 +398,12 @@ impl GitReader {
     /// Every worktree of this repository as git lists them; the first entry
     /// is the main worktree. One git call.
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
-        let out = run(&self.path, &["worktree", "list", "--porcelain"], None)?;
+        let out = run(
+            &self.path,
+            &self.deadline,
+            &["worktree", "list", "--porcelain"],
+            None,
+        )?;
         let text = String::from_utf8_lossy(&out);
         let mut result = Vec::new();
         for (i, block) in text.split("\n\n").enumerate() {
@@ -404,6 +447,7 @@ impl GitReader {
     pub fn remotes(&self) -> Result<Vec<(String, String)>> {
         let out = run_codes(
             &self.path,
+            &self.deadline,
             &["config", "--null", "--get-regexp", r"^remote\..*\.url$"],
             None,
             &[0, 1],
@@ -447,7 +491,12 @@ impl GitReader {
     /// Blob entries of one commit's tree as `(path, size)`, symlinks and
     /// gitlinks excluded. One git call; reads the object database only.
     pub fn commit_blob_sizes(&self, commit: &str) -> Result<Vec<(String, u64)>> {
-        let out = run(&self.path, &["ls-tree", "-r", "-l", "-z", commit], None)?;
+        let out = run(
+            &self.path,
+            &self.deadline,
+            &["ls-tree", "-r", "-l", "-z", commit],
+            None,
+        )?;
         let mut result = Vec::new();
         for record in String::from_utf8_lossy(&out).split('\0') {
             let Some((meta, path)) = record.split_once('\t') else {
@@ -471,15 +520,15 @@ impl GitReader {
     /// Deterministic ancestor check: is `old` an ancestor of `new`?
     /// Exit code 0 means provably yes; exit 1 means provably no.
     pub fn is_ancestor(&self, old: &str, new: &str) -> Result<bool> {
-        let out = git_command(&self.path)
-            .args(["merge-base", "--is-ancestor", old, new])
+        let mut cmd = git_command(&self.path);
+        cmd.args(["merge-base", "--is-ancestor", old, new])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| Error::GitUnavailable {
-                detail: format!("cannot run git: {e}"),
-            })?;
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().map_err(|e| Error::GitUnavailable {
+            detail: format!("cannot run git: {e}"),
+        })?;
+        let out = collect_output(child, None, &self.deadline, "merge-base")?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -539,18 +588,20 @@ fn git_command(dir: &Path) -> Command {
     cmd
 }
 
-fn run(path: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-    run_codes(path, args, stdin, &[0])
+fn run(path: &Path, deadline: &Deadline, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+    run_codes(path, deadline, args, stdin, &[0])
 }
 
 /// Like [`run`], but exit codes in `ok_codes` count as success (for commands
 /// such as `git config --get-regexp`, which exit 1 when nothing matches).
 fn run_codes(
     path: &Path,
+    deadline: &Deadline,
     args: &[&str],
     stdin: Option<&[u8]>,
     ok_codes: &[i32],
 ) -> Result<Vec<u8>> {
+    deadline.check(&format!("starting `git {}`", args.first().unwrap_or(&"")))?;
     let mut cmd = git_command(path);
     cmd.args(args)
         .stdin(if stdin.is_some() {
@@ -560,31 +611,10 @@ fn run_codes(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| Error::GitUnavailable {
+    let child = cmd.spawn().map_err(|e| Error::GitUnavailable {
         detail: format!("cannot run git: {e}"),
     })?;
-    // Feed stdin from a separate thread while this thread drains stdout and
-    // stderr. Writing all input first deadlocks once both pipe buffers fill
-    // (git blocks writing output, we block writing input): that happened for
-    // any repository with more than a few thousand objects.
-    let pipe = if stdin.is_some() {
-        child.stdin.take()
-    } else {
-        None
-    };
-    let out = std::thread::scope(|scope| {
-        if let (Some(input), Some(mut pipe)) = (stdin, pipe) {
-            scope.spawn(move || {
-                // A broken pipe means git exited early; its status and
-                // stderr are reported below, so the write error is moot.
-                let _ = pipe.write_all(input);
-            });
-        }
-        child.wait_with_output()
-    })
-    .map_err(|e| Error::GitUnavailable {
-        detail: format!("cannot read git output: {e}"),
-    })?;
+    let out = collect_output(child, stdin, deadline, args.first().unwrap_or(&""))?;
     if !out.status.code().is_some_and(|c| ok_codes.contains(&c)) {
         return Err(Error::GitCommand {
             command: format!("git {}", args.join(" ")),
@@ -592,6 +622,91 @@ fn run_codes(
         });
     }
     Ok(out.stdout)
+}
+
+/// Feeds `stdin`, drains stdout and stderr, and waits for the process.
+///
+/// Without a limit this is the plain blocking path. With a limit, the process
+/// is polled and killed when the limit expires, which is what turns a hung git
+/// into a clear error instead of a silent stall. The reader threads are then
+/// detached rather than joined: a grandchild holding a pipe open must not keep
+/// the caller waiting. None of the git commands used here starts long-lived
+/// children (unverified for every git version).
+fn collect_output(
+    mut child: Child,
+    stdin: Option<&[u8]>,
+    deadline: &Deadline,
+    command: &str,
+) -> Result<Output> {
+    let unreadable = |e: std::io::Error| Error::GitUnavailable {
+        detail: format!("cannot read git output: {e}"),
+    };
+    // Feed stdin from a separate thread while this thread drains stdout and
+    // stderr. Writing all input first deadlocks once both pipe buffers fill
+    // (git blocks writing output, we block writing input): that happened for
+    // any repository with more than a few thousand objects.
+    if deadline.limit().is_none() {
+        let pipe = if stdin.is_some() {
+            child.stdin.take()
+        } else {
+            None
+        };
+        return std::thread::scope(|scope| {
+            if let (Some(input), Some(mut pipe)) = (stdin, pipe) {
+                scope.spawn(move || {
+                    // A broken pipe means git exited early; its status and
+                    // stderr are reported by the caller, so the error is moot.
+                    let _ = pipe.write_all(input);
+                });
+            }
+            child.wait_with_output()
+        })
+        .map_err(unreadable);
+    }
+
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&input);
+        });
+    }
+    let mut nap = Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => return Err(unreadable(e)),
+        }
+        if deadline.expired() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(deadline.error(
+                &format!("waiting for `git {command}`"),
+                "the database was not changed",
+            ));
+        }
+        let left = deadline.remaining().unwrap_or(nap);
+        std::thread::sleep(nap.min(left.max(Duration::from_millis(1))));
+        nap = (nap * 2).min(Duration::from_millis(20));
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Parses `cat-file --batch` output: a stream of
@@ -891,7 +1006,12 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let path = dir.path().to_path_buf();
         std::thread::spawn(move || {
-            let out = run(&path, &["cat-file", "--batch-check"], Some(input.as_bytes()));
+            let out = run(
+                &path,
+                &Deadline::none(),
+                &["cat-file", "--batch-check"],
+                Some(input.as_bytes()),
+            );
             let _ = tx.send(out);
         });
         let out = rx

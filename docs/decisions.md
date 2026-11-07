@@ -787,6 +787,87 @@ Whether `git -C /proc/self/fd/N` behaves correctly for all commands used here
 is untested. Until this is fixed, do not allow roots that untrusted local
 processes can write to.
 
+**ADR-026 addendum (2026-11-07): ingest time limit (MIND-4).** `repo_ingest`
+is synchronous, so a long ingest can outlive a client's tool timeout, and a
+hung git (the original deadlock) stalled without any message.
+
+Decision: `mind mcp --ingest-timeout <SECONDS>` (also
+`MINDSPACE_MCP_INGEST_TIMEOUT`, default 30, accepted range 0.001 to 3600;
+zero, negative, non-finite and out-of-range values stop the server at startup).
+The default is below the 60 s that MCP clients commonly allow; the real
+timeouts of specific clients were not verified. **The flag is a deadline for
+the preparation of an ingest, not an end-to-end timeout.** It stops what can be
+stopped cleanly and does not bound the total duration: the write phase is
+allowed to exceed it.
+
+- **Enforced:** every step of the preparation (listing refs and objects,
+  reading contents, parsing, deriving), the git processes themselves (a git
+  that is still running at the limit is killed), and a last check immediately
+  before the first database write. Aborting there changes nothing in the
+  database. The error names the phase and points to `paths`, `repo_outline`
+  and the flag. For several selected paths of a plain directory, which are
+  independent ingest roots, the finished ones are kept and the error says how
+  many.
+- **Not interrupted:** the database write and what follows it (code structure,
+  relationship resolution). Because of that, a successful call can finish after
+  the limit, and it reports three fields:
+  - `elapsed_ms`: time from the start of the call (authorization and size check
+    included) to its end;
+  - `limit_ms`: the configured deadline;
+  - `over_limit`: `true` exactly when the call finished after the deadline had
+    passed. It describes timing only. It does **not** mean that anything failed,
+    was rolled back, or was cut short: the ingest is complete. It is `false`
+    when the call finished within the limit. A call that the deadline did stop
+    is an error and carries none of these fields.
+- **Not covered:** `repo_outline` (including its repository facts), walking a
+  very large plain directory, and processes that git itself might start.
+  Client cancellation (`notifications/cancelled`) is not handled; whether any
+  client sends it was not checked.
+- **Requests** are processed one after the other on one thread. A second
+  request sent while the first runs is queued and answered in order (tested);
+  its own limit starts when it starts.
+
+**Why writes are not interrupted (measured, not assumed).** Interrupting a
+fenced write transaction was tried on the real fence code in a throwaway
+experiment: SQLite rolls the transaction back by itself, the transaction's
+`Drop` then fails its own rollback, the store is marked poisoned, and the next
+write of the session fails with "connection was discarded after an uncertain
+transaction outcome". A timeout would therefore disable every later write of
+the session. Changing the M6 fence is a separate, security-relevant decision.
+Also, the write is followed by two more transactions (code structure,
+resolution); stopping between them would leave memories without their code
+layer.
+
+**What this means in numbers (one repository, so treat it as an example).** A
+first ingest of the `gpui-shell` fork (6,597 objects, 3.9 s): preparation
+0.57 s, the main write 1.9 s, code structure and resolution 1.5 s, so about
+85 % of the time is in the part the limit cannot stop. A second, unchanged
+ingest took 0.3 s. The limit with the 30 s default has no measurable cost
+(3.9 s with and without it).
+
+**Correction to the paragraph above ("scoping is the mitigation").** `paths`
+helps but does not remove the cost of the history: ingesting that repository
+with a single file took 1.5 s instead of 4.0 s and a 19 MB instead of a 43.6 MB
+database, because the whole object graph is still recorded. For a large
+repository the first ingest can therefore exceed a client timeout even with
+`paths`. The honest answer to that is an asynchronous job (start, poll), which
+is not built. It is tracked as MIND-20 together with the open question of
+interrupting writes, and becomes necessary when a real client times out on a
+first ingest.
+
+**Verified:** `tests/mcp_ingest_timeout.rs` (9, real binary) and the checkpoint
+sweeps in `src/ingest/mod.rs` (2): the limit expires at each of nine git and
+four directory checkpoints in turn, and every table of the database is
+unchanged each time; an aborted ingest retires nothing and the retry converges;
+a later write in the same session still works; a hung `git` is killed (also for
+a scoped ingest); invalid values stop the server. Eight deliberate mutations
+were each caught by at least one test: the pre-write check in both pipelines,
+three other checkpoints, the kill, and the hand-over of the deadline to the
+scan and to the ingest's reader (the last one only after a test was added: the
+first version of the hung-git test never reached the reader). The remaining
+checkpoints are covered by the sweep by construction (a removed checkpoint lets
+the ingest succeed, which the sweep rejects) but were not mutated one by one.
+
 ## ADR-027: Repository slugs are observations from remotes; no fork claims (2026-11-07)
 
 **Decision.** `mind repo info <path>` (and a `repository` block in MCP

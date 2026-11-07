@@ -29,6 +29,11 @@ pub enum Error {
     #[error("git command failed: {command}: {stderr}")]
     GitCommand { command: String, stderr: String },
 
+    /// An ingest hit its time limit before it wrote anything (or between
+    /// independent ingest roots). The message says what was and was not kept.
+    #[error("{message}")]
+    IngestTimeout { message: String },
+
     #[error("cannot establish repository identity for {path}: {reason}")]
     RepositoryIdentity { path: String, reason: String },
 

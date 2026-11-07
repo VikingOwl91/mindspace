@@ -121,7 +121,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "repo_ingest",
-            "Ingest a directory or git repository into existing spaces. Pass `paths` (repository-relative directories or files, from repo_outline) to ingest only those; an unscoped ingest of a very large tree is refused. Git: HEAD and live worktrees are interpreted by default, tags always become releases, and `branches`/`remotes`/`tags` add more ref tips (`history` interprets every tip). It writes to the database and, for git, a repository identity marker in the repo's .git directory. Only absolute paths inside a read-write allowed root are accepted; read-only roots can be outlined but not ingested.",
+            "Ingest a directory or git repository into existing spaces. Pass `paths` (repository-relative directories or files, from repo_outline) to ingest only those; an unscoped ingest of a very large tree is refused. Git: HEAD and live worktrees are interpreted by default, tags always become releases, and `branches`/`remotes`/`tags` add more ref tips (`history` interprets every tip). It writes to the database and, for git, a repository identity marker in the repo's .git directory. Only absolute paths inside a read-write allowed root are accepted; read-only roots can be outlined but not ingested. A deadline (`--ingest-timeout`) applies to the preparation only: it stops an ingest that is still preparing without changing the database, but the database write, once started, runs to its end. The result reports `elapsed_ms`, `limit_ms` and `over_limit` (true: the call finished after the limit, the ingest is complete). Use `paths` to keep it small.",
             json!({
                 "type": "object",
                 "properties": {

@@ -189,8 +189,25 @@ pub enum Command {
         /// read-write one (the default without a suffix). Repeatable, or
         /// several joined with ':' in MINDSPACE_MCP_ALLOW_ROOTS
         /// (/a:ro:/b:rw). Without any root those tools are disabled.
-        #[arg(long = "allow-root", value_name = "DIR[:ro|:rw]", env = "MINDSPACE_MCP_ALLOW_ROOTS")]
+        #[arg(
+            long = "allow-root",
+            value_name = "DIR[:ro|:rw]",
+            env = "MINDSPACE_MCP_ALLOW_ROOTS"
+        )]
         allow_roots: Vec<String>,
+        /// Deadline for the PREPARATION of a repo_ingest, in seconds (0.001 to
+        /// 3600). It is not an end-to-end timeout: until the database write
+        /// starts it stops the ingest without changing anything and kills a
+        /// hung git; the write, once started, runs to its end and may exceed
+        /// the limit.
+        #[arg(
+            long = "ingest-timeout",
+            value_name = "SECONDS",
+            env = "MINDSPACE_MCP_INGEST_TIMEOUT",
+            default_value = "30",
+            value_parser = crate::mcp::parse_ingest_timeout
+        )]
+        ingest_timeout: std::time::Duration,
     },
 }
 
@@ -770,8 +787,12 @@ License: {}",
                 println!("indexing_available: {}", enabled && selected.is_some());
             }
         },
-        Command::Mcp { allow_roots } => {
-            let config = crate::mcp::McpConfig::from_specs(allow_roots)?;
+        Command::Mcp {
+            allow_roots,
+            ingest_timeout,
+        } => {
+            let config = crate::mcp::McpConfig::from_specs(allow_roots)?
+                .with_ingest_timeout(*ingest_timeout);
             let store = open(cli)?;
             crate::mcp::serve_with_config(&store, &config)?;
         }

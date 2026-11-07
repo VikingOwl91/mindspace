@@ -18,17 +18,24 @@
 //!   target may not contain a read-only root.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::core::{Error, IngestOutcome, Result};
-use crate::ingest::{self, outline::PathSelection, GitScope, GitViews};
+use crate::ingest::{self, deadline::Deadline, outline::PathSelection, GitScope, GitViews};
 use crate::storage::Store;
 
 /// An unscoped ingest of more ingestable files than this is refused: the
 /// call is synchronous, and the agent should pick directories from the
 /// outline instead.
 pub const MAX_UNSCOPED_INGEST_FILES: u64 = 2000;
+/// Default limit for the part of a `repo_ingest` that can be stopped cleanly.
+/// Chosen below the 60 s that MCP clients commonly allow for a tool call; the
+/// clients' real timeouts were not verified.
+pub const DEFAULT_INGEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_INGEST_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_INGEST_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Outline responses are capped so a huge tree cannot flood the context.
 pub const MAX_OUTLINE_NODES: usize = 300;
 const SAMPLE: usize = 10;
@@ -55,9 +62,40 @@ pub struct AllowRoot {
     pub access: Access,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct McpConfig {
     roots: Vec<AllowRoot>,
+    ingest_timeout: Duration,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            ingest_timeout: DEFAULT_INGEST_TIMEOUT,
+        }
+    }
+}
+
+/// Parses `--ingest-timeout`: seconds as a decimal number, 0.001 to 3600.
+/// Zero, negative, non-finite and absurdly large values are refused instead
+/// of silently meaning "no limit".
+pub fn parse_ingest_timeout(raw: &str) -> std::result::Result<Duration, String> {
+    let secs: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{raw}' is not a number of seconds"))?;
+    if !secs.is_finite() {
+        return Err(format!("'{raw}' is not a finite number of seconds"));
+    }
+    let limit = Duration::try_from_secs_f64(secs)
+        .map_err(|_| format!("'{raw}' is not a valid number of seconds"))?;
+    if limit < MIN_INGEST_TIMEOUT || limit > MAX_INGEST_TIMEOUT {
+        return Err(format!(
+            "'{raw}' is out of range; use 0.001 to 3600 seconds"
+        ));
+    }
+    Ok(limit)
 }
 
 impl McpConfig {
@@ -119,7 +157,18 @@ impl McpConfig {
                 .into_iter()
                 .map(|(path, access)| AllowRoot { path, access })
                 .collect(),
+            ingest_timeout: DEFAULT_INGEST_TIMEOUT,
         })
+    }
+
+    /// Limit for the clean-abort part of `repo_ingest`.
+    pub fn with_ingest_timeout(mut self, limit: Duration) -> Self {
+        self.ingest_timeout = limit;
+        self
+    }
+
+    pub fn ingest_timeout(&self) -> Duration {
+        self.ingest_timeout
     }
 
     pub fn roots(&self) -> &[AllowRoot] {
@@ -327,6 +376,7 @@ pub fn ingest(
     config: &McpConfig,
     obj: &serde_json::Map<String, Value>,
 ) -> Result<Value> {
+    let deadline = Deadline::after(config.ingest_timeout());
     let path = config
         .authorize(str_arg(obj, "path")?, Access::ReadWrite)
         .map_err(Error::Storage)?;
@@ -350,7 +400,7 @@ pub fn ingest(
     };
 
     if selection.is_all() {
-        let total = ingest::scan_path(&path, 0)?
+        let total = ingest::scan_path_with_deadline(&path, 0, &deadline)?
             .nodes
             .first()
             .map(|n| n.ingestable_files)
@@ -364,9 +414,15 @@ pub fn ingest(
         }
     }
 
-    let outcomes = ingest::ingest_paths(store, &path, &selection, scope, &spaces)?;
+    let outcomes =
+        ingest::ingest_paths_with_deadline(store, &path, &selection, scope, &spaces, &deadline)?;
+    // The limit stops the ingest only before it writes; the write itself runs
+    // to its end, so a call can finish after the limit. Say so.
     Ok(json!({
         "ingested": outcomes.iter().map(summarize).collect::<Vec<_>>(),
+        "elapsed_ms": deadline.elapsed().as_millis() as u64,
+        "limit_ms": config.ingest_timeout().as_millis() as u64,
+        "over_limit": deadline.expired(),
         "next": "Use code_search for definitions and memory_search for documents."
     }))
 }

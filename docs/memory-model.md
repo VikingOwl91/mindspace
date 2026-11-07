@@ -1,5 +1,7 @@
 # The Mindspace memory model (v0.5)
 
+*Snapshot note: written for v0.5 and extended for later work where noted (sections 4, 10, 12). Statements about what is "deferred" describe the model level; the README and `docs/decisions.md` are authoritative for the current feature state.*
+
 This document defines the conceptual model that v0 implements. It is the
 authoritative description of what objects exist, how they relate, what is
 immutable, and what the v0 semantics of supersession, conflict, and deletion
@@ -326,6 +328,15 @@ Two consequences worth naming:
   keeps the assertion immutable and dated, so a future valid-time or
   re-interpretation pass can correct the view without rewriting history.
 
+**Recording layer (migration 0008, ADR-021 and `docs/adr-m6-temporal-recording.md`).**
+Separately from the `--at` predicate above, the database records a monotonically
+increasing recording revision for knowledge writes, per-table history, and
+explicit coverage (history starts at a migration baseline; earlier history is not
+inferred from timestamps). This is recording infrastructure for Stage 0/1. The
+query semantics it is meant to enable (`belief_at(R)`, `world_history(R, V)`) are
+not delivered, and `mind search --at` keeps its original timestamp semantics and
+is not a revision or world-validity query.
+
 ## 5. Conflict
 
 Definition (v0, deterministic): two or more **active** memories whose
@@ -530,7 +541,7 @@ Three invalidation words must never collapse into one mechanism:
 
 ## 10. Scope versus space
 
-Kept separate, as the README requires:
+Kept separate (see `docs/reference.md`, "Spaces, scopes, and memory types"):
 
 - **Space** (implemented): which knowledge domain a memory is useful in.
 - **Scope** (minimal, for code since ADR-028): where information originated:
@@ -571,9 +582,9 @@ identified by `(repository, oid)`; objects are never deduplicated across
 repositories (two clones stay distinct stores of knowledge). A commit keeps
 its parent list in order, so merges are topologically real. Trees keep
 their entries (name, mode, target oid, kind), which is how blob-at-path
-provenance is reconstructed. Blob content is stored only for text blobs
-(`.md`, `.markdown`, `.txt`), the derivation inputs; every other blob is
-recorded as identity and size. Objects are never deleted: a commit that
+provenance is reconstructed. Blob content is stored only for the derivation inputs
+(`.md`, `.markdown`, `.txt` and, for the syntax layer of section 13, `.rs`);
+every other blob is recorded as identity and size. Objects are never deleted: a commit that
 became unreachable after a history rewrite was still observed once, and the
 store keeps it.
 
@@ -584,7 +595,9 @@ common dir. Moving the repository moves the marker; a fresh clone starts
 without it and gets its own; a byte-level copy inherits it (it is the same
 repository bit-for-bit). If the marker cannot be read or written, ingestion
 fails rather than guessing. Remote URLs are observations, not identity, and
-changing them never rewrites identity.
+changing them never rewrites identity. Through the MCP repository tools the
+marker is only created inside a read-write root and never through a symbolic
+link; a read-only root is never written (ADR-029).
 
 ### 12.3 Refs
 
@@ -627,7 +640,17 @@ Memory -> Assertion -> Evidence -> Source version (git blob text)
   -> repository (marker identity) -> refs pointing at the commit
 ```
 
-### 12.5 Idempotence layers
+### 12.5 Remotes, views and scopes (migration 0009, ADR-027 and ADR-028)
+
+Remotes are stored as observed (credential-free URL, slug key, first and last
+observation, `is_current` for the latest), never as identity. `git_views`
+records the commits that make up a repository's current views (the HEAD commit by
+default; more with `--branches`, `--remotes`, `--tags`). A repository or an ingest root is a minimal *scope* attached to
+spaces through `scope_spaces`; code definitions reach spaces only through their
+scope. Nothing is backfilled: re-ingesting attaches scopes and views to older
+data.
+
+### 12.6 Idempotence layers
 
 Three independent guarantees, all tested:
 

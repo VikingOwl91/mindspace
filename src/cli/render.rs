@@ -14,6 +14,70 @@ fn json<T: serde::Serialize + ?Sized>(value: &T) {
     );
 }
 
+pub fn outline(outline: &crate::ingest::outline::Outline, as_json: bool) {
+    if as_json {
+        json(outline);
+        return;
+    }
+    match &outline.commit {
+        Some(c) => println!("{} ({} @ {})", outline.root, outline.source, &c[..c.len().min(12)]),
+        None => println!("{} ({})", outline.root, outline.source),
+    }
+    println!(
+        "{:<44} {:>7} {:>9} {:>10}  kinds",
+        "path", "files", "ingest", "bytes"
+    );
+    for n in &outline.nodes {
+        let kinds = n
+            .kinds
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{:<44} {:>7} {:>9} {:>10}  {}",
+            format!("{}{}", "  ".repeat(n.depth as usize), n.path),
+            n.files,
+            n.ingestable_files,
+            n.bytes,
+            kinds
+        );
+    }
+}
+
+pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
+    if as_json {
+        json(hits);
+        return;
+    }
+    if hits.is_empty() {
+        println!("no definitions found");
+        return;
+    }
+    for (i, h) in hits.iter().enumerate() {
+        let name = h
+            .qualified_name
+            .as_deref()
+            .or(h.name.as_deref())
+            .unwrap_or("<anonymous>");
+        println!(
+            "{}. {} {}{}",
+            i + 1,
+            h.kind.as_str(),
+            name,
+            if h.current { "" } else { "  [not current]" }
+        );
+        if let Some(sig) = &h.signature {
+            println!("   {}", first_line(sig).trim());
+        }
+        let at = match (&h.commit_oid, &h.repository_path) {
+            (Some(c), Some(r)) => format!("  @ {} in {r}", &c[..c.len().min(12)]),
+            _ => String::new(),
+        };
+        println!("   {}:{}-{}{at}", h.path, h.start_line, h.end_line);
+    }
+}
+
 pub fn code_structure(items: &[CodeDerivation], as_json: bool) {
     if as_json {
         json(items);

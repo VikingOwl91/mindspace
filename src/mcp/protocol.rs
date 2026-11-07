@@ -6,6 +6,7 @@ use crate::core::{Error, Result};
 use crate::retrieval::semantic::SemanticCache;
 use crate::storage::Store;
 
+use super::repo_tools::McpConfig;
 use super::tools;
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -18,16 +19,22 @@ enum Phase {
     Ready,
 }
 
+/// Serves with the repository tools disabled (no allowed roots).
 pub fn serve(store: &dyn Store) -> Result<()> {
+    serve_with_config(store, &McpConfig::none())
+}
+
+pub fn serve_with_config(store: &dyn Store, config: &McpConfig) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
-    serve_with_io(store, &mut reader, &mut writer)
+    serve_with_io(store, config, &mut reader, &mut writer)
 }
 
 fn serve_with_io<R: BufRead, W: Write>(
     store: &dyn Store,
+    config: &McpConfig,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<()> {
@@ -55,7 +62,7 @@ fn serve_with_io<R: BufRead, W: Write>(
         }
 
         let response = match serde_json::from_slice::<Value>(&line) {
-            Ok(message) => handle_message(store, &mut semantic, &mut phase, message),
+            Ok(message) => handle_message(store, config, &mut semantic, &mut phase, message),
             Err(error) => Some(json_rpc_error(
                 Value::Null,
                 -32700,
@@ -78,6 +85,7 @@ fn serve_with_io<R: BufRead, W: Write>(
 
 fn handle_message(
     store: &dyn Store,
+    config: &McpConfig,
     semantic: &mut SemanticCache,
     phase: &mut Phase,
     message: Value,
@@ -282,7 +290,7 @@ fn handle_message(
             };
             Some(json_rpc_result(
                 id,
-                tools::call_result(store, semantic, name, &arguments),
+                tools::call_result(store, config, semantic, name, &arguments),
             ))
         }
         _ => Some(json_rpc_error(
@@ -320,7 +328,7 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let mut reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
-        serve_with_io(&store, &mut reader, &mut output).unwrap();
+        serve_with_io(&store, &McpConfig::none(), &mut reader, &mut output).unwrap();
         String::from_utf8(output).unwrap()
     }
 

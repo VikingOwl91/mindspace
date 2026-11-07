@@ -8,7 +8,7 @@ use crate::core::{
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
-pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "1", "tree-sitter-rust", "0.24.2");
+pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "2", "tree-sitter-rust", "0.24.2");
 pub fn identity() -> CodeParserIdentity {
     CodeParserIdentity {
         extractor: IDENTITY.0.into(),
@@ -137,13 +137,9 @@ fn walk(
                 range: range(n),
             });
         }
-        let mut cursor = n.walk();
-        let type_name = n
-            .children(&mut cursor)
-            .find(|child| matches!(child.kind(), "type_identifier" | "generic_type"))
-            .map(|child| text(child, s))
-            .or(type_target)
-            .unwrap_or_else(|| "impl".to_string());
+        // The `type` field is the implementing type; for `impl Trait for
+        // Type` the first type identifier would be the trait.
+        let type_name = type_target.unwrap_or_else(|| "impl".to_string());
         let impl_parent = Some(format!("impl:{type_name}@{}", n.start_byte()));
         let impl_q = Some(
             parent_q
@@ -163,7 +159,7 @@ fn walk(
         "enum_item" => Some(CodeEntityKind::Enum),
         "trait_item" => Some(CodeEntityKind::Trait),
         "type_item" => Some(CodeEntityKind::TypeAlias),
-        "function_item" => Some(
+        "function_item" | "function_signature_item" => Some(
             if parent
                 .as_deref()
                 .is_some_and(|p| p.contains("impl") || p.contains("trait"))
@@ -381,5 +377,48 @@ mod tests {
             parsed.relationships[0].range.start_byte,
             parsed.relationships[1].range.start_byte
         );
+    }
+
+    #[test]
+    fn trait_method_declarations_are_indexed_as_methods() {
+        let parsed = parse(
+            CodeLanguage::Rust,
+            "pub trait Store { fn record_manual_write(&self, d: u8) -> u8; fn with_body(&self) {} }",
+        );
+        let find = |name: &str| {
+            parsed
+                .entities
+                .iter()
+                .find(|e| e.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert_eq!(find("record_manual_write").kind, CodeEntityKind::Method);
+        assert_eq!(
+            find("record_manual_write").qualified_name.as_deref(),
+            Some("Store::record_manual_write")
+        );
+        assert!(find("record_manual_write")
+            .signature
+            .as_deref()
+            .unwrap()
+            .starts_with("fn record_manual_write"));
+        assert_eq!(find("with_body").kind, CodeEntityKind::Method);
+    }
+
+    #[test]
+    fn trait_impl_methods_are_named_after_the_implementing_type() {
+        let parsed = parse(
+            CodeLanguage::Rust,
+            "trait Store { fn put(&self); } struct SqliteStore; impl Store for SqliteStore { fn put(&self) {} }",
+        );
+        let names: Vec<_> = parsed
+            .entities
+            .iter()
+            .filter(|e| e.name.as_deref() == Some("put"))
+            .map(|e| e.qualified_name.clone().unwrap())
+            .collect();
+        assert!(names.contains(&"Store::put".to_string()), "{names:?}");
+        assert!(names.contains(&"SqliteStore::put".to_string()), "{names:?}");
+        assert_eq!(names.len(), 2);
     }
 }

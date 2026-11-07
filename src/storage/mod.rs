@@ -3,8 +3,8 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    AssertionEmbedding, CodeDerivation, CodeLanguage, CodeObservation, CodeObservationReport,
-    CodeParserIdentity, CodeResolutionReport, ConflictGroup, EmbeddingIndexStatus, GitObservation,
+    AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation, CodeObservationReport,
+    CodeParserIdentity, CodeResolutionReport, CodeSearchQuery, ConflictGroup, EmbeddingIndexStatus, GitObservation,
     GitObservationReport, GitRefObservation, IngestObservation, ManualMemoryDraft,
     ManualMemoryReport, Memory, MemoryDetail, MemorySummary, ObservationReport, Result,
     SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, TemporalDimension,
@@ -58,6 +58,10 @@ pub trait Store {
         observation: CodeObservation,
     ) -> Result<CodeObservationReport>;
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>>;
+    /// Symbol search over the code-structure layer: definitions whose name,
+    /// qualified name, signature, or path match every query term, ranked by
+    /// match quality. Read-only; by default only current definitions.
+    fn search_code(&self, query: &CodeSearchQuery) -> Result<Vec<CodeHit>>;
     fn has_code_derivation(
         &self,
         language: CodeLanguage,

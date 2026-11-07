@@ -603,6 +603,11 @@ update.
 
 ### 12.4 Derivations
 
+> Default scope is HEAD (ADR-023): only the commit HEAD resolves to is
+> interpreted, and memories derived at other commits are retired when HEAD
+> moves. The text below describes `--history` scope, where every ref tip is
+> interpreted and nothing is retired.
+
 Text blobs at ref tips are derived through the normal pipeline (evidence ->
 assertions -> memories) with git-prefixed extractor ids
 (`git:markdown:section-heading`, ...). The logical source of a derivation is
@@ -643,7 +648,7 @@ blob reuse avoids reparsing the same repository-qualified blob, while path and
 commit contexts remain separate observations. Syntax equality, names, paths,
 or line numbers do not establish durable symbol identity. Recovered parses
 remain honestly marked as such. This layer creates no Evidence, Assertion, or
-Memory and is deliberately absent from recall until a later retrieval slice.
+Memory and stays out of recall. It is searchable through its own surface, `mind symbols` and the MCP `code_search` tool (ADR-025), which returns definitions and their locations rather than memories.
 
 ## 14. Explicit manual writes (v0.5)
 

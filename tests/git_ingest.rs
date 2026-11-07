@@ -109,7 +109,19 @@ impl Repo {
 }
 
 fn ingest(store: &dyn Store, repo: &Repo) -> GitObservationReport {
-    match ingest::ingest_path(store, repo.path(), &["coding"]).unwrap() {
+    ingest_scoped(store, repo, ingest::GitScope::History)
+}
+
+fn ingest_scoped(
+    store: &dyn Store,
+    repo: &Repo,
+    scope: ingest::GitScope,
+) -> GitObservationReport {
+    let sel = ingest::outline::PathSelection::all();
+    match ingest::ingest_paths(store, repo.path(), &sel, scope, &["coding"])
+        .unwrap()
+        .remove(0)
+    {
         mindspace::core::IngestOutcome::Git(report) => report,
         mindspace::core::IngestOutcome::Files(_) => panic!("git repository ingested as files"),
     }
@@ -935,9 +947,14 @@ fn scenario_k_annotated_and_lightweight_tags() {
         report.objects_new, 1,
         "only the annotated tag object is new"
     );
-    // The annotated tag peels to the commit: no new derivations, but the
-    // tag object exists.
-    assert_eq!(report.derivations_new, 0);
+    // The annotated tag peels to the commit: no new file derivations, but
+    // the tag object exists. Each tag derives exactly one release memory.
+    assert_eq!(report.derivations_new, 2);
+    assert!(report
+        .files
+        .iter()
+        .filter(|f| !f.path.starts_with("/refs/tags/"))
+        .all(|f| f.outcome == mindspace::core::GitFileOutcome::Unchanged));
 
     // An exact re-ingest observes no ref changes.
     let again = ingest(&store, &r);
@@ -1165,4 +1182,371 @@ fn derivation_idempotence_survives_repos_and_sessions() {
     let hits = search(&store, "Stable proposition");
     let detail = store.get_memory_detail(hits[0].memory_id).unwrap().unwrap();
     assert_eq!(detail.memory.state, MemoryState::Active);
+}
+
+// ---------------------------------------------------------------------------
+// Head scope (default): HEAD defines the current view
+// ---------------------------------------------------------------------------
+
+#[test]
+fn head_scope_derives_only_head_and_still_journals_every_ref() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("README.md", "# Main\n\nmainmarker\n");
+    r.commit("main");
+    git(r.path(), &["checkout", "-q", "-b", "feature"]);
+    r.write("FEATURE.md", "# Feature\n\nfeaturemarker\n");
+    r.commit("feature work");
+    git(r.path(), &["checkout", "-q", "main"]);
+
+    let report = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(search(&store, "mainmarker").len(), 1);
+    assert_eq!(
+        search(&store, "featuremarker").len(),
+        0,
+        "a non-HEAD branch is not interpreted"
+    );
+    assert!(report.refs_observed >= 3, "both branches and HEAD journaled");
+    assert_eq!(report.stale_retired, 0);
+
+    // History scope adds the other tip without retiring anything.
+    ingest_scoped(&store, &r, ingest::GitScope::History);
+    assert_eq!(search(&store, "featuremarker").len(), 1);
+    // The feature tip also contains README.md: history scope keeps one
+    // commit-bound copy per tip (ADR-015), the duplication head scope avoids.
+    assert_eq!(search(&store, "mainmarker").len(), 2);
+}
+
+#[test]
+fn head_move_retires_memories_derived_at_the_previous_commit() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("docs.md", "# Setup\n\nuse iced for the ui\n");
+    let first = r.commit("v1");
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(search(&store, "iced").len(), 1);
+
+    // Unchanged HEAD: idempotent, nothing retired.
+    let again = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(again.stale_retired, 0);
+    assert_eq!(search(&store, "iced").len(), 1);
+
+    r.write("docs.md", "# Setup\n\nuse slint for the ui\n");
+    let second = r.commit("v2");
+    let report = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert!(report.stale_retired >= 1);
+
+    assert_eq!(search(&store, "slint").len(), 1, "new HEAD is current");
+    assert_eq!(search(&store, "iced").len(), 0, "old HEAD is no longer current");
+
+    // The stale memory stays inspectable, with a reason naming both commits.
+    let hits = store
+        .search(&SearchQuery {
+            text: "iced".into(),
+            space_ids: None,
+            limit: 10,
+            at: None,
+            include_superseded: true,
+            include_retired: true,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    let detail = store.get_memory_detail(hits[0].memory_id).unwrap().unwrap();
+    assert_eq!(detail.memory.state, MemoryState::Retired);
+    let reason = detail.memory.retire_reason.unwrap();
+    assert!(reason.contains(&second[..12]) && reason.contains(&first[..12]), "{reason}");
+}
+
+#[test]
+fn file_deleted_at_head_is_no_longer_current() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("a.md", "# A\n\nalphamarker\n");
+    r.write("b.md", "# B\n\nbetamarker\n");
+    r.commit("both");
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    r.rm("b.md");
+    r.commit("drop b");
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(search(&store, "alphamarker").len(), 1);
+    assert_eq!(search(&store, "betamarker").len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Views: worktrees, branches, remote branches, tags
+// ---------------------------------------------------------------------------
+
+fn ingest_at(store: &dyn Store, path: &Path, scope: ingest::GitScope) -> GitObservationReport {
+    let sel = ingest::outline::PathSelection::all();
+    match ingest::ingest_paths(store, path, &sel, scope, &["coding"])
+        .unwrap()
+        .remove(0)
+    {
+        mindspace::core::IngestOutcome::Git(report) => report,
+        mindspace::core::IngestOutcome::Files(_) => panic!("git repository ingested as files"),
+    }
+}
+
+/// Main worktree on `main` with a.md, plus a linked worktree on `feature`
+/// carrying an extra commit with b.md. Returns (repo, worktree dir, wt path).
+fn repo_with_worktree() -> (Repo, tempfile::TempDir, PathBuf) {
+    let r = repo();
+    r.write("a.md", "# A\n\nmainmarker\n");
+    r.commit("main");
+    git(r.path(), &["branch", "feature"]);
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = wt_parent.path().join("wt");
+    git(r.path(), &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"]);
+    std::fs::write(wt.join("b.md"), "# B\n\nfeatmarker\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-q", "-m", "feature work"]);
+    (r, wt_parent, wt)
+}
+
+#[test]
+fn linked_worktrees_are_current_views_and_do_not_retire_each_other() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let (r, _keep, wt) = repo_with_worktree();
+
+    // Ingesting from the main worktree also derives the linked worktree HEAD.
+    let first = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    assert_eq!(first.stale_retired, 0);
+    assert_eq!(search(&store, "featmarker").len(), 1);
+    assert!(!search(&store, "mainmarker").is_empty());
+
+    // Ingesting from the linked worktree must not flip-flop.
+    let from_wt = ingest_at(&store, &wt, ingest::GitScope::Head);
+    assert_eq!(from_wt.repository_id, first.repository_id, "one repository");
+    assert_eq!(from_wt.stale_retired, 0);
+    let again = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    assert_eq!(again.stale_retired, 0);
+    assert_eq!(search(&store, "featmarker").len(), 1);
+}
+
+#[test]
+fn removed_worktree_stops_being_a_current_view() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let (r, _keep, wt) = repo_with_worktree();
+    ingest_at(&store, r.path(), ingest::GitScope::Head);
+    assert_eq!(search(&store, "featmarker").len(), 1);
+
+    git(r.path(), &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+    let report = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    assert!(report.stale_retired >= 1);
+    assert_eq!(search(&store, "featmarker").len(), 0);
+}
+
+#[test]
+fn branches_remotes_and_tags_are_opt_in_views() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("a.md", "# A\n\nmainmarker\n");
+    r.commit("main");
+    git(r.path(), &["checkout", "-q", "-b", "topic"]);
+    r.write("t.md", "# T\n\nbranchmarker\n");
+    r.commit("topic");
+    let topic = git(r.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    git(r.path(), &["checkout", "-q", "-b", "other", "main"]);
+    r.write("o.md", "# O\n\nremotemarker\n");
+    let other = r.commit("other");
+    git(r.path(), &["update-ref", "refs/remotes/origin/dev", &other]);
+    git(r.path(), &["checkout", "-q", "-b", "rel", "main"]);
+    git(r.path(), &["branch", "-q", "-D", "other"]);
+    r.write("r.md", "# R\n\ntagmarker\n");
+    let rel = r.commit("rel");
+    git(r.path(), &["tag", "-a", "v1", "-m", "release", &rel]);
+    git(r.path(), &["checkout", "-q", "main"]);
+    git(r.path(), &["branch", "-q", "-D", "rel"]);
+    let _ = topic;
+
+    ingest_at(&store, r.path(), ingest::GitScope::Head);
+    for m in ["branchmarker", "remotemarker", "tagmarker"] {
+        assert_eq!(search(&store, m).len(), 0, "{m} only with its view");
+    }
+
+    let only = |branches, remotes, tags| {
+        ingest::GitScope::Views(ingest::GitViews { branches, remotes, tags })
+    };
+    ingest_at(&store, r.path(), only(true, false, false));
+    assert_eq!(search(&store, "branchmarker").len(), 1);
+    assert_eq!(search(&store, "remotemarker").len(), 0);
+
+    ingest_at(&store, r.path(), only(true, true, true));
+    assert_eq!(search(&store, "branchmarker").len(), 1);
+    assert_eq!(search(&store, "remotemarker").len(), 1);
+    assert_eq!(search(&store, "tagmarker").len(), 1, "annotated tag is peeled");
+
+    // Dropping the views retires what they alone made current.
+    let back = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    assert!(back.stale_retired >= 3);
+    for m in ["branchmarker", "remotemarker", "tagmarker"] {
+        assert_eq!(search(&store, m).len(), 0, "{m} no longer current");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Releases from tags
+// ---------------------------------------------------------------------------
+
+fn release_repo() -> Repo {
+    let r = repo();
+    r.write("a.md", "# A\n\nplain doc\n");
+    r.commit("first");
+    git(r.path(), &["tag", "-a", "v1.0", "-m", "First stable release. Adds frobnication.", "HEAD"]);
+    r.write("a.md", "# A\n\nplain doc, second revision\n");
+    r.commit("second");
+    git(r.path(), &["tag", "v1.1"]); // lightweight
+    r.write("a.md", "# A\n\nplain doc, third revision\n");
+    r.commit("third: unreleased work");
+    r
+}
+
+#[test]
+fn tags_become_release_memories_independent_of_current_views() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = release_repo();
+
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    // v1.0 points at the first commit, which is not a current view.
+    let annotated = search(&store, "frobnication");
+    assert_eq!(annotated.len(), 1);
+    assert_eq!(annotated[0].subject, "Release v1.0");
+    // Lightweight tags use the tagged commit's message and author.
+    let light = search(&store, "second");
+    assert!(light.iter().any(|h| h.subject == "Release v1.1"), "{light:?}");
+
+    // Full provenance chain loads (needs the tagged commit row).
+    let raw = store
+        .search(&SearchQuery {
+            text: "frobnication".into(),
+            space_ids: None,
+            limit: 5,
+            at: None,
+            include_superseded: false,
+            include_retired: false,
+        })
+        .unwrap();
+    let detail = store.get_memory_detail(raw[0].memory_id).unwrap().unwrap();
+    let g = detail.git.expect("git provenance");
+    assert_eq!(g.path, "/refs/tags/v1.0");
+    assert_eq!(detail.assertion.extraction, "git:tag:release");
+    assert!(detail.assertion.content.contains("Tagger: tester <tester@example.com>"));
+    assert!(detail.assertion.content.contains("(annotated)"));
+}
+
+#[test]
+fn release_ingest_is_idempotent_and_survives_head_moves() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = release_repo();
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    let again = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(again.derivations_new, 0);
+    assert_eq!(again.stale_retired, 0);
+
+    r.write("a.md", "# A\n\nfourth revision\n");
+    r.commit("fourth");
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(search(&store, "frobnication").len(), 1, "release not stale");
+}
+
+#[test]
+fn deleted_or_moved_tag_retires_its_release() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = release_repo();
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+
+    git(r.path(), &["tag", "-d", "v1.1"]);
+    let report = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(report.stale_retired, 1);
+    assert!(!search(&store, "second").iter().any(|h| h.subject == "Release v1.1"));
+
+    // Moving an annotated tag: new release version, old one retired.
+    git(r.path(), &["tag", "-f", "-a", "v1.0", "-m", "Retagged: now includes refrobnication.", "HEAD"]);
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(search(&store, "refrobnication").len(), 1);
+    assert_eq!(search(&store, "frobnication").len(), 0);
+}
+
+#[test]
+fn tag_retirement_requires_an_authoritative_tag_inventory() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = release_repo();
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    let release_active = |subject: &str| {
+        store
+            .search(&SearchQuery {
+                text: "Release".into(),
+                space_ids: None,
+                limit: 50,
+                at: None,
+                include_superseded: false,
+                include_retired: false,
+            })
+            .unwrap()
+            .iter()
+            .any(|h| h.subject == subject)
+    };
+    assert!(release_active("Release v1.1"));
+
+    // The tag disappears, but this ingest is partial (`--path`): it takes no
+    // tag inventory, so it must neither retire nor derive any release.
+    git(r.path(), &["tag", "-d", "v1.1"]);
+    let sel = ingest::outline::PathSelection::new(&["a.md"]).unwrap();
+    let out = ingest::ingest_paths(&store, r.path(), &sel, ingest::GitScope::Head, &["coding"])
+        .unwrap()
+        .remove(0);
+    let mindspace::core::IngestOutcome::Git(partial) = out else { panic!() };
+    assert_eq!(partial.stale_retired, 0, "partial ingest retired something");
+    assert!(partial.files.iter().all(|f| !f.path.starts_with("/refs/tags/")));
+    assert!(release_active("Release v1.1"), "partial ingest hid a release");
+    assert!(release_active("Release v1.0"));
+
+    // A full ingest is authoritative: now the deleted tag retires, the
+    // surviving one stays.
+    let full = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(full.stale_retired, 1);
+    assert!(!release_active("Release v1.1"));
+    assert!(release_active("Release v1.0"));
+}
+
+#[test]
+fn releases_have_their_own_source_kind() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = release_repo();
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    let hit = store
+        .search(&SearchQuery {
+            text: "frobnication".into(),
+            space_ids: None,
+            limit: 5,
+            at: None,
+            include_superseded: false,
+            include_retired: false,
+        })
+        .unwrap()
+        .remove(0);
+    let d = store.get_memory_detail(hit.memory_id).unwrap().unwrap();
+    assert_eq!(d.source.kind.as_str(), "git_tag");
 }

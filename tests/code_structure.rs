@@ -37,7 +37,7 @@ fn derivation_is_idempotent_and_parser_versions_coexist() {
         .unwrap();
     assert_eq!((repeat.parsed, repeat.reused), (0, 1));
     let mut changed = input("/tmp/a.rs", source);
-    changed.derivation.identity.extractor_version = "2".into();
+    changed.derivation.identity.extractor_version = "99".into();
     assert_eq!(
         store
             .record_code_observation(CodeObservation {

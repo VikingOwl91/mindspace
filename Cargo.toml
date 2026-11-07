@@ -19,6 +19,7 @@ embeddings = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "de
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive", "env"] }
+ignore = "0.4.34"
 pulldown-cmark = "0.13.4"
 rusqlite = { version = "0.40.2", features = ["bundled", "functions", "hooks"] }
 serde = { version = "1", features = ["derive"] }

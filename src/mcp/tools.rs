@@ -7,6 +7,8 @@ use crate::retrieval;
 use crate::retrieval::semantic::SemanticCache;
 use crate::storage::Store;
 
+use super::repo_tools::{self, McpConfig};
+
 pub fn definitions() -> Vec<Value> {
     vec![
         tool(
@@ -80,6 +82,57 @@ pub fn definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "code_search",
+            "Find definitions (functions, methods, structs, traits, ...) in ingested source code by name, qualified name, signature, or path. Every whitespace-separated term must match. Results are locations with line ranges, not memories; they carry no confidence. By default only definitions in a current view are returned (HEAD and worktrees for git sources, the latest version of a present file); all_versions includes stale ones, marked current=false.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "kinds": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["module","struct","enum","trait","type_alias","function","method","constant","static","field","import"] }
+                    },
+                    "repository": { "type": "string", "minLength": 1, "description": "Repository path substring or id prefix." },
+                    "path": { "type": "string", "minLength": 1, "description": "Path prefix, repository-relative for git sources." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                    "all_versions": { "type": "boolean", "default": false }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "repo_outline",
+            "Outline a directory or git repository without ingesting it: file counts, bytes, ingestable files, and file kinds per directory down to `depth`. Git sources are read at HEAD. Use it first to choose which directories to ingest. Only absolute paths inside the server's allowed roots are accepted; with no allowed roots the tool is disabled.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": "Absolute path of a directory or git repository root." },
+                    "depth": { "type": "integer", "minimum": 0, "maximum": 4, "default": 2 }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "repo_ingest",
+            "Ingest a directory or git repository into existing spaces. Pass `paths` (repository-relative directories or files, from repo_outline) to ingest only those; an unscoped ingest of a very large tree is refused. Git: HEAD and live worktrees are interpreted by default, tags always become releases, and `branches`/`remotes`/`tags` add more ref tips (`history` interprets every tip). It writes to the database and, for git, a repository identity marker in the repo's .git directory. Only absolute paths inside the server's allowed roots are accepted.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": "Absolute path of a directory or git repository root." },
+                    "spaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+                    "paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Repository-relative paths to ingest." },
+                    "history": { "type": "boolean", "default": false },
+                    "branches": { "type": "boolean", "default": false },
+                    "remotes": { "type": "boolean", "default": false },
+                    "tags": { "type": "boolean", "default": false }
+                },
+                "required": ["path", "spaces"],
                 "additionalProperties": false
             }),
         ),
@@ -165,11 +218,12 @@ fn empty_object_schema() -> Value {
 
 pub fn call_result(
     store: &dyn Store,
+    config: &McpConfig,
     semantic: &mut SemanticCache,
     name: &str,
     arguments: &Value,
 ) -> Value {
-    match call_tool(store, semantic, name, arguments) {
+    match call_tool(store, config, semantic, name, arguments) {
         Ok(structured) => {
             let text = serde_json::to_string(&structured)
                 .unwrap_or_else(|error| format!("cannot serialize result: {error}"));
@@ -188,6 +242,7 @@ pub fn call_result(
 
 fn call_tool(
     store: &dyn Store,
+    config: &McpConfig,
     semantic: &mut SemanticCache,
     name: &str,
     args: &Value,
@@ -275,6 +330,26 @@ fn call_tool(
                 }
             }
         }
+        "code_search" => {
+            let kinds: Vec<&str> = match obj.get("kinds") {
+                Some(_) => string_array(obj, "kinds")?,
+                None => Vec::new(),
+            };
+            let hits = retrieval::search_code(
+                store,
+                crate::core::CodeSearchQuery {
+                    text: string(obj, "query")?.to_string(),
+                    kinds: retrieval::parse_code_kinds(&kinds)?,
+                    repository: optional_string(obj, "repository")?.map(str::to_string),
+                    path_prefix: optional_string(obj, "path")?.map(str::to_string),
+                    limit: optional_u32(obj, "limit")?.unwrap_or(20),
+                    all_versions: optional_bool(obj, "all_versions")?.unwrap_or(false),
+                },
+            )?;
+            Ok(json!({ "hits": hits }))
+        }
+        "repo_outline" => repo_tools::outline(config, obj),
+        "repo_ingest" => repo_tools::ingest(store, config, obj),
         "memory_history" => {
             let subject = normalize_subject(string(obj, "subject")?);
             if subject.is_empty() {
@@ -343,6 +418,15 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             ],
             &["query"],
         ),
+        "code_search" => (
+            &["query", "kinds", "repository", "path", "limit", "all_versions"],
+            &["query"],
+        ),
+        "repo_outline" => (&["path", "depth"], &["path"]),
+        "repo_ingest" => (
+            &["path", "spaces", "paths", "history", "branches", "remotes", "tags"],
+            &["path", "spaces"],
+        ),
         "memory_history" => (&["subject"], &["subject"]),
         "memory_conflicts" | "space_list" => (&[], &[]),
         "memory_add_spaces" => (&["id", "spaces"], &["id", "spaces"]),
@@ -358,6 +442,44 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
     for key in required {
         if !obj.contains_key(*key) {
             return Err(format!("missing required argument '{key}'"));
+        }
+    }
+    if let Some(value) = obj.get("depth") {
+        if !value.as_u64().is_some_and(|d| d <= 4) {
+            return Err("argument 'depth' must be an integer from 0 to 4".to_string());
+        }
+    }
+    if let Some(value) = obj.get("paths") {
+        let ok = value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())));
+        if !ok {
+            return Err("argument 'paths' must be an array of non-empty strings".to_string());
+        }
+    }
+    for key in ["history", "branches", "remotes", "tags"] {
+        if obj.get(key).is_some_and(|v| !v.is_boolean()) {
+            return Err(format!("argument '{key}' must be a boolean"));
+        }
+    }
+    for key in ["repository", "path"] {
+        if let Some(value) = obj.get(key) {
+            if value.as_str().is_none_or(|s| s.trim().is_empty()) {
+                return Err(format!("argument '{key}' must be a non-empty string"));
+            }
+        }
+    }
+    if let Some(value) = obj.get("kinds") {
+        let Some(values) = value.as_array() else {
+            return Err("argument 'kinds' must be an array of strings".to_string());
+        };
+        if values.iter().any(|v| !v.is_string()) {
+            return Err("argument 'kinds' entries must be strings".to_string());
+        }
+    }
+    if let Some(value) = obj.get("all_versions") {
+        if !value.is_boolean() {
+            return Err("argument 'all_versions' must be a boolean".to_string());
         }
     }
     for key in [
@@ -497,7 +619,7 @@ mod tests {
     #[test]
     fn registers_all_tools_with_object_schemas() {
         let definitions = definitions();
-        assert_eq!(definitions.len(), 11);
+        assert_eq!(definitions.len(), 14);
         for tool in definitions {
             assert!(tool["inputSchema"]["type"].as_str() == Some("object"));
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
@@ -509,6 +631,7 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let result = call_result(
             &store,
+            &McpConfig::none(),
             &mut SemanticCache::default(),
             "memory_create",
             &json!({"content":"x"}),

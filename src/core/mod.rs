@@ -262,6 +262,8 @@ pub fn default_manual_subject(content: &str) -> Option<String> {
 pub enum SourceKind {
     File,
     GitBlob,
+    /// A release derived from a tag ref (ADR-024); not a blob.
+    GitTag,
     Manual,
 }
 
@@ -270,6 +272,7 @@ impl SourceKind {
         match self {
             SourceKind::File => "file",
             SourceKind::GitBlob => "git_blob",
+            SourceKind::GitTag => "git_tag",
             SourceKind::Manual => "manual",
         }
     }
@@ -278,6 +281,7 @@ impl SourceKind {
         match s {
             "file" => Some(SourceKind::File),
             "git_blob" => Some(SourceKind::GitBlob),
+            "git_tag" => Some(SourceKind::GitTag),
             "manual" => Some(SourceKind::Manual),
             _ => None,
         }
@@ -1037,6 +1041,50 @@ pub struct CodeEntity {
     pub visibility: Option<String>,
     pub is_async: bool,
 }
+/// A symbol search over the deterministic code-structure layer (ADR-025).
+/// Matching is case-insensitive substring matching; every whitespace-separated
+/// term must occur in the name, qualified name, signature, or path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeSearchQuery {
+    pub text: String,
+    /// Empty means every entity kind.
+    pub kinds: Vec<CodeEntityKind>,
+    /// Case-insensitive substring of the repository path, or a repository id prefix.
+    pub repository: Option<String>,
+    /// Path prefix (component-wise); repository-relative for git sources.
+    pub path_prefix: Option<String>,
+    pub limit: u32,
+    /// Include definitions that are no longer part of a current view.
+    pub all_versions: bool,
+}
+
+/// One definition found by a symbol search, with where it lives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeHit {
+    pub entity_id: Uuid,
+    pub kind: CodeEntityKind,
+    pub name: Option<String>,
+    pub qualified_name: Option<String>,
+    pub signature: Option<String>,
+    pub visibility: Option<String>,
+    pub is_async: bool,
+    pub language: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub repository_id: Option<Uuid>,
+    pub repository_path: Option<String>,
+    pub commit_oid: Option<String>,
+    pub blob_oid: Option<String>,
+    pub content_hash: String,
+    /// True when the definition belongs to a current view (git) or to the
+    /// latest version of a present file.
+    pub current: bool,
+    /// Match quality, lower is better: 0 exact name ... 6 other term match.
+    /// Not comparable with retrieval scores or confidence.
+    pub match_rank: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeImport {
     pub raw: String,
@@ -1376,6 +1424,7 @@ pub struct GitTagData {
 /// existing evidence/assertion pipeline with git extraction rule ids.
 #[derive(Debug, Clone)]
 pub struct GitDerivedFile {
+    pub source_kind: SourceKind,
     pub path: String,
     pub blob_oid: String,
     pub commit_oid: String,
@@ -1433,6 +1482,19 @@ pub struct GitObservation {
     pub tags: Vec<GitTagData>,
     pub derivations: Vec<GitDerivedFile>,
     pub ref_events: Vec<GitRefEventDraft>,
+    /// The commits that make up the repository's current views (HEAD,
+    /// worktrees, and any selected refs). Active git-derived memories of this
+    /// repository derived at any other commit are retired in the same
+    /// transaction. `None` keeps every derivation active (history scope).
+    pub current_commits: Option<Vec<String>>,
+    /// `(virtual path, blob oid)` of every release derived from a tag ref in
+    /// this observation. Active release memories of this repository that are
+    /// not in the list belong to deleted or moved tags and are retired.
+    /// `None` leaves release memories untouched.
+    pub current_tags: Option<Vec<(String, String)>>,
+    /// Every commit this observation derived at. Stored as the repository's
+    /// current code views, so symbol search can tell current from stale.
+    pub view_commits: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1477,6 +1539,9 @@ pub struct GitObservationReport {
     pub objects_existing: u64,
     pub derivations_new: u64,
     pub derivations_reused: u64,
+    /// Memories retired because they were derived at a commit other than the
+    /// current one (head scope only).
+    pub stale_retired: u64,
     /// Syntax-only structural derivations. These counters never include memories.
     pub code: CodeObservationReport,
     pub files: Vec<GitFileReport>,

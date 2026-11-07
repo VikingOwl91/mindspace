@@ -1,6 +1,8 @@
 pub mod code;
 pub mod git;
 pub mod markdown;
+pub mod outline;
+pub mod release;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,31 @@ use crate::core::{
     Result, SessionDraft, Ts, Uuid,
 };
 use crate::storage::Store;
+
+/// Which ref classes beyond HEAD and worktrees are interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GitViews {
+    pub branches: bool,
+    pub remotes: bool,
+    pub tags: bool,
+}
+
+/// Which part of a git repository is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitScope {
+    /// The default: HEAD of the ingest path plus HEAD of every live linked
+    /// worktree. These commits are the repository's current views; memories
+    /// derived at any other commit are retired as stale. Refs are still
+    /// journaled completely.
+    #[default]
+    Head,
+    /// `Head` plus the selected ref classes (local branches, remote
+    /// branches, tags). Every selected tip is a current view.
+    Views(GitViews),
+    /// Every ref tip is observed and interpreted (ADR-015). Derivations at
+    /// different commits coexist and nothing is retired.
+    History,
+}
 
 /// Ingests a path: a single file, a plain directory, or a git repository
 /// (detected by the presence of `.git` or bare-repository markers).
@@ -120,6 +147,111 @@ pub fn ingest_path<S: AsRef<str>>(
     Ok(IngestOutcome::Files(report))
 }
 
+/// Ingests only the selected paths below `path`.
+///
+/// - Git repository: the whole object graph is observed, but only selected
+///   files are interpreted.
+/// - Plain directory: every selected sub-path is its own ingest root, so
+///   lifecycle inference (moves, disappearances) stays scoped to it. Files
+///   outside the selection are never marked absent.
+///
+/// An empty selection is the same as [`ingest_path`].
+pub fn ingest_paths<S: AsRef<str>>(
+    store: &dyn Store,
+    path: &Path,
+    selection: &outline::PathSelection,
+    scope: GitScope,
+    space_names: &[S],
+) -> Result<Vec<IngestOutcome>> {
+    let canonical_is_git = std::fs::canonicalize(path)
+        .map(|c| c.is_dir() && git::looks_like_git_repository(&c))
+        .unwrap_or(false);
+    if selection.is_all() && !(canonical_is_git && scope != GitScope::Head) {
+        return Ok(vec![ingest_path(store, path, space_names)?]);
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::InvalidPath {
+            path: path.display().to_string(),
+            reason: "--path needs a directory or git repository as the ingest root".into(),
+        });
+    }
+    if git::looks_like_git_repository(&canonical) {
+        return Ok(vec![IngestOutcome::Git(ingest_git_repository_selected(
+            store,
+            &canonical,
+            space_names,
+            selection,
+            scope,
+        )?)]);
+    }
+    let mut outcomes = Vec::new();
+    for prefix in selection.prefixes() {
+        let target = std::fs::canonicalize(canonical.join(prefix)).map_err(|e| Error::Io {
+            path: canonical.join(prefix).display().to_string(),
+            source: e,
+        })?;
+        if !target.starts_with(&canonical) {
+            return Err(Error::InvalidPath {
+                path: prefix.clone(),
+                reason: "resolves outside the ingest root".into(),
+            });
+        }
+        outcomes.push(ingest_path(store, &target, space_names)?);
+    }
+    Ok(outcomes)
+}
+
+/// Read-only outline of a git repository (at HEAD) or directory, down to
+/// `depth` directory levels. Opens no database and writes nothing.
+pub fn scan_path(path: &Path, depth: u32) -> Result<outline::Outline> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::InvalidPath {
+            path: path.display().to_string(),
+            reason: "scan needs a directory or git repository".into(),
+        });
+    }
+    let root = canonical.display().to_string();
+    if git::looks_like_git_repository(&canonical) {
+        let reader = git::GitReader::open(&canonical)?;
+        let commit = reader.head_commit()?;
+        let files = reader.commit_blob_sizes(&commit)?;
+        return Ok(outline::Outline {
+            root,
+            source: "git".into(),
+            commit: Some(commit),
+            depth,
+            nodes: outline::build_nodes(files, depth),
+        });
+    }
+    let mut files = Vec::new();
+    for file in outline::walk_files(&canonical)? {
+        let rel = file
+            .strip_prefix(&canonical)
+            .unwrap_or(&file)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        files.push((rel, size));
+    }
+    Ok(outline::Outline {
+        root,
+        source: "directory".into(),
+        commit: None,
+        depth,
+        nodes: outline::build_nodes(files, depth),
+    })
+}
+
 /// Single-file ingest: a partial observation (kept for API compatibility
 /// with the v0 tests and simple workflows).
 pub fn ingest_file<S: AsRef<str>>(
@@ -156,15 +288,63 @@ pub fn ingest_git_repository<S: AsRef<str>>(
     repo_path: &Path,
     space_names: &[S],
 ) -> Result<GitObservationReport> {
+    ingest_git_repository_selected(
+        store,
+        repo_path,
+        space_names,
+        &outline::PathSelection::all(),
+        GitScope::Head,
+    )
+}
+
+/// Like [`ingest_git_repository`], but derives memories and code structure
+/// only for files inside `selection`. The object graph and refs are still
+/// observed completely; selection narrows what is interpreted.
+pub fn ingest_git_repository_selected<S: AsRef<str>>(
+    store: &dyn Store,
+    repo_path: &Path,
+    space_names: &[S],
+    selection: &outline::PathSelection,
+    scope: GitScope,
+) -> Result<GitObservationReport> {
     let reader = git::GitReader::open(repo_path)?;
     let repository_id = reader.repository_id()?;
     let space_ids = resolve_spaces(store, space_names)?;
 
     // Refs: heads, remotes, tags, and HEAD, sorted by name.
     let refs = reader.refs()?;
+    let views = match scope {
+        GitScope::Views(v) => v,
+        _ => GitViews::default(),
+    };
+    let worktree_heads: Vec<String> = match scope {
+        GitScope::History => Vec::new(),
+        _ => reader.worktree_heads()?,
+    };
+    let selected: Vec<&crate::core::GitRefObservation> = refs
+        .iter()
+        .filter(|r| match scope {
+            GitScope::History => true,
+            _ => {
+                r.name == "HEAD"
+                    || (views.branches && r.name.starts_with("refs/heads/"))
+                    || (views.remotes && r.name.starts_with("refs/remotes/"))
+                    || (views.tags && r.name.starts_with("refs/tags/"))
+            }
+        })
+        .collect();
 
-    // Object discovery: everything reachable from the ref targets.
-    let tips: Vec<String> = refs.iter().map(|r| r.target_oid.clone()).collect();
+    // Object discovery: everything reachable from the scope's tips.
+    let mut tips: Vec<String> = selected.iter().map(|r| r.target_oid.clone()).collect();
+    tips.extend(worktree_heads.iter().cloned());
+    tips.sort();
+    tips.dedup();
+    if tips.is_empty() && !refs.is_empty() {
+        return Err(Error::GitCommand {
+            command: "HEAD".into(),
+            stderr: "HEAD does not resolve to a commit; use --history to observe all refs".into(),
+        });
+    }
     let reachable = reader.reachable_oids(&tips)?;
     let checked = reader.batch_check(&reachable)?;
     let mut structural: Vec<String> = Vec::new();
@@ -176,7 +356,7 @@ pub fn ingest_git_repository<S: AsRef<str>>(
             structural.push(oid);
         }
     }
-    let (commits, trees, tags) = reader.objects(&reachable)?;
+    let (mut commits, trees, tags) = reader.objects(&reachable)?;
     let blob_datas: Vec<crate::core::GitBlobData> = blob_sizes
         .into_iter()
         .map(|(oid, size_bytes)| crate::core::GitBlobData {
@@ -188,11 +368,12 @@ pub fn ingest_git_repository<S: AsRef<str>>(
 
     // Derivation tips: every commit a ref directly points at, plus the
     // commits annotated tags resolve to (peeled through nested tags).
-    let mut tip_commits: BTreeSet<String> = refs
+    let mut tip_commits: BTreeSet<String> = selected
         .iter()
         .filter(|r| r.target_kind == GitObjectKind::Commit)
         .map(|r| r.target_oid.clone())
         .collect();
+    tip_commits.extend(worktree_heads.iter().cloned());
     let tag_by_oid: std::collections::HashMap<&str, &crate::core::GitTagData> =
         tags.iter().map(|t| (t.oid.as_str(), t)).collect();
     let mut peel_queue: Vec<String> = tags
@@ -218,6 +399,9 @@ pub fn ingest_git_repository<S: AsRef<str>>(
         for (mode, kind, oid, path) in reader.commit_files(commit)? {
             if kind != "blob" || mode.starts_with("12") {
                 // Not a blob, or a symlink: never derived, never traversed.
+                continue;
+            }
+            if !selection.matches(&path) {
                 continue;
             }
             if !is_ingestable(Path::new(&path)) && code::language_for(Path::new(&path)).is_none() {
@@ -263,6 +447,7 @@ pub fn ingest_git_repository<S: AsRef<str>>(
                 a.extraction = format!("git:{}", a.extraction);
             }
             derivations.push(GitDerivedFile {
+                source_kind: crate::core::SourceKind::GitBlob,
                 path,
                 blob_oid,
                 commit_oid: commit.clone(),
@@ -344,6 +529,24 @@ pub fn ingest_git_repository<S: AsRef<str>>(
 
     let code_inputs =
         tip_files_to_code_inputs(store, repository_id, &derivations, &content_by_oid)?;
+
+    // Releases: every tag ref is a document-shaped memory, independent of
+    // which commits are current views. A targeted (`--path`) ingest skips
+    // them, since tags are not files.
+    let current_tags = if selection.is_all() {
+        let (tag_files, tag_commits) = release::derive(&reader, &refs, &space_ids)?;
+        let known: BTreeSet<String> = commits.iter().map(|c| c.oid.clone()).collect();
+        commits.extend(tag_commits.into_iter().filter(|c| !known.contains(&c.oid)));
+        let keys = tag_files
+            .iter()
+            .map(|d| (d.path.clone(), d.blob_oid.clone()))
+            .collect::<Vec<_>>();
+        derivations.extend(tag_files);
+        derivations.sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
+        Some(keys)
+    } else {
+        None
+    };
     let observation = GitObservation {
         session: SessionDraft {
             root: repo_path.display().to_string(),
@@ -359,6 +562,10 @@ pub fn ingest_git_repository<S: AsRef<str>>(
         tags,
         derivations,
         ref_events,
+        current_tags,
+        view_commits: tip_commits.iter().cloned().collect(),
+        current_commits: (scope != GitScope::History)
+            .then(|| tip_commits.iter().cloned().collect()),
     };
     let mut report = store.record_git_observation(observation)?;
     if !code_inputs.is_empty() {
@@ -434,43 +641,16 @@ fn tip_files_to_code_inputs(
 // Directory and file observation
 // ---------------------------------------------------------------------------
 
-/// Recursively walks one directory, deterministic order, no ignore rules,
-/// symlinks skipped. Only `.md`, `.markdown`, and `.txt` files take part in
-/// the observed set.
+/// Walks one directory deterministically (see [`outline::walk_files`]):
+/// project-local ignore files apply, symlinks are skipped, and only
+/// `.md`, `.markdown`, `.txt`, and `.rs` files take part in the observed set.
 fn observe_directory(root: &Path, space_ids: &[Uuid]) -> Result<Vec<ObservedFile>> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    collect_files(root, &mut paths)?;
+    let mut paths: Vec<PathBuf> = outline::walk_files(root)?
+        .into_iter()
+        .filter(|p| is_ingestable(p))
+        .collect();
     paths.sort();
     paths.iter().map(|p| observe_file(p, space_ids)).collect()
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = std::fs::read_dir(dir).map_err(|e| Error::Io {
-        path: dir.display().to_string(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| Error::Io {
-            path: dir.display().to_string(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| Error::Io {
-            path: path.display().to_string(),
-            source: e,
-        })?;
-        // Deterministic and cycle-safe: symlinks (files and directories)
-        // are skipped entirely.
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_files(&path, out)?;
-        } else if is_ingestable(&path) {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn is_ingestable(path: &Path) -> bool {

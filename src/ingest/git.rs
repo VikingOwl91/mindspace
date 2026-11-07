@@ -304,6 +304,62 @@ impl GitReader {
         Ok(result)
     }
 
+    /// The commit HEAD resolves to. Errors for an unborn branch.
+    pub fn head_commit(&self) -> Result<String> {
+        let out = run(&self.path, &["rev-parse", "--verify", "HEAD^{commit}"], None)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    /// HEAD commits of every live worktree of this repository (the main one
+    /// and linked ones), sorted. Bare entries, prunable worktrees whose
+    /// directory is gone, and unborn HEADs are skipped. One git call.
+    pub fn worktree_heads(&self) -> Result<Vec<String>> {
+        let out = run(&self.path, &["worktree", "list", "--porcelain"], None)?;
+        let text = String::from_utf8_lossy(&out);
+        let mut heads = std::collections::BTreeSet::new();
+        for block in text.split("\n\n") {
+            let mut head: Option<&str> = None;
+            let mut skip = false;
+            for line in block.lines() {
+                if let Some(h) = line.strip_prefix("HEAD ") {
+                    head = Some(h.trim());
+                } else if line == "bare" || line.starts_with("prunable") {
+                    skip = true;
+                }
+            }
+            if let (false, Some(h)) = (skip, head) {
+                if h.chars().any(|c| c != '0') {
+                    heads.insert(h.to_string());
+                }
+            }
+        }
+        Ok(heads.into_iter().collect())
+    }
+
+    /// Blob entries of one commit's tree as `(path, size)`, symlinks and
+    /// gitlinks excluded. One git call; reads the object database only.
+    pub fn commit_blob_sizes(&self, commit: &str) -> Result<Vec<(String, u64)>> {
+        let out = run(&self.path, &["ls-tree", "-r", "-l", "-z", commit], None)?;
+        let mut result = Vec::new();
+        for record in String::from_utf8_lossy(&out).split('\0') {
+            let Some((meta, path)) = record.split_once('\t') else {
+                continue;
+            };
+            let mut parts = meta.split_whitespace();
+            let (mode, kind, _oid, size) = (
+                parts.next().unwrap_or_default(),
+                parts.next().unwrap_or_default(),
+                parts.next(),
+                parts.next().unwrap_or_default(),
+            );
+            if kind != "blob" || mode.starts_with("12") {
+                continue;
+            }
+            result.push((path.to_string(), size.parse::<u64>().unwrap_or(0)));
+        }
+        Ok(result)
+    }
+
     /// Deterministic ancestor check: is `old` an ancestor of `new`?
     /// Exit code 0 means provably yes; exit 1 means provably no.
     pub fn is_ancestor(&self, old: &str, new: &str) -> Result<bool> {
@@ -345,16 +401,28 @@ fn run(path: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut child = cmd.spawn().map_err(|e| Error::GitUnavailable {
         detail: format!("cannot run git: {e}"),
     })?;
-    if let Some(input) = stdin {
-        if let Some(mut pipe) = child.stdin.take() {
-            let _ = pipe.write_all(input);
+    // Feed stdin from a separate thread while this thread drains stdout and
+    // stderr. Writing all input first deadlocks once both pipe buffers fill
+    // (git blocks writing output, we block writing input): that happened for
+    // any repository with more than a few thousand objects.
+    let pipe = if stdin.is_some() {
+        child.stdin.take()
+    } else {
+        None
+    };
+    let out = std::thread::scope(|scope| {
+        if let (Some(input), Some(mut pipe)) = (stdin, pipe) {
+            scope.spawn(move || {
+                // A broken pipe means git exited early; its status and
+                // stderr are reported below, so the write error is moot.
+                let _ = pipe.write_all(input);
+            });
         }
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| Error::GitUnavailable {
-            detail: format!("cannot read git output: {e}"),
-        })?;
+        child.wait_with_output()
+    })
+    .map_err(|e| Error::GitUnavailable {
+        detail: format!("cannot read git output: {e}"),
+    })?;
     if !out.status.success() {
         return Err(Error::GitCommand {
             command: format!("git {}", args.join(" ")),
@@ -632,6 +700,43 @@ mod tests {
         assert_eq!(t.entries[0].target_kind, GitObjectKind::Blob);
         assert_eq!(t.entries[0].target_oid, "ab".repeat(20));
         assert_eq!(t.entries[1].target_kind, GitObjectKind::Tree);
+    }
+
+    /// Regression: input and output both far larger than a pipe buffer
+    /// (64 KiB) used to deadlock `run` because stdin was written fully
+    /// before stdout was read.
+    #[test]
+    fn run_handles_input_and_output_larger_than_pipe_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "git {args:?}: {:?}", st.stderr);
+            String::from_utf8(st.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.md"), "# a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let oid = git(&["rev-parse", "HEAD"]);
+
+        let n = 30_000;
+        let input = vec![oid.as_str(); n].join("\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let out = run(&path, &["cat-file", "--batch-check"], Some(input.as_bytes()));
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("run deadlocked")
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).lines().count(), n);
     }
 
     #[test]

@@ -361,7 +361,7 @@ fn rust_module_index(
         syntax: String,
         qualified: Option<String>,
     }
-    let mut stmt = tx.prepare("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 ORDER BY c.path,e.syntax_path,e.id").map_err(dberr)?;
+    let mut stmt = tx.prepare("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND d.created_at=(SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id=d.input_id) ORDER BY c.path,e.syntax_path,e.id").map_err(dberr)?;
     let rows = stmt
         .query_map(
             rusqlite::params![repository_id.to_string(), commit_oid],
@@ -1957,6 +1957,144 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn search_code(&self, query: &crate::core::CodeSearchQuery) -> Result<Vec<crate::core::CodeHit>> {
+        let conn = self.connection()?;
+        let terms: Vec<String> = query
+            .text
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        if terms.is_empty() {
+            return Err(Error::EmptyQuery);
+        }
+        let whole = terms.join(" ");
+        let mut params: Vec<Value> = Vec::new();
+        let push = |params: &mut Vec<Value>, v: &str| -> usize {
+            params.push(Value::Text(v.to_string()));
+            params.len()
+        };
+
+        // Rank against the whole (lowercased) query: exact name, exact
+        // qualified name, name prefix, then substring in name, qualified
+        // name, signature; anything else matched only through other terms or
+        // the path. Imports and fields sort behind real definitions.
+        let q = push(&mut params, &whole);
+        let rank = format!(
+            "(CASE \
+               WHEN lower(coalesce(e.name,'')) = ?{q} THEN 0 \
+               WHEN lower(coalesce(e.qualified_name,'')) = ?{q} THEN 1 \
+               WHEN substr(lower(coalesce(e.name,'')),1,length(?{q})) = ?{q} THEN 2 \
+               WHEN instr(lower(coalesce(e.name,'')), ?{q}) > 0 THEN 3 \
+               WHEN instr(lower(coalesce(e.qualified_name,'')), ?{q}) > 0 THEN 4 \
+               WHEN instr(lower(coalesce(e.signature,'')), ?{q}) > 0 THEN 5 \
+               ELSE 6 END)"
+        );
+        let current = "(CASE WHEN i.repository_id IS NOT NULL THEN \
+               EXISTS (SELECT 1 FROM mind_meta m \
+                        WHERE m.key = 'git_views:' || i.repository_id \
+                          AND instr(char(10) || m.value || char(10), char(10) || c.commit_oid || char(10)) > 0) \
+             ELSE \
+               EXISTS (SELECT 1 FROM logical_sources ls \
+                        WHERE ls.current_location = c.path AND ls.state = 'present' AND ls.kind = 'file' \
+                          AND (SELECT s.content_hash FROM sources s WHERE s.logical_id = ls.id \
+                                ORDER BY s.ingested_at DESC, s.rowid DESC LIMIT 1) = i.content_hash) \
+             END)";
+
+        let mut wheres: Vec<String> = vec![
+            "d.created_at = (SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id = d.input_id)"
+                .to_string(),
+        ];
+        for t in &terms {
+            let n = push(&mut params, t);
+            wheres.push(format!(
+                "(instr(lower(coalesce(e.name,'')), ?{n}) > 0 \
+                  OR instr(lower(coalesce(e.qualified_name,'')), ?{n}) > 0 \
+                  OR instr(lower(coalesce(e.signature,'')), ?{n}) > 0 \
+                  OR instr(lower(c.path), ?{n}) > 0)"
+            ));
+        }
+        if !query.kinds.is_empty() {
+            let marks: Vec<String> = query
+                .kinds
+                .iter()
+                .map(|k| format!("?{}", push(&mut params, k.as_str())))
+                .collect();
+            wheres.push(format!("e.kind IN ({})", marks.join(",")));
+        }
+        if let Some(repo) = query.repository.as_deref().map(str::to_lowercase) {
+            let n = push(&mut params, &repo);
+            wheres.push(format!(
+                "(instr(lower(coalesce(r.current_path,'')), ?{n}) > 0 \
+                  OR substr(lower(coalesce(i.repository_id,'')),1,length(?{n})) = ?{n})"
+            ));
+        }
+        if let Some(prefix) = query.path_prefix.as_deref() {
+            let prefix = prefix.trim_end_matches('/');
+            let n = push(&mut params, prefix);
+            wheres.push(format!(
+                "(c.path = ?{n} OR substr(c.path,1,length(?{n})+1) = ?{n} || '/')"
+            ));
+        }
+        if !query.all_versions {
+            wheres.push(format!("{current} = 1"));
+        }
+        params.push(Value::Integer(i64::from(query.limit)));
+        let limit_n = params.len();
+
+        let sql = format!(
+            "SELECT e.id, e.kind, e.name, e.qualified_name, e.signature, e.visibility, e.is_async, \
+                    d.language, c.path, e.start_line, e.end_line, i.repository_id, r.current_path, \
+                    c.commit_oid, i.blob_oid, i.content_hash, {current} AS is_current, {rank} AS match_rank \
+             FROM code_entities e \
+             JOIN code_derivations d ON d.id = e.derivation_id \
+             JOIN code_inputs i ON i.id = d.input_id \
+             JOIN code_contexts c ON c.input_id = i.id \
+             LEFT JOIN repositories r ON r.id = i.repository_id \
+             WHERE {} \
+             ORDER BY {rank} + (CASE e.kind WHEN 'import' THEN 10 WHEN 'field' THEN 2 ELSE 0 END), \
+                      length(coalesce(e.qualified_name, e.name, '')), c.path, e.start_line, e.id \
+             LIMIT ?{limit_n}",
+            wheres.join(" AND ")
+        );
+        let mut stmt = conn.prepare(&sql).map_err(dberr)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                let kind: String = r.get(1)?;
+                let id: String = r.get(0)?;
+                let repo: Option<String> = r.get(11)?;
+                Ok(crate::core::CodeHit {
+                    entity_id: Uuid::parse_str(&id).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
+                    })?,
+                    kind: crate::core::CodeEntityKind::parse(&kind).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            Type::Text,
+                            format!("unknown entity kind '{kind}'").into(),
+                        )
+                    })?,
+                    name: r.get(2)?,
+                    qualified_name: r.get(3)?,
+                    signature: r.get(4)?,
+                    visibility: r.get(5)?,
+                    is_async: r.get::<_, i64>(6)? != 0,
+                    language: r.get(7)?,
+                    path: r.get(8)?,
+                    start_line: r.get(9)?,
+                    end_line: r.get(10)?,
+                    repository_id: repo.and_then(|s| Uuid::parse_str(&s).ok()),
+                    repository_path: r.get(12)?,
+                    commit_oid: r.get(13)?,
+                    blob_oid: r.get(14)?,
+                    content_hash: r.get(15)?,
+                    current: r.get::<_, i64>(16)? != 0,
+                    match_rank: r.get::<_, i64>(17)? as u8,
+                })
+            })
+            .map_err(dberr)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(dberr)
+    }
+
     fn has_code_derivation(
         &self,
         _language: crate::core::CodeLanguage,
@@ -1994,7 +2132,7 @@ impl Store for SqliteStore {
             ..Default::default()
         };
         let module_index = rust_module_index(&tx, repository_id, commit_oid)?;
-        let mut stmt=tx.prepare("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 ORDER BY o.id,c.path").map_err(dberr)?;
+        let mut stmt=tx.prepare("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND d.created_at=(SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id=d.input_id) ORDER BY o.id,c.path").map_err(dberr)?;
         let rows = stmt
             .query_map(
                 rusqlite::params![repository_id.to_string(), commit_oid],
@@ -4434,7 +4572,7 @@ fn record_git_observation_tx(
             memories: d.memories.clone(),
         };
         let (added, version_id, evidence_ids) =
-            ensure_version(conn, logical, SourceKind::GitBlob, &observed, at)?;
+            ensure_version(conn, logical, d.source_kind, &observed, at)?;
         if added {
             conn.execute(
                 "INSERT INTO git_source_versions (source_id, repository_id, blob_oid, path, \
@@ -4474,6 +4612,109 @@ fn record_git_observation_tx(
         });
     }
 
+    // 6. Current views: the commits in `current_commits` (HEAD, worktrees,
+    //    selected refs) define the repository's current knowledge. Memories
+    //    derived at any other commit are stale. They are retired (never
+    //    deleted) with a reason naming the commit and the current views.
+    let mut stale_retired: u64 = 0;
+    if let Some(current) = &observation.current_commits {
+        let current_set: std::collections::BTreeSet<&str> =
+            current.iter().map(String::as_str).collect();
+        let derived: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.id, g.commit_oid FROM memories m \
+                     JOIN assertions a ON a.id = m.assertion_id \
+                     JOIN evidence e ON e.id = a.evidence_id \
+                     JOIN git_source_versions g ON g.source_id = e.source_id \
+                     WHERE m.state = 'active' AND g.repository_id = ?1 \
+                       AND g.path NOT LIKE '/refs/tags/%' \
+                     ORDER BY m.created_at, m.id",
+                )
+                .map_err(dberr)?;
+            let rows = stmt
+                .query_map(rusqlite::params![observation.repository_id.to_string()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(dberr)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(dberr)?;
+            rows
+        };
+        let short = |oid: &str| oid[..oid.len().min(12)].to_string();
+        let shown: Vec<String> = current.iter().take(3).map(|c| short(c)).collect();
+        let more = current.len().saturating_sub(3);
+        for (id, commit) in derived {
+            if current_set.contains(commit.as_str()) {
+                continue;
+            }
+            let id = Uuid::parse_str(&id).map_err(|e| Error::Storage(e.to_string()))?;
+            let reason = format!(
+                "derived at {}, which is no longer a current view (current: {}{})",
+                short(&commit),
+                shown.join(", "),
+                if more > 0 { format!(" +{more}") } else { String::new() }
+            );
+            retire_conn(conn, id, at, &reason)?;
+            stale_retired += 1;
+        }
+    }
+
+    // 6b. Current code views of this repository, replaced wholesale. Syntax
+    //     facts are immutable, so currency is recorded here, not on them.
+    conn.execute(
+        "INSERT INTO mind_meta (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![
+            format!("git_views:{}", observation.repository_id),
+            observation.view_commits.join("\n")
+        ],
+    )
+    .map_err(dberr)?;
+
+    // 7. Releases follow their tag refs, not the views: a deleted or moved
+    //    tag retires its release memory.
+    if let Some(current) = &observation.current_tags {
+        let keep: std::collections::BTreeSet<(&str, &str)> = current
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect();
+        let releases: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.id, g.path, g.blob_oid FROM memories m \
+                     JOIN assertions a ON a.id = m.assertion_id \
+                     JOIN evidence e ON e.id = a.evidence_id \
+                     JOIN git_source_versions g ON g.source_id = e.source_id \
+                     WHERE m.state = 'active' AND g.repository_id = ?1 \
+                       AND g.path LIKE '/refs/tags/%' \
+                     ORDER BY m.created_at, m.id",
+                )
+                .map_err(dberr)?;
+            let rows = stmt
+                .query_map(rusqlite::params![observation.repository_id.to_string()], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(dberr)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(dberr)?;
+            rows
+        };
+        for (id, path, blob) in releases {
+            if keep.contains(&(path.as_str(), blob.as_str())) {
+                continue;
+            }
+            let id = Uuid::parse_str(&id).map_err(|e| Error::Storage(e.to_string()))?;
+            let name = path.trim_start_matches("/refs/tags/");
+            retire_conn(conn, id, at, &format!("tag {name} was deleted or moved"))?;
+            stale_retired += 1;
+        }
+    }
+
     Ok(GitObservationReport {
         session_id,
         repository_id: observation.repository_id,
@@ -4487,6 +4728,7 @@ fn record_git_observation_tx(
         objects_existing,
         derivations_new,
         derivations_reused,
+        stale_retired,
         code: CodeObservationReport::default(),
         files,
         events,

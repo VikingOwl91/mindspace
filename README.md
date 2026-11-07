@@ -223,7 +223,12 @@ The commands implemented in v0:
 mind init
 mind ingest ./notes.md --space coding
 mind ingest ~/Documents --space personal   # directory: full source-lifecycle scan
-mind ingest ~/src/owlry --space coding     # git repo: committed objects + ref journal
+mind ingest ~/src/owlry --space coding     # git repo: HEAD + worktrees, full ref journal
+mind ingest ~/src/owlry --space coding --branches --remotes --tags   # more current views
+mind ingest ~/src/owlry --space coding --history   # every ref tip, no stale retirement
+# tags always become "Release <name>" memories (ADR-024)
+mind scan ~/src/owlry [--depth 2]          # read-only outline, no database
+mind ingest ~/src/owlry --space coding --path crates/core --path docs   # targeted
 mind space list
 mind space create eragon
 mind space link coding linux
@@ -231,6 +236,7 @@ mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-supers
 mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--mode lexical|semantic|hybrid|auto] [--json]
 mind inspect <memory> [--json]
 mind structure <path-or-blob> [--json]
+mind symbols <name or words> [--kind fn|struct|...] [--repo R] [--path P] [--all-versions] [--json]
 mind trace <memory> [--json]
 mind history <subject words...> [--json]
 mind conflicts [--json]
@@ -260,7 +266,7 @@ The MCP server exposes explicit memory writes. It does not automatically extract
 
 Initialize the database once with `mind init`, create the spaces you need, then run `mind mcp`. The server uses newline-delimited JSON-RPC over stdin/stdout and the MCP protocol version `2025-06-18`. Diagnostics go to stderr; stdout is reserved for protocol messages. EOF on stdin shuts the process down cleanly.
 
-The server exposes eleven tools:
+The server exposes fourteen tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -269,6 +275,9 @@ The server exposes eleven tools:
 | `memory_retire` | Retire an active memory without deleting its history. |
 | `memory_get` | Read a memory and its assertion, evidence, source, spaces, and lifecycle. |
 | `memory_search` | Search with SQLite FTS5, optional directed space traversal, and transaction-time filtering. |
+| `code_search` | Find definitions (functions, structs, ...) in ingested Rust code by name, signature, or path. Returns locations, not memories; current definitions only unless `all_versions`. |
+| `repo_outline` | Outline a directory or git repository (HEAD) without ingesting: files, bytes, kinds per directory. Allowlisted paths only. |
+| `repo_ingest` | Ingest a directory or repository, optionally only chosen `paths`, into existing spaces. Allowlisted paths only; unscoped ingest of very large trees is refused. |
 | `memory_history` | List episodes for a normalized subject. |
 | `memory_conflicts` | List active same-subject memories sharing a space. |
 | `memory_add_spaces` | Add existing spaces to an active memory. |
@@ -282,6 +291,10 @@ Updates are restricted in storage to active memories whose source and extraction
 
 Writes use SQLite WAL, a five-second busy timeout, and immediate transactions. Lock contention is returned as an error after the timeout; Mindspace does not blindly retry writes. SQLite transactions keep each multi-row write atomic.
 
+`repo_outline` and `repo_ingest` are disabled unless the server is started with `--allow-root <DIR>` (or `MINDSPACE_MCP_ALLOW_ROOTS`). Only absolute paths inside those directories are accepted (ADR-026). `repo_ingest` writes to the database and, for git repositories, a repository identity marker into the repository's `.git` directory, so allow specific project directories, not your home directory.
+
+An end-to-end agent test drives the real binary through MCP (outline, targeted ingest, symbol search, then opens the reported file at the reported commit). `cargo test --test agent_e2e` runs it on a fixture. `MINDSPACE_E2E_REPO=<repo dir> cargo test --test agent_e2e real_repo -- --nocapture` runs it on any repository; only a copy of its `.git` directory is used.
+
 The server is local-only: it has no HTTP transport or authentication. Anyone who can start or communicate with the configured process can call its tools, including persistent write tools. Review client permissions and confirmations accordingly. Space links organize retrieval; they do not enforce confidentiality. Manual content is an explicit user-authored assertion, not an independently verified fact. No confidence score is inferred.
 
 #### Codex configuration
@@ -291,7 +304,7 @@ Codex reads MCP servers from `~/.codex/config.toml`. This local stdio example us
 ```toml
 [mcp_servers.mindspace]
 command = "mind"
-args = ["--db", "/absolute/path/to/mind.db", "mcp"]
+args = ["--db", "/absolute/path/to/mind.db", "mcp", "--allow-root", "/absolute/path/to/your/repos"]
 enabled = true
 ```
 
@@ -305,7 +318,7 @@ OpenCode supports local MCP servers in `opencode.json` (or `opencode.jsonc`) wit
   "mcp": {
     "mindspace": {
       "type": "local",
-      "command": ["mind", "--db", "/absolute/path/to/mind.db", "mcp"],
+      "command": ["mind", "--db", "/absolute/path/to/mind.db", "mcp", "--allow-root", "/absolute/path/to/your/repos"],
       "enabled": true
     }
   }
@@ -432,7 +445,7 @@ and tested. What works today:
   facts are not Memories; inspect them with `mind structure <path-or-blob>`.
 - a CLI (`mind`) with human and `--json` output
 - explicit manual memory creation, updates, retirement, retrieval, and space membership through the MCP tools; document-derived memory updates are rejected
-- an eleven-tool MCP server over stdio with real-binary protocol tests
+- a fourteen-tool MCP server over stdio with real-binary protocol tests
 - SQLite WAL, five-second busy timeout, and `BEGIN IMMEDIATE` write transactions, with no automatic retry
 
 What git ingest observes and what it defers: it reads committed objects and

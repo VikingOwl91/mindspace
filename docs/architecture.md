@@ -321,7 +321,7 @@ are part of the trust boundary. Space links are retrieval imports, not
 authorization. Future remote interfaces require separate transport and
 security decisions.
 
-The eleven tools are `memory_create`, `memory_update`, `memory_retire`,
+The fourteen tools are `repo_outline` and `repo_ingest` (allowlisted, ADR-026), `code_search` (symbol search over the code-structure layer, ADR-025), `memory_create`, `memory_update`, `memory_retire`,
 `memory_get`, `memory_search`, `memory_history`, `memory_conflicts`,
 `memory_add_spaces`, `space_create`, `space_list`, and `space_link`. Manual
 creation and update use the same `Store` boundary as the CLI and ingestion;

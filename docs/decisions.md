@@ -278,7 +278,7 @@ history-rewrite explanation (rebase detection) become real requirements.
 
 **Decision.** v0.4 parses Rust (`.rs`) with Tree-sitter, using path extension
 as deterministic language metadata. A derivation is unique for immutable
-input plus `mind-code@1`, `tree-sitter-rust@0.24.2`, and its grammar identity.
+input plus `mind-code@1` (now `@2`, see below), `tree-sitter-rust@0.24.2`, and its grammar identity.
 Old derivations are immutable, so a future extractor or grammar version adds
 a sibling derivation instead of rewriting history. Tree-sitter nodes stay in
 `ingest/code`; core and storage use normalized Rust-independent records.
@@ -430,3 +430,176 @@ checked against canonical data and are not historical truth.
 inferred from timestamps. Unsupported temporal dimensions return an explicit
 capability error. See [adr-m6-temporal-recording.md](adr-m6-temporal-recording.md)
 for the Stage 0/1 contract and boundaries.
+
+## ADR-022: Outline-first targeted ingest, ignore-aware directory walk (2026-11-07)
+
+**Decision.** `mind scan <path> [--depth N]` prints a read-only outline
+(files, bytes, ingestable files, kinds per directory) of a git repository at
+HEAD or of a directory, and opens no database. `mind ingest --path <subpath>`
+(repeatable) interprets only the selected files. For a git repository the
+object graph and refs are still observed completely; only derivation is
+narrowed. For a plain directory each selected sub-path is its own ingest root,
+so moves and disappearances stay scoped to it and unselected files are never
+marked absent. Selections must be relative and cannot contain `..`.
+
+Directory walks now use the `ignore` crate: project-local `.gitignore` and
+`.ignore` apply (also outside a git work tree), `.git` is never entered, hidden
+files are included, symlinks are skipped. Global, `info/exclude`, and parent
+ignore files are deliberately off so the result depends only on the contents
+of the root. This supersedes "no ignore rules" from ADR-013.
+
+**Fix.** `ingest::git::run` fed all of stdin before reading stdout and
+deadlocked once both pipe buffers filled (repositories above roughly 2,800
+objects hung without error). Stdin is now written from a scoped thread while
+stdout and stderr are drained.
+
+**Not decided here.** Parallel parsing is a separate step.
+
+## ADR-023: Git ingest derives the HEAD view by default; history is opt-in (2026-11-07)
+
+**Decision.** The default scope interprets *current views*: HEAD of the ingest
+path plus HEAD of every live linked worktree (`git worktree list --porcelain`;
+bare and prunable entries skipped). `--branches`, `--remotes`, and `--tags`
+add those ref classes as further views (annotated tags are peeled). Only
+history reachable from a view is observed and only its files are interpreted.
+All refs are still journaled completely, so the ref journal of ADR-015 is
+unchanged. Memories of this repository derived at any commit that is not a
+current view are retired in the same transaction, with the reason `derived at
+<old>, which is no longer a current view (current: ...)`. Repository identity
+is shared by all worktrees, so ingesting from any of them yields the same set
+of views and no worktree retires another. `mind ingest --history`
+(`GitScope::History`) restores ADR-015 behavior: every ref tip is interpreted,
+derivations at different commits coexist, and nothing is retired.
+
+**Why.** Per-commit logical sources never supersede (ADR-015), so after every
+new commit the old and new versions of a document were both active, and every
+branch added another copy. Search could not answer "what is true now". Retiring
+is deterministic, reversible in the sense that nothing is deleted, and keeps the
+stale memory inspectable.
+
+**Consequences.** Retirement replaces supersession lineage for HEAD moves:
+`mind history` shows a retired episode, not a link to its successor. Running a
+head-scope ingest after a history-scope one retires the other tips' memories.
+Narrowing `--path` on a later ingest does not keep older-commit memories of
+unselected paths alive. The object graph reachable from HEAD is still stored
+completely, so database size is dominated by commits and tree entries.
+`GitObservationReport.stale_retired` counts the retirements.
+
+**Revisit when.** Pairwise supersession across HEAD moves (path and subject
+matching), a configurable default ref instead of HEAD, or a depth limit on the
+stored graph are wanted.
+
+## ADR-024: Releases are derived from tag refs (2026-11-07)
+
+**Decision.** Every `refs/tags/*` ref of a git repository becomes one
+document-shaped memory, "Release <name>": the tag message (for lightweight
+tags the tagged commit's message), tagger or author, date, and the peeled
+commit. Rule id `git:tag:release`; no markdown parsing, so changelog headings
+in a tag message cannot create colliding subjects across releases. The
+derivation uses the normal source -> evidence -> assertion -> memory pipeline
+with the virtual path `/refs/tags/<name>` (a leading slash can never be a git
+tree path). The stored version's commit is the peeled target commit and its
+blob oid is the tag object (annotated) or the commit (lightweight), so a
+moved tag is a new version. Releases have their own source kind, `git_tag`,
+so source identity does not hang on a false `git_blob` type; the logical
+source stays a `git_path` scoped to the virtual path. The tagged commit rows are
+stored so provenance loads; their ancestors are not.
+
+Releases are independent of current views: a tag on an old commit is still a
+release. They are retired only when their tag is deleted or moved, in every
+scope. Head-move retirement (ADR-023) never touches them. A targeted
+`--path` ingest skips releases and leaves existing ones untouched. Retirement
+happens only when the ingest took a complete tag inventory (an unscoped
+ingest); a partial ingest never declares a release gone. A regression test pins
+this.
+
+**Not decided here.** Forge releases (GitHub/Forgejo notes and assets) live
+outside git. An adapter would need network access and credentials and must be
+optional and explicitly invoked.
+
+## ADR-025: Code retrieval is a separate symbol search, not memories (2026-11-07)
+
+**Decision.** The code-structure layer (ADR-016) becomes searchable through
+its own surface: `mind symbols <query>` and the MCP tool `code_search`. It is
+the "later retrieval slice" ADR-016 anticipated. Code definitions stay
+immutable syntax facts; no Evidence, Assertion, or Memory is created for them,
+so code churn is still not knowledge churn and ordinary recall is unchanged.
+
+A query is whitespace-separated terms. Every term must occur, case-insensitively,
+in an entity's name, qualified name, signature, or path. Results are ranked by
+match quality (exact name, exact qualified name, name prefix, name substring,
+qualified-name substring, signature substring, other) with imports and fields
+sorted behind real definitions. The rank is a match class, not a score or
+confidence. Filters: entity kind, repository (path substring or id prefix),
+path prefix. Hits carry kind, names, signature, visibility, path, line range,
+repository, commit, blob, and a `current` flag.
+
+**Currency.** Immutable syntax facts cannot be retired, so currency is
+recorded beside them. Each git ingest replaces `git_views:<repository id>` in
+`mind_meta` with the commits it derived at (HEAD, worktrees, selected refs;
+all tips under `--history`). A git definition is current when its context
+commit is in that set. A file definition is current when its logical source is
+present and the definition's content is the source's latest version. Stale
+definitions are hidden by default and returned with `current=false` under
+`--all-versions` / `all_versions`.
+
+**Why `mind_meta`, not a table.** The M6 baseline and write fence are tied to
+schema version 8. A new migration would have to rework that coupling, which is
+outside this change. `mind_meta` is current-state only and carries no
+historical claim, which matches what a view set is. Promote it to a table once
+M6 settles.
+
+**Limits.** No spaces: code is not yet attached to spaces, so scoping is by
+repository and path. Rust only (the only grammar). Signatures are the first
+line of a definition; doc comments and bodies are not indexed, and source text
+is not stored, so hits are locations to read with the agent's own file access
+or `git show <commit>:<path>`. Matching is substring scanning without an
+index, which is fast at repository scale (16 ms on a 318-file Rust workspace)
+but will need an FTS index for very large databases. No call or implementation
+queries yet, although the relationship observations exist.
+
+**Revisit when.** Spaces for code, more grammars, a symbol FTS index, or
+relationship queries (callers, implementors) are wanted.
+
+**ADR-025 addendum: `mind-code@2`.** Two extractor defects found while proving
+code search on the `record_manual_write` case. Trait method declarations
+without a body (`function_signature_item`) were not entities, so a trait's own
+interface was invisible; they are now `method` entities (a bodiless `extern`
+function is a `function`). And `impl Trait for Type` named its methods after the
+trait (`Store::put`) instead of the implementing type (`SqliteStore::put`),
+because the first type identifier was used instead of the `type` field. Both
+change derivation output, so the extractor version moves to 2 and v2
+derivations sit beside v1 ones; nothing is rewritten. Symbol search and the
+relationship resolver read only the newest derivation of each input.
+
+## ADR-026: Agent-driven ingest behind a restrictive allowlist (2026-11-07)
+
+**Decision.** The MCP server gains `repo_outline` (read-only) and `repo_ingest`
+so an agent can look at a repository and ingest chosen parts of it. Because the
+server has no authentication, both tools fail closed:
+
+- Allowed roots are configured with `mind mcp --allow-root <DIR>` (repeatable)
+  or `MINDSPACE_MCP_ALLOW_ROOTS` (`:`-separated). With none, which is the
+  default, both tools refuse every call.
+- Roots are canonicalized and validated at startup; a missing root or `/` stops
+  the server.
+- A requested path must be absolute and, after `canonicalize` (symlinks and
+  `..` resolved), lie inside an allowed root. Paths with a `.git` component and
+  plain files are refused. A refusal does not reveal whether a path exists.
+- An unscoped `repo_ingest` of more than 2000 ingestable files is refused with
+  a pointer to `repo_outline`; the call is synchronous and the agent should
+  select directories. `repo_outline` returns at most 300 nodes (shallowest
+  first) and a `truncated` flag. Ingest results are summarized, not dumped.
+
+`repo_ingest` takes the same scope options as the CLI (`paths`, `branches`,
+`remotes`, `tags`, `history`) and existing spaces; it never creates spaces.
+
+**Consequences.** `repo_ingest` writes to the database and, for git, a
+repository identity marker into the repository's git common dir. Allowing a
+root therefore grants write access of that kind. Choose specific directories,
+not a home directory. Synchronous ingest can exceed a client's tool timeout on
+very large inputs; scoping is the mitigation. Git is run in allowed
+repositories only, with the read-only plumbing of ADR-014.
+
+**Revisit when.** Read-only versus ingest roots need to differ, ingest must run
+asynchronously, or HTTP transport and real authentication arrive.

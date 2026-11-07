@@ -29,11 +29,37 @@ pub struct Cli {
 pub enum Command {
     /// Initialize a new mindspace database (idempotent)
     Init,
-    /// Ingest a file as a source (markdown or plain text)
+    /// Ingest a file, directory, or git repository as sources
     Ingest {
         path: PathBuf,
         #[arg(long = "space", required = true)]
         spaces: Vec<String>,
+        /// Only ingest this path below a directory or repository root
+        /// (repeatable). See `mind scan` for an outline to choose from.
+        #[arg(long = "path", value_name = "SUBPATH")]
+        select: Vec<String>,
+        /// Git: observe and interpret every ref tip, not only HEAD. Derived
+        /// memories of different commits then coexist.
+        #[arg(long)]
+        history: bool,
+        /// Git: also interpret local branch tips (HEAD and worktrees always are)
+        #[arg(long, conflicts_with = "history")]
+        branches: bool,
+        /// Git: also interpret remote-tracking branch tips
+        #[arg(long, conflicts_with = "history")]
+        remotes: bool,
+        /// Git: also interpret tag tips
+        #[arg(long, conflicts_with = "history")]
+        tags: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Outline a directory or git repository (at HEAD) without ingesting
+    Scan {
+        path: PathBuf,
+        /// Directory levels to show below the root
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
         #[arg(long)]
         json: bool,
     },
@@ -60,6 +86,28 @@ pub enum Command {
         /// Retrieval mode; omitted mode preserves legacy lexical search
         #[arg(long, value_enum)]
         mode: Option<SearchModeArg>,
+    },
+    /// Find definitions (functions, structs, ...) by name, signature, or path
+    Symbols {
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Restrict to an entity kind (repeatable): fn, method, struct, enum,
+        /// trait, type, const, static, mod, field, use
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+        /// Restrict to a repository (path substring or id prefix)
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+        /// Restrict to a path prefix (repository-relative for git sources)
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Include definitions that are no longer part of a current view
+        #[arg(long)]
+        all_versions: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Recall the most relevant current memories with their provenance
     Recall {
@@ -126,7 +174,18 @@ pub enum Command {
         command: IndexCommand,
     },
     /// Run the local MCP server over stdio
-    Mcp,
+    Mcp {
+        /// Directory the repo_outline and repo_ingest tools may read and
+        /// ingest (repeatable, or ':'-separated in MINDSPACE_MCP_ALLOW_ROOTS).
+        /// Without any, those tools are disabled.
+        #[arg(
+            long = "allow-root",
+            value_name = "DIR",
+            env = "MINDSPACE_MCP_ALLOW_ROOTS",
+            value_delimiter = ':'
+        )]
+        allow_roots: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,16 +296,59 @@ pub fn execute(cli: &Cli) -> Result<()> {
             initialize(&path)?;
             println!("initialized mindspace at {}", path.display());
         }
-        Command::Ingest { path, spaces, json } => {
+        Command::Ingest {
+            path,
+            spaces,
+            select,
+            history,
+            branches,
+            remotes,
+            tags,
+            json,
+        } => {
+            let scope = if *history {
+                ingest::GitScope::History
+            } else if *branches || *remotes || *tags {
+                ingest::GitScope::Views(ingest::GitViews {
+                    branches: *branches,
+                    remotes: *remotes,
+                    tags: *tags,
+                })
+            } else {
+                ingest::GitScope::Head
+            };
+            let selection = ingest::outline::PathSelection::new(select)?;
             let store = open(cli)?;
-            match ingest::ingest_path(&store, path, spaces)? {
-                crate::core::IngestOutcome::Files(report) => {
-                    render::observation_report(&report, *json)
-                }
-                crate::core::IngestOutcome::Git(report) => {
-                    render::git_observation_report(&report, *json)
+            let outcomes = ingest::ingest_paths(&store, path, &selection, scope, spaces)?;
+            if *json && outcomes.len() > 1 {
+                // One valid JSON document for several ingest roots.
+                let values: Vec<serde_json::Value> = outcomes
+                    .iter()
+                    .map(|o| match o {
+                        crate::core::IngestOutcome::Files(r) => serde_json::to_value(r),
+                        crate::core::IngestOutcome::Git(r) => serde_json::to_value(r),
+                    })
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&values).expect("values serialize")
+                );
+            } else {
+                for outcome in outcomes {
+                    match outcome {
+                        crate::core::IngestOutcome::Files(report) => {
+                            render::observation_report(&report, *json)
+                        }
+                        crate::core::IngestOutcome::Git(report) => {
+                            render::git_observation_report(&report, *json)
+                        }
+                    }
                 }
             }
+        }
+        Command::Scan { path, depth, json } => {
+            render::outline(&ingest::scan_path(path, *depth)?, *json);
         }
         Command::Space { command } => match command {
             SpaceCommand::Create {
@@ -275,6 +377,29 @@ pub fn execute(cli: &Cli) -> Result<()> {
                 render::space_linked(&from_space, &to_space, *json);
             }
         },
+        Command::Symbols {
+            query,
+            kinds,
+            repo,
+            path,
+            limit,
+            all_versions,
+            json,
+        } => {
+            let store = open(cli)?;
+            let hits = retrieval::search_code(
+                &store,
+                crate::core::CodeSearchQuery {
+                    text: query.join(" "),
+                    kinds: retrieval::parse_code_kinds(kinds)?,
+                    repository: repo.clone(),
+                    path_prefix: path.clone(),
+                    limit: *limit,
+                    all_versions: *all_versions,
+                },
+            )?;
+            render::code_hits(&hits, *json);
+        }
         Command::Structure { target, json } => {
             let store = open(cli)?;
             let target = std::fs::canonicalize(target)
@@ -612,9 +737,10 @@ License: {}",
                 println!("indexing_available: {}", enabled && selected.is_some());
             }
         },
-        Command::Mcp => {
+        Command::Mcp { allow_roots } => {
+            let config = crate::mcp::McpConfig::new(allow_roots)?;
             let store = open(cli)?;
-            crate::mcp::serve(&store)?;
+            crate::mcp::serve_with_config(&store, &config)?;
         }
     }
     Ok(())

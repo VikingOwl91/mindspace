@@ -108,6 +108,9 @@ pub enum Error {
     #[error("SQLite connection was discarded after an uncertain transaction outcome")]
     ConnectionDiscarded,
 
+    #[error("invalid path '{path}': {reason}")]
+    InvalidPath { path: String, reason: String },
+
     #[error("FTS index is inconsistent with canonical assertions: {detail}")]
     FtsIndexInconsistent { detail: String },
 }

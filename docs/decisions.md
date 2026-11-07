@@ -625,9 +625,18 @@ of a raw URL; its result never contains userinfo (including the scp-style `git@`
 so no downstream code can store or show a secret. In MCP, worktree paths outside
 the allowed roots are redacted.
 
-**No fork or mirror claims.** Git cannot prove that a repository is a fork, and
-remote names (`upstream`, `mirror`, `origin-github`) are conventions. Mindspace
-lists remotes and says nothing about their relationship.
+**No fork or mirror claims (for now).** Git cannot prove that a repository is a
+fork, and remote names (`upstream`, `mirror`, `origin-github`) are conventions.
+Mindspace lists remotes and says nothing about their relationship.
+
+**Still to discuss: upstream hints.** Whether to surface a hint such as "has an
+`upstream*` remote with a different slug than `origin`" is undecided. It was
+deliberately left out of this slice, not rejected. Open questions: whether a
+heuristic hint belongs in the model at all, how to keep it clearly separate from
+fact, how mirrors of the same slug on other hosts (as in a repository with
+`origin`, `origin-github`, `upstream`, `upstream-github`) must not read as forks,
+and whether authoritative fork data from a forge API (optional, networked, with
+credentials) is wanted instead.
 
 **Consequences.** Nothing is persisted yet; slugs are computed per call. Storing
 remote observations and attaching repositories to spaces (a Scope object,

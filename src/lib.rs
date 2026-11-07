@@ -11,6 +11,7 @@ pub mod embeddings;
 pub mod indexing;
 pub mod ingest;
 pub mod mcp;
+pub mod pathenv;
 pub mod paths;
 pub mod retrieval;
 #[cfg(target_os = "linux")]

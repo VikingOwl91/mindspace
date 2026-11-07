@@ -231,17 +231,6 @@ fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-fn first_on_path(path_env: &std::ffi::OsStr) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::split_paths(path_env)
-        .map(|d| d.join("mind"))
-        .find(|p| {
-            std::fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
-}
-
 fn check_binary(exe: Option<&Path>, path_env: Option<&std::ffi::OsStr>) -> Check {
     let version = env!("CARGO_PKG_VERSION");
     let Some(exe) = exe else {
@@ -253,7 +242,10 @@ fn check_binary(exe: Option<&Path>, path_env: Option<&std::ffi::OsStr>) -> Check
         );
     };
     let exe = canonical(exe);
-    let on_path = path_env.and_then(first_on_path).map(|p| canonical(&p));
+    let on_path = crate::pathenv::executables("mind", path_env)
+        .into_iter()
+        .next()
+        .map(|p| canonical(&p));
     let mut c = Check::new("binary", "Binary", Status::Pass, format!("mind {version}"));
     let mut d = json!({"version": version, "executable": exe.display().to_string()});
     match &on_path {

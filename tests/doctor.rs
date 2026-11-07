@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
+
+mod common;
 use sha2::{Digest, Sha256};
 
 const MIND: &str = env!("CARGO_BIN_EXE_mind");
@@ -724,7 +726,6 @@ fn an_invalid_invocation_exits_with_2_and_cannot_switch_the_sandbox_off() {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::os::unix::process::CommandExt;
 
     #[test]
     fn the_sandbox_self_test_separates_kernel_evidence_from_application_validation() {
@@ -755,43 +756,6 @@ mod linux {
             .contains("does not by itself prove the kernel sandbox"));
     }
 
-    fn landlock_blocker(errno: i32) -> Vec<libc::sock_filter> {
-        let (bpf_ld, bpf_jmp, bpf_ret) = (0x00u16, 0x05u16, 0x06u16);
-        let (w, abs, jeq, jge, jgt, k) = (0x00u16, 0x20u16, 0x10u16, 0x30u16, 0x20u16, 0x00u16);
-        #[cfg(target_arch = "x86_64")]
-        let arch = 0xC000_003Eu32;
-        #[cfg(target_arch = "aarch64")]
-        let arch = 0xC000_00B7u32;
-        let f = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
-        vec![
-            f(bpf_ld | w | abs, 0, 0, 4),
-            f(bpf_jmp | jeq | k, 0, 4, arch),
-            f(bpf_ld | w | abs, 0, 0, 0),
-            f(bpf_jmp | jge | k, 0, 2, 444),
-            f(bpf_jmp | jgt | k, 1, 0, 446),
-            f(bpf_ret | k, 0, 0, 0x0005_0000 | errno as u32),
-            f(bpf_ret | k, 0, 0, 0x7FFF_0000),
-        ]
-    }
-
-    fn with_blocked_landlock(c: &mut Command, errno: i32) {
-        let prog = landlock_blocker(errno);
-        // SAFETY: only prctl, on data prepared before the fork.
-        unsafe {
-            c.pre_exec(move || {
-                let fprog = libc::sock_fprog {
-                    len: prog.len() as u16,
-                    filter: prog.as_ptr() as *mut _,
-                };
-                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                if libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
     fn unavailable_case(errno: i32) {
         let t = tmp();
         let xdg = t.path().join("xdg");
@@ -800,7 +764,7 @@ mod linux {
         std::fs::create_dir(&scratch).unwrap();
         let mut c = mind(&["doctor", "--json"]);
         c.env("XDG_DATA_HOME", &xdg).env("TMPDIR", &scratch);
-        with_blocked_landlock(&mut c, errno);
+        common::block_landlock(&mut c, errno);
         let (code, r, _) = doctor_json(c);
         assert_eq!(
             code, 0,

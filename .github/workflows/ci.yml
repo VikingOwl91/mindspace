@@ -1,0 +1,97 @@
+# CI for Mindspace.
+#
+# STATUS: DRAFT. This workflow has never run on GitHub. Verified locally: every command below passes
+# on Linux 7.2 (fmt, build, clippy -D warnings, test, cargo audit, cargo deny, doc-link check,
+# sandbox-enforcement check, security profile). Not verifiable before the first run: that the
+# GitHub-hosted runner provides Landlock (ABI >= 3). The security-profile job is written to FAIL
+# VISIBLY if it does not; it never skips.
+#
+# Hardening: no secrets are used, the token is read-only (`contents: read`), actions are pinned to
+# commit SHAs (the comment names the release), `pull_request` is used (never `pull_request_target`),
+# and checkout does not persist credentials. Update the pins deliberately, not automatically.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain (with rustfmt and clippy) is pinned in rust-toolchain.toml.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Documentation links
+        run: python3 scripts/check-doc-links.py
+
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo audit (no ignored advisories)
+        # Fails on any vulnerability. Unmaintained-crate warnings (today: `paste`, a build-time
+        # proc-macro without a fix) are printed but do not fail; do not add --ignore flags.
+        run: |
+          cargo install cargo-audit --locked --version 0.22.1
+          cargo audit
+      - name: cargo deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
+  security-profile:
+    # Landlock gate for the MCP repository tools (ADR-029), about 5 minutes.
+    # Never uses --insecure-no-sandbox itself. scripts/security-profile.sh runs its own step 2/4 with
+    # that flag on purpose: it tests the application layer alone, with its result printed.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Kernel and active security modules
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm
+          grep -qw landlock /sys/kernel/security/lsm || { echo "::error::Landlock is not in the active LSM list of this runner"; exit 1; }
+      - name: Build
+        run: cargo build --locked
+      - name: Sandbox is really enforced (fails if the kernel layer is missing)
+        run: python3 scripts/check-sandbox-enforced.py target/debug/mind
+      - name: Security profile
+        run: scripts/security-profile.sh

@@ -1,0 +1,33 @@
+# DRAFT (MIND public-readiness). Checked locally with `cargo deny check`.
+# Run in CI as `cargo deny check advisories licenses bans sources`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on vulnerabilities and on unmaintained crates that we depend on directly.
+unmaintained = "workspace"
+yanked = "deny"
+# No ignores. `paste` (RUSTSEC-2024-0436, unmaintained, no vulnerability) is a
+# build-time proc-macro reached only through candle-core/gemm; `cargo audit`
+# still prints it as a warning, `unmaintained = "workspace"` only fails on
+# direct dependencies. Re-evaluate when candle drops it.
+
+[licenses]
+# Every license in the current tree (checked with `cargo deny list`) is
+# permissive. r-efi is `MIT OR Apache-2.0 OR LGPL-2.1-or-later` (UEFI only), the
+# permissive alternatives apply.
+allow = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+    "ISC", "Unicode-3.0", "Unlicense", "Zlib", "BSL-1.0", "0BSD", "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

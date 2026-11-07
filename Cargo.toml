@@ -4,6 +4,11 @@ version = "0.5.0"
 edition = "2021"
 description = "Local-first memory engine: sources are evidence, memories are interpretations."
 license = "MIT"
+repository = "https://github.com/VikingOwl91/mindspace"
+readme = "README.md"
+keywords = ["memory", "mcp", "sqlite", "code-search", "ai-agents"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
 
 [lib]
 name = "mindspace"

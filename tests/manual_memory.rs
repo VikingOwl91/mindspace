@@ -456,7 +456,7 @@ fn migration_seven_adds_embedding_tables_to_phase_one_database() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration, 7);
+    assert_eq!(migration, 8);
     let index: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_logical_sources_manual'",

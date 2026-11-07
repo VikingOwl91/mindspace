@@ -422,14 +422,9 @@ fn memory_search_resolves_embedding_capability_again_between_requests() {
         "embeddings_disabled"
     );
 
-    let conn = Connection::open(&db).unwrap();
-    conn.execute(
-        "INSERT INTO mind_meta (key, value) VALUES ('embedding.enabled', 'true') \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )
-    .unwrap();
-    drop(conn);
+    let store = SqliteStore::open(&db).unwrap();
+    store.set_meta("embedding.enabled", "true").unwrap();
+    drop(store);
 
     let enabled_without_model = success_content(&process.call(
         41,

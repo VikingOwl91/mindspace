@@ -767,6 +767,90 @@ pub struct SearchQuery {
     pub include_retired: bool,
 }
 
+/// Historical dimensions whose recording coverage can be reported without
+/// implying that a historical query API is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalDimension {
+    BeliefLifecycle,
+    SpaceState,
+    SpaceMembership,
+    SpaceLinks,
+    SourceState,
+    RepositoryState,
+    GitRefs,
+    CanonicalProvenance,
+    Observations,
+    WorldValidity,
+    CodeStructure,
+    EmbeddingIndex,
+    FtsRanking,
+    Configuration,
+}
+
+impl TemporalDimension {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BeliefLifecycle => "belief_lifecycle",
+            Self::SpaceState => "space_state",
+            Self::SpaceMembership => "space_membership",
+            Self::SpaceLinks => "space_links",
+            Self::SourceState => "source_state",
+            Self::RepositoryState => "repository_state",
+            Self::GitRefs => "git_refs",
+            Self::CanonicalProvenance => "canonical_provenance",
+            Self::Observations => "observations",
+            Self::WorldValidity => "world_validity",
+            Self::CodeStructure => "code_structure",
+            Self::EmbeddingIndex => "embedding_index",
+            Self::FtsRanking => "fts_ranking",
+            Self::Configuration => "configuration",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::BeliefLifecycle,
+            Self::SpaceState,
+            Self::SpaceMembership,
+            Self::SpaceLinks,
+            Self::SourceState,
+            Self::RepositoryState,
+            Self::GitRefs,
+            Self::CanonicalProvenance,
+            Self::Observations,
+            Self::WorldValidity,
+            Self::CodeStructure,
+            Self::EmbeddingIndex,
+            Self::FtsRanking,
+            Self::Configuration,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalCoverageStatus {
+    Covered,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalCoverage {
+    pub dimension: TemporalDimension,
+    pub status: TemporalCoverageStatus,
+    pub baseline_revision: i64,
+    pub complete_from_revision: Option<i64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalHistoryCapabilities {
+    pub baseline_revision: i64,
+    pub current_revision: i64,
+    pub dimensions: Vec<TemporalCoverage>,
+}
+
 /// Two or more active memories with the same normalized subject that are
 /// direct members of the same space. Conflicts coexist; the engine never
 /// collapses them.

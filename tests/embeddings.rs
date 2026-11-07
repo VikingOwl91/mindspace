@@ -156,7 +156,7 @@ fn migration_seven_adds_embedding_tables_to_phase_one_database() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration, 7);
+    assert_eq!(migration, 8);
 
     // New tables exist.
     for table in ["assertion_embeddings", "mind_meta"] {
@@ -202,7 +202,7 @@ fn reopening_migrated_database_is_idempotent() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(v, 7);
+    assert_eq!(v, 8);
     drop(store);
     drop(store2);
 }
@@ -661,8 +661,12 @@ fn search_vectors_skips_malformed_blob() {
             supersedes: None,
         })
         .unwrap();
-    // Insert a row with a malformed blob directly (wrong length).
+    // Insert a row with a malformed blob directly (wrong length). The write
+    // fence guards ordinary tables, so the fixture temporarily drops the
+    // fence trigger and restores it before the store is reopened.
     let conn = Connection::open(&db.path).unwrap();
+    conn.execute("DROP TRIGGER m6_fence_assertion_embeddings_i", [])
+        .unwrap();
     conn.execute(
         "INSERT INTO assertion_embeddings (assertion_id, derivation_key, model, model_version, dimension, embedding, created_at) \
          VALUES (?1, 'k', 'm', 'v1', 2, ?2, 0)",
@@ -670,6 +674,16 @@ fn search_vectors_skips_malformed_blob() {
     )
     .unwrap();
     drop(conn);
+    let restorer = Connection::open(&db.path).unwrap();
+    restorer
+        .execute_batch(
+            "CREATE TRIGGER m6_fence_assertion_embeddings_i BEFORE INSERT ON assertion_embeddings \
+             WHEN m6_write_revision() IS NULL OR NOT EXISTS \
+               (SELECT 1 FROM m6_revisions WHERE revision_id=m6_write_revision()) \
+             BEGIN SELECT RAISE(ABORT, 'revisioned write required'); END;",
+        )
+        .unwrap();
+    drop(restorer);
 
     let q = SearchQuery {
         text: "ignored".to_string(),

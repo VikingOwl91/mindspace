@@ -7,7 +7,8 @@ use crate::core::{
     CodeParserIdentity, CodeResolutionReport, ConflictGroup, EmbeddingIndexStatus, GitObservation,
     GitObservationReport, GitRefObservation, IngestObservation, ManualMemoryDraft,
     ManualMemoryReport, Memory, MemoryDetail, MemorySummary, ObservationReport, Result,
-    SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, Ts, UnembeddedAssertion,
+    SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink, TemporalDimension,
+    TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
 
 /// The storage boundary. Methods correspond to use cases, not tables, and
@@ -15,6 +16,13 @@ use crate::core::{
 /// transaction; a future PostgreSQL backend would implement this trait
 /// without exposing transaction handles to callers.
 pub trait Store {
+    fn temporal_history_capabilities(&self) -> Result<TemporalHistoryCapabilities>;
+    fn require_temporal_coverage(
+        &self,
+        revision: i64,
+        dimensions: &[TemporalDimension],
+    ) -> Result<()>;
+
     // -- spaces -------------------------------------------------------------
 
     fn create_space(&self, name: &str, description: &str) -> Result<Space>;

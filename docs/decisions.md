@@ -413,3 +413,20 @@ measurements.
 writers, changing to mmap-backed weights, adding persistent verification state,
 or changing the synchronous MCP execution model requires a new integrity
 decision. None is part of this optimization.
+
+## ADR-021: Temporal recording and history coverage (2026-10-23)
+
+**Decision.** Recording revisions, observation timestamps, and world-validity
+time are separate coordinates. `belief_at(R)` and `world_history(R, V)` have
+different semantics; legacy `SearchQuery.at` remains unchanged. Revisioned
+history starts at an atomic migration baseline, with explicit typed coverage
+and fail-closed capability checks. Lifecycle ownership is separate from
+assertion derivation identity and manual-write authorization. Database-local
+write fencing uses persistent triggers and connection-local revision state,
+within the non-hostile database-owner threat model. Derived indexes must be
+checked against canonical data and are not historical truth.
+
+**Consequences.** Pre-baseline recording history is unavailable and cannot be
+inferred from timestamps. Unsupported temporal dimensions return an explicit
+capability error. See [adr-m6-temporal-recording.md](adr-m6-temporal-recording.md)
+for the Stage 0/1 contract and boundaries.

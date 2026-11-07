@@ -97,6 +97,19 @@ pub enum Error {
 
     #[error("requested retrieval mode unavailable: {reason}")]
     SemanticUnavailable { reason: String },
+
+    #[error("temporal history unavailable for {dimension} at revision {revision}: {reason}")]
+    TemporalHistoryUnavailable {
+        revision: i64,
+        dimension: String,
+        reason: String,
+    },
+
+    #[error("SQLite connection was discarded after an uncertain transaction outcome")]
+    ConnectionDiscarded,
+
+    #[error("FTS index is inconsistent with canonical assertions: {detail}")]
+    FtsIndexInconsistent { detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

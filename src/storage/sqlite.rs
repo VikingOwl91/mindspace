@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use uuid::Uuid;
@@ -15,8 +19,9 @@ use crate::core::{
     IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft, ManualMemoryReport, Memory,
     MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
     ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
-    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, Ts, UnembeddedAssertion,
-    EXTRACTION_MANUAL_WRITE,
+    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, TemporalCoverage,
+    TemporalCoverageStatus, TemporalDimension, TemporalHistoryCapabilities, Ts,
+    UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
 
@@ -34,12 +39,117 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (6, include_str!("../../migrations/0006_manual_writes.sql")),
     (7, include_str!("../../migrations/0007_embeddings.sql")),
+    (
+        8,
+        include_str!("../../migrations/0008_temporal_recording.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
+const CURRENT_SCHEMA_VERSION: i64 = 8;
+const FILE_PRODUCER_FAMILY: &str = "file:legacy";
+const GIT_PRODUCER_FAMILY: &str = "git:legacy";
+const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
 
 pub struct SqliteStore {
-    conn: Connection,
+    conn: Mutex<Option<Connection>>,
+    revision_state: Arc<RevisionState>,
+    fts_integrity: AtomicBool,
+}
+
+struct RevisionState {
+    active_revision: AtomicI64,
+    poisoned: AtomicBool,
+}
+
+struct ConnectionGuard<'a> {
+    guard: MutexGuard<'a, Option<Connection>>,
+    revision_state: Arc<RevisionState>,
+}
+
+impl Deref for ConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("connection guard never contains a discarded handle")
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if self.revision_state.poisoned.load(Ordering::SeqCst) {
+            let still_open = self.guard.as_ref().is_some_and(|conn| conn.is_autocommit());
+            if !still_open {
+                self.guard.take();
+            }
+        }
+    }
+}
+
+struct WriteTransaction<'conn> {
+    tx: Option<Transaction<'conn>>,
+    conn: &'conn Connection,
+    revision_state: Arc<RevisionState>,
+}
+
+impl<'conn> Deref for WriteTransaction<'conn> {
+    type Target = Transaction<'conn>;
+
+    fn deref(&self) -> &Self::Target {
+        self.tx
+            .as_ref()
+            .expect("write transaction is present until commit or rollback")
+    }
+}
+
+impl<'conn> DerefMut for WriteTransaction<'conn> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.tx
+            .as_mut()
+            .expect("write transaction is present until commit or rollback")
+    }
+}
+
+impl WriteTransaction<'_> {
+    fn commit(mut self) -> Result<()> {
+        let tx = self
+            .tx
+            .take()
+            .expect("write transaction is present until commit");
+        let result = tx.commit().map_err(dberr);
+        self.revision_state
+            .active_revision
+            .store(0, Ordering::SeqCst);
+        if result.is_err() {
+            if !self.conn.is_autocommit() {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+            self.revision_state.poisoned.store(true, Ordering::SeqCst);
+            return result;
+        }
+        if !self.conn.is_autocommit() {
+            self.revision_state.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::Storage(
+                "SQLite commit returned with an active transaction".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WriteTransaction<'_> {
+    fn drop(&mut self) {
+        self.revision_state
+            .active_revision
+            .store(0, Ordering::SeqCst);
+        if let Some(tx) = self.tx.take() {
+            if tx.rollback().is_err() || !self.conn.is_autocommit() {
+                self.revision_state.poisoned.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 impl SqliteStore {
@@ -63,13 +173,62 @@ impl SqliteStore {
     }
 
     fn init_conn(conn: Connection) -> Result<Self> {
+        let revision_state = Arc::new(RevisionState {
+            active_revision: AtomicI64::new(0),
+            poisoned: AtomicBool::new(false),
+        });
         conn.busy_timeout(Duration::from_secs(5)).map_err(dberr)?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
             .map_err(dberr)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(dberr)?;
+        register_revision_context(&conn, &revision_state)?;
+        reject_future_schema(&conn)?;
         run_migrations(&conn)?;
-        Ok(Self { conn })
+        validate_fence_inventory(&conn)?;
+        let fts_integrity = verify_fts_counts(&conn).is_ok();
+        Ok(Self {
+            conn: Mutex::new(Some(conn)),
+            revision_state,
+            fts_integrity: AtomicBool::new(fts_integrity),
+        })
+    }
+
+    fn connection(&self) -> Result<ConnectionGuard<'_>> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Storage("SQLite connection lock is poisoned".to_string()))?;
+        if guard.is_none() {
+            return Err(Error::ConnectionDiscarded);
+        }
+        Ok(ConnectionGuard {
+            guard,
+            revision_state: Arc::clone(&self.revision_state),
+        })
+    }
+
+    pub fn verify_fts_index(&self) -> Result<()> {
+        let conn = self.connection()?;
+        let result = verify_fts_index(&conn);
+        self.fts_integrity.store(result.is_ok(), Ordering::SeqCst);
+        result
+    }
+
+    pub fn rebuild_fts_index(&self) -> Result<()> {
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
+        tx.execute("DELETE FROM assertion_fts", []).map_err(dberr)?;
+        tx.execute(
+            "INSERT INTO assertion_fts (assertion_id, subject, content) \
+             SELECT id, subject, content FROM assertions ORDER BY id",
+            [],
+        )
+        .map_err(dberr)?;
+        verify_fts_index(&tx)?;
+        tx.commit()?;
+        self.fts_integrity.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -306,8 +465,86 @@ fn dberr(e: rusqlite::Error) -> Error {
     Error::Storage(e.to_string())
 }
 
-fn begin_write(conn: &Connection) -> Result<Transaction<'_>> {
-    Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)
+fn register_revision_context(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
+    let function_state = Arc::clone(state);
+    conn.create_scalar_function(
+        "m6_write_revision",
+        0,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
+        move |_| {
+            let revision = function_state.active_revision.load(Ordering::SeqCst);
+            Ok((revision > 0).then_some(revision))
+        },
+    )
+    .map_err(dberr)?;
+
+    let commit_state = Arc::clone(state);
+    conn.commit_hook(Some(move || {
+        commit_state.active_revision.store(0, Ordering::SeqCst);
+        false
+    }))
+    .map_err(dberr)?;
+    let rollback_state = Arc::clone(state);
+    conn.rollback_hook(Some(move || {
+        rollback_state.active_revision.store(0, Ordering::SeqCst);
+    }))
+    .map_err(dberr)?;
+    Ok(())
+}
+
+fn begin_write<'conn>(
+    conn: &'conn Connection,
+    state: &Arc<RevisionState>,
+) -> Result<WriteTransaction<'conn>> {
+    if state.poisoned.load(Ordering::SeqCst) {
+        return Err(Error::ConnectionDiscarded);
+    }
+    if !conn.is_autocommit() || state.active_revision.load(Ordering::SeqCst) != 0 {
+        return Err(Error::Storage(
+            "nested or unmanaged SQLite write transaction is not allowed".to_string(),
+        ));
+    }
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)?;
+    let last_revision: Option<i64> = tx
+        .query_row("SELECT MAX(revision_id) FROM m6_revisions", [], |row| {
+            row.get(0)
+        })
+        .map_err(dberr)?;
+    let revision_id = last_revision
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Storage("recording revision space exhausted".to_string()))?;
+    if state
+        .active_revision
+        .compare_exchange(0, revision_id, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        rollback_unowned_transaction(tx, conn, state);
+        return Err(Error::Storage(
+            "connection already has an active recording revision".to_string(),
+        ));
+    }
+    if let Err(error) = tx.execute(
+        "INSERT INTO m6_revisions (revision_id, recorded_at, kind) VALUES (?1, ?2, 'write')",
+        rusqlite::params![revision_id, Ts::now().0],
+    ) {
+        state.active_revision.store(0, Ordering::SeqCst);
+        rollback_unowned_transaction(tx, conn, state);
+        return Err(dberr(error));
+    }
+    Ok(WriteTransaction {
+        tx: Some(tx),
+        conn,
+        revision_state: Arc::clone(state),
+    })
+}
+
+fn rollback_unowned_transaction(tx: Transaction<'_>, conn: &Connection, state: &RevisionState) {
+    state.active_revision.store(0, Ordering::SeqCst);
+    if tx.rollback().is_err() || !conn.is_autocommit() {
+        state.poisoned.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Shared filter clause for lexical and vector search: temporal `at`,
@@ -391,16 +628,10 @@ fn classify_query_err(e: rusqlite::Error) -> Error {
     }
 }
 
-fn run_migrations(conn: &Connection) -> Result<()> {
-    // Migrations run with foreign keys disabled: table rebuilds (the
-    // documented SQLite way to change constraints) drop referenced tables.
-    // The setting is a no-op inside a transaction, so it is toggled at the
-    // connection level around the migration batch and restored after.
-    conn.pragma_update(None, "foreign_keys", "OFF")
-        .map_err(dberr)?;
+fn reject_future_schema(conn: &Connection) -> Result<()> {
     let has_migration_table: bool = conn
         .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
             [],
             |_| Ok(()),
         )
@@ -408,60 +639,728 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .map_err(dberr)?
         .is_some();
     if !has_migration_table {
-        let tx = begin_write(conn)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                 version    INTEGER PRIMARY KEY,
-                 applied_at INTEGER NOT NULL
-             )",
+        return Ok(());
+    }
+    let future: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(version) FROM schema_migrations WHERE version > ?1",
+            rusqlite::params![CURRENT_SCHEMA_VERSION],
+            |row| row.get(0),
         )
         .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
+    if let Some(version) = future {
+        return Err(Error::Storage(format!(
+            "database schema version {version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+        )));
     }
+    Ok(())
+}
 
-    let mut applied: HashSet<i64> = HashSet::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT version FROM schema_migrations")
-            .map_err(dberr)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(dberr)?;
-        for version in rows {
-            applied.insert(version.map_err(dberr)?);
+fn validate_migration_prefix(conn: &Connection) -> Result<()> {
+    let has_migration_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(dberr)?
+        .is_some();
+    if !has_migration_table {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .map_err(dberr)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(dberr)?;
+    for (expected, row) in (1_i64..).zip(rows) {
+        let version = row.map_err(dberr)?;
+        if version != expected {
+            return Err(Error::Storage(format!(
+                "schema migration history is not a contiguous prefix at version {expected}"
+            )));
         }
     }
+    Ok(())
+}
 
-    for (version, sql) in MIGRATIONS {
-        if applied.contains(version) {
-            continue;
-        }
-        let tx = begin_write(conn)?;
-        let already_applied: bool = tx
+fn run_migrations(conn: &Connection) -> Result<()> {
+    reject_future_schema(conn)?;
+    validate_migration_prefix(conn)?;
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(dberr)?;
+
+    let migration_result = (|| {
+        let has_migration_table: bool = conn
             .query_row(
-                "SELECT 1 FROM schema_migrations WHERE version = ?1",
-                rusqlite::params![version],
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
+                [],
                 |_| Ok(()),
             )
             .optional()
             .map_err(dberr)?
             .is_some();
-        if already_applied {
+        if !has_migration_table {
+            let tx =
+                Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 )",
+            )
+            .map_err(dberr)?;
             tx.commit().map_err(dberr)?;
-            applied.insert(*version);
-            continue;
         }
-        tx.execute_batch(sql).map_err(dberr)?;
+
+        for (version, sql) in MIGRATIONS {
+            let tx =
+                Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)?;
+            reject_future_schema(&tx)?;
+            let already_applied: bool = tx
+                .query_row(
+                    "SELECT 1 FROM schema_migrations WHERE version=?1",
+                    rusqlite::params![version],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(dberr)?
+                .is_some();
+            if already_applied {
+                tx.commit().map_err(dberr)?;
+                continue;
+            }
+            tx.execute_batch(sql).map_err(dberr)?;
+            if *version == CURRENT_SCHEMA_VERSION {
+                apply_m6_baseline(&tx)?;
+            }
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                rusqlite::params![version, Ts::now().0],
+            )
+            .map_err(dberr)?;
+            if *version == CURRENT_SCHEMA_VERSION {
+                install_m6_write_fence(&tx)?;
+                validate_fence_inventory(&tx)?;
+            }
+            tx.commit().map_err(dberr)?;
+        }
+        validate_migration_prefix(conn)?;
+        let current: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .map_err(dberr)?;
+        if current != CURRENT_SCHEMA_VERSION {
+            return Err(Error::Storage(format!(
+                "schema migration stopped at version {current}, expected {CURRENT_SCHEMA_VERSION}"
+            )));
+        }
+        Ok(())
+    })();
+
+    let restore_result = conn
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(dberr);
+    migration_result?;
+    restore_result?;
+    Ok(())
+}
+
+const FENCED_TABLES: &[&str] = &[
+    "spaces",
+    "space_links",
+    "sources",
+    "evidence",
+    "assertions",
+    "memories",
+    "memory_spaces",
+    "logical_sources",
+    "ingest_sessions",
+    "source_events",
+    "source_observations",
+    "repositories",
+    "git_commits",
+    "git_commit_parents",
+    "git_trees",
+    "git_tree_entries",
+    "git_blobs",
+    "git_tags",
+    "git_refs",
+    "git_ref_events",
+    "git_source_versions",
+    "code_inputs",
+    "code_derivations",
+    "code_contexts",
+    "code_entities",
+    "code_imports",
+    "code_relationship_observations",
+    "code_resolution_derivations",
+    "code_relationship_resolutions",
+    "code_resolution_candidates",
+    "assertion_embeddings",
+    "mind_meta",
+    "m6_history_coverage",
+    "m6_row_availability",
+    "m6_memory_history",
+    "m6_space_history",
+    "m6_space_link_history",
+    "m6_memory_space_history",
+    "m6_logical_source_history",
+    "m6_repository_history",
+    "m6_git_ref_history",
+];
+
+const IMMUTABLE_TABLES: &[&str] = &[
+    "sources",
+    "evidence",
+    "assertions",
+    "ingest_sessions",
+    "source_events",
+    "source_observations",
+    "git_commits",
+    "git_commit_parents",
+    "git_trees",
+    "git_tree_entries",
+    "git_blobs",
+    "git_tags",
+    "git_ref_events",
+    "git_source_versions",
+    "code_inputs",
+    "code_derivations",
+    "code_contexts",
+    "code_entities",
+    "code_imports",
+    "code_relationship_observations",
+    "code_resolution_derivations",
+    "code_relationship_resolutions",
+    "code_resolution_candidates",
+];
+
+const ROW_AVAILABILITY_KEYS: &[(&str, &str)] = &[
+    ("sources", "{id}"),
+    ("evidence", "{id}"),
+    ("assertions", "{id}"),
+    ("ingest_sessions", "{id}"),
+    ("source_events", "{id}"),
+    (
+        "source_observations",
+        "hex(CAST({session_id} AS BLOB)) || ':' || hex(CAST({location} AS BLOB))",
+    ),
+    (
+        "git_commits",
+        "hex(CAST({repository_id} AS BLOB)) || ':' || hex(CAST({oid} AS BLOB))",
+    ),
+    (
+        "git_commit_parents",
+        "hex(CAST({repository_id} AS BLOB)) || ':' || hex(CAST({commit_oid} AS BLOB)) || ':' || hex(CAST({position} AS BLOB))",
+    ),
+    (
+        "git_trees",
+        "hex(CAST({repository_id} AS BLOB)) || ':' || hex(CAST({oid} AS BLOB))",
+    ),
+    (
+        "git_tree_entries",
+        "hex(CAST({repository_id} AS BLOB)) || ':' || hex(CAST({tree_oid} AS BLOB)) || ':' || hex(CAST({name} AS BLOB))",
+    ),
+    (
+        "git_blobs",
+        "hex(CAST({repository_id} AS BLOB)) || ':' || hex(CAST({oid} AS BLOB))",
+    ),
+    (
+        "git_tags",
+        "hex(CAST({repository_id} AS BLOB)) || ':' || hex(CAST({oid} AS BLOB))",
+    ),
+    ("git_ref_events", "{id}"),
+    ("git_source_versions", "{source_id}"),
+];
+
+fn availability_key_expr(table: &str, key: &str, prefix: &str) -> String {
+    let expr = ROW_AVAILABILITY_KEYS
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, expr)| *expr)
+        .unwrap_or(key);
+    let owned = expr.to_string();
+    if !owned.contains('{') {
+        return owned;
+    }
+    let columns = owned
+        .split('{')
+        .skip(1)
+        .filter_map(|part| part.split('}').next())
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let mut out = owned;
+    for column in columns {
+        out = out.replace(&format!("{{{column}}}"), &format!("{prefix}{column}"));
+    }
+    out
+}
+
+const TEMPORAL_COVERAGE: &[(TemporalDimension, bool, &str)] = &[
+    (TemporalDimension::BeliefLifecycle, true, ""),
+    (TemporalDimension::SpaceState, true, ""),
+    (TemporalDimension::SpaceMembership, true, ""),
+    (TemporalDimension::SpaceLinks, true, ""),
+    (TemporalDimension::SourceState, true, ""),
+    (TemporalDimension::RepositoryState, true, ""),
+    (TemporalDimension::GitRefs, true, ""),
+    (TemporalDimension::CanonicalProvenance, true, ""),
+    (TemporalDimension::Observations, true, ""),
+    (
+        TemporalDimension::WorldValidity,
+        false,
+        "no world-validity assertion model is implemented",
+    ),
+    (
+        TemporalDimension::CodeStructure,
+        false,
+        "code derivations and associations do not yet have complete temporal reconstruction",
+    ),
+    (
+        TemporalDimension::EmbeddingIndex,
+        false,
+        "embedding availability and model execution are current-index semantics only",
+    ),
+    (
+        TemporalDimension::FtsRanking,
+        false,
+        "FTS index ranking is derived and is not replayed historically",
+    ),
+    (
+        TemporalDimension::Configuration,
+        false,
+        "database configuration is not historical knowledge",
+    ),
+];
+
+fn apply_m6_baseline(tx: &Transaction<'_>) -> Result<()> {
+    const BASELINE: i64 = 1;
+    tx.execute(
+        "INSERT INTO m6_revisions (revision_id, recorded_at, kind) VALUES (?1, ?2, 'baseline')",
+        rusqlite::params![BASELINE, Ts::now().0],
+    )
+    .map_err(dberr)?;
+    tx.execute(
+        "UPDATE memories SET producer_family = CASE \
+           WHEN (SELECT ls.kind FROM logical_sources ls JOIN assertions a ON a.id=memories.assertion_id \
+                 WHERE ls.id=(SELECT s.logical_id FROM evidence e JOIN sources s ON s.id=e.source_id \
+                              WHERE e.id=a.evidence_id)) = 'manual' \
+                AND (SELECT extraction FROM assertions WHERE id=memories.assertion_id)='manual:write' \
+             THEN 'manual:write' \
+           WHEN (SELECT ls.kind FROM logical_sources ls JOIN assertions a ON a.id=memories.assertion_id \
+                 WHERE ls.id=(SELECT s.logical_id FROM evidence e JOIN sources s ON s.id=e.source_id \
+                              WHERE e.id=a.evidence_id)) = 'file' \
+                AND (SELECT extraction FROM assertions WHERE id=memories.assertion_id) IN \
+                    ('markdown:section-heading','markdown:preamble','markdown:document','text:document') \
+             THEN 'file:legacy' \
+           WHEN (SELECT ls.kind FROM logical_sources ls JOIN assertions a ON a.id=memories.assertion_id \
+                 WHERE ls.id=(SELECT s.logical_id FROM evidence e JOIN sources s ON s.id=e.source_id \
+                              WHERE e.id=a.evidence_id)) = 'git_path' \
+                AND (SELECT extraction FROM assertions WHERE id=memories.assertion_id) LIKE 'git:%' \
+             THEN 'git:legacy' \
+           ELSE 'legacy:isolated:' || id END",
+        [],
+    )
+    .map_err(dberr)?;
+
+    seed_m6_availability(tx, BASELINE)?;
+    seed_m6_histories(tx, BASELINE)?;
+    for (dimension, covered, reason) in TEMPORAL_COVERAGE {
         tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            rusqlite::params![version, Ts::now().0],
+            "INSERT INTO m6_history_coverage \
+             (dimension, baseline_revision, complete_from_revision, status, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                dimension.as_str(),
+                BASELINE,
+                covered.then_some(BASELINE),
+                if *covered { "covered" } else { "unsupported" },
+                (!covered).then_some(*reason),
+            ],
         )
         .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
-        applied.insert(*version);
     }
-    conn.pragma_update(None, "foreign_keys", "ON")
+    install_immutable_triggers(tx)?;
+    install_availability_triggers(tx)?;
+    install_snapshot_triggers(tx)?;
+    verify_fts_index(tx)?;
+    Ok(())
+}
+
+fn seed_m6_availability(tx: &Transaction<'_>, baseline: i64) -> Result<()> {
+    for (table, key) in ROW_AVAILABILITY_KEYS {
+        let expr = availability_key_expr(table, key, "");
+        let sql = format!(
+            "INSERT INTO m6_row_availability(table_name,entity_key,revision_id) \
+             SELECT '{table}', CAST(({expr}) AS TEXT), {baseline} FROM {table}"
+        );
+        tx.execute(&sql, []).map_err(dberr)?;
+    }
+    Ok(())
+}
+
+fn seed_m6_histories(tx: &Transaction<'_>, baseline: i64) -> Result<()> {
+    let queries = [
+        format!(
+            "INSERT INTO m6_memory_history \
+             SELECT id,{baseline},0,assertion_id,state,created_at,superseded_by,superseded_at,retired_at,retire_reason,producer_family FROM memories"
+        ),
+        format!(
+            "INSERT INTO m6_space_history \
+             SELECT id,{baseline},0,name,description,created_at FROM spaces"
+        ),
+        format!(
+            "INSERT INTO m6_space_link_history \
+             SELECT from_space,to_space,{baseline},0,created_at FROM space_links"
+        ),
+        format!(
+            "INSERT INTO m6_memory_space_history \
+             SELECT memory_id,space_id,{baseline},0,created_at FROM memory_spaces"
+        ),
+        format!(
+            "INSERT INTO m6_logical_source_history \
+             SELECT id,{baseline},0,kind,state,current_location,created_at,repository_id,commit_oid,git_path FROM logical_sources"
+        ),
+        format!(
+            "INSERT INTO m6_repository_history \
+             SELECT id,{baseline},0,current_path,created_at FROM repositories"
+        ),
+        format!(
+            "INSERT INTO m6_git_ref_history \
+             SELECT repository_id,name,{baseline},0,target_oid,target_kind,symbolic_target,last_observed_at FROM git_refs"
+        ),
+    ];
+    for sql in queries {
+        tx.execute(&sql, []).map_err(dberr)?;
+    }
+    Ok(())
+}
+
+fn install_immutable_triggers(conn: &Connection) -> Result<()> {
+    for table in IMMUTABLE_TABLES {
+        for (suffix, event) in [("u", "UPDATE"), ("d", "DELETE")] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER m6_immutable_{table}_{suffix} BEFORE {event} ON {table} \
+                 BEGIN SELECT RAISE(ABORT, '{table} rows are append-only'); END;"
+            ))
+            .map_err(dberr)?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER m6_memory_owner_immutable \
+         BEFORE UPDATE OF producer_family ON memories \
+         WHEN NEW.producer_family IS NOT OLD.producer_family \
+         BEGIN SELECT RAISE(ABORT, 'memory producer family is immutable'); END;",
+    )
+    .map_err(dberr)?;
+    Ok(())
+}
+
+fn install_availability_triggers(conn: &Connection) -> Result<()> {
+    for (table, key) in ROW_AVAILABILITY_KEYS {
+        let expr = availability_key_expr(table, key, "NEW.");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER m6_birth_{table} AFTER INSERT ON {table} BEGIN \
+             INSERT OR IGNORE INTO m6_row_availability(table_name,entity_key,revision_id) \
+             VALUES ('{table}',CAST(({expr}) AS TEXT),m6_write_revision()); END;"
+        ))
         .map_err(dberr)?;
+    }
+    Ok(())
+}
+
+struct SnapshotSpec {
+    table: &'static str,
+    history: &'static str,
+    keys: &'static [&'static str],
+    history_keys: &'static [&'static str],
+    values: &'static [&'static str],
+}
+
+const SNAPSHOT_SPECS: &[SnapshotSpec] = &[
+    SnapshotSpec {
+        table: "memories",
+        history: "m6_memory_history",
+        keys: &["id"],
+        history_keys: &["memory_id"],
+        values: &[
+            "assertion_id",
+            "state",
+            "created_at",
+            "superseded_by",
+            "superseded_at",
+            "retired_at",
+            "retire_reason",
+            "producer_family",
+        ],
+    },
+    SnapshotSpec {
+        table: "spaces",
+        history: "m6_space_history",
+        keys: &["id"],
+        history_keys: &["space_id"],
+        values: &["name", "description", "created_at"],
+    },
+    SnapshotSpec {
+        table: "space_links",
+        history: "m6_space_link_history",
+        keys: &["from_space", "to_space"],
+        history_keys: &["from_space", "to_space"],
+        values: &["created_at"],
+    },
+    SnapshotSpec {
+        table: "memory_spaces",
+        history: "m6_memory_space_history",
+        keys: &["memory_id", "space_id"],
+        history_keys: &["memory_id", "space_id"],
+        values: &["created_at"],
+    },
+    SnapshotSpec {
+        table: "logical_sources",
+        history: "m6_logical_source_history",
+        keys: &["id"],
+        history_keys: &["logical_id"],
+        values: &[
+            "kind",
+            "state",
+            "current_location",
+            "created_at",
+            "repository_id",
+            "commit_oid",
+            "git_path",
+        ],
+    },
+    SnapshotSpec {
+        table: "repositories",
+        history: "m6_repository_history",
+        keys: &["id"],
+        history_keys: &["repository_id"],
+        values: &["current_path", "created_at"],
+    },
+    SnapshotSpec {
+        table: "git_refs",
+        history: "m6_git_ref_history",
+        keys: &["repository_id", "name"],
+        history_keys: &["repository_id", "ref_name"],
+        values: &[
+            "target_oid",
+            "target_kind",
+            "symbolic_target",
+            "last_observed_at",
+        ],
+    },
+];
+
+fn install_snapshot_triggers(conn: &Connection) -> Result<()> {
+    for spec in SNAPSHOT_SPECS {
+        for (action, event, prefix, deleted) in [
+            ("i", "INSERT", "NEW", 0),
+            ("u", "UPDATE", "NEW", 0),
+            ("d", "DELETE", "OLD", 1),
+        ] {
+            let source_keys = spec
+                .keys
+                .iter()
+                .map(|key| format!("{prefix}.{key}"))
+                .collect::<Vec<_>>();
+            let history_key_columns = spec.history_keys.join(",");
+            let value_columns = spec.values.join(",");
+            let value_exprs = spec
+                .values
+                .iter()
+                .map(|column| format!("{prefix}.{column}"))
+                .collect::<Vec<_>>();
+            let insert_columns = if value_columns.is_empty() {
+                format!("{},revision_id,is_deleted", history_key_columns)
+            } else {
+                format!(
+                    "{},revision_id,is_deleted,{}",
+                    history_key_columns, value_columns
+                )
+            };
+            let insert_values = if value_exprs.is_empty() {
+                format!("{},m6_write_revision(),{deleted}", source_keys.join(","))
+            } else {
+                format!(
+                    "{},m6_write_revision(),{deleted},{}",
+                    source_keys.join(","),
+                    value_exprs.join(",")
+                )
+            };
+            let conflict = spec
+                .history_keys
+                .iter()
+                .map(|key| (*key).to_string())
+                .chain(std::iter::once("revision_id".to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let assignments = std::iter::once("is_deleted=excluded.is_deleted".to_string())
+                .chain(
+                    spec.values
+                        .iter()
+                        .map(|column| format!("{column}=excluded.{column}")),
+                )
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER m6_snapshot_{table}_{action} AFTER {event} ON {table} BEGIN \
+                 INSERT INTO {history} ({insert_columns}) VALUES ({insert_values}) \
+                 ON CONFLICT({conflict}) DO UPDATE SET {assignments}; END;",
+                table = spec.table,
+                history = spec.history,
+            ))
+            .map_err(dberr)?;
+        }
+        for key in spec.keys {
+            let condition = spec
+                .keys
+                .iter()
+                .map(|other| format!("NEW.{other} IS NOT OLD.{other}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER m6_key_immutable_{table}_{key} \
+                 BEFORE UPDATE OF {key} ON {table} WHEN {condition} \
+                 BEGIN SELECT RAISE(ABORT, 'temporal entity keys are immutable'); END;",
+                table = spec.table
+            ))
+            .map_err(dberr)?;
+        }
+    }
+    Ok(())
+}
+
+fn install_m6_write_fence(conn: &Connection) -> Result<()> {
+    for table in FENCED_TABLES {
+        for (suffix, event) in [("i", "INSERT"), ("u", "UPDATE"), ("d", "DELETE")] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER m6_fence_{table}_{suffix} BEFORE {event} ON {table} \
+                 WHEN m6_write_revision() IS NULL OR NOT EXISTS \
+                   (SELECT 1 FROM m6_revisions WHERE revision_id=m6_write_revision()) \
+                 BEGIN SELECT RAISE(ABORT, 'revisioned write required'); END;"
+            ))
+            .map_err(dberr)?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER m6_fence_revisions_insert BEFORE INSERT ON m6_revisions \
+         WHEN m6_write_revision() IS NULL \
+           OR NEW.revision_id IS NOT m6_write_revision() \
+           OR NEW.kind IS NOT 'write' \
+           OR NEW.revision_id IS NOT (SELECT COALESCE(MAX(revision_id),0)+1 FROM m6_revisions) \
+         BEGIN SELECT RAISE(ABORT, 'revision allocation is storage-owned'); END; \
+         CREATE TRIGGER m6_fence_revisions_update BEFORE UPDATE ON m6_revisions \
+         BEGIN SELECT RAISE(ABORT, 'recording revisions are append-only'); END; \
+         CREATE TRIGGER m6_fence_revisions_delete BEFORE DELETE ON m6_revisions \
+         BEGIN SELECT RAISE(ABORT, 'recording revisions are append-only'); END;",
+    )
+    .map_err(dberr)?;
+    Ok(())
+}
+
+fn validate_fence_inventory(conn: &Connection) -> Result<()> {
+    let mut expected: HashSet<String> = FENCED_TABLES
+        .iter()
+        .flat_map(|table| {
+            ["i", "u", "d"]
+                .iter()
+                .map(move |suffix| format!("m6_fence_{table}_{suffix}"))
+        })
+        .chain([
+            "m6_fence_revisions_insert".to_string(),
+            "m6_fence_revisions_update".to_string(),
+            "m6_fence_revisions_delete".to_string(),
+        ])
+        .collect();
+    // Recording triggers: history capture, availability births, immutability.
+    for table in IMMUTABLE_TABLES {
+        for suffix in ["u", "d"] {
+            expected.insert(format!("m6_immutable_{table}_{suffix}"));
+        }
+    }
+    expected.insert("m6_memory_owner_immutable".to_string());
+    for (table, _) in ROW_AVAILABILITY_KEYS {
+        expected.insert(format!("m6_birth_{table}"));
+    }
+    for spec in SNAPSHOT_SPECS {
+        for suffix in ["i", "u", "d"] {
+            expected.insert(format!("m6_snapshot_{}_{}", spec.table, suffix));
+        }
+        for key in spec.keys {
+            expected.insert(format!("m6_key_immutable_{}_{}", spec.table, key));
+        }
+    }
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'm6_%'")
+        .map_err(dberr)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(dberr)?;
+    for row in rows {
+        expected.remove(&row.map_err(dberr)?);
+    }
+    if !expected.is_empty() {
+        let mut missing: Vec<String> = expected.into_iter().collect();
+        missing.sort_unstable();
+        let first = missing.first().map(String::as_str).unwrap_or_default();
+        return Err(Error::Storage(format!(
+            "revision-fence trigger inventory is incomplete: missing {first} (and {} more)",
+            missing.len() - 1
+        )));
+    }
+    Ok(())
+}
+
+fn verify_fts_index(conn: &Connection) -> Result<()> {
+    verify_fts_counts(conn)?;
+    conn.execute(
+        "INSERT INTO assertion_fts(assertion_fts,rank) VALUES ('integrity-check',1)",
+        [],
+    )
+    .map_err(|error| Error::FtsIndexInconsistent {
+        detail: error.to_string(),
+    })?;
+    let mismatches: i64 = conn
+        .query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM assertions a LEFT JOIN assertion_fts f ON f.assertion_id=a.id \
+                WHERE f.rowid IS NULL OR f.subject IS NOT a.subject OR f.content IS NOT a.content) + \
+               (SELECT COUNT(*) FROM assertion_fts f LEFT JOIN assertions a ON a.id=f.assertion_id \
+                WHERE a.id IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(dberr)?;
+    if mismatches != 0 {
+        return Err(Error::FtsIndexInconsistent {
+            detail: format!("{mismatches} canonical/FTS row mismatches"),
+        });
+    }
+    Ok(())
+}
+
+/// Cheap open-time structural check: row counts must agree between the
+/// canonical assertions and the derived FTS index. The full agreement and
+/// internal integrity checks run on demand via `verify_fts_index` and before
+/// and after every rebuild.
+fn verify_fts_counts(conn: &Connection) -> Result<()> {
+    let mismatched: bool = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM assertions) \
+             IS NOT (SELECT COUNT(*) FROM assertion_fts)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(dberr)?;
+    if mismatched {
+        return Err(Error::FtsIndexInconsistent {
+            detail: "assertion and FTS row counts disagree".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -622,12 +1521,27 @@ fn space_names_by_memory(
 // ---------------------------------------------------------------------------
 
 impl Store for SqliteStore {
+    fn temporal_history_capabilities(&self) -> Result<TemporalHistoryCapabilities> {
+        let conn = self.connection()?;
+        load_temporal_capabilities(&conn)
+    }
+
+    fn require_temporal_coverage(
+        &self,
+        revision: i64,
+        dimensions: &[TemporalDimension],
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        require_temporal_coverage(&conn, revision, dimensions)
+    }
+
     fn create_space(&self, name: &str, description: &str) -> Result<Space> {
         let name = name.trim();
         if name.is_empty() {
             return Err(Error::EmptyName);
         }
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM spaces WHERE name = ?1",
@@ -649,7 +1563,7 @@ impl Store for SqliteStore {
             rusqlite::params![id.to_string(), name, description, created_at.0],
         )
         .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(Space {
             id,
             name: name.to_string(),
@@ -659,22 +1573,22 @@ impl Store for SqliteStore {
     }
 
     fn get_space(&self, name: &str) -> Result<Space> {
-        self.conn
-            .query_row(
-                "SELECT id, name, description, created_at FROM spaces WHERE name = ?1",
-                rusqlite::params![name],
-                row_space,
-            )
-            .optional()
-            .map_err(dberr)?
-            .ok_or_else(|| Error::SpaceNotFound {
-                name: name.to_string(),
-            })
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT id, name, description, created_at FROM spaces WHERE name = ?1",
+            rusqlite::params![name],
+            row_space,
+        )
+        .optional()
+        .map_err(dberr)?
+        .ok_or_else(|| Error::SpaceNotFound {
+            name: name.to_string(),
+        })
     }
 
     fn list_spaces(&self) -> Result<Vec<Space>> {
-        let mut stmt = self
-            .conn
+        let conn = self.connection()?;
+        let mut stmt = conn
             .prepare("SELECT id, name, description, created_at FROM spaces ORDER BY name")
             .map_err(dberr)?;
         let rows = stmt.query_map([], row_space).map_err(dberr)?;
@@ -686,8 +1600,8 @@ impl Store for SqliteStore {
     }
 
     fn list_spaces_with_counts(&self) -> Result<Vec<(Space, u64)>> {
-        let mut stmt = self
-            .conn
+        let conn = self.connection()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.name, s.description, s.created_at,
                         (SELECT COUNT(*) FROM memory_spaces ms
@@ -707,8 +1621,8 @@ impl Store for SqliteStore {
     }
 
     fn list_space_links(&self) -> Result<Vec<SpaceLink>> {
-        let mut stmt = self
-            .conn
+        let conn = self.connection()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT from_space, to_space, created_at FROM space_links \
                  ORDER BY created_at, from_space, to_space",
@@ -731,7 +1645,8 @@ impl Store for SqliteStore {
     }
 
     fn link_spaces(&self, from: Uuid, to: Uuid) -> Result<SpaceLink> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let from_space = tx
             .query_row(
                 "SELECT id, name, description, created_at FROM spaces WHERE id = ?1",
@@ -780,7 +1695,7 @@ impl Store for SqliteStore {
             rusqlite::params![from.to_string(), to.to_string(), created_at.0],
         )
         .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(SpaceLink {
             from_space: from,
             to_space: to,
@@ -789,19 +1704,20 @@ impl Store for SqliteStore {
     }
 
     fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let report = record_observation_tx(&tx, observation)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(report)
     }
-
     fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>> {
-        load_source_lifecycle(&self.conn, logical_id)
+        let conn = self.connection()?;
+        load_source_lifecycle(&conn, logical_id)
     }
 
     fn get_memory_detail(&self, id: Uuid) -> Result<Option<MemoryDetail>> {
-        let memory = self
-            .conn
+        let conn = self.connection()?;
+        let memory = conn
             .query_row(
                 "SELECT id, assertion_id, state, created_at, superseded_by, superseded_at, \
                         retired_at, retire_reason \
@@ -814,10 +1730,9 @@ impl Store for SqliteStore {
         let Some(memory) = memory else {
             return Ok(None);
         };
-        let assertion = load_assertion(&self.conn, memory.assertion_id)?;
-        let evidence = load_evidence(&self.conn, assertion.evidence_id)?;
-        let source = self
-            .conn
+        let assertion = load_assertion(&conn, memory.assertion_id)?;
+        let evidence = load_evidence(&conn, assertion.evidence_id)?;
+        let source = conn
             .query_row(
                 "SELECT id, logical_id, kind, location, title, content, content_hash, \
                         media_type, size_bytes, ingested_at \
@@ -826,10 +1741,9 @@ impl Store for SqliteStore {
                 row_source,
             )
             .map_err(dberr)?;
-        let source_lifecycle = load_source_lifecycle(&self.conn, source.logical_id)?
+        let source_lifecycle = load_source_lifecycle(&conn, source.logical_id)?
             .ok_or_else(|| Error::Storage("source without logical identity".to_string()))?;
-        let mut spaces_stmt = self
-            .conn
+        let mut spaces_stmt = conn
             .prepare(
                 "SELECT s.id, s.name, s.description, s.created_at \
                  FROM memory_spaces ms JOIN spaces s ON s.id = ms.space_id \
@@ -844,23 +1758,18 @@ impl Store for SqliteStore {
             spaces.push(r.map_err(dberr)?);
         }
         let superseded_by = match memory.superseded_by {
-            Some(sb) => load_summaries(
-                &self.conn,
-                "",
-                "m.id = ?",
-                vec![Value::Text(sb.to_string())],
-            )?
-            .into_iter()
-            .next(),
+            Some(sb) => load_summaries(&conn, "", "m.id = ?", vec![Value::Text(sb.to_string())])?
+                .into_iter()
+                .next(),
             None => None,
         };
         let supersedes = load_summaries(
-            &self.conn,
+            &conn,
             "",
             "m.superseded_by = ?",
             vec![Value::Text(memory.id.to_string())],
         )?;
-        let git = load_git_provenance(&self.conn, &source.id)?;
+        let git = load_git_provenance(&conn, &source.id)?;
         Ok(Some(MemoryDetail {
             memory,
             assertion,
@@ -878,15 +1787,15 @@ impl Store for SqliteStore {
         &self,
         observation: crate::core::GitObservation,
     ) -> Result<GitObservationReport> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let report = record_git_observation_tx(&tx, &observation)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(report)
     }
-
     fn git_refs_current(&self, repository_id: Uuid) -> Result<Vec<GitRefObservation>> {
-        let mut stmt = self
-            .conn
+        let conn = self.connection()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT name, target_oid, target_kind, symbolic_target FROM git_refs \
                  WHERE repository_id = ?1 ORDER BY name",
@@ -913,7 +1822,8 @@ impl Store for SqliteStore {
         &self,
         observation: CodeObservation,
     ) -> Result<CodeObservationReport> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let mut report = CodeObservationReport::default();
         for input in observation.inputs {
             report.supported_inputs += 1;
@@ -947,12 +1857,13 @@ impl Store for SqliteStore {
                 tx.execute("INSERT INTO code_relationship_observations(id,derivation_id,kind,source_syntax_path,raw_target,start_byte,end_byte) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),relationship.kind.as_str(),relationship.source_syntax_path,relationship.raw_target,relationship.range.start_byte as i64,relationship.range.end_byte as i64]).map_err(dberr)?;
             }
         }
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(report)
     }
 
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>> {
-        let mut stmt=self.conn.prepare("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path=?1 OR i.blob_oid=?1 ORDER BY d.created_at").map_err(dberr)?;
+        let conn = self.connection()?;
+        let mut stmt=conn.prepare("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path=?1 OR i.blob_oid=?1 ORDER BY d.created_at").map_err(dberr)?;
         let rows = stmt
             .query_map(rusqlite::params![target], |r| {
                 Ok((
@@ -981,7 +1892,7 @@ impl Store for SqliteStore {
                 error_count,
                 content_hash,
             ) = row.map_err(dberr)?;
-            let mut es=self.conn.prepare("SELECT id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async FROM code_entities WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
+            let mut es=conn.prepare("SELECT id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async FROM code_entities WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
             let entities = es
                 .query_map(rusqlite::params![id.to_string()], |r| {
                     Ok(CodeEntity {
@@ -1007,7 +1918,7 @@ impl Store for SqliteStore {
                 .map_err(dberr)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(dberr)?;
-            let mut is=self.conn.prepare("SELECT raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column FROM code_imports WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
+            let mut is=conn.prepare("SELECT raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column FROM code_imports WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
             let imports = is
                 .query_map(rusqlite::params![id.to_string()], |r| {
                     Ok(CodeImport {
@@ -1054,7 +1965,8 @@ impl Store for SqliteStore {
         blob_oid: Option<&str>,
         identity: &crate::core::CodeParserIdentity,
     ) -> Result<bool> {
-        let found:Option<i64>=match (repository_id,blob_oid) { (Some(repo),Some(blob))=>self.conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id=?1 AND i.blob_oid=?2 AND d.extractor=?3 AND d.extractor_version=?4 AND d.grammar=?5 AND d.grammar_version=?6",rusqlite::params![repo.to_string(),blob,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?, _=>self.conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id IS NULL AND i.content_hash=?1 AND d.extractor=?2 AND d.extractor_version=?3 AND d.grammar=?4 AND d.grammar_version=?5",rusqlite::params![content_hash,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?};
+        let conn = self.connection()?;
+        let found:Option<i64>=match (repository_id,blob_oid) { (Some(repo),Some(blob))=>conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id=?1 AND i.blob_oid=?2 AND d.extractor=?3 AND d.extractor_version=?4 AND d.grammar=?5 AND d.grammar_version=?6",rusqlite::params![repo.to_string(),blob,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?, _=>conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id IS NULL AND i.content_hash=?1 AND d.extractor=?2 AND d.extractor_version=?3 AND d.grammar=?4 AND d.grammar_version=?5",rusqlite::params![content_hash,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?};
         Ok(found.is_some())
     }
 
@@ -1065,10 +1977,11 @@ impl Store for SqliteStore {
         resolver: &str,
         version: &str,
     ) -> Result<crate::core::CodeResolutionReport> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let existing:Option<String>=tx.query_row("SELECT id FROM code_resolution_derivations WHERE repository_id=?1 AND commit_oid=?2 AND resolver=?3 AND resolver_version=?4",rusqlite::params![repository_id.to_string(),commit_oid,resolver,version],|r|r.get(0)).optional().map_err(dberr)?;
         if existing.is_some() {
-            tx.commit().map_err(dberr)?;
+            tx.commit()?;
             return Ok(crate::core::CodeResolutionReport {
                 derivations_reused: 1,
                 ..Default::default()
@@ -1154,12 +2067,13 @@ impl Store for SqliteStore {
                 report.unresolved += 1
             }
         }
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(report)
     }
 
     fn record_manual_write(&self, draft: ManualMemoryDraft) -> Result<ManualMemoryReport> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let at = Ts::now();
         if draft.content.trim().is_empty() {
             return Err(Error::EmptyContent);
@@ -1224,8 +2138,9 @@ impl Store for SqliteStore {
             .map_err(dberr)?;
         let active_id: Option<String> = tx
             .query_row(
-                "SELECT id FROM memories WHERE assertion_id = ?1 AND state = 'active'",
-                rusqlite::params![assertion_id.to_string()],
+                "SELECT id FROM memories WHERE assertion_id = ?1 AND state = 'active' \
+                 AND producer_family = ?2",
+                rusqlite::params![assertion_id.to_string(), MANUAL_PRODUCER_FAMILY],
                 |row| row.get(0),
             )
             .optional()
@@ -1257,7 +2172,7 @@ impl Store for SqliteStore {
                 }
             }
             (Some(old_id), None) => {
-                let new_id = create_memory(&tx, assertion_id, at)?;
+                let new_id = create_memory(&tx, assertion_id, at, MANUAL_PRODUCER_FAMILY)?;
                 add_spaces(&tx, new_id, &spaces, at)?;
                 supersede_existing_memory(&tx, old_id, new_id, at)?;
                 (
@@ -1280,13 +2195,13 @@ impl Store for SqliteStore {
                 (active_id, action)
             }
             (None, None) => {
-                let new_id = create_memory(&tx, assertion_id, at)?;
+                let new_id = create_memory(&tx, assertion_id, at, MANUAL_PRODUCER_FAMILY)?;
                 add_spaces(&tx, new_id, &spaces, at)?;
                 (new_id, MemoryActionKind::Created)
             }
         };
         let space_names = memory_space_names(&tx, memory_id)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(ManualMemoryReport {
             memory_id,
             assertion_id,
@@ -1297,22 +2212,23 @@ impl Store for SqliteStore {
     }
 
     fn add_memory_spaces(&self, memory_id: Uuid, space_ids: Vec<Uuid>) -> Result<Vec<String>> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         validate_active_memory(&tx, memory_id)?;
         let spaces = validate_space_ids(&tx, &space_ids)?;
         let added = add_spaces(&tx, memory_id, &spaces, Ts::now())?;
         let names = names_for_space_ids(&tx, &added)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(names)
     }
 
     // -- Phase 2 M1: embeddings / vector index -----------------------------
-
     fn save_embeddings(&self, embeddings: &[AssertionEmbedding]) -> Result<usize> {
         if embeddings.is_empty() {
             return Ok(0);
         }
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let mut inserted = 0usize;
         for e in embeddings {
             // Validate before persisting: dimension must match and the vector
@@ -1347,10 +2263,9 @@ impl Store for SqliteStore {
                 .map_err(dberr)?;
             inserted += changed;
         }
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(inserted)
     }
-
     fn list_assertions_needing_embedding(
         &self,
         derivation_key: &str,
@@ -1393,7 +2308,8 @@ impl Store for SqliteStore {
                 ],
             ),
         };
-        let mut stmt = self.conn.prepare(&sql).map_err(dberr)?;
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(&sql).map_err(dberr)?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 Ok(UnembeddedAssertion {
@@ -1412,12 +2328,11 @@ impl Store for SqliteStore {
     }
 
     fn embedding_index_status(&self, derivation_key: &str) -> Result<EmbeddingIndexStatus> {
-        let total: i64 = self
-            .conn
+        let conn = self.connection()?;
+        let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM assertions", [], |r| r.get(0))
             .map_err(dberr)?;
-        let embedded: i64 = self
-            .conn
+        let embedded: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM assertion_embeddings WHERE derivation_key = ?1",
                 rusqlite::params![derivation_key],
@@ -1432,37 +2347,39 @@ impl Store for SqliteStore {
     }
 
     fn clear_embeddings(&self, derivation_key: &str) -> Result<usize> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         let n = tx
             .execute(
                 "DELETE FROM assertion_embeddings WHERE derivation_key = ?1",
                 rusqlite::params![derivation_key],
             )
             .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(n)
     }
 
     fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM mind_meta WHERE key = ?1",
-                rusqlite::params![key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(dberr)
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT value FROM mind_meta WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(dberr)
     }
 
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         tx.execute(
             "INSERT INTO mind_meta (key, value) VALUES (?1, ?2) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value],
         )
         .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1510,7 +2427,8 @@ impl Store for SqliteStore {
         sql.push_str(&filter_sql);
 
         // Fetch candidates (no ORDER BY in SQL; ranking happens in Rust).
-        let mut stmt = self.conn.prepare(&sql).map_err(dberr)?;
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(&sql).map_err(dberr)?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 let memory_id: String = r.get("id")?;
@@ -1574,7 +2492,7 @@ impl Store for SqliteStore {
 
         // Fill space_names post-hoc, identical to lexical search.
         let ids: Vec<String> = hits.iter().map(|h| h.memory_id.to_string()).collect();
-        let names = space_names_by_memory(&self.conn, &ids)?;
+        let names = space_names_by_memory(&conn, &ids)?;
         for h in &mut hits {
             if let Some(ns) = names.get(&h.memory_id.to_string()) {
                 h.space_names = ns.clone();
@@ -1585,8 +2503,9 @@ impl Store for SqliteStore {
     }
 
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {
+        let conn = self.connection()?;
         load_summaries(
-            &self.conn,
+            &conn,
             "",
             "a.subject_normalized = ?1",
             vec![Value::Text(subject_normalized.to_string())],
@@ -1594,8 +2513,9 @@ impl Store for SqliteStore {
     }
 
     fn list_replaced_by(&self, id: Uuid) -> Result<Vec<MemorySummary>> {
+        let conn = self.connection()?;
         load_summaries(
-            &self.conn,
+            &conn,
             "",
             "m.superseded_by = ?1",
             vec![Value::Text(id.to_string())],
@@ -1603,6 +2523,7 @@ impl Store for SqliteStore {
     }
 
     fn memory_id_prefix_matches(&self, prefix: &str) -> Result<Vec<Uuid>> {
+        let conn = self.connection()?;
         let lowered: String = prefix
             .to_lowercase()
             .chars()
@@ -1612,8 +2533,7 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
         let pattern = format!("{lowered}%");
-        let mut stmt = self
-            .conn
+        let mut stmt = conn
             .prepare("SELECT id FROM memories WHERE REPLACE(id, '-', '') LIKE ?1 ORDER BY id")
             .map_err(dberr)?;
         let rows = stmt
@@ -1633,11 +2553,17 @@ impl Store for SqliteStore {
     }
 
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHitRaw>> {
+        let conn = self.connection()?;
+        if !self.fts_integrity.load(Ordering::SeqCst) {
+            return Err(Error::FtsIndexInconsistent {
+                detail: "the last open-time integrity check failed; verify or rebuild the index"
+                    .to_string(),
+            });
+        }
         let text = query.text.trim();
         if text.is_empty() {
             return Err(Error::EmptyQuery);
         }
-
         let mut sql = String::from(
             "SELECT m.id, a.id AS assertion_id, a.subject, a.content, \
                     snippet(assertion_fts, 2, '[', ']', '…', 12) AS snip, \
@@ -1675,7 +2601,7 @@ impl Store for SqliteStore {
         let run = |match_text: &str| -> Result<Vec<SearchHitRaw>> {
             let mut p = params.clone();
             p[0] = Value::Text(match_text.to_string());
-            run_search_sql(&self.conn, &sql, p)
+            run_search_sql(&conn, &sql, p)
         };
         match run(text) {
             Err(Error::QuerySyntax(_)) => run(&format!("\"{}\"", text.replace('"', "\"\""))),
@@ -1684,8 +2610,8 @@ impl Store for SqliteStore {
     }
 
     fn list_conflicts(&self) -> Result<Vec<ConflictGroup>> {
-        let mut stmt = self
-            .conn
+        let conn = self.connection()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.name, a.subject_normalized \
                  FROM memory_spaces ms \
@@ -1711,7 +2637,7 @@ impl Store for SqliteStore {
         for r in rows {
             let (space_id, space_name, subject) = r.map_err(dberr)?;
             let members = load_summaries(
-                &self.conn,
+                &conn,
                 "JOIN memory_spaces fms ON fms.memory_id = m.id",
                 "m.state = 'active' AND fms.space_id = ? AND a.subject_normalized = ?",
                 vec![
@@ -1729,7 +2655,8 @@ impl Store for SqliteStore {
     }
 
     fn retire_memory(&self, id: Uuid, reason: Option<String>, at: Ts) -> Result<Memory> {
-        let tx = begin_write(&self.conn)?;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
         // The state check and the transition are one conditional statement,
         // so only an active memory can be retired, atomically.
         let changed = tx
@@ -1769,9 +2696,130 @@ impl Store for SqliteStore {
                 row_memory,
             )
             .map_err(dberr)?;
-        tx.commit().map_err(dberr)?;
+        tx.commit()?;
         Ok(memory)
     }
+}
+
+fn load_temporal_capabilities(conn: &Connection) -> Result<TemporalHistoryCapabilities> {
+    let baseline_revision: i64 = conn
+        .query_row("SELECT MIN(revision_id) FROM m6_revisions", [], |row| {
+            row.get(0)
+        })
+        .map_err(dberr)?;
+    let current_revision: i64 = conn
+        .query_row("SELECT MAX(revision_id) FROM m6_revisions", [], |row| {
+            row.get(0)
+        })
+        .map_err(dberr)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT dimension, status, complete_from_revision, reason \
+             FROM m6_history_coverage ORDER BY dimension",
+        )
+        .map_err(dberr)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let dimension_name: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            let complete_from_revision: Option<i64> = row.get(2)?;
+            let reason: Option<String> = row.get(3)?;
+            let dimension = TemporalDimension::all()
+                .iter()
+                .copied()
+                .find(|d| d.as_str() == dimension_name)
+                .ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(0, "dimension".to_string(), Type::Text)
+                })?;
+            Ok(TemporalCoverage {
+                dimension,
+                status: match status.as_str() {
+                    "covered" => TemporalCoverageStatus::Covered,
+                    _ => TemporalCoverageStatus::Unsupported,
+                },
+                baseline_revision,
+                complete_from_revision,
+                reason,
+            })
+        })
+        .map_err(dberr)?;
+    let mut dimensions = Vec::new();
+    for row in rows {
+        dimensions.push(row.map_err(dberr)?);
+    }
+    Ok(TemporalHistoryCapabilities {
+        baseline_revision,
+        current_revision,
+        dimensions,
+    })
+}
+
+fn require_temporal_coverage(
+    conn: &Connection,
+    revision: i64,
+    dimensions: &[TemporalDimension],
+) -> Result<()> {
+    if revision < 1 {
+        return Err(Error::TemporalHistoryUnavailable {
+            revision,
+            dimension: "recording_revision".to_string(),
+            reason: "revision must be positive".to_string(),
+        });
+    }
+    for dimension in dimensions {
+        let row: Option<(i64, String, Option<i64>, Option<String>)> = conn
+            .query_row(
+                "SELECT baseline_revision, status, complete_from_revision, reason \
+                 FROM m6_history_coverage WHERE dimension=?1",
+                rusqlite::params![dimension.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(dberr)?;
+        let Some((baseline, status, complete_from, reason)) = row else {
+            return Err(Error::TemporalHistoryUnavailable {
+                revision,
+                dimension: dimension.as_str().to_string(),
+                reason: "no coverage record exists".to_string(),
+            });
+        };
+        if status != "covered" {
+            return Err(Error::TemporalHistoryUnavailable {
+                revision,
+                dimension: dimension.as_str().to_string(),
+                reason: reason.unwrap_or_else(|| "dimension is unsupported".to_string()),
+            });
+        }
+        if revision < baseline {
+            return Err(Error::TemporalHistoryUnavailable {
+                revision,
+                dimension: dimension.as_str().to_string(),
+                reason: "requested revision precedes the v8 baseline".to_string(),
+            });
+        }
+        if let Some(complete_from) = complete_from {
+            if revision < complete_from {
+                return Err(Error::TemporalHistoryUnavailable {
+                    revision,
+                    dimension: dimension.as_str().to_string(),
+                    reason: format!("coverage is only complete from revision {complete_from}"),
+                });
+            }
+        }
+    }
+    let max_revision: Option<i64> = conn
+        .query_row("SELECT MAX(revision_id) FROM m6_revisions", [], |row| {
+            row.get(0)
+        })
+        .map_err(dberr)?;
+    if revision > max_revision.unwrap_or(0) {
+        return Err(Error::TemporalHistoryUnavailable {
+            revision,
+            dimension: "recording_revision".to_string(),
+            reason: "requested revision is not yet recorded".to_string(),
+        });
+    }
+    Ok(())
 }
 
 use rusqlite::params_from_iter;
@@ -2044,8 +3092,14 @@ fn record_observation_tx(
                 // reconciliation can only reuse (never supersede).
                 let (_, _, evidence_ids) =
                     ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
-                let actions =
-                    reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
+                let actions = reconcile_logical(
+                    conn,
+                    logical,
+                    &files[file_idx],
+                    &evidence_ids,
+                    at,
+                    FILE_PRODUCER_FAMILY,
+                )?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
                 report_files.push(FileObservation {
                     location,
@@ -2061,8 +3115,14 @@ fn record_observation_tx(
             } => {
                 let (_, _, evidence_ids) =
                     ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
-                let actions =
-                    reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
+                let actions = reconcile_logical(
+                    conn,
+                    logical,
+                    &files[file_idx],
+                    &evidence_ids,
+                    at,
+                    FILE_PRODUCER_FAMILY,
+                )?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
                 report_files.push(FileObservation {
                     location,
@@ -2075,8 +3135,14 @@ fn record_observation_tx(
                 let logical = create_logical_source(conn, &files[file_idx], at)?;
                 let (_, _, evidence_ids) =
                     ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
-                let actions =
-                    reconcile_logical(conn, logical, &files[file_idx], &evidence_ids, at)?;
+                let actions = reconcile_logical(
+                    conn,
+                    logical,
+                    &files[file_idx],
+                    &evidence_ids,
+                    at,
+                    FILE_PRODUCER_FAMILY,
+                )?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
                 report_files.push(FileObservation {
                     location,
@@ -2555,13 +3621,17 @@ fn reconcile_logical(
     file: &ObservedFile,
     evidence_ids: &[Uuid],
     at: Ts,
+    producer_family: &str,
 ) -> Result<Vec<MemoryAction>> {
     let mut olds_by_subject: BTreeMap<String, Vec<MemorySummary>> = BTreeMap::new();
     let olds = load_summaries(
         conn,
         "",
-        "m.state = 'active' AND src.logical_id = ?",
-        vec![Value::Text(logical.to_string())],
+        "m.state = 'active' AND src.logical_id = ? AND m.producer_family = ?",
+        vec![
+            Value::Text(logical.to_string()),
+            Value::Text(producer_family.to_string()),
+        ],
     )?;
     for o in olds {
         olds_by_subject
@@ -2676,6 +3746,7 @@ fn reconcile_logical(
                             at,
                             &requested_by_assertion,
                             &mut actions,
+                            producer_family,
                         )?;
                     }
                 }
@@ -2708,6 +3779,7 @@ fn reconcile_logical(
                     at,
                     &requested_by_assertion,
                     &mut actions,
+                    producer_family,
                 )?;
             }
             None => unmatched_olds.push(old),
@@ -2715,7 +3787,7 @@ fn reconcile_logical(
     }
     for ai in pending_news {
         let assertion_id = get_assertion(conn, ai)?;
-        let new_id = create_memory(conn, assertion_id, at)?;
+        let new_id = create_memory(conn, assertion_id, at, producer_family)?;
         let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
         add_spaces(conn, new_id, &requested, at)?;
         push_action(
@@ -2808,9 +3880,10 @@ fn supersede(
     at: Ts,
     requested_by_assertion: &HashMap<usize, Vec<Uuid>>,
     actions: &mut Vec<MemoryAction>,
+    producer_family: &str,
 ) -> Result<()> {
     let assertion_id = get_assertion(conn, ai)?;
-    let new_id = create_memory(conn, assertion_id, at)?;
+    let new_id = create_memory(conn, assertion_id, at, producer_family)?;
     let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
     add_spaces(conn, new_id, &requested, at)?;
     conn.execute(
@@ -2879,11 +3952,16 @@ fn add_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) ->
     Ok(added)
 }
 
-fn create_memory(conn: &Connection, assertion_id: Uuid, created_at: Ts) -> Result<Uuid> {
+fn create_memory(
+    conn: &Connection,
+    assertion_id: Uuid,
+    created_at: Ts,
+    producer_family: &str,
+) -> Result<Uuid> {
     let id = Uuid::now_v7();
     conn.execute(
-        "INSERT INTO memories (id, assertion_id, state, created_at) VALUES (?1, ?2, 'active', ?3)",
-        rusqlite::params![id.to_string(), assertion_id.to_string(), created_at.0],
+        "INSERT INTO memories (id, assertion_id, state, created_at, producer_family) VALUES (?1, ?2, 'active', ?3, ?4)",
+        rusqlite::params![id.to_string(), assertion_id.to_string(), created_at.0, producer_family],
     )
     .map_err(dberr)?;
     Ok(id)
@@ -3375,7 +4453,14 @@ fn record_git_observation_tx(
         } else {
             derivations_reused += 1;
         }
-        let actions = reconcile_logical(conn, logical, &observed, &evidence_ids, at)?;
+        let actions = reconcile_logical(
+            conn,
+            logical,
+            &observed,
+            &evidence_ids,
+            at,
+            GIT_PRODUCER_FAMILY,
+        )?;
         files.push(GitFileReport {
             path: d.path.clone(),
             commit_oid: d.commit_oid.clone(),

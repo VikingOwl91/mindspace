@@ -467,12 +467,32 @@ fn equal_timestamp_cursor_pagination() {
     make_assertion(&store, "a");
     make_assertion(&store, "b");
     make_assertion(&store, "c");
-    // drop immutability trigger and force equal created_at
+    // drop immutability triggers and force equal created_at; the revision
+    // fence must also be lifted for this deliberate direct-SQL fixture
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute("DROP TRIGGER IF EXISTS assertions_immutable", [])
         .unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS m6_fence_assertions_u", [])
+        .unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS m6_immutable_assertions_u", [])
+        .unwrap();
     conn.execute("UPDATE assertions SET created_at = 1000", [])
         .unwrap();
+    // restore what the tamper removed so the next store open stays valid
+    conn.execute(
+        "CREATE TRIGGER m6_fence_assertions_u BEFORE UPDATE ON assertions \
+         WHEN m6_write_revision() IS NULL OR NOT EXISTS \
+           (SELECT 1 FROM m6_revisions WHERE revision_id=m6_write_revision()) \
+         BEGIN SELECT RAISE(ABORT, 'revisioned write required'); END;",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TRIGGER m6_immutable_assertions_u BEFORE UPDATE ON assertions \
+         BEGIN SELECT RAISE(ABORT, 'assertions rows are append-only'); END;",
+        [],
+    )
+    .unwrap();
     drop(conn);
     let mut d = mindspace::embeddings::manifest::derivation_from_manifest(
         mindspace::embeddings::manifest::find_model("nomic-embed-text-v1.5").unwrap(),

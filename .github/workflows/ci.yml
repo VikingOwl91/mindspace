@@ -1,6 +1,7 @@
 # CI for Mindspace.
 #
-# STATUS: DRAFT. This workflow has never run on GitHub. Verified locally: every command below passes
+# STATUS: DRAFT. This workflow has never run on GitHub. Verified locally: actionlint 1.7.12 and
+# zizmor 1.32.0 (offline, --persona=pedantic) report nothing, and every command below passes
 # on Linux 7.2 (fmt, build, clippy -D warnings, test, cargo audit, cargo deny, doc-link check,
 # sandbox-enforcement check, security profile). Not verifiable before the first run: that the
 # GitHub-hosted runner provides Landlock (ABI >= 3). The security-profile job is written to FAIL
@@ -28,6 +29,7 @@ env:
 
 jobs:
   build-test:
+    name: Build, format, clippy, tests
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -51,6 +53,7 @@ jobs:
         run: python3 scripts/check-doc-links.py
 
   dependencies:
+    name: Dependencies (audit, deny)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -71,6 +74,7 @@ jobs:
           command: check advisories licenses bans sources
 
   security-profile:
+    name: Landlock security profile
     # Landlock gate for the MCP repository tools (ADR-029), about 5 minutes.
     # Never uses --insecure-no-sandbox itself. scripts/security-profile.sh runs its own step 2/4 with
     # that flag on purpose: it tests the application layer alone, with its result printed.

@@ -8,11 +8,11 @@ Only the latest commit on `main` is supported. There are no maintained release b
 
 ## Reporting a vulnerability
 
-Please do **not** open a public issue for a vulnerability.
+Please do **not** open a public issue, pull request or discussion for a vulnerability.
 
 Report it privately through GitHub: **Security > Report a vulnerability** on the repository page
-(private vulnerability reporting). <!-- MAINTAINER: enable "Private vulnerability reporting" in the
-repository settings before going public, and add a fallback contact here if you want one. -->
+(GitHub private vulnerability reporting). This is the only reporting channel; it keeps the report
+visible to the maintainer alone until a fix is ready.
 
 Please include: the version or commit, your Linux kernel and distribution, how you started `mind mcp`
 (flags, allowed roots), and a reproduction. Use temporary directories and your own repositories only.

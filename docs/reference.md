@@ -228,6 +228,7 @@ The commands currently implemented:
 
 ```sh
 mind init
+mind doctor [--json]                         # read-only check of the installation (docs/doctor.md)
 mind ingest ./notes.md --space coding
 mind ingest ~/Documents --space personal   # directory: full source-lifecycle scan
 mind ingest ~/src/owlry --space coding     # git repo: HEAD + worktrees, full ref journal
@@ -500,6 +501,8 @@ embeddings enable`, `mind model install`, `mind model use`, then `mind index
 run`). Search never downloads, installs, indexes, or writes metadata. Lexical
 mode requires no model. Without default features, lexical retrieval still works;
 semantic and hybrid are unavailable, while Auto visibly falls back to lexical.
+
+*Known discrepancy (not yet reworded above):* `mind embeddings enable` itself asks to download the default model (about 550 MB) and selects it, so `mind model install` and `mind model use` are only needed to choose another model. See "Known limits" in the README.
 
 Semantic, Hybrid, and Auto check current model selection, enablement and index
 readiness on every request. CLI searches verify artifacts independently. An

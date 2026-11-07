@@ -104,6 +104,7 @@ mind ingest . --space demo                        # a Git repository with at lea
 mind symbols ingest_confined --space demo         # where is this defined? (Rust definitions)
 mind search "sandbox minimum ABI" --space demo    # keyword search over the documents
 mind space list                                   # see what is stored
+mind doctor                                       # check the installation (read-only, no network)
 ```
 
 To use your own project, replace `.` with its path. Code definitions appear
@@ -197,6 +198,12 @@ Please read these; they are the difference between a surprise and a plan.
   trees without their code entities; re-running the ingest repairs it.
 - **Re-ingesting a changed repository re-derives all its documents** (they are
   bound to the commit), which costs time on big repos.
+- **Setting up semantic search is simpler than `docs/reference.md` describes.**
+  `mind embeddings enable` itself asks to download the default model (about 550 MB)
+  and selects it; `mind model install` and `mind model use` are only needed to pick
+  another model, and `mind index run` is still required. The reference lists them as
+  separate steps because it predates this behaviour. `mind doctor` reports the state
+  and never downloads anything.
 - **Local and unauthenticated.** MCP is stdio only. Anyone who can start or
   talk to the process can call all its tools, including writes. Spaces
   organize retrieval; they are not access control.
@@ -340,6 +347,7 @@ scripts/bench-baseline.sh               # benchmarks
 
 ## More documentation
 
+- [`docs/doctor.md`](docs/doctor.md): what `mind doctor` checks, its exit codes and JSON format
 - [`docs/reference.md`](docs/reference.md): design principles, the full command
   list, MCP details, search modes, Codex/OpenCode configuration.
 - [`docs/architecture.md`](docs/architecture.md), [`docs/memory-model.md`](docs/memory-model.md)

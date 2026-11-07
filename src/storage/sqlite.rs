@@ -161,6 +161,121 @@ impl Drop for WriteTransaction<'_> {
     }
 }
 
+/// Facts about a database file that `mind doctor` needs, read without touching
+/// the file (see [`inspect_database`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseInspection {
+    /// Applied migration versions, ascending. Empty when the file has no
+    /// `schema_migrations` table.
+    pub schema_versions: Vec<i64>,
+    /// The newest schema this binary supports.
+    pub supported_version: i64,
+    pub embedding_enabled: Option<String>,
+    pub embedding_model: Option<String>,
+    /// The inspection had to see a write-ahead log (`mode=ro`); otherwise the
+    /// file was opened `immutable` and no auxiliary file was created.
+    pub saw_wal: bool,
+}
+
+/// Reads schema versions and embedding settings WITHOUT migrating or writing.
+///
+/// A normal open runs migrations, so it cannot be used to ask "is this
+/// database compatible?". Two modes, chosen by whether a `-wal` file exists:
+///  - no WAL file: the file is opened `immutable=1`. SQLite then creates no
+///    `-wal`/`-shm` file (a plain read-only open of a WAL-mode database leaves
+///    both behind) and there is no log to ignore;
+///  - WAL file present (a server may be writing): `mode=ro`, which reads the log
+///    and, because the files already exist, creates nothing new.
+///
+/// A writer that starts between the check and the open is not detected; the
+/// result is a snapshot.
+pub fn inspect_database(path: &Path) -> Result<DatabaseInspection> {
+    let abs = std::path::absolute(path).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let mut wal = abs.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = std::path::PathBuf::from(wal);
+    let saw_wal = wal.exists();
+    match read_inspection(&abs, saw_wal) {
+        Ok(i) => Ok(i),
+        // A writer may have started after the WAL check: an `immutable` read of a
+        // file that is changing can fail. Look again, now through the log.
+        Err(_) if !saw_wal && wal.exists() => read_inspection(&abs, true),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_inspection(abs: &Path, with_wal: bool) -> Result<DatabaseInspection> {
+    // The path goes into a URI as bytes: everything but unreserved characters is
+    // percent-encoded, so spaces, `?`, `#`, `%` and non-UTF-8 names all name the
+    // file they are meant to (SQLite decodes %HH into the raw bytes).
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file:");
+    for &byte in abs.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
+                uri.push(byte as char)
+            }
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    uri.push_str(if with_wal { "?mode=ro" } else { "?immutable=1" });
+    let conn = Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| Error::Storage(format!("cannot open {}: {e}", abs.display())))?;
+    // One read transaction: schema versions and settings come from the same snapshot.
+    let tx = conn.unchecked_transaction().map_err(dberr)?;
+    let has_table = |name: &str| -> Result<bool> {
+        Ok(tx
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+                rusqlite::params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(dberr)?
+            .is_some())
+    };
+    let schema_versions = if has_table("schema_migrations")? {
+        let mut stmt = tx
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .map_err(dberr)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(dberr)?;
+        rows
+    } else {
+        Vec::new()
+    };
+    let (mut embedding_enabled, mut embedding_model) = (None, None);
+    if has_table("mind_meta")? {
+        let get = |key: &str| -> Result<Option<String>> {
+            tx.query_row(
+                "SELECT value FROM mind_meta WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(dberr)
+        };
+        embedding_enabled = get("embedding.enabled")?;
+        embedding_model = get("embedding.model")?;
+    }
+    Ok(DatabaseInspection {
+        schema_versions,
+        supported_version: CURRENT_SCHEMA_VERSION,
+        embedding_enabled,
+        embedding_model,
+        saw_wal: with_wal,
+    })
+}
+
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {

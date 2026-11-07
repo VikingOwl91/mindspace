@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod core;
+pub mod doctor;
 pub mod embeddings;
 pub mod indexing;
 pub mod ingest;

@@ -32,7 +32,7 @@ pub enum Source {
 }
 
 impl Source {
-    /// Stable, human-readable label (for diagnostics).
+    /// Stable, human-readable label (also used in `mind doctor --json`).
     pub fn label(&self) -> String {
         match self {
             Source::CommandLine => "--db".to_string(),

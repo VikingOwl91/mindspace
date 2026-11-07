@@ -28,8 +28,8 @@ use landlock::{
 /// stays allowed (measured), so those kernels are refused.
 pub const MIN_ABI: ABI = ABI::V3;
 
-const ENV_STAGE2: &str = "MINDSPACE_SANDBOX_STAGE2";
-const ENV_CANARY: &str = "MINDSPACE_SANDBOX_CANARY";
+pub(crate) const ENV_STAGE2: &str = "MINDSPACE_SANDBOX_STAGE2";
+pub(crate) const ENV_CANARY: &str = "MINDSPACE_SANDBOX_CANARY";
 
 /// Why stage 1 did not produce a confined process.
 #[derive(Debug)]

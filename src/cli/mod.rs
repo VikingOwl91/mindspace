@@ -22,7 +22,7 @@ pub struct Cli {
     pub db: Option<PathBuf>,
 
     /// How `--db` was supplied (flag or environment); set by [`parse`], used by
-    /// diagnostics to say where the effective path came from.
+    /// `mind doctor` to say where the effective path came from.
     #[arg(skip)]
     pub db_origin: crate::paths::DbOrigin,
 
@@ -34,6 +34,14 @@ pub struct Cli {
 pub enum Command {
     /// Initialize a new mindspace database (idempotent)
     Init,
+    /// Diagnose the installation: binary, database, configuration, git,
+    /// embeddings and the MCP sandbox. Read-only; exit code 0 = no blocking
+    /// failure, 1 = a check failed, 2 = the diagnosis could not be carried out
+    Doctor {
+        /// Print the report as JSON (and nothing else) on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Ingest a file, directory, or git repository as sources
     Ingest {
         path: PathBuf,
@@ -346,6 +354,11 @@ fn search_for_cli(
 
 pub fn execute(cli: &Cli) -> Result<()> {
     match &cli.command {
+        // Library callers get the report printed but not the exit code; the
+        // binary goes through `run`.
+        Command::Doctor { json } => {
+            doctor_command(cli, *json)?;
+        }
         Command::Init => {
             let path = db_path(cli)?;
             initialize(&path)?;
@@ -937,6 +950,40 @@ fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::Sandb
 #[cfg(not(target_os = "linux"))]
 fn sandbox_state(_cli: &Cli, _config: &crate::mcp::McpConfig) -> crate::mcp::SandboxState {
     crate::mcp::SandboxState::Unavailable("the kernel sandbox exists only on Linux".to_string())
+}
+
+/// Runs a command and returns the process exit code. `mind doctor` has a
+/// contract of its own (0 / 1 / 2); every other command is 0 on success and an
+/// error otherwise.
+pub fn run(cli: &Cli) -> Result<i32> {
+    if let Command::Doctor { json } = &cli.command {
+        return Ok(doctor_command(cli, *json).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            2
+        }));
+    }
+    execute(cli)?;
+    Ok(0)
+}
+
+fn doctor_command(cli: &Cli, json: bool) -> Result<i32> {
+    use std::io::Write;
+    let inputs =
+        crate::doctor::Inputs::from_process(db_location(cli), crate::paths::data_dir(), true);
+    let report = crate::doctor::run(&inputs);
+    let text = if json {
+        let mut s = serde_json::to_string_pretty(&report.to_json())
+            .map_err(|e| Error::Storage(format!("cannot render the report: {e}")))?;
+        s.push('\n');
+        s
+    } else {
+        report.render_text()
+    };
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| Error::Storage(format!("cannot write the report: {e}")))?;
+    Ok(report.exit_code())
 }
 
 /// Parses the command line and records whether `--db` came from the flag or

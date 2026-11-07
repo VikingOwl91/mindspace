@@ -1,7 +1,10 @@
 fn main() {
     let cli = mindspace::cli::parse();
-    if let Err(e) = mindspace::cli::execute(&cli) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match mindspace::cli::run(&cli) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }

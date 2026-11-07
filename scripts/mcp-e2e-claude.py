@@ -41,7 +41,9 @@ def check(name, ok, evidence=""):
 
 
 def git(cwd, *a):
-    return subprocess.run(["git", *a], cwd=cwd, env=GENV, check=True, capture_output=True, text=True).stdout.strip()
+    # `git commit` spawns a detached `git maintenance run --auto` that briefly creates
+    # objects/maintenance.lock; switch it off so fixture fingerprints cannot race with it.
+    return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *a], cwd=cwd, env=GENV, check=True, capture_output=True, text=True).stdout.strip()
 
 
 def commit(cwd, msg):

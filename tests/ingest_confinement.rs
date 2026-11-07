@@ -183,6 +183,10 @@ impl Drop for Server {
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let o = Command::new("git")
+        // `git commit` spawns a detached `git maintenance run --auto`, which creates and removes
+        // objects/maintenance.lock a few milliseconds later. Fixture setup must not leave that behind,
+        // or a fingerprint taken right after it races with it (seen on a loaded CI runner).
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .arg("-C")
         .arg(dir)
         .args(args)

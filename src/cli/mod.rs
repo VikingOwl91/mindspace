@@ -184,16 +184,13 @@ pub enum Command {
     },
     /// Run the local MCP server over stdio
     Mcp {
-        /// Directory the repo_outline and repo_ingest tools may read and
-        /// ingest (repeatable, or ':'-separated in MINDSPACE_MCP_ALLOW_ROOTS).
-        /// Without any, those tools are disabled.
-        #[arg(
-            long = "allow-root",
-            value_name = "DIR",
-            env = "MINDSPACE_MCP_ALLOW_ROOTS",
-            value_delimiter = ':'
-        )]
-        allow_roots: Vec<PathBuf>,
+        /// Directory the repo_outline and repo_ingest tools may use, as
+        /// DIR[:ro|:rw]. repo_outline works on any root; repo_ingest needs a
+        /// read-write one (the default without a suffix). Repeatable, or
+        /// several joined with ':' in MINDSPACE_MCP_ALLOW_ROOTS
+        /// (/a:ro:/b:rw). Without any root those tools are disabled.
+        #[arg(long = "allow-root", value_name = "DIR[:ro|:rw]", env = "MINDSPACE_MCP_ALLOW_ROOTS")]
+        allow_roots: Vec<String>,
     },
 }
 
@@ -774,7 +771,7 @@ License: {}",
             }
         },
         Command::Mcp { allow_roots } => {
-            let config = crate::mcp::McpConfig::new(allow_roots)?;
+            let config = crate::mcp::McpConfig::from_specs(allow_roots)?;
             let store = open(cli)?;
             crate::mcp::serve_with_config(&store, &config)?;
         }

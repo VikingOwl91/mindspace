@@ -654,6 +654,94 @@ repositories only, with the read-only plumbing of ADR-014.
 **Revisit when.** Read-only versus ingest roots need to differ, ingest must run
 asynchronously, or HTTP transport and real authentication arrive.
 
+**ADR-026 addendum (2026-11-07): read-only and read-write roots (MIND-3).**
+ADR-026 listed "read-only versus ingest roots need to differ" as a revisit
+trigger. Until now every allowed root granted ingest, including the write of
+the identity marker into the repository, so an agent that was only meant to
+look at a directory could change it. (Verified by construction: there was no
+way to express a read-only root.)
+
+Decision: `--allow-root DIR[:ro|:rw]`. `repo_outline` accepts any root;
+`repo_ingest` needs a read-write root.
+
+- A root without a suffix is **read-write**, kept only for backward
+  compatibility. This is *not* least privilege: the safer default would be
+  read-only, and a forgotten suffix grants ingest and the identity-marker write.
+  Always write the suffix explicitly, and use `:ro` unless ingest is intended.
+  Changing the default to read-only would be a breaking change and needs its own
+  decision.
+- The most specific root governs a path (longest path wins). A read-write
+  directory inside a read-only one is writable; a read-only directory inside a
+  read-write one is not.
+- The same directory listed twice (also through a symlink or trailing slash)
+  keeps the more restrictive mode.
+- Permission is decided on the canonical path, so a symlink in a read-write
+  root cannot move a request into a read-only root.
+- An ingest target (the path itself, or each selected `paths` entry) must be
+  governed by a read-write root and must not *contain* a read-only root.
+  Otherwise ingesting a parent would capture the read-only part. The agent is
+  told which root is in the way and can select paths that avoid it.
+- The refusal names the root and the missing right (`--allow-root DIR:rw`).
+  A request outside every root is still indistinguishable from a missing path.
+
+**Consequences (behavior changes).** `:` already separated roots in
+`MINDSPACE_MCP_ALLOW_ROOTS`. A mode now belongs to the path before it *within
+one value* (`/a:ro:/b:rw`); a lone `--allow-root ro` is an error, not a mode
+for the previous argument, and a directory literally named `ro`/`rw` is written
+`./ro`. In a value with several parts, paths must be absolute or start with
+`./` or `../`, so a mistyped mode (`/a:rx`) fails at startup instead of
+becoming a second, relative root. Modes are lowercase. Malformed specs stop
+the server; they are never ignored. The `McpConfig` library API keeps
+`McpConfig::new` (read-write) and gains `from_specs`.
+
+**Verified** with `tests/mcp_allowlist_modes.rs` (11 tests) against the real
+binary: read-only root refuses ingest and writes neither database rows nor the
+identity marker (outline on the same repository also writes no marker);
+nesting in both directions; duplicate roots in either order; symlink into a
+read-only root; prefix collision (`repo` vs `repo-evil`), `..`, missing paths;
+trailing slash; environment-variable form; nine malformed specs, each failing
+for the spec and not for an unrelated reason. Removing any single rule turns
+at least one test red, except the read-only check in `authorize`, which is
+deliberately duplicated by `check_ingest_scope` (removing both turns seven
+tests red).
+
+**Not tested.** Case sensitivity on a case-insensitive filesystem: the
+requested path is canonicalized, so a differently-cased spelling should resolve
+to the real root, but the test only asserts the distinction on a case-sensitive
+filesystem (it is skipped otherwise, and none was available). Selected `paths`
+are checked lexically against the roots; this relies on directory ingest not
+following symlinks (tested) and git ingest reading objects instead of the
+working tree (design, ADR-014). Read-only does not mean "no process runs":
+`repo_outline` still runs read-only git plumbing in the repository (ADR-014).
+
+**Known limitation: time-of-check to time-of-use (not fixed here).**
+`authorize` resolves a path once; the ingest then uses that resolved path for
+its whole run (several git processes and file reads), so the window is the
+duration of the ingest, not an instant. If a path component of the resolved
+directory is replaced by a symlink after the check, the ingest follows it
+outside the allowed roots. **Reproduced** with a script that renames the
+authorized directory away and puts a symlink to an outside repository in its
+place while `repo_ingest` runs repeatedly: outside content reached the database
+in 5 of 5 runs, after 8 to 10 attempts each, and the identity marker was
+written into the outside repository (a write outside every root).
+
+Threat model: the attacker must be able to change directory entries inside an
+allowed root while an ingest runs. That is a local process, another user on a
+shared directory, or an agent that also has shell or filesystem tools; a
+client that can only call the MCP tools cannot do it by itself. Impact:
+anything the `mind` process can read as a git repository or directory tree can
+be pulled into the database and then read back through search, which defeats
+the allowlist; plus one marker file per repository written outside it. A
+read-only root is not a defense against this, because the swap happens below
+it. `repo_outline` has the same window for reads. Mitigation direction
+(separate follow-up, MIND-18): open the authorized directory once
+(`O_DIRECTORY|O_NOFOLLOW`), run git and file reads relative to that descriptor
+(for example `git -C /proc/self/fd/N`), resolve with `RESOLVE_BENEATH`, and
+verify afterwards that the descriptor still lies inside the governing root.
+Whether `git -C /proc/self/fd/N` behaves correctly for all commands used here
+is untested. Until this is fixed, do not allow roots that untrusted local
+processes can write to.
+
 ## ADR-027: Repository slugs are observations from remotes; no fork claims (2026-11-07)
 
 **Decision.** `mind repo info <path>` (and a `repository` block in MCP

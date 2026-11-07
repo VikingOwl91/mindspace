@@ -10,7 +10,12 @@
 //! - a requested path must be absolute, and after `canonicalize` (symlinks
 //!   and `..` resolved) must lie inside an allowed root;
 //! - paths with a `.git` component are refused;
-//! - a refused path reveals nothing about whether it exists.
+//! - a refused path reveals nothing about whether it exists;
+//! - roots are read-only (`:ro`) or read-write (`:rw`, the default).
+//!   `repo_outline` works on any root, `repo_ingest` needs a read-write one.
+//!   The most specific (longest) root governing a path decides, the same
+//!   directory listed twice gets the more restrictive mode, and an ingest
+//!   target may not contain a read-only root.
 
 use std::path::{Path, PathBuf};
 
@@ -28,9 +33,31 @@ pub const MAX_UNSCOPED_INGEST_FILES: u64 = 2000;
 pub const MAX_OUTLINE_NODES: usize = 300;
 const SAMPLE: usize = 10;
 
+/// What a root permits. Ordered so that `min` is the more restrictive mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Access {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl Access {
+    fn as_str(self) -> &'static str {
+        match self {
+            Access::ReadOnly => "ro",
+            Access::ReadWrite => "rw",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowRoot {
+    pub path: PathBuf,
+    pub access: Access,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct McpConfig {
-    allow_roots: Vec<PathBuf>,
+    roots: Vec<AllowRoot>,
 }
 
 impl McpConfig {
@@ -39,11 +66,31 @@ impl McpConfig {
         Self::default()
     }
 
+    /// Read-write roots (the behavior of a root without a suffix).
     pub fn new<P: AsRef<Path>>(roots: &[P]) -> Result<Self> {
-        let mut allow_roots = Vec::new();
-        for root in roots {
-            let root = root.as_ref();
-            let canonical = std::fs::canonicalize(root).map_err(|e| Error::Io {
+        Self::from_roots(roots.iter().map(|r| (r.as_ref().to_path_buf(), Access::ReadWrite)))
+    }
+
+    /// Roots from `--allow-root` / `MINDSPACE_MCP_ALLOW_ROOTS` values. Each
+    /// value is `PATH[:ro|:rw]`, and several may be joined with `:`
+    /// (`/a:ro:/b:rw`). A mode belongs to the path before it *within the same
+    /// value*, so a lone `--allow-root ro` is an error rather than a mode for
+    /// the previous argument. A directory literally named `ro` or `rw` is
+    /// written `./ro`. A value with more than one part must use absolute or
+    /// explicit `./` / `../` paths, so a mistyped mode such as `/a:rx` cannot
+    /// silently become a second, relative root.
+    pub fn from_specs<S: AsRef<str>>(specs: &[S]) -> Result<Self> {
+        let mut parsed = Vec::new();
+        for spec in specs {
+            parsed.extend(parse_spec(spec.as_ref())?);
+        }
+        Self::from_roots(parsed)
+    }
+
+    fn from_roots<I: IntoIterator<Item = (PathBuf, Access)>>(roots: I) -> Result<Self> {
+        let mut merged: std::collections::BTreeMap<PathBuf, Access> = Default::default();
+        for (root, access) in roots {
+            let canonical = std::fs::canonicalize(&root).map_err(|e| Error::Io {
                 path: root.display().to_string(),
                 source: e,
             })?;
@@ -60,27 +107,46 @@ impl McpConfig {
                         .into(),
                 });
             }
-            allow_roots.push(canonical);
+            // The same directory twice (also via a symlink or a trailing
+            // slash) keeps the more restrictive mode.
+            merged
+                .entry(canonical)
+                .and_modify(|a| *a = (*a).min(access))
+                .or_insert(access);
         }
-        allow_roots.sort();
-        allow_roots.dedup();
-        Ok(Self { allow_roots })
+        Ok(Self {
+            roots: merged
+                .into_iter()
+                .map(|(path, access)| AllowRoot { path, access })
+                .collect(),
+        })
     }
 
-    pub fn allow_roots(&self) -> &[PathBuf] {
-        &self.allow_roots
+    pub fn roots(&self) -> &[AllowRoot] {
+        &self.roots
+    }
+
+    /// The root that governs `path`: the most specific (longest) one that
+    /// contains it. Roots are unique after canonicalization, so there are no ties.
+    fn governing(&self, path: &Path) -> Option<&AllowRoot> {
+        self.roots
+            .iter()
+            .filter(|r| path.starts_with(&r.path))
+            .max_by_key(|r| r.path.components().count())
     }
 
     /// Lexical check that a path string lies inside an allowed root, used to
     /// redact paths in responses (it does not touch the filesystem).
     pub fn is_inside(&self, path: &str) -> bool {
-        self.allow_roots.iter().any(|r| Path::new(path).starts_with(r))
+        self.roots.iter().any(|r| Path::new(path).starts_with(&r.path))
     }
 
     /// Resolves a requested path to a canonical directory inside an allowed
-    /// root, or explains the refusal without disclosing what exists.
-    pub fn authorize(&self, raw: &str) -> std::result::Result<PathBuf, String> {
-        if self.allow_roots.is_empty() {
+    /// root that grants at least `need`, or explains the refusal without
+    /// disclosing what exists. The permission is decided on the canonical
+    /// path, so a symlink cannot move a request into a more permissive root.
+    pub fn authorize(&self, raw: &str, need: Access) -> std::result::Result<PathBuf, String> {
+        if self.roots.is_empty() {
             return Err("repository tools are disabled: this server has no allowed roots; \
                         start it with `mind mcp --allow-root <DIR>` (or MINDSPACE_MCP_ALLOW_ROOTS)"
                 .to_string());
@@ -92,16 +158,17 @@ impl McpConfig {
         let denied = || {
             format!(
                 "path is not accessible or outside the allowed roots ({})",
-                self.allow_roots
+                self.roots
                     .iter()
-                    .map(|r| r.display().to_string())
+                    .map(|r| format!("{}:{}", r.path.display(), r.access.as_str()))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         };
         let canonical = std::fs::canonicalize(path).map_err(|_| denied())?;
-        if !self.allow_roots.iter().any(|r| canonical.starts_with(r)) {
-            return Err(denied());
+        let root = self.governing(&canonical).ok_or_else(denied)?;
+        if need == Access::ReadWrite && root.access == Access::ReadOnly {
+            return Err(read_only_message(&root.path));
         }
         if canonical.components().any(|c| c.as_os_str() == ".git") {
             return Err("paths inside .git are not allowed".to_string());
@@ -111,10 +178,110 @@ impl McpConfig {
         }
         Ok(canonical)
     }
+
+    /// Checks what an ingest would cover, after [`authorize`](Self::authorize)
+    /// accepted `base`. Every target (`base` itself, or each selected path)
+    /// must be governed by a read-write root, and must not contain a read-only
+    /// root: otherwise ingesting a parent would capture the read-only part.
+    /// Selected paths are checked lexically; directory ingest does not follow
+    /// symlinks and git ingest reads objects, not the working tree.
+    pub fn check_ingest_scope(
+        &self,
+        base: &Path,
+        selection: &PathSelection,
+    ) -> std::result::Result<(), String> {
+        let targets: Vec<(String, PathBuf)> = if selection.is_all() {
+            vec![(".".to_string(), base.to_path_buf())]
+        } else {
+            selection
+                .prefixes()
+                .iter()
+                .map(|p| (p.clone(), base.join(p)))
+                .collect()
+        };
+        for (label, target) in targets {
+            if let Some(root) = self.governing(&target) {
+                if root.access == Access::ReadOnly {
+                    return Err(read_only_message(&root.path));
+                }
+            }
+            if let Some(inner) = self
+                .roots
+                .iter()
+                .find(|r| r.access == Access::ReadOnly && r.path != target && r.path.starts_with(&target))
+            {
+                return Err(format!(
+                    "ingesting '{label}' would include the read-only root {}; select paths \
+                     that avoid it (see repo_outline) or make that root read-write",
+                    inner.path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_only_message(root: &Path) -> String {
+    format!(
+        "path is inside the read-only root {root}; ingesting needs a read-write root \
+         (start the server with --allow-root {root}:rw)",
+        root = root.display()
+    )
+}
+
+/// Parses one `--allow-root` value, see [`McpConfig::from_specs`].
+fn parse_spec(spec: &str) -> Result<Vec<(PathBuf, Access)>> {
+    let bad = |reason: &str| Error::InvalidPath {
+        path: spec.to_string(),
+        reason: reason.to_string(),
+    };
+    if spec.is_empty() {
+        return Err(bad("empty allowed root"));
+    }
+    let parts: Vec<&str> = spec.split(':').collect();
+    let multi = parts.len() > 1;
+    let mut out: Vec<(PathBuf, Option<Access>)> = Vec::new();
+    for part in parts {
+        match part {
+            "" => return Err(bad("empty path or stray ':' in allowed root")),
+            "ro" | "rw" => {
+                let mode = if part == "ro" { Access::ReadOnly } else { Access::ReadWrite };
+                match out.last_mut() {
+                    None => {
+                        return Err(bad(
+                            "mode without a path; write PATH:ro or PATH:rw \
+                             (a directory named 'ro' is './ro')",
+                        ))
+                    }
+                    Some((_, Some(_))) => return Err(bad("more than one mode for one path")),
+                    Some((_, m)) => *m = Some(mode),
+                }
+            }
+            p if p.eq_ignore_ascii_case("ro") || p.eq_ignore_ascii_case("rw") => {
+                return Err(bad("modes are lowercase: 'ro' or 'rw'"));
+            }
+            p => {
+                let explicit = p.starts_with('/') || p.starts_with("./") || p.starts_with("../");
+                if multi && !explicit {
+                    return Err(bad(
+                        "unknown mode or relative path; modes are 'ro' or 'rw', and a path \
+                         in a multi-part value must be absolute or start with ./ or ../",
+                    ));
+                }
+                out.push((PathBuf::from(p), None));
+            }
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|(p, m)| (p, m.unwrap_or(Access::ReadWrite)))
+        .collect())
 }
 
 pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Result<Value> {
-    let path = config.authorize(str_arg(obj, "path")?).map_err(Error::Storage)?;
+    let path = config
+        .authorize(str_arg(obj, "path")?, Access::ReadOnly)
+        .map_err(Error::Storage)?;
     let depth = obj
         .get("depth")
         .and_then(Value::as_u64)
@@ -160,10 +327,15 @@ pub fn ingest(
     config: &McpConfig,
     obj: &serde_json::Map<String, Value>,
 ) -> Result<Value> {
-    let path = config.authorize(str_arg(obj, "path")?).map_err(Error::Storage)?;
+    let path = config
+        .authorize(str_arg(obj, "path")?, Access::ReadWrite)
+        .map_err(Error::Storage)?;
     let spaces = string_list(obj, "spaces")?;
     let selected = string_list(obj, "paths").unwrap_or_default();
     let selection = PathSelection::new(&selected)?;
+    config
+        .check_ingest_scope(&path, &selection)
+        .map_err(Error::Storage)?;
     let flag = |k: &str| obj.get(k).and_then(Value::as_bool).unwrap_or(false);
     let scope = if flag("history") {
         GitScope::History

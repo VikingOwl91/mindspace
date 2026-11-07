@@ -108,7 +108,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "repo_outline",
-            "Outline a directory or git repository without ingesting it: file counts, bytes, ingestable files, and file kinds per directory down to `depth`. Git sources are read at HEAD. Use it first to choose which directories to ingest. Only absolute paths inside the server's allowed roots are accepted; with no allowed roots the tool is disabled.",
+            "Outline a directory or git repository without ingesting it: file counts, bytes, ingestable files, and file kinds per directory down to `depth`. Git sources are read at HEAD. Use it first to choose which directories to ingest. Only absolute paths inside the server's allowed roots (read-only or read-write) are accepted; with no allowed roots the tool is disabled.",
             json!({
                 "type": "object",
                 "properties": {
@@ -121,7 +121,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "repo_ingest",
-            "Ingest a directory or git repository into existing spaces. Pass `paths` (repository-relative directories or files, from repo_outline) to ingest only those; an unscoped ingest of a very large tree is refused. Git: HEAD and live worktrees are interpreted by default, tags always become releases, and `branches`/`remotes`/`tags` add more ref tips (`history` interprets every tip). It writes to the database and, for git, a repository identity marker in the repo's .git directory. Only absolute paths inside the server's allowed roots are accepted.",
+            "Ingest a directory or git repository into existing spaces. Pass `paths` (repository-relative directories or files, from repo_outline) to ingest only those; an unscoped ingest of a very large tree is refused. Git: HEAD and live worktrees are interpreted by default, tags always become releases, and `branches`/`remotes`/`tags` add more ref tips (`history` interprets every tip). It writes to the database and, for git, a repository identity marker in the repo's .git directory. Only absolute paths inside a read-write allowed root are accepted; read-only roots can be outlined but not ingested.",
             json!({
                 "type": "object",
                 "properties": {

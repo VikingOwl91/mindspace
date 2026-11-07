@@ -622,6 +622,51 @@ change derivation output, so the extractor version moves to 2 and v2
 derivations sit beside v1 ones; nothing is rewritten. Symbol search and the
 relationship resolver read only the newest derivation of each input.
 
+**ADR-025 addendum: `mind-code@3` (MIND-5).** `mind-code@2` decided
+"method or function" by searching for the substring `impl` or `trait` in the
+syntax path of the enclosing entity. That path contains the enclosing entity's
+*name*, so a function nested in `fn impl_helper()`, `fn reimplement()`,
+`mod impl_utils`, `mod traits`, `mod r#impl`, or in a method called
+`trait_name`, was reported as a method. Reproduced end to end with the `@2`
+binary: `inner_fn` and `in_traits_mod` came back as `method`.
+
+Decision: an entity is a method exactly when its direct container is an `impl`
+block or a `trait`, decided from the syntax tree (the ancestors, looking
+through only the `declaration_list` body), never from names. Syntax paths,
+qualified names and everything else are unchanged; only `kind` can differ.
+The extractor version moves to 3.
+
+**Upgrade path (verified).** Re-ingesting into a database that holds `@2`
+derivations creates `@3` derivations beside them; symbol search shows only the
+`@3` classification, also with `--all-versions` (that flag is about current
+views, not extractor versions). Nothing is rewritten, consistent with the `@2`
+addendum above.
+
+**Not done: pruning old derivations.** The original plan was to delete `@1` and
+`@2` derivations. Resolutions (`code_relationship_resolutions`,
+`code_resolution_candidates`) reference observations and entities of the old
+derivations by foreign key, so removal is a cascade across several tables that
+destroys provenance, not a small cleanup. It needs its own decision (tracked
+as a separate item); the old rows only cost space.
+
+**What counts as a defect and what does not.** Pinned by
+`tests/code_classification.rs` as *unsupported by design*, not as bugs: macro
+bodies are not expanded (items a macro would generate are not entities), and
+`cfg` attributes are not evaluated (every branch is extracted as written).
+Malformed code has no ground truth beyond tree-sitter's recovered tree, and
+the test pins the classification observed with `@2`. Looking through parser
+`ERROR` nodes was considered and left out: removing it changed nothing across
+600+ corrupted variants of the project's sources (3,000+ entities checked
+against a name-independent oracle), so it would have been untested code. A
+tree shape that needs it may exist; none was found.
+
+**Verified:** 15 tests in `tests/code_classification.rs`, 5 of them failing
+against `@2` (nested function in a free function named like `impl`, in
+modules named like `impl`/`trait`, in a method named like `trait`, in a
+closure, and the corpus oracle); every mutation of the rule is caught by at
+least one test; the benchmark gate is unchanged (ingest within noise, DB size
+identical).
+
 ## ADR-026: Agent-driven ingest behind a restrictive allowlist (2026-11-07)
 
 **Decision.** The MCP server gains `repo_outline` (read-only) and `repo_ingest`

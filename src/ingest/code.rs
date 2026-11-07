@@ -8,7 +8,7 @@ use crate::core::{
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
-pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "2", "tree-sitter-rust", "0.24.2");
+pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "3", "tree-sitter-rust", "0.24.2");
 pub fn identity() -> CodeParserIdentity {
     CodeParserIdentity {
         extractor: IDENTITY.0.into(),
@@ -99,6 +99,29 @@ fn name(n: Node, s: &str) -> Option<String> {
         .map(|x| text(x, s))
         .filter(|x| !x.is_empty())
 }
+/// True when the item is an associated item: its direct container is an `impl`
+/// block or a `trait`. Decided from the syntax tree, never from names:
+/// `mind-code@2` looked for "impl"/"trait" in the enclosing entity's syntax
+/// path, which contains that entity's *name*, so a function nested in
+/// `fn impl_helper()` or `mod traits` was reported as a method.
+///
+/// Only `declaration_list` (the body of an impl or trait) is looked through;
+/// any other ancestor, such as a function body, a module, a closure or a parser
+/// `ERROR` node, means the item is not associated. Looking through `ERROR` was
+/// considered and left out: no corrupted variant of the project's own sources
+/// (600+ malformed files, 3,000+ entities, `tests/code_classification.rs`)
+/// needed it, so it would be untested code.
+fn is_associated_item(n: Node) -> bool {
+    let mut cur = n.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "declaration_list" => cur = p.parent(),
+            "impl_item" | "trait_item" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
 fn walk(
     n: Node,
     s: &str,
@@ -159,16 +182,11 @@ fn walk(
         "enum_item" => Some(CodeEntityKind::Enum),
         "trait_item" => Some(CodeEntityKind::Trait),
         "type_item" => Some(CodeEntityKind::TypeAlias),
-        "function_item" | "function_signature_item" => Some(
-            if parent
-                .as_deref()
-                .is_some_and(|p| p.contains("impl") || p.contains("trait"))
-            {
-                CodeEntityKind::Method
-            } else {
-                CodeEntityKind::Function
-            },
-        ),
+        "function_item" | "function_signature_item" => Some(if is_associated_item(n) {
+            CodeEntityKind::Method
+        } else {
+            CodeEntityKind::Function
+        }),
         "const_item" => Some(CodeEntityKind::Constant),
         "static_item" => Some(CodeEntityKind::Static),
         "field_declaration" => Some(CodeEntityKind::Field),

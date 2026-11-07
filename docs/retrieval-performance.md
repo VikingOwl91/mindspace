@@ -177,3 +177,80 @@ qualification, recent artifacts and observed clock rollback. Real release MCP
 measurements exercise the production btrfs qualification path. Non-Linux
 compilation has not been exercised on this host; its cache implementation is
 excluded by target cfg and uses the original uncached adapter instead.
+
+## Benchmark baseline (MIND-1)
+
+Reproduce with `scripts/bench-baseline.sh`. `RUNS` (default 5) fresh databases
+are ingested per target; every metric is reported as median / min / max over
+those runs. `MINDSPACE_BENCH_REPO="<repo> <repo>..."` adds real repositories.
+
+**Metrics.** `process start` is the median of 20 `mind --version` runs and is
+the cost every CLI query pays. `symbols query incl. start` is the median of 20
+`mind symbols fn --limit 20` runs per database. `symbols net` is the query
+minus process start (search work only, floored at 0). The query uses a fixed
+term (`fn`) and the script aborts if it returns no hits.
+
+**Isolation (checked by the script).** Git ignores user and system
+configuration for the whole run (`GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_NOSYSTEM=1`); a global `tag.gpgsign=true` otherwise breaks the
+fixture. A real repository is never touched: only its `.git` is copied (hooks
+removed from the copy, checkout with `core.fsmonitor=false` and
+`core.hooksPath=/dev/null`), and a fingerprint of every file's path, size and
+mtime in the source `.git` must be identical before and after, otherwise the
+script fails. This protects the repositories it was run on; it does not make
+benchmarking an *untrusted* repository safe (see MIND-2).
+
+**Regression gate.** `BASELINE_FILE=<saved output>`. A metric regresses only if
+its median exceeds the baseline median by more than `THRESHOLD_PCT` (25 %)
+**and** its minimum is above the baseline median (a single slow outlier cannot
+trigger it), and for time metrics the absolute increase exceeds `MIN_ABS_MS`
+(5 ms) so millisecond noise on tiny values is ignored. Review any regression
+before merging. Verified: the unmodified baseline passes (exit 0); a baseline
+with the synthetic ingest median halved fails (exit 1, message names the
+metric).
+
+**Synthetic fixture.** Deterministic: 2,400 Rust files across 24 crates with
+long path segments, 6 revisions, 6 annotated and 200 lightweight tags
+(29,976 objects, far above the ~2,800-object range of the original ingest
+deadlock).
+
+Baseline at commit `c6df2a9`, 2026-11-07, Linux 7.2.14-zen, release build,
+5 runs, local machine:
+
+| target | metric | median | min | max |
+|---|---|---|---|---|
+| synthetic | objects | 29976 | - | - |
+| synthetic | ingest (ms) | 5503 | 5442 | 5547 |
+| synthetic | process start (ms) | 3 | 3 | 3 |
+| synthetic | symbols query incl. start (ms) | 45 | 45 | 45 |
+| synthetic | symbols net (ms) | 42 | 42 | 42 |
+| synthetic | DB size (KiB) | 52952 | 52952 | 52952 |
+| projects/gpui-shell@7e6298d | objects | 6575 | - | - |
+| projects/gpui-shell@7e6298d | ingest (ms) | 3741 | 3644 | 3849 |
+| projects/gpui-shell@7e6298d | process start (ms) | 3 | 3 | 3 |
+| projects/gpui-shell@7e6298d | symbols query incl. start (ms) | 26 | 26 | 26 |
+| projects/gpui-shell@7e6298d | symbols net (ms) | 23 | 23 | 23 |
+| projects/gpui-shell@7e6298d | DB size (KiB) | 39188 | 39188 | 39188 |
+| forks/gpui-shell@be56c2c | objects | 6597 | - | - |
+| forks/gpui-shell@be56c2c | ingest (ms) | 3946 | 3933 | 3967 |
+| forks/gpui-shell@be56c2c | process start (ms) | 3 | 3 | 3 |
+| forks/gpui-shell@be56c2c | symbols query incl. start (ms) | 36 | 36 | 36 |
+| forks/gpui-shell@be56c2c | symbols net (ms) | 33 | 33 | 33 |
+| forks/gpui-shell@be56c2c | DB size (KiB) | 43596 | 43596 | 43596 |
+| projects/mindspace@c6df2a9 | objects | 469 | - | - |
+| projects/mindspace@c6df2a9 | ingest (ms) | 693 | 688 | 707 |
+| projects/mindspace@c6df2a9 | process start (ms) | 3 | 3 | 3 |
+| projects/mindspace@c6df2a9 | symbols query incl. start (ms) | 12 | 12 | 13 |
+| projects/mindspace@c6df2a9 | symbols net (ms) | 9 | 9 | 10 |
+| projects/mindspace@c6df2a9 | DB size (KiB) | 11972 | 11972 | 11972 |
+
+**gpui-shell reference.** Two checkouts exist locally and both have grown past
+the 6,120 objects of the original note: `~/git/projects/gpui-shell` (upstream
+`andre-brandao/gpui-shell`, 6,575 objects, two uncommitted files that the
+Git-view ingest does not read) and `~/git/forks/gpui-shell` (the
+`VikingOwl91` fork, 6,597 objects). The original figures were 7 s ingest,
+16 ms query and 40 MB. Measured here: 3.7 to 3.9 s ingest, 23 to 33 ms net
+query time and 38 to 43 MiB. The 6,120-object commit was not identified, so
+these are *new* baselines, not a reproduction of the old numbers. The
+differences to the old note (hardware, binary version, query term and cache
+state) are unknown and not explained here.

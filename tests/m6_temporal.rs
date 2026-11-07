@@ -435,7 +435,6 @@ fn file_reingest_does_not_retire_other_producer_families() {
          CREATE TRIGGER m6_birth_assertions AFTER INSERT ON assertions BEGIN \
          INSERT OR IGNORE INTO m6_row_availability(table_name,entity_key,revision_id) \
          VALUES ('assertions',CAST((NEW.id) AS TEXT),m6_write_revision()); END; \
-
          CREATE TRIGGER m6_snapshot_memories_i AFTER INSERT ON memories BEGIN \
          INSERT INTO m6_memory_history (memory_id,revision_id,is_deleted,assertion_id,state,created_at,superseded_by,superseded_at,retired_at,retire_reason,producer_family) \
          VALUES (NEW.id,m6_write_revision(),0,NEW.assertion_id,NEW.state,NEW.created_at,NEW.superseded_by,NEW.superseded_at,NEW.retired_at,NEW.retire_reason,NEW.producer_family) \

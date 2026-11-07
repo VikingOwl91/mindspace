@@ -737,6 +737,63 @@ fn path_from_root(
     )
 }
 
+/// Symbol search over the deterministic code-structure layer. Validates the
+/// query, then delegates to the store. Results are definitions with their
+/// location, not memories: they carry no score, confidence, or lifecycle.
+pub fn search_code(
+    store: &dyn Store,
+    mut query: crate::core::CodeSearchQuery,
+) -> Result<Vec<crate::core::CodeHit>> {
+    query.text = query.text.trim().to_string();
+    if query.text.is_empty() {
+        return Err(Error::EmptyQuery);
+    }
+    if query.limit == 0 {
+        return Ok(Vec::new());
+    }
+    query.limit = query.limit.min(100);
+    // Space filters follow directed links, exactly like memory search.
+    if let Some(roots) = query.space_ids.clone().filter(|r| !r.is_empty()) {
+        let probe = SearchQuery {
+            text: String::new(),
+            space_ids: Some(roots),
+            limit: 1,
+            at: None,
+            include_superseded: false,
+            include_retired: false,
+        };
+        query.space_ids = expand_scope(store, probe)?.0.space_ids;
+    }
+    store.search_code(&query)
+}
+
+/// Parses entity kind names for symbol search. Accepts the canonical names
+/// (`function`, `type_alias`, ...) plus the usual short forms (`fn`, `type`,
+/// `const`, `mod`, `use`).
+pub fn parse_code_kinds<S: AsRef<str>>(names: &[S]) -> Result<Vec<crate::core::CodeEntityKind>> {
+    names
+        .iter()
+        .map(|n| {
+            let raw = n.as_ref().trim().to_lowercase();
+            let canonical = match raw.as_str() {
+                "fn" | "func" => "function",
+                "type" => "type_alias",
+                "const" => "constant",
+                "mod" => "module",
+                "use" => "import",
+                other => other,
+            };
+            crate::core::CodeEntityKind::parse(canonical).ok_or_else(|| {
+                Error::QuerySyntax(format!(
+                    "unknown code kind '{}'; expected one of: module, struct, enum, trait, \
+                     type_alias, function, method, constant, static, field, import",
+                    n.as_ref()
+                ))
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,61 +972,4 @@ mod tests {
         assert!(matches!(result, Err(Error::EmptyQuery)));
         assert_eq!(resolutions.get(), 0);
     }
-}
-
-/// Symbol search over the deterministic code-structure layer. Validates the
-/// query, then delegates to the store. Results are definitions with their
-/// location, not memories: they carry no score, confidence, or lifecycle.
-pub fn search_code(
-    store: &dyn Store,
-    mut query: crate::core::CodeSearchQuery,
-) -> Result<Vec<crate::core::CodeHit>> {
-    query.text = query.text.trim().to_string();
-    if query.text.is_empty() {
-        return Err(Error::EmptyQuery);
-    }
-    if query.limit == 0 {
-        return Ok(Vec::new());
-    }
-    query.limit = query.limit.min(100);
-    // Space filters follow directed links, exactly like memory search.
-    if let Some(roots) = query.space_ids.clone().filter(|r| !r.is_empty()) {
-        let probe = SearchQuery {
-            text: String::new(),
-            space_ids: Some(roots),
-            limit: 1,
-            at: None,
-            include_superseded: false,
-            include_retired: false,
-        };
-        query.space_ids = expand_scope(store, probe)?.0.space_ids;
-    }
-    store.search_code(&query)
-}
-
-/// Parses entity kind names for symbol search. Accepts the canonical names
-/// (`function`, `type_alias`, ...) plus the usual short forms (`fn`, `type`,
-/// `const`, `mod`, `use`).
-pub fn parse_code_kinds<S: AsRef<str>>(names: &[S]) -> Result<Vec<crate::core::CodeEntityKind>> {
-    names
-        .iter()
-        .map(|n| {
-            let raw = n.as_ref().trim().to_lowercase();
-            let canonical = match raw.as_str() {
-                "fn" | "func" => "function",
-                "type" => "type_alias",
-                "const" => "constant",
-                "mod" => "module",
-                "use" => "import",
-                other => other,
-            };
-            crate::core::CodeEntityKind::parse(canonical).ok_or_else(|| {
-                Error::QuerySyntax(format!(
-                    "unknown code kind '{}'; expected one of: module, struct, enum, trait, \
-                     type_alias, function, method, constant, static, field, import",
-                    n.as_ref()
-                ))
-            })
-        })
-        .collect()
 }

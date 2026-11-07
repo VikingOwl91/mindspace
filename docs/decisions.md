@@ -787,6 +787,10 @@ Whether `git -C /proc/self/fd/N` behaves correctly for all commands used here
 is untested. Until this is fixed, do not allow roots that untrusted local
 processes can write to.
 
+**Update (MIND-18):** fixed for the default configuration, see ADR-029 (kernel
+sandbox plus anchored access). Without the sandbox (`--insecure-no-sandbox`) the
+residual risk described there remains.
+
 **ADR-026 addendum (2026-11-07): ingest time limit (MIND-4).** `repo_ingest`
 is synchronous, so a long ingest can outlive a client's tool timeout, and a
 hung git (the original deadlock) stalled without any message.
@@ -947,7 +951,7 @@ must be queryable.
 
 ## ADR-029: Confinement of MCP ingest and outline: kernel sandbox plus anchored access (2026-11-07)
 
-**Status: proposed; amended at the end of MIND-18 with what was measured.**
+**Status: accepted (2026-11-07), with the measurements and residual risks below.**
 
 **Problem.** Repository contents and the directory tree below an allowed root are
 untrusted. Without any race, a repository can carry pointers that make Git read
@@ -1022,4 +1026,99 @@ outside the rw roots are refused. Not Linux: the repository tools stay off.
 | environment marker set but canary reachable | process exits |
 | `--insecure-no-sandbox` | warning on every start, results carry `sandbox: disabled`; application layer stays on |
 
-**Residual risk** is listed at the end of MIND-18 once measured.
+**Entry points.** Only two MCP tools take a filesystem path: `repo_outline`
+(`path`) and `repo_ingest` (`path`, `paths`); both go through the sandbox gate,
+`authorize`, and the anchored access. `paths` entries are relative and without
+`..` (`PathSelection`), and are opened below the anchor. The other tools work on
+the database only (`code_search`'s `path` is a string filter on stored data). The
+`mind` command line is not an MCP entry point and is neither sandboxed nor
+restricted: it acts with the user's own authority.
+
+**What was built.** `src/sandbox` (kernel layer, self re-exec, canary probes,
+descriptor closing), `src/ingest/confined.rs` (anchor, pointer checks, checked
+reads), a pinned `GitReader`, and `scripts/security-profile.sh`.
+
+**Measured.**
+
+- 26 tests in `tests/ingest_confinement.rs` (3 controls, 1 positive case, 22
+  attacks). Against the code before MIND-18 (commit `187806c`): all 22 attacks
+  fail, controls and the positive case pass. Against the result: all 26 pass in
+  both modes, except that `r4` and `r4b` are not run for the application layer
+  alone (below). With the kernel layer only (no application layer), 11 of the then
+  15 attack tests passed and the four that need read-only semantics failed, as
+  predicted.
+- Race attempts are calibrated from 108 measurements against the old code (first
+  leak after 1 to 67 attempts). The profile uses 150 per race test, `cargo test`
+  uses 40 as a smoke check. Two directed races (`r3b`, `r4b`: the redirection is
+  installed after the ingest has started, and stays) leak on the first attempt in
+  the old code.
+- Failure behavior (`tests/sandbox_failure_modes.rs`, 8 tests): Landlock missing
+  (`ENOSYS`) or disabled (`EOPNOTSUPP`), emulated with seccomp, a database
+  directory that overlaps a root, a forged sandbox marker, an inherited
+  descriptor, the opt-out, and no roots. An older Landlock ABI cannot be emulated
+  that way; below ABI 3 the start is refused by `HardRequirement`, and the canary
+  probes would catch the measured gap (`truncate()` of an outside file stays
+  allowed on ABI 1 and 2).
+- Mutations: every protection was removed in turn and the responsible test failed
+  (descriptor closing, canary check in stage 2, silent fallback, sandbox gate,
+  layout check, git-dir links, pin of `GIT_DIR`, real-path comparison of files,
+  non-blocking open, gitdir pointer check, alternates check). Equivalent mutants
+  (another protection covers the same case) are the `.git` symlink arm and each
+  of the two marker defenses (`O_EXCL`, `O_NOFOLLOW`); the marker helpers have a
+  deterministic unit test.
+- Found by review and fixed beyond the original plan: the old code wrote the
+  identity marker **through a dangling symlink** to a path outside the roots;
+  a FIFO swapped in for a listed file hung the ingest; `repo_outline` disclosed
+  directory names outside the roots; symbolic links inside the git directory
+  (objects, refs, `config`) redirected reads.
+- Real session under the sandbox: outline, git and directory ingest, lexical,
+  semantic and hybrid search with the installed 547 MB model, write; identical to
+  the unsandboxed baseline.
+
+**Opt-out (`--insecure-no-sandbox`): the application layer alone.** It holds for
+every scenario except one. A file that appears in the git directory after the
+checks, an `alternates` file, is read by git: one leak in 5,626 random attempts
+(`r4`, attempt 2,626 of the second long run; none in the first 3,000), none in
+700 directed attempts (`r4b`). Reasoned, not measured: the same applies to any
+other change inside the git directory after the link scan, for example a pack
+file replaced by a link. The profile therefore runs `r4`/`r4b` only with the
+kernel layer. Use the opt-out only for trusted input.
+
+**Residual risks.**
+
+1. *Nested read-only areas.* The kernel cannot express "read-only inside
+   read-write". There, the application layer carries the protection; it cannot
+   exclude that a file inside a repository's git directory changes after the
+   check. Alternates are refused outright in a root that contains a read-only
+   area; other late changes inside the git directory are not excluded in that
+   configuration (reasoned, not measured).
+2. *Kernel and platform.* Linux 6.2 or newer with Landlock (ABI 3) is required.
+   Tested on one kernel (7.2.14, ABI 10) and one standard-layout distribution.
+   Not tested: store-based distributions (the allowed system paths are derived
+   from the mapped libraries and the git binary, and the git probe shows if that
+   is not enough), containers, overlay, NFS, FUSE, a different PID namespace or
+   `/proc` mount (pinned paths use `/proc/<pid>/fd/<n>`; if they do not resolve,
+   ingest fails, it does not fall back), `hidepid`. A non-Linux target is not
+   installed here, so the non-Linux code paths were not compiled.
+3. *Landlock does not cover everything.* `/proc` is readable in full (metadata of
+   other processes of the same user, not reachable from the database), network
+   and signals are not restricted. The MCP server opens no network connection,
+   but that is not enforced.
+4. *The database directory is opened in full* and must be dedicated (checked at
+   start). A model directory that is created after the server started is not
+   readable until a restart.
+5. *Stage 1 runs unconfined* for a short moment: it reads the configuration,
+   creates the private temp directory and the canary (a tiny file in
+   `$XDG_RUNTIME_DIR` or `/tmp`, left in place), and runs `git --exec-path` with a
+   2 s limit. `PATH` and the `git` binary are trusted.
+6. *Not a threat here (reasoned):* a hard link inside a root to a file outside
+   puts that file's content in the root, which is what copying it would do;
+   someone who can create the link can read the file. Mount tricks are out of
+   scope.
+7. *Time.* The profile takes a few minutes (about 2.5 minutes per mode); it
+   needs the kernel support above.
+
+**Decision on a worker.** An isolated ingest worker was not needed: confining the
+whole process cost no functionality, and the application layer closes what the
+kernel cannot. It stays an option for hardening against bugs in git or the
+parsers (not shown to exist).

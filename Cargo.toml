@@ -38,6 +38,9 @@ ureq = { version = "2", optional = true, features = ["tls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"], optional = true }
+# Kernel sandbox for the MCP repository tools (ADR-029). Linux only.
+landlock = "0.4.7"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

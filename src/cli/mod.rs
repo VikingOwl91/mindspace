@@ -208,6 +208,13 @@ pub enum Command {
             value_parser = crate::mcp::parse_ingest_timeout
         )]
         ingest_timeout: std::time::Duration,
+        /// Run the repository tools WITHOUT the kernel sandbox. Only the
+        /// application layer (anchored access, pointer checks, ro/rw rules)
+        /// protects then: a repository or a concurrent actor that exploits a gap
+        /// there is no longer stopped by the kernel. A warning is printed on every
+        /// start and every result says so. Use only for trusted input.
+        #[arg(long = "insecure-no-sandbox")]
+        insecure_no_sandbox: bool,
     },
 }
 
@@ -790,14 +797,110 @@ License: {}",
         Command::Mcp {
             allow_roots,
             ingest_timeout,
-        } => {
-            let config = crate::mcp::McpConfig::from_specs(allow_roots)?
-                .with_ingest_timeout(*ingest_timeout);
-            let store = open(cli)?;
-            crate::mcp::serve_with_config(&store, &config)?;
-        }
+            insecure_no_sandbox,
+        } => mcp_command(cli, allow_roots, *ingest_timeout, *insecure_no_sandbox)?,
     }
     Ok(())
+}
+
+/// `mind mcp`: sets up the kernel sandbox (self re-exec, ADR-029) when roots are
+/// configured, then serves. Never starts the repository tools without either a
+/// verified sandbox or the explicit opt-out.
+fn mcp_command(
+    cli: &Cli,
+    allow_roots: &[String],
+    ingest_timeout: std::time::Duration,
+    insecure: bool,
+) -> Result<()> {
+    use crate::mcp::{McpConfig, SandboxState};
+    #[cfg(target_os = "linux")]
+    crate::sandbox::close_inherited_fds();
+    let config = McpConfig::from_specs(allow_roots)?.with_ingest_timeout(ingest_timeout);
+    let state = if config.roots().is_empty() {
+        SandboxState::NotNeeded
+    } else if insecure {
+        #[cfg(target_os = "linux")]
+        {
+            eprintln!(
+                "mind: WARNING: --insecure-no-sandbox: the repository tools run WITHOUT the kernel \
+                 sandbox. Only the application layer protects; use only for trusted input (ADR-029)."
+            );
+            SandboxState::Disabled
+        }
+        #[cfg(not(target_os = "linux"))]
+        SandboxState::Unavailable("--insecure-no-sandbox is only supported on Linux".to_string())
+    } else {
+        sandbox_state(cli, &config)
+    };
+    if let SandboxState::Unavailable(reason) = &state {
+        eprintln!("mind: the repository tools are OFF: {reason}");
+    }
+    let config = config.with_sandbox(state);
+    let store = open(cli)?;
+    crate::mcp::serve_with_config(&store, &config)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::SandboxState {
+    use crate::mcp::{Access, SandboxState};
+    use crate::sandbox::{self, Outcome, Plan};
+    let db = db_path(cli);
+    let Some(db_dir) = db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .or_else(|| Some(PathBuf::from(".")))
+    else {
+        return SandboxState::Unavailable("cannot determine the database directory".into());
+    };
+    let db_dir = match std::fs::canonicalize(&db_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return SandboxState::Unavailable(format!(
+                "database directory {}: {e}",
+                db_dir.display()
+            ))
+        }
+    };
+    let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(e) => e,
+        Err(e) => return SandboxState::Unavailable(format!("cannot locate the mind binary: {e}")),
+    };
+    let plan = Plan {
+        roots: config
+            .roots()
+            .iter()
+            .map(|r| (r.path.clone(), r.access == Access::ReadWrite))
+            .collect(),
+        db_dir,
+        models_dir: crate::embeddings::manager::data_dir().join("models"),
+        exe,
+    };
+    match sandbox::verify_stage2(&plan.tmp_dir()) {
+        Ok(Some(report)) => {
+            return match crate::ingest::git::sandbox_probe(&plan.tmp_dir()) {
+                Ok(()) => SandboxState::Enforced(report.description),
+                Err(e) => {
+                    SandboxState::Unavailable(format!("Git does not work inside the sandbox: {e}"))
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("mind: sandbox: {e}");
+            std::process::exit(78);
+        }
+    }
+    match sandbox::enter(&plan) {
+        Outcome::NotNeeded => SandboxState::NotNeeded,
+        Outcome::Unavailable(reason) => SandboxState::Unavailable(reason),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_state(_cli: &Cli, _config: &crate::mcp::McpConfig) -> crate::mcp::SandboxState {
+    crate::mcp::SandboxState::Unavailable("the kernel sandbox exists only on Linux".to_string())
 }
 
 fn db_path(cli: &Cli) -> PathBuf {

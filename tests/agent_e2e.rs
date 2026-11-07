@@ -197,14 +197,18 @@ fn agent_flow(
 ) -> Outcome {
     // Work on a copy of `.git` so the original repository stays untouched.
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    // The database gets a directory of its own, outside the allowed root: the
+    // sandbox opens the whole database directory (ADR-029).
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("work");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(base.join("state")).unwrap();
     let cp = Command::new("cp").arg("-a").arg(source_repo.join(".git")).arg(repo.join(".git")).status().unwrap();
     assert!(cp.success(), "copying .git failed");
     let head = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
 
-    let db = root.join("mind.db");
+    let db = base.join("state/mind.db");
     assert!(mind(&db, &["init"]).1);
     assert!(mind(&db, &["space", "create", "project"]).1);
     let mut s = Server::start(&db, &root);
@@ -340,10 +344,12 @@ fn record_manual_write_is_found_in_trait_and_impl() {
 fn fixture_details_qualified_names_scoping_and_memory_boundary() {
     let repo = fixture();
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("work");
     std::fs::create_dir_all(root.join("repo")).unwrap();
+    std::fs::create_dir_all(base.join("state")).unwrap();
     assert!(Command::new("cp").arg("-a").arg(repo.path().join(".git")).arg(root.join("repo/.git")).status().unwrap().success());
-    let db = root.join("mind.db");
+    let db = base.join("state/mind.db");
     assert!(mind(&db, &["init"]).1 && mind(&db, &["space", "create", "project"]).1);
     let mut s = Server::start(&db, &root);
     let p = root.join("repo").display().to_string();

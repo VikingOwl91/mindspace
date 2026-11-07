@@ -62,10 +62,39 @@ pub struct AllowRoot {
     pub access: Access,
 }
 
+/// Whether the kernel sandbox protects the repository tools (ADR-029).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxState {
+    /// No roots are configured, so the repository tools are off anyway.
+    NotNeeded,
+    /// Confined by the kernel and verified by observation.
+    Enforced(String),
+    /// `--insecure-no-sandbox`: only the application layer protects. The
+    /// operator chose this explicitly.
+    Disabled,
+    /// The sandbox could not be established or verified: the tools are off.
+    Unavailable(String),
+}
+
+impl SandboxState {
+    /// Short label for tool results.
+    pub fn label(&self) -> String {
+        match self {
+            SandboxState::NotNeeded => "not needed".to_string(),
+            SandboxState::Enforced(d) => format!("enforced ({d})"),
+            SandboxState::Disabled => {
+                "DISABLED by --insecure-no-sandbox (application layer only)".to_string()
+            }
+            SandboxState::Unavailable(r) => format!("unavailable ({r})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     roots: Vec<AllowRoot>,
     ingest_timeout: Duration,
+    sandbox: SandboxState,
 }
 
 impl Default for McpConfig {
@@ -73,6 +102,9 @@ impl Default for McpConfig {
         Self {
             roots: Vec::new(),
             ingest_timeout: DEFAULT_INGEST_TIMEOUT,
+            sandbox: SandboxState::Unavailable(
+                "no sandbox has been set up for this configuration".to_string(),
+            ),
         }
     }
 }
@@ -158,7 +190,19 @@ impl McpConfig {
                 .map(|(path, access)| AllowRoot { path, access })
                 .collect(),
             ingest_timeout: DEFAULT_INGEST_TIMEOUT,
+            sandbox: SandboxState::Unavailable(
+                "no sandbox has been set up for this configuration".to_string(),
+            ),
         })
+    }
+
+    pub fn with_sandbox(mut self, state: SandboxState) -> Self {
+        self.sandbox = state;
+        self
+    }
+
+    pub fn sandbox(&self) -> &SandboxState {
+        &self.sandbox
     }
 
     /// Limit for the clean-abort part of `repo_ingest`.
@@ -199,6 +243,13 @@ impl McpConfig {
             return Err("repository tools are disabled: this server has no allowed roots; \
                         start it with `mind mcp --allow-root <DIR>` (or MINDSPACE_MCP_ALLOW_ROOTS)"
                 .to_string());
+        }
+        if let SandboxState::Unavailable(reason) = &self.sandbox {
+            return Err(format!(
+                "repository tools are disabled: the kernel sandbox is not active ({reason}). \
+                 Use a Linux kernel with Landlock ABI 3 or newer (6.2+), or start the server \
+                 with --insecure-no-sandbox to accept the reduced protection described in ADR-029"
+            ));
         }
         let path = Path::new(raw);
         if !path.is_absolute() {
@@ -367,6 +418,7 @@ pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Resu
         "repository": repository,
         "node_count": total,
         "truncated": truncated,
+        "sandbox": config.sandbox().label(),
         "hint": "Pick directories with ingestable_files > 0 and pass them as `paths` to repo_ingest."
     }))
 }
@@ -422,6 +474,7 @@ pub fn ingest(
         "ingested": outcomes.iter().map(summarize).collect::<Vec<_>>(),
         "elapsed_ms": deadline.elapsed().as_millis() as u64,
         "limit_ms": config.ingest_timeout().as_millis() as u64,
+        "sandbox": config.sandbox().label(),
         "over_limit": deadline.expired(),
         "next": "Use code_search for definitions and memory_search for documents."
     }))

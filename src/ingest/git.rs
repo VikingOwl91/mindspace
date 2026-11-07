@@ -709,6 +709,44 @@ fn collect_output(
     })
 }
 
+/// Proves that the Git invocation style used for ingest works in the current
+/// environment (for example inside the sandbox): creates a tiny repository in
+/// `dir`, stores a blob and reads it back.
+pub fn sandbox_probe(dir: &Path) -> Result<()> {
+    let repo = dir.join(format!("git-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&repo).map_err(|e| Error::Io {
+        path: repo.display().to_string(),
+        source: e,
+    })?;
+    // A hung or broken git must not block the start of the server.
+    let limit = Deadline::after(std::time::Duration::from_secs(10));
+    let result = (|| -> Result<()> {
+        run(&repo, &limit, &["init", "-q"], None)?;
+        let oid = run(
+            &repo,
+            &limit,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"probe\n"),
+        )?;
+        let oid = String::from_utf8_lossy(&oid).trim().to_string();
+        let out = run(
+            &repo,
+            &limit,
+            &["cat-file", "--batch-check"],
+            Some(format!("{oid}\n").as_bytes()),
+        )?;
+        if !String::from_utf8_lossy(&out).contains("blob") {
+            return Err(Error::GitCommand {
+                command: "cat-file --batch-check".into(),
+                stderr: "probe object not found".into(),
+            });
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&repo);
+    result
+}
+
 /// Parses `cat-file --batch` output: a stream of
 /// `<oid> <type> <size>\n<raw bytes>\n`.
 fn parse_batch_stream(out: &[u8]) -> Result<Vec<(String, GitObjectKind, Vec<u8>)>> {

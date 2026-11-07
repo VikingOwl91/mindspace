@@ -11,6 +11,8 @@ pub mod indexing;
 pub mod ingest;
 pub mod mcp;
 pub mod retrieval;
+#[cfg(target_os = "linux")]
+pub mod sandbox;
 pub mod storage;
 
 pub use core::{Error, Result};

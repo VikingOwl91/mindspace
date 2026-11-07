@@ -28,7 +28,9 @@ fn mind() -> Command {
 }
 
 fn new_db(dir: &Path) -> PathBuf {
-    let db = dir.join("mind.db");
+    // A directory of its own, outside the allowed root (ADR-029).
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let db = dir.join("state/mind.db");
     for args in [vec!["init"], vec!["space", "create", "p"]] {
         let o = mind().env("MINDSPACE_DB", &db).args(args).output().unwrap();
         assert!(o.status.success());
@@ -61,6 +63,9 @@ impl Server {
             cmd.arg("--ingest-timeout").arg(t);
         }
         if let Some(p) = path_env {
+            // The hung-git tests replace `git` by a script that hangs; the sandbox
+            // probe would (rightly) refuse such a git. They test the deadline.
+            cmd.arg("--insecure-no-sandbox");
             let old = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{old}", p.display()));
         }
@@ -243,7 +248,7 @@ fn an_expired_limit_aborts_with_a_clear_error_and_changes_nothing() {
     let db = new_db(tmp.path());
     let before = snapshot(&db);
 
-    let mut s = Server::start(&db, tmp.path(), Some("0.001"));
+    let mut s = Server::start(&db, &repo, Some("0.001"));
     let r = s.ingest(&repo);
     drop(s);
 
@@ -271,7 +276,7 @@ fn an_aborted_ingest_retires_nothing_and_the_retry_converges() {
     let db = new_db(tmp.path());
 
     // State A, ingested normally.
-    let mut s = Server::start(&db, tmp.path(), None);
+    let mut s = Server::start(&db, &repo, None);
     assert_eq!(s.ingest(&repo)["isError"], false);
     drop(s);
     let active_a = active_memories(&db);
@@ -282,7 +287,7 @@ fn an_aborted_ingest_retires_nothing_and_the_retry_converges() {
     git(&repo, &["commit", "-q", "-m", "drop beta"]);
     let before = snapshot(&db);
 
-    let mut s = Server::start(&db, tmp.path(), Some("0.001"));
+    let mut s = Server::start(&db, &repo, Some("0.001"));
     assert_eq!(s.ingest(&repo)["isError"], true);
     drop(s);
     assert_eq!(
@@ -298,7 +303,7 @@ fn an_aborted_ingest_retires_nothing_and_the_retry_converges() {
     integrity_ok(&db);
 
     // Retry without the tiny limit completes and retires exactly the old memory.
-    let mut s = Server::start(&db, tmp.path(), None);
+    let mut s = Server::start(&db, &repo, None);
     assert_eq!(s.ingest(&repo)["isError"], false);
     drop(s);
     assert!(
@@ -309,7 +314,7 @@ fn an_aborted_ingest_retires_nothing_and_the_retry_converges() {
     // Repeating changes nothing (idempotent), also with the tiny limit
     // refusing before any write.
     let settled = snapshot(&db);
-    let mut s = Server::start(&db, tmp.path(), None);
+    let mut s = Server::start(&db, &repo, None);
     assert_eq!(s.ingest(&repo)["isError"], false);
     drop(s);
     let again = snapshot(&db);
@@ -333,7 +338,7 @@ fn the_session_stays_writable_after_an_aborted_ingest() {
     small_repo(&repo);
     let db = new_db(tmp.path());
 
-    let mut s = Server::start(&db, tmp.path(), Some("0.001"));
+    let mut s = Server::start(&db, &repo, Some("0.001"));
     assert_eq!(s.ingest(&repo)["isError"], true);
     let w = s.call(
         "memory_create",
@@ -395,7 +400,7 @@ fn a_hung_git_is_killed_when_the_limit_expires() {
     let db = new_db(tmp.path());
     let (bin, pidfile) = fake_hanging_git(tmp.path());
 
-    let mut s = Server::start_with(&db, tmp.path(), Some("1"), Some(&bin));
+    let mut s = Server::start_with(&db, &repo, Some("1"), Some(&bin));
     let started = Instant::now();
     let r = s.ingest(&repo);
     let took = started.elapsed();
@@ -418,7 +423,7 @@ fn a_hung_git_is_killed_during_a_scoped_ingest() {
     let db = new_db(tmp.path());
     let (bin, pidfile) = fake_hanging_git(tmp.path());
 
-    let mut s = Server::start_with(&db, tmp.path(), Some("1"), Some(&bin));
+    let mut s = Server::start_with(&db, &repo, Some("1"), Some(&bin));
     let started = Instant::now();
     let r = s.call(
         "repo_ingest",
@@ -449,7 +454,7 @@ fn a_second_request_is_queued_and_answered_in_order() {
     small_repo(&repo);
     let db = new_db(tmp.path());
 
-    let mut s = Server::start(&db, tmp.path(), None);
+    let mut s = Server::start(&db, &repo, None);
     let path = repo.canonicalize().unwrap().display().to_string();
     let first = s.send(
         "tools/call",
@@ -476,7 +481,7 @@ fn a_successful_ingest_reports_elapsed_time_and_limit() {
     let repo = tmp.path().join("repo");
     small_repo(&repo);
     let db = new_db(tmp.path());
-    let mut s = Server::start(&db, tmp.path(), Some("120"));
+    let mut s = Server::start(&db, &repo, Some("120"));
     let r = s.ingest(&repo);
     assert_eq!(r["isError"], false, "{r}");
     let sc = &r["structuredContent"];
@@ -502,7 +507,7 @@ fn invalid_timeouts_stop_the_server() {
         "100000",
         "0.0000001",
     ] {
-        let o = startup(&db, tmp.path(), bad);
+        let o = startup(&db, &tmp.path().join("repo"), bad);
         assert!(
             !o.status.success(),
             "--ingest-timeout {bad:?} must be refused"
@@ -515,7 +520,9 @@ fn invalid_timeouts_stop_the_server() {
     }
     for good in ["0.5", "30", "3600"] {
         assert!(
-            startup(&db, tmp.path(), good).status.success(),
+            startup(&db, &tmp.path().join("repo"), good)
+                .status
+                .success(),
             "{good} should be accepted"
         );
     }

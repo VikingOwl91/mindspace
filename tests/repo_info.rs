@@ -202,7 +202,9 @@ fn repo_outline_reports_the_slug_and_redacts_worktree_paths_outside_the_roots() 
     let outside = outside_parent.path().canonicalize().unwrap().join("wt-outside");
     git(&repo, &["worktree", "add", "-q", "-b", "out", outside.to_str().unwrap()]);
 
-    let db = root.join("mind.db");
+    // A directory of its own for the database, outside the allowed root (ADR-029).
+    let dbdir = tempfile::tempdir().unwrap();
+    let db = dbdir.path().join("mind.db");
     assert!(mind(&db, &["init"]).2);
     let result = mcp_outline(&db, &root, &repo);
     assert_eq!(result["isError"], false, "{result}");

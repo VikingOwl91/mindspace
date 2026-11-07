@@ -79,7 +79,7 @@ fn status_reports_not_installed_when_absent() {
     let path = dir.path().join("mind.db");
     SqliteStore::open(&path).unwrap();
     let store = SqliteStore::open(&path).unwrap();
-    let st = manager::status(&store);
+    let st = manager::status(&store).unwrap();
     assert!(!st.installed);
     assert!(!st.verified);
     assert!(!st.indexing_available);
@@ -92,7 +92,7 @@ fn status_reports_no_runtime_without_embedding_support() {
     let path = dir.path().join("mind.db");
     SqliteStore::open(&path).unwrap();
     let store = SqliteStore::open(&path).unwrap();
-    let status = manager::status(&store);
+    let status = manager::status(&store).unwrap();
     assert_eq!(status.runtime, "none (build without embeddings)");
     assert!(!status.indexing_available);
 }
@@ -111,7 +111,7 @@ fn no_network_during_status() {
 #[test]
 fn lazy_load_not_triggered_on_construction() {
     use mindspace::embeddings::CandleRuntime;
-    let rt = CandleRuntime::new(&mindspace::embeddings::manifest::NOMIC_V1_5);
+    let rt = CandleRuntime::new(&mindspace::embeddings::manifest::NOMIC_V1_5).unwrap();
     assert_eq!(rt.dimension(), 768);
     assert_eq!(rt.model_id(), "nomic-embed-text-v1.5");
 }
@@ -120,7 +120,7 @@ fn lazy_load_not_triggered_on_construction() {
 #[test]
 fn candle_runtime_prefix_distinction() {
     // Only run if model is installed.
-    let dir = manager::model_dir("nomic-embed-text-v1.5");
+    let dir = manager::model_dir("nomic-embed-text-v1.5").unwrap();
     if !manager::is_installed(
         mindspace::embeddings::manifest::find_model("nomic-embed-text-v1.5").unwrap(),
     ) {

@@ -111,11 +111,36 @@ impl SemanticCache {
         query: SearchQuery,
         mode: SearchMode,
     ) -> Result<SearchOutcome> {
+        let base = match super::manager::data_dir() {
+            Ok(base) => base,
+            Err(e) => {
+                // No usable data directory: no model can be found. Same early
+                // checks as `search_with`, and the old source is evicted.
+                self.entry = None;
+                if query.text.trim().is_empty() {
+                    return Err(Error::EmptyQuery);
+                }
+                let reason = if mode == SearchMode::Lexical {
+                    FallbackReason::EmbeddingsDisabled
+                } else {
+                    FallbackReason::RuntimeUnavailable {
+                        detail: e.to_string(),
+                    }
+                };
+                return search_with_mode(
+                    store,
+                    query,
+                    mode,
+                    &SemanticCapability::Unavailable(reason),
+                    RetrievalOptions::default(),
+                );
+            }
+        };
         self.search_with(
             store,
             query,
             mode,
-            &super::manager::data_dir(),
+            &base,
             super::manifest::find_model,
             &super::candle_runtime,
             &SystemTime::now,

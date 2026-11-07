@@ -15,24 +15,18 @@ use crate::storage::Store;
 const ENABLED_KEY: &str = "embedding.enabled";
 const MODEL_KEY: &str = "embedding.model";
 
-pub fn data_dir() -> PathBuf {
-    if let Ok(x) = std::env::var("XDG_DATA_HOME") {
-        if !x.is_empty() {
-            return PathBuf::from(x).join("mindspace");
-        }
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        return PathBuf::from(h).join(".local/share/mindspace");
-    }
-    PathBuf::from(".mindspace")
+/// The data directory (see `crate::paths`); fails instead of guessing when no
+/// usable `XDG_DATA_HOME`/`HOME` exists.
+pub fn data_dir() -> Result<PathBuf> {
+    Ok(crate::paths::data_dir()?.path)
 }
 
-pub fn models_dir() -> PathBuf {
-    data_dir().join("models")
+pub fn models_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("models"))
 }
 
-pub fn model_dir(id: &str) -> PathBuf {
-    models_dir().join(id)
+pub fn model_dir(id: &str) -> Result<PathBuf> {
+    Ok(models_dir()?.join(id))
 }
 
 pub fn model_dir_in(base: &Path, id: &str) -> PathBuf {
@@ -74,7 +68,7 @@ pub(crate) fn reject_symlink(path: &Path) -> Result<()> {
 }
 
 pub fn is_installed(entry: &ModelManifestEntry) -> bool {
-    is_installed_in(&data_dir(), entry)
+    data_dir().is_ok_and(|base| is_installed_in(&base, entry))
 }
 
 pub fn is_installed_in(base: &Path, entry: &ModelManifestEntry) -> bool {
@@ -137,7 +131,7 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
 }
 
 pub fn install_model(entry: &ModelManifestEntry) -> Result<()> {
-    install_model_opts(entry, &data_dir(), None)
+    install_model_opts(entry, &data_dir()?, None)
 }
 
 pub fn install_model_opts(
@@ -258,7 +252,7 @@ pub(crate) fn download_with(url: &str, dest: &Path, max_size: u64, https_only: b
 
 pub fn remove_model(id: &str) -> Result<()> {
     let entry = validate_model_id(id)?;
-    let dir = model_dir(entry.id);
+    let dir = model_dir(entry.id)?;
     reject_symlink(&dir)?;
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| Error::Storage(e.to_string()))?;
@@ -313,8 +307,8 @@ pub struct EmbeddingsStatus {
     pub indexing_available: bool,
 }
 
-pub fn status(store: &dyn Store) -> EmbeddingsStatus {
-    status_in(&data_dir(), store)
+pub fn status(store: &dyn Store) -> Result<EmbeddingsStatus> {
+    Ok(status_in(&data_dir()?, store))
 }
 
 pub fn status_in(base: &Path, store: &dyn Store) -> EmbeddingsStatus {

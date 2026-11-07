@@ -27,8 +27,13 @@ struct Loaded {
 impl CandleRuntime {
     /// Lazily loaded runtime for the default data directory. Construction
     /// touches no files; artifacts are read on first use.
-    pub fn new(entry: &crate::embeddings::manifest::ModelManifestEntry) -> Self {
-        Self::new_in(entry, crate::embeddings::manager::model_dir(entry.id))
+    pub fn new(
+        entry: &crate::embeddings::manifest::ModelManifestEntry,
+    ) -> crate::core::Result<Self> {
+        Ok(Self::new_in(
+            entry,
+            crate::embeddings::manager::model_dir(entry.id)?,
+        ))
     }
 
     /// Lazily loaded runtime that reads artifacts from `model_dir`. A caller
@@ -212,7 +217,7 @@ mod tests {
     #[cfg(feature = "embeddings")]
     fn lazy_load_not_triggered_on_construction() {
         // Constructing a runtime must not require artifacts to be present.
-        let rt = CandleRuntime::new(&crate::embeddings::manifest::NOMIC_V1_5);
+        let rt = CandleRuntime::new(&crate::embeddings::manifest::NOMIC_V1_5).unwrap();
         assert_eq!(rt.dimension(), 768);
         assert_eq!(rt.model_id(), "nomic-embed-text-v1.5");
     }
@@ -220,7 +225,7 @@ mod tests {
     #[test]
     #[cfg(feature = "embeddings")]
     fn inputs_get_the_manifest_prefix_for_their_path() {
-        let rt = CandleRuntime::new(&crate::embeddings::manifest::NOMIC_V1_5);
+        let rt = CandleRuntime::new(&crate::embeddings::manifest::NOMIC_V1_5).unwrap();
         assert_eq!(
             rt.prefixed("rust borrow rules", true),
             "search_query: rust borrow rules"

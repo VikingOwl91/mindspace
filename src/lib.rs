@@ -10,6 +10,7 @@ pub mod embeddings;
 pub mod indexing;
 pub mod ingest;
 pub mod mcp;
+pub mod paths;
 pub mod retrieval;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
@@ -24,19 +25,10 @@ use storage::Store;
 use uuid::Uuid;
 
 /// Default database location: `$XDG_DATA_HOME/mindspace/mind.db`, falling
-/// back to `$HOME/.local/share/mindspace/mind.db`.
-pub fn default_db_path() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("mindspace").join("mind.db");
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".local/share/mindspace/mind.db");
-        }
-    }
-    PathBuf::from("mind.db")
+/// back to `$HOME/.local/share/mindspace/mind.db`. Fails when neither is
+/// usable (see [`paths`]); it never falls back to the working directory.
+pub fn default_db_path() -> Result<PathBuf> {
+    Ok(paths::db_path_from(None, paths::DbOrigin::Unset, paths::data_dir)?.path)
 }
 
 /// Creates the database file, its parent directories, and the schema.

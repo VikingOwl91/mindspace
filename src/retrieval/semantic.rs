@@ -229,12 +229,19 @@ fn resolve_ready(model: &ReadyModel, factory: RuntimeFactory<'_>) -> Result<Sema
 pub fn resolve(store: &dyn Store) -> Result<SemanticCapability> {
     #[cfg(feature = "embeddings")]
     {
-        resolve_with(
-            store,
-            &manager::data_dir(),
-            manifest::find_model,
-            &candle_runtime,
-        )
+        // No usable data directory means no model can be found: semantic search
+        // is unavailable (Auto falls back to lexical), it does not guess a path.
+        let base = match manager::data_dir() {
+            Ok(base) => base,
+            Err(e) => {
+                return Ok(SemanticCapability::Unavailable(
+                    FallbackReason::RuntimeUnavailable {
+                        detail: e.to_string(),
+                    },
+                ))
+            }
+        };
+        resolve_with(store, &base, manifest::find_model, &candle_runtime)
     }
     #[cfg(not(feature = "embeddings"))]
     {

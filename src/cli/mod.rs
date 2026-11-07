@@ -21,6 +21,11 @@ pub struct Cli {
     #[arg(long, global = true, env = "MINDSPACE_DB", value_name = "PATH")]
     pub db: Option<PathBuf>,
 
+    /// How `--db` was supplied (flag or environment); set by [`parse`], used by
+    /// diagnostics to say where the effective path came from.
+    #[arg(skip)]
+    pub db_origin: crate::paths::DbOrigin,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -254,15 +259,25 @@ pub enum ModelCommand {
     /// List supported models and installation state
     List,
     /// Show metadata for a model
-    Info { id: String },
+    Info {
+        /// Model id, as listed by `mind model list`
+        id: String,
+    },
     /// Download and install a trusted model
     Install {
+        /// Model id, as listed by `mind model list`
         id: String,
+        /// Download without asking for confirmation (required when stdin is not
+        /// a terminal). The files come from the model's source over HTTPS and
+        /// are checked against the sizes and SHA-256 hashes in the built-in manifest.
         #[arg(long)]
         yes: bool,
     },
     /// Select an installed model
-    Use { id: String },
+    Use {
+        /// Model id, as listed by `mind model list`
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -332,9 +347,10 @@ fn search_for_cli(
 pub fn execute(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Init => {
-            let path = db_path(cli);
+            let path = db_path(cli)?;
             initialize(&path)?;
             println!("initialized mindspace at {}", path.display());
+            println!("next: mind space create <name>   (then: mind ingest <path> --space <name>)");
         }
         Command::Ingest {
             path,
@@ -589,7 +605,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
                 println!("source: {}", m.source);
                 println!("installed: {}", crate::embeddings::manager::is_installed(m));
                 for a in m.artifacts {
-                    let p = crate::embeddings::manager::model_dir(m.id).join(a.filename);
+                    let p = crate::embeddings::manager::model_dir(m.id)?.join(a.filename);
                     let verified = crate::embeddings::manager::verify_file(&p, a).is_ok();
                     println!(
                         "  artifact {} size={} sha256={} verified={}",
@@ -634,6 +650,12 @@ License: {}",
                 }
                 crate::embeddings::manager::install_model(m)?;
                 println!("installed {}", m.id);
+                println!(
+                    "note: a `mind mcp` server with repository roots that was started before the \
+                     first model was installed cannot read the new model directory (its sandbox \
+                     is built at start); restart it. Next: mind model use {}",
+                    m.id
+                );
             }
             ModelCommand::Use { id } => {
                 let store = open(cli)?;
@@ -709,7 +731,7 @@ License: {}",
             }
             EmbeddingsCommand::Status => {
                 let store = open(cli)?;
-                let st = crate::embeddings::manager::status(&store);
+                let st = crate::embeddings::manager::status(&store)?;
                 println!("enabled: {}", st.enabled);
                 println!("selected_model: {:?}", st.selected_model);
                 println!("installed: {}", st.installed);
@@ -741,7 +763,7 @@ License: {}",
                 }
                 #[cfg(feature = "embeddings")]
                 {
-                    let dir = crate::embeddings::manager::model_dir(&selected);
+                    let dir = crate::embeddings::manager::model_dir(&selected)?;
                     let rt = crate::embeddings::CandleRuntime::load(&dir)?;
                     let deriv = crate::embeddings::manifest::derivation_from_manifest(entry);
                     let report = crate::indexing::index_assertions(
@@ -815,6 +837,14 @@ fn mcp_command(
     use crate::mcp::{McpConfig, SandboxState};
     #[cfg(target_os = "linux")]
     crate::sandbox::close_inherited_fds();
+    // One clear primary error for a database that was never initialized, before
+    // any sandbox work that would otherwise report an unrelated reason first.
+    let db = db_path(cli)?;
+    if !db.exists() {
+        return Err(Error::NotInitialized {
+            path: db.display().to_string(),
+        });
+    }
     let config = McpConfig::from_specs(allow_roots)?.with_ingest_timeout(ingest_timeout);
     let state = if config.roots().is_empty() {
         SandboxState::NotNeeded
@@ -845,7 +875,10 @@ fn mcp_command(
 fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::SandboxState {
     use crate::mcp::{Access, SandboxState};
     use crate::sandbox::{self, Outcome, Plan};
-    let db = db_path(cli);
+    let db = match db_path(cli) {
+        Ok(db) => db,
+        Err(e) => return SandboxState::Unavailable(e.to_string()),
+    };
     let Some(db_dir) = db
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -874,7 +907,10 @@ fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::Sandb
             .map(|r| (r.path.clone(), r.access == Access::ReadWrite))
             .collect(),
         db_dir,
-        models_dir: crate::embeddings::manager::data_dir().join("models"),
+        // Without a usable data directory there is no model directory to allow;
+        // the rule for a path that does not exist is skipped (sandbox::rules).
+        models_dir: crate::embeddings::manager::models_dir()
+            .unwrap_or_else(|_| PathBuf::from("/nonexistent/mindspace-models")),
         exe,
     };
     match sandbox::verify_stage2(&plan.tmp_dir()) {
@@ -903,12 +939,31 @@ fn sandbox_state(_cli: &Cli, _config: &crate::mcp::McpConfig) -> crate::mcp::San
     crate::mcp::SandboxState::Unavailable("the kernel sandbox exists only on Linux".to_string())
 }
 
-fn db_path(cli: &Cli) -> PathBuf {
-    cli.db.clone().unwrap_or_else(crate::default_db_path)
+/// Parses the command line and records whether `--db` came from the flag or
+/// from `MINDSPACE_DB` (clap merges the two; the source is only known here).
+pub fn parse() -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    cli.db_origin = match matches.value_source("db") {
+        Some(clap::parser::ValueSource::CommandLine) => crate::paths::DbOrigin::CommandLine,
+        Some(clap::parser::ValueSource::EnvVariable) => crate::paths::DbOrigin::Environment,
+        _ => crate::paths::DbOrigin::Unset,
+    };
+    cli
+}
+
+/// The effective database location and where it came from.
+fn db_location(cli: &Cli) -> Result<crate::paths::Located> {
+    crate::paths::db_path_from(cli.db.as_deref(), cli.db_origin, crate::paths::data_dir)
+}
+
+fn db_path(cli: &Cli) -> Result<PathBuf> {
+    Ok(db_location(cli)?.path)
 }
 
 fn open(cli: &Cli) -> Result<SqliteStore> {
-    open_existing(&db_path(cli))
+    open_existing(&db_path(cli)?)
 }
 
 /// Formats a memory action for human ingest output.

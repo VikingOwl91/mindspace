@@ -11,6 +11,12 @@ pub enum Error {
     #[error("database at {path} is not initialized; run: mind init")]
     NotInitialized { path: String },
 
+    #[error(
+        "cannot determine where to keep data: {reason}; set MINDSPACE_DB (or pass --db) for \
+         the database and XDG_DATA_HOME or HOME for models"
+    )]
+    DataDirUnresolved { reason: String },
+
     #[error("space '{name}' already exists")]
     SpaceExists { name: String },
 

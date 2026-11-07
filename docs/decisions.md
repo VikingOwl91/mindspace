@@ -944,3 +944,82 @@ Upstream and fork hints remain undecided (ADR-027).
 **Revisit when.** Scope-level operations are needed (detach a space, forget a
 repository), memories should derive their spaces from scopes, or scope history
 must be queryable.
+
+## ADR-029: Confinement of MCP ingest and outline: kernel sandbox plus anchored access (2026-11-07)
+
+**Status: proposed; amended at the end of MIND-18 with what was measured.**
+
+**Problem.** Repository contents and the directory tree below an allowed root are
+untrusted. Without any race, a repository can carry pointers that make Git read
+and write outside every allowed root (`.git` as a symlink, a `gitdir:` file,
+`objects/info/alternates`, a linked worktree whose main repository is elsewhere);
+with a race, any path component can be swapped after it was checked (ADR-026
+addendum). Both reached the database and wrote the identity marker outside the
+roots. `repo_outline` leaked directory names the same way. Evidence and
+experiments: MIND-18, `tests/ingest_confinement.rs` (19 tests).
+
+**Invariants** (stated as outcomes, tested without reference to a mechanism):
+
+- I1 no byte from outside the allowed roots reaches the database or a tool
+  response, including `repo_outline`;
+- I2 ingest reads only from locations governed by an rw root (target, git dir,
+  common dir, object stores, work tree);
+- I3 the only filesystem write of an ingest is the identity marker, inside an rw
+  root;
+- I4 read-only areas, also nested ones, are neither ingested nor changed, also
+  under races;
+- I5 fail closed: if protection cannot be established and *verified*, the
+  repository tools are off, with a reason; nothing falls back silently;
+- I6 no regression: plain repositories, linked worktrees whose main repository is
+  inside the roots, `paths`, symlinks in a work tree are still not followed;
+- I7 no inherited file descriptors survive into the confined process.
+
+**Decision: two layers, because neither alone is enough** (measured, see the
+Landlock spike in MIND-18: the kernel layer alone left exactly the four tests
+that need ro/rw semantics red).
+
+1. *Kernel layer (Landlock), minimum ABI 3.* Checked at the moment of access, so
+   it does not matter which path trick or race redirected an access. It cannot
+   express "read-only inside read-write" and cannot stop reading a read-only
+   root. Applied by **self re-exec**: stage 1 validates the configuration,
+   restricts itself and `exec`s itself; stage 2 starts confined. `restrict_self`
+   confines only the calling and later threads (verified: a thread that existed
+   before kept reading outside), so restricting a running process is not safe.
+   Enforcement is never taken on trust: `FullyEnforced` is required **and**
+   canary probes observe the behavior (reading, listing, creating and
+   truncating outside must fail with EACCES; ENOENT does not count), in stage 1
+   after restricting and again in stage 2, which does not rely on an environment
+   marker. A Git probe proves Git works under the sandbox.
+2. *Application layer, always on* (also with `--insecure-no-sandbox`). The target
+   directory is opened once and the **opened inode** is checked (its real path
+   via `/proc/self/fd`), not the name; Git runs with the work tree and `GIT_DIR`
+   / `GIT_COMMON_DIR` pinned to `/proc/<pid>/fd/<n>`, so Git does not look up
+   `.git` again; `.git` is opened and checked, a `gitdir:` pointer and
+   `commondir` are resolved and must lie in rw roots; alternates must lie in the
+   governing rw root; every file read in a directory ingest is opened, then its
+   real path is checked against the ingest root and the governing mode.
+
+**Library.** The `landlock` crate (official `landlock-lsm` organization,
+0.4.x, MSRV 1.71) with `CompatLevel::HardRequirement`, over direct syscalls: it
+carries the ABI negotiation that would otherwise be our risk, and it gave results
+identical to a raw-syscall launcher on the same tests (15 green, 4 red before the
+application layer). Condition: the dependency stays Linux-only and is reviewed
+with the lockfile on every update.
+
+**Configuration rules.** The DB directory must be dedicated: it is opened in
+full (SQLite keeps `-wal` and `-shm` beside the database), so it must neither
+contain nor lie inside an allowed root. Temp files go to a private directory
+inside it (`TMPDIR`), not `/tmp`. Linked worktrees whose common directory is
+outside the rw roots are refused. Not Linux: the repository tools stay off.
+
+**Failure behavior.**
+
+| Situation | Behavior |
+|---|---|
+| no roots configured | repository tools are off anyway; no sandbox is set up |
+| Landlock missing, ABI < 3, not fully enforced | server runs, repository tools off, reason in every error |
+| canary or Git probe fails after restricting | process exits (it is confined but unverified) |
+| environment marker set but canary reachable | process exits |
+| `--insecure-no-sandbox` | warning on every start, results carry `sandbox: disabled`; application layer stays on |
+
+**Residual risk** is listed at the end of MIND-18 once measured.

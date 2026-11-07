@@ -16,6 +16,7 @@ pub mod paths;
 pub mod retrieval;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+pub mod setup;
 pub mod storage;
 
 pub use core::{Error, Result};

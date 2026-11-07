@@ -1,4 +1,4 @@
-//! Finding programs on `PATH` (used by `mind doctor`).
+//! Finding programs on `PATH` (shared by `mind doctor` and `mind setup`).
 //!
 //! Empty and relative `PATH` entries are skipped: they mean "the current
 //! directory" to a shell, and a program found there would not be the one

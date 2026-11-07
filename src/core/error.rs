@@ -17,6 +17,11 @@ pub enum Error {
     )]
     DataDirUnresolved { reason: String },
 
+    /// `mind setup` stopped before or while registering a client; the text says what
+    /// was (not) changed and what to do next.
+    #[error("{0}")]
+    Setup(String),
+
     #[error("space '{name}' already exists")]
     SpaceExists { name: String },
 

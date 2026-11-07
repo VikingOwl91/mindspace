@@ -229,6 +229,7 @@ The commands currently implemented:
 ```sh
 mind init
 mind doctor [--json]                         # read-only check of the installation (docs/doctor.md)
+mind setup [claude-code|codex|opencode] [--ro DIR] [--rw DIR] [--scope user|local] [--apply] [--yes]   # connect an agent (docs/setup.md)
 mind ingest ./notes.md --space coding
 mind ingest ~/Documents --space personal   # directory: full source-lifecycle scan
 mind ingest ~/src/owlry --space coding     # git repo: HEAD + worktrees, full ref journal

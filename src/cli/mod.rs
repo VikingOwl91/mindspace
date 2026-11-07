@@ -34,6 +34,42 @@ pub struct Cli {
 pub enum Command {
     /// Initialize a new mindspace database (idempotent)
     Init,
+    /// Register Mindspace as an MCP server with Claude Code, Codex CLI or OpenCode
+    ///
+    /// MCP (Model Context Protocol) is how a coding agent talks to local tools; this
+    /// registers Mindspace with your agent. Mindspace keeps its data in one local
+    /// database. Nothing is changed unless you pass --apply and confirm.
+    ///
+    /// `mind setup` in a terminal guides you. `mind setup <client>` shows a preview of
+    /// what would be registered. `--apply` registers it through the client's own
+    /// `mcp add` command and checks the result before reporting success.
+    #[command(after_long_help = crate::setup::HELP_AFTER)]
+    Setup {
+        /// The client to set up. Without it, a terminal session guides you (and without a
+        /// terminal the clients found are listed)
+        #[arg(value_enum)]
+        client: Option<crate::setup::Client>,
+        /// Share a folder READ-ONLY: Mindspace may read repository files inside it and
+        /// cannot change them (recommended). Repeatable; absolute path of an existing
+        /// folder (~/projects is only an example). Default: no folder is shared
+        #[arg(long = "ro", value_name = "DIR")]
+        ro: Vec<PathBuf>,
+        /// Share a folder READ-WRITE: Mindspace may also change repository files inside it.
+        /// Repeatable; you are asked to confirm it explicitly
+        #[arg(long = "rw", value_name = "DIR")]
+        rw: Vec<PathBuf>,
+        /// Claude Code only: 'user' = all your sessions (default), 'local' = only sessions
+        /// started in the directory you run setup from
+        #[arg(long, value_enum, default_value = "user")]
+        scope: crate::setup::Scope,
+        /// Register Mindspace (otherwise: preview only). Asks for confirmation
+        #[arg(long)]
+        apply: bool,
+        /// Confirm without asking, for scripts and when there is no terminal. With --rw
+        /// folders this means you accept write access
+        #[arg(long)]
+        yes: bool,
+    },
     /// Diagnose the installation: binary, database, configuration, git,
     /// embeddings and the MCP sandbox. Read-only; exit code 0 = no blocking
     /// failure, 1 = a check failed, 2 = the diagnosis could not be carried out
@@ -359,6 +395,14 @@ pub fn execute(cli: &Cli) -> Result<()> {
         Command::Doctor { json } => {
             doctor_command(cli, *json)?;
         }
+        Command::Setup {
+            client,
+            ro,
+            rw,
+            scope,
+            apply,
+            yes,
+        } => setup_command(cli, *client, ro, rw, *scope, *apply, *yes)?,
         Command::Init => {
             let path = db_path(cli)?;
             initialize(&path)?;
@@ -964,6 +1008,69 @@ pub fn run(cli: &Cli) -> Result<i32> {
     }
     execute(cli)?;
     Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_command(
+    cli: &Cli,
+    client: Option<crate::setup::Client>,
+    ro: &[PathBuf],
+    rw: &[PathBuf],
+    scope: crate::setup::Scope,
+    apply: bool,
+    yes: bool,
+) -> Result<()> {
+    use crate::setup::{Context, Request, Ui};
+    use std::io::IsTerminal;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute());
+    let ctx = Context {
+        db: db_path(cli)?,
+        exe: std::env::current_exe()
+            .map_err(|e| Error::Setup(format!("cannot locate the running mind binary: {e}")))?,
+        path_env: std::env::var_os("PATH"),
+        home,
+        codex_home: std::env::var_os("CODEX_HOME"),
+        interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        selftest: true,
+        client_timeout: std::time::Duration::from_secs(60),
+    };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout().lock();
+    let mut ui = Ui {
+        input: &mut input,
+        out: &mut out,
+    };
+    match client {
+        Some(client) => crate::setup::run(
+            &Request {
+                client,
+                scope,
+                ro: ro.to_vec(),
+                rw: rw.to_vec(),
+                apply,
+                yes,
+            },
+            &ctx,
+            &mut ui,
+        ),
+        None => {
+            if apply || yes || !ro.is_empty() || !rw.is_empty() {
+                return Err(Error::Setup(
+                    "name the client to set up: mind setup <claude-code|codex|opencode> ...; nothing was changed"
+                        .into(),
+                ));
+            }
+            if ctx.interactive {
+                crate::setup::run_wizard(&ctx, &mut ui)
+            } else {
+                crate::setup::print_detection(&ctx, &mut ui);
+                Ok(())
+            }
+        }
+    }
 }
 
 fn doctor_command(cli: &Cli, json: bool) -> Result<i32> {

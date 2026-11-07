@@ -123,9 +123,31 @@ and, for `mind search`, the matching section of the architecture decision
 record with its source file and commit, so you can see where it came from.
 Add `--json` to any command for machine-readable output (unstable format).
 
-## Use it from Claude Code (MCP)
+## Connect your agent (`mind setup`)
 
-Mindspace ships an MCP server (`mind mcp`, stdio only). Create the database and
+MCP (Model Context Protocol) is how a coding agent talks to local tools. `mind setup` registers Mindspace with
+**Claude Code** or **Codex CLI** (and shows the exact command for **OpenCode**), through the client's own `mcp add`.
+The default is a **zero-permission setup**: no folder is shared, the registration is complete, the agent gets all the
+memory tools and Mindspace can read no repository files.
+
+```sh
+mind init                                  # once
+mind setup claude-code                     # preview, nothing is changed (or just `mind setup`, guided, in a terminal)
+mind setup claude-code --apply             # register after you confirm; the result is read back
+mind doctor                                # check it
+```
+
+Sharing repository folders is optional, for example `mind setup claude-code --ro ~/projects --apply`
+(`~/projects` is only an example and is never created). **`--ro`** lets Mindspace read repository files inside the
+folder and not change them (recommended); **`--rw`** lets it read and change them, and you must confirm that
+explicitly. These are Mindspace permissions: they say nothing about
+what your agent or its other tools may do, and read access is not a confidentiality guarantee towards the agent. Where no
+effective sandbox exists the repository tools stay off. Setup never overwrites an existing `mindspace` entry. Details,
+the per-client differences, undo and the limits are in [`docs/setup.md`](docs/setup.md).
+
+## Manual MCP configuration (Claude Code)
+
+Mindspace ships an MCP server (`mind mcp`, stdio only). `mind setup` does the following for you; to do it by hand, Create the database and
 a space first (`mind init`, `mind space create demo`, using the same
 `--db`/`MINDSPACE_DB` as in the config below), then add a project-level
 `.mcp.json` (or pass the same file with `claude --mcp-config`):
@@ -166,9 +188,9 @@ tool call. The same configuration (loaded with `--mcp-config`) was exercised wit
 ingestion, symbol questions checked against the source, refusal of paths
 outside the roots, restart, re-ingest, repository changes and crash recovery
 (40/40 checks, report in
-[`docs/reviews/mind-21-mcp-e2e.md`](docs/reviews/mind-21-mcp-e2e.md)). Not
-verified: `claude mcp add` (the same settings, entered on the command line),
-the interactive UI, and other MCP clients. A Codex and an OpenCode example are
+[`docs/reviews/mind-21-mcp-e2e.md`](docs/reviews/mind-21-mcp-e2e.md)). `mind setup` is tested against the real Claude Code 2.1.319 and Codex CLI 0.167.0 in throw-away configuration
+directories (registration, read-back, refusal of an existing entry, foreign entries). Not
+verified: the interactive UI of the clients, and OpenCode registration (preview only). A Codex and an OpenCode example are
 in [`docs/reference.md`](docs/reference.md).
 
 Typical agent use: `repo_outline` (see what is there), `repo_ingest` with
@@ -347,6 +369,7 @@ scripts/bench-baseline.sh               # benchmarks
 
 ## More documentation
 
+- [`docs/setup.md`](docs/setup.md): `mind setup`, `--ro`/`--rw`, the three clients, undo and limits
 - [`docs/doctor.md`](docs/doctor.md): what `mind doctor` checks, its exit codes and JSON format
 - [`docs/reference.md`](docs/reference.md): design principles, the full command
   list, MCP details, search modes, Codex/OpenCode configuration.

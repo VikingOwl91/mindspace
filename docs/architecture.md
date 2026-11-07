@@ -1,4 +1,6 @@
-# Mindspace architecture (v0.5)
+# Mindspace architecture (v0.5 design, partly updated)
+
+*Snapshot note: this document was written for v0.5. Later work is covered in `docs/decisions.md` (temporal recording ADR-021, scopes, ADR-025 to ADR-029) and only partly reflected here: the module map and the MCP section mention the sandbox, but the schema section still abbreviates migration 0001. Where they differ, the README and the decision log describe the current state.*
 
 This document describes how the v0.5 implementation is built: module boundaries, storage
 design, and the seams deliberately left for later growth. The conceptual model
@@ -17,7 +19,7 @@ Mindspace engine          (pure domain logic: core, ingest, retrieval)
 Store trait               (the storage boundary)
    |
    v
-SQLite (rusqlite)         (only implementation in v0)
+SQLite (rusqlite)         (the only implementation)
 ```
 
 One crate, one binary (`mind`), no daemon or network service, and no runtime
@@ -50,6 +52,10 @@ src/
                 cycle-safe), and the mode-aware semantic/hybrid retrieval API.
   mcp/         synchronous JSON-RPC 2.0 / MCP stdio lifecycle and tool adapter.
                 Depends on core, retrieval, and Store; never SQL.
+  sandbox/     Linux-only Landlock confinement of the `mind mcp` process for the
+                repository tools (self re-exec, canary probes, fail-closed;
+                ADR-029). `ingest/confined.rs` is its application-layer
+                counterpart (descriptor-anchored access, Git pointer checks).
   cli/         clap definitions and human/JSON rendering. Knows the engine,
                 never SQL.
   lib.rs       engine assembly: opening a store, running migrations.
@@ -72,10 +78,13 @@ Boundary rules enforced by review and by `use` statements:
 `search`, `list_conflicts`, `retire_memory`, ...), not to tables. All
 signatures traffic in owned `core` types.
 
-v0.5 ships one implementation, `storage::sqlite::SqliteStore`. A PostgreSQL
-implementation would implement the same trait; nothing else in the codebase
-would change. Two deliberate compromises keep the trait honest without
-speculative machinery:
+v0.5 ships one implementation, `storage::sqlite::SqliteStore`. The intent is that
+a PostgreSQL implementation would implement the same trait, with the changes
+confined to the storage layer. This is an architectural goal, not a tested
+claim: no second backend exists, and code outside `storage` still names the
+concrete `SqliteStore` (for example in `lib.rs` and the CLI), the migrations are
+SQLite SQL, and the FTS and locking behaviour described below is SQLite-specific.
+Two deliberate compromises keep the trait honest without speculative machinery:
 
 1. **Multi-invariant operations are single trait methods.** An observation
    must atomically record the session, per-file observations, source
@@ -320,6 +329,13 @@ invoke its read and write tools. Client permissions and confirmation prompts
 are part of the trust boundary. Space links are retrieval imports, not
 authorization. Future remote interfaces require separate transport and
 security decisions.
+
+Repository tools run confined: with `--allow-root` the process restricts its
+file system access with Landlock before serving and verifies the restriction by
+probes (network, signals and `/proc` are not restricted); without a
+working sandbox `repo_outline`/`repo_ingest` are disabled (`--insecure-no-sandbox`
+is an explicit opt-out). Roots are read-write or read-only. The model, tests
+and residual risks are in ADR-029 and the README security section.
 
 The fourteen tools are `repo_outline` and `repo_ingest` (allowlisted, ADR-026), `code_search` (symbol search over the code-structure layer, ADR-025), `memory_create`, `memory_update`, `memory_retire`,
 `memory_get`, `memory_search`, `memory_history`, `memory_conflicts`,

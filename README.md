@@ -1,519 +1,355 @@
 # Mindspace
 
-> Local-first, inspectable, durable memory infrastructure for humans, tools, and agents.
-
-Mindspace is an early-stage memory system built around a simple idea: durable memory should be more than disconnected text chunks and embeddings.
-
-It should preserve where knowledge came from, distinguish evidence from interpretation, understand that knowledge changes over time, keep different knowledge domains separate without turning them into isolated silos, and remain useful without requiring an AI model.
-
-The current repository version is 0.5.0. Interfaces and serialized output remain pre-alpha and may change as the memory model develops.
-
-## Design principles
-
-### Local first
-
-A useful Mindspace should work on one machine with minimal setup. SQLite is the intended default store and the core system should not require a cloud service.
-
-The same engine may later run as a network service and be accessed through a configured URL or IP address. Remote deployment should extend the local model, not become a separate product architecture.
-
-### AI is optional
-
-Mindspace should remain operational without an LLM, embedding model, or external AI API.
-
-Prefer deterministic algorithms whenever a result can be obtained reliably without a model. Parsers should parse formats, Git should provide Git facts, ASTs should describe code structure, timestamps and hashes should remain ordinary data, and lexical search should not require semantic inference.
-
-AI can later enrich the system through extraction, summarization, semantic linking, consolidation, reranking, and other optional capabilities.
-
-**AI should enrich memory, not own memory.**
-
-### Sources are evidence; memories are interpretations
-
-Mindspace should preserve the material from which knowledge was derived.
-
-A useful conceptual flow is:
-
-```text
-Source
-  -> Evidence
-  -> Claim / Event / Relation
-  -> Memory
-```
-
-A memory should be traceable back to its evidence. Derived information should retain provenance about how it was produced, including deterministic rules or model-assisted enrichment where applicable.
-
-### Temporal knowledge is first-class
-
-New information must not blindly overwrite old information.
-
-Mindspace should be able to represent that something was previously true, is currently true, was contradicted, or was explicitly superseded. This should make questions such as these possible:
-
-- What do we use now?
-- What did we use six months ago?
-- When did this decision change?
-- What evidence supports the current memory?
-
-### Avoid the global memory soup
-
-Knowledge belongs to spaces. Example spaces might include:
-
-```text
-eragon
-coding
-linux
-rust
-wayland
-personal
-project:owlry
-project:tyto
-```
-
-Spaces can be linked. A project space may be allowed to use knowledge from `coding`, which in turn may use `linux`, without automatically making every project memory visible from a generic Linux context.
-
-Links are directed imports and traversal is transitive and cycle-safe. Permissions are separate from space links; links are not access-control boundaries.
-
-A single piece of knowledge may belong to multiple spaces; spaces should not require duplicating the underlying memory.
-
-### Provenance and conflicts stay inspectable
-
-Mindspace should be able to answer: **Where do you know that from?**
-
-Potential provenance includes:
-
-- source and source location
-- source version, commit, or timestamp
-- ingestion time
-- effective time
-- extraction method
-- confidence
-- authority
-- supersession state
-
-Conflicting evidence should remain inspectable rather than being silently collapsed into one answer.
-
-### Embeddings are an index, not the memory model
-
-Semantic/vector search can be useful, but embeddings should be an optional retrieval signal rather than the canonical representation of memory.
-
-Mindspace should be capable of combining multiple retrieval mechanisms over time, for example:
-
-- structured queries
-- lexical/full-text search
-- graph traversal
-- temporal filtering
-- semantic/vector search
-- optional reranking
-
-In short: **Mindspace is not a vector database with an LLM attached.**
-
-## Spaces, scopes, and memory types
-
-These concepts are intentionally separate.
-
-A **space** describes the knowledge domain in which a memory is useful, such as `eragon`, `coding`, or `linux`.
-
-A **scope** describes where information originated or where it applies, such as a repository, session, conversation, document, or project.
-
-A **memory type** describes what kind of knowledge is represented. Candidate types include:
-
-- semantic
-- episodic
-- procedural
-- decision
-- preference
-- source
-
-The exact model is still being designed.
-
-## Deterministic ingest
-
-Basic ingestion should not require AI.
-
-```text
-source
-  -> parse
-  -> normalize
-  -> preserve metadata
-  -> preserve provenance
-  -> identify deterministic structure
-  -> store evidence
-  -> deterministic extraction where possible
-  -> indexes
-```
-
-Examples of deterministic structure include Markdown headings, EPUB chapters, chat messages and authors, Git commits, repository paths, source-code syntax trees, timestamps, and document metadata.
-
-Interpretive extraction can be added later as an enrichment stage rather than being required for ingestion.
-
-## Optional intelligence
-
-Model-backed functionality should sit behind explicit capabilities/providers rather than leaking into the core memory model.
-
-Possible future capabilities include:
-
-```text
-LLM
-  -> claim/entity/relation extraction
-  -> summarization
-  -> consolidation suggestions
-  -> contradiction assistance
-  -> semantic linking
-  -> reranking
-
-Embedding model
-  -> optional vector index
-  -> semantic retrieval
-```
-
-Model-derived results must remain traceable to their inputs and should be replaceable or recomputable as extraction methods improve.
-
-## Local and remote operation
-
-The intended architecture uses the same memory engine in both modes:
-
-```text
-                 clients
-             /      |      \
-            CLI     MCP     future API
-             \      |      /
-              connection
-              /        \
-         local          remote
-           |               |
-       Mindspace        Mindspace
-         engine           server
-           |               |
-        SQLite        configured store
-```
-
-A local installation should be the zero-configuration path. A remote Mindspace instance should be addressable through configuration and use normal secure transport.
-
-Authentication is not yet specified. Candidate mechanisms include SSH public-key challenge/signature authentication, API credentials, mTLS, and OIDC. Transport security and authentication should remain separate concerns.
-
-## Storage
-
-SQLite is the intended default because it provides an excellent local-first deployment story.
-
-The storage layer should nevertheless be abstracted so server deployments can use other backends. PostgreSQL is the first likely additional backend.
-
-Structured storage, full-text indexing, and vector indexing should be treated as separate capabilities rather than assuming one database must implement every concern.
-
-Initial direction:
-
-```text
-Mindspace engine
-      |
-      +-- structured store
-      |     +-- SQLite (default)
-      |     `-- PostgreSQL (planned)
-      |
-      +-- lexical/search index
-      |
-      `-- optional vector index
-```
-
-Additional storage adapters can be considered once the core model is stable.
-
-## Interfaces
-
-The working project name is **Mindspace** and the CLI command is **`mind`**.
-
-The commands implemented in v0:
+> Local-first memory and code intelligence for AI agents.
+
+In practical terms: a persistent, inspectable memory and code index that AI
+coding agents (for example Claude Code, over MCP) can query across sessions.
+
+Mindspace keeps what you and your agents know in one local SQLite file, with
+the evidence behind it and its history over time, and lets an agent query it
+over [MCP](https://modelcontextprotocol.io). It indexes your notes and your
+Git repositories (Rust code is parsed into definitions), answers "where is X
+defined?" and "what did we decide about Y?", and can tell you where each
+answer came from.
+
+**Status: pre-alpha, version 0.5.0** (the crate version; earlier 0.x numbers
+were internal milestones, only `v0.2.0` and `v0.3.0` are tagged). Command-line
+output, JSON shapes and the database schema can still change. Read [Known limits](#known-limits) before you
+point it at anything you care about.
+
+- **Local.** One binary (`mind`), one SQLite file. No server and no account.
+  In Mindspace's own source the only network client is the optional
+  embedding-model download (`mind model install`, from Hugging Face, checked
+  against a pinned manifest); a search of the source found no other HTTP or
+  socket use outside tests. This was not verified for external processes such
+  as the `git` binary it runs, nor by observing traffic, so it is not a
+  guarantee of network silence.
+  The sandbox does not block network access (see [Security model](#security-model)).
+- **Deterministic.** Parsing, Git facts and lexical search need no AI model.
+  Semantic search is an optional extra.
+- **Inspectable.** A memory traces back to its evidence and source. Old
+  versions are superseded, never silently overwritten.
+- **Sandboxed for agents.** The MCP repository tools restrict their *file
+  system* access with a Linux Landlock sandbox to the directories you allow,
+  the database directory and what the process needs to run. Network access,
+  signals and reading `/proc` are not restricted (details and limits under
+  [Security model](#security-model)).
+
+## What it does today
+
+| You want to... | Use | Needs a model? |
+| --- | --- | --- |
+| Remember a decision or fact and find it later | **Memory**: `memory_create`, `memory_search` (MCP) | No |
+| Ask "where is `Foo` defined, at which commit?" | **Repo ingestion** + `code_search` / `mind symbols` | No |
+| Search notes and docs by meaning, not keywords | **Semantic search** (`--mode semantic`/`hybrid`) | Yes, optional, about 550 MB |
+
+**Memory.** Three different things feed it, and they are kept apart:
+*explicit creation* (you or an agent deliberately write a fact or decision,
+for example through the MCP tool `memory_create`), *document-based ingestion*
+(`mind ingest` turns Markdown/text files and Git repositories into memories
+through deterministic parsing, each tied to its source file and commit) and
+*automatic conversation capture*, which **does not exist**: Mindspace does not
+record chats or sessions and does not extract memories from conversations by
+itself; an agent remembers only what it explicitly writes. Memories belong to *spaces*. A space is a named
+knowledge domain such as `coding` or `project-x`; spaces can import each other
+so a project can use general knowledge without everything being visible
+everywhere (`mind space link coding linux`). Each memory has a
+lifecycle: active, superseded by a newer one, or retired. You can ask what was
+true at an earlier time (`mind search --at`) and list conflicting memories.
+
+**Repo ingestion.** Reads *committed* Git objects and refs (not your
+uncommitted working tree) into the database. Markdown and text files become
+searchable documents. Rust files are parsed with Tree-sitter into definitions
+(functions, methods, structs, enums, traits, modules, constants, ...) with file, line range and signature, tied to
+the commit they came from. Re-ingesting an unchanged repository does no new
+work.
+
+**Semantic search (optional).** Search by meaning with a local embedding model
+(nomic-embed-text v1.5, run on the CPU through Candle). It is off until you
+enable it, install the model and run the indexer. Lexical search (SQLite FTS5)
+always works and is the default.
+
+## Install
+
+Requirements: Linux (the MCP repository tools need Linux 6.2 or newer with
+Landlock; only Linux has been built and tested), Git, a C compiler (SQLite and
+Tree-sitter are built from source) and a Rust toolchain. The repository pins Rust 1.98.1 in
+`rust-toolchain.toml`, which `rustup` installs for you (install Rust with
+[rustup](https://rustup.rs) if you do not have it).
 
 ```sh
+git clone https://github.com/VikingOwl91/mindspace.git
+cd mindspace
+cargo build --release          # produces target/release/mind
+```
+
+```sh
+export PATH="$PWD/target/release:$PATH"   # so that `mind` works in this shell
+mind --version
+```
+
+This is the only install path that has been tested; there are no prebuilt
+binaries yet. The build takes a few minutes.
+
+## Quickstart (no AI model needed)
+
+This ingests the Mindspace checkout itself, so the example queries have
+something to find. Run it from the repository directory after building:
+
+```sh
+export MINDSPACE_DB="$HOME/.local/share/mindspace-demo/mind.db"   # any path outside a repository; created if missing
 mind init
-mind ingest ./notes.md --space coding
-mind ingest ~/Documents --space personal   # directory: full source-lifecycle scan
-mind ingest ~/src/owlry --space coding     # git repo: HEAD + worktrees, full ref journal
-mind ingest ~/src/owlry --space coding --branches --remotes --tags   # more current views
-mind ingest ~/src/owlry --space coding --history   # every ref tip, no stale retirement
-# tags always become "Release <name>" memories (ADR-024)
-mind scan ~/src/owlry [--depth 2]          # read-only outline, no database
-mind repo info ~/src/owlry [--json]        # identity, HEAD, remotes + slug, worktrees (read-only)
-mind ingest ~/src/owlry --space coding --path crates/core --path docs   # targeted
-mind space list
-mind space create eragon
-mind space link coding linux
-mind search "Wayland protocol" [--space coding] [--at RFC3339] [--include-superseded] [--include-retired] [--mode lexical|semantic|hybrid|auto] [--json]
-mind recall "why did we choose Slint?" [--space coding] [--limit 5] [--mode lexical|semantic|hybrid|auto] [--json]
-mind inspect <memory> [--json]
-mind structure <path-or-blob> [--json]
-mind symbols <name or words> [--space S] [--kind fn|struct|...] [--repo owner/name] [--path P] [--all-versions] [--json]
-mind trace <memory> [--json]
-mind history <subject words...> [--json]
-mind conflicts [--json]
-mind retire <memory> [--reason "why"]
-mind model list
-mind model info <id>
-mind model install <id> [--yes]
-mind model use <id>
-mind embeddings enable [--yes]
-mind embeddings disable
-mind embeddings status
-mind index run [--batch-size 32] [--limit <count>]
-mind index status
-mind mcp                                      # local MCP server over stdio
+mind space create demo
+mind ingest . --space demo                        # a Git repository with at least one commit, or a folder of notes
+mind symbols ingest_confined --space demo         # where is this defined? (Rust definitions)
+mind search "sandbox minimum ABI" --space demo    # keyword search over the documents
+mind space list                                   # see what is stored
 ```
 
-`--json` on informational commands prints the exact engine structs, so
-scripts and humans see the same data. Treat the JSON shape as unstable
-pre-alpha output: it may change without notice while the model settles.
-Every command honors a global `--db`
-flag (or `MINDSPACE_DB`); the default database lives under
-`$XDG_DATA_HOME/mindspace/mind.db`.
+To use your own project, replace `.` with its path. Code definitions appear
+only for Rust files; Markdown and text files are searchable for any project.
+A real run on this repository (commit `5cfacb1`, 0.9 s to ingest) printed, for
+`mind symbols`:
 
-The MCP server exposes explicit memory writes. It does not automatically extract memories from conversations or documents.
-
-### MCP server
-
-Initialize the database once with `mind init`, create the spaces you need, then run `mind mcp`. The server uses newline-delimited JSON-RPC over stdin/stdout and the MCP protocol version `2025-06-18`. Diagnostics go to stderr; stdout is reserved for protocol messages. EOF on stdin shuts the process down cleanly.
-
-The server exposes fourteen tools:
-
-| Tool | Purpose |
-| --- | --- |
-| `memory_create` | Create an explicit manual memory. Requires existing spaces; the optional subject defaults to the first non-empty content line. |
-| `memory_update` | Supersede an active manually created memory. Document-derived memories are rejected. |
-| `memory_retire` | Retire an active memory without deleting its history. |
-| `memory_get` | Read a memory and its assertion, evidence, source, spaces, and lifecycle. |
-| `memory_search` | Search with SQLite FTS5, optional directed space traversal, and transaction-time filtering. |
-| `code_search` | Find definitions (functions, structs, ...) in ingested Rust code by name, signature, or path, optionally scoped to `spaces` or a `repository` (owner/name slug). Returns locations, not memories; current definitions only unless `all_versions`. |
-| `repo_outline` | Outline a directory or git repository (HEAD) without ingesting: files, bytes, kinds per directory, plus repository facts (slug, remotes, worktrees) for git. Allowlisted paths only. |
-| `repo_ingest` | Ingest a directory or repository, optionally only chosen `paths`, into existing spaces. Allowlisted paths only; unscoped ingest of very large trees is refused. |
-| `memory_history` | List episodes for a normalized subject. |
-| `memory_conflicts` | List active same-subject memories sharing a space. |
-| `memory_add_spaces` | Add existing spaces to an active memory. |
-| `space_create` | Create a space. |
-| `space_list` | List spaces and active-memory counts. |
-| `space_link` | Add a directed space import link. |
-
-Manual content is stored as a `manual` source at `manual://writes`, with an immutable evidence row and a `manual:write` assertion extraction marker. The chain remains source -> evidence -> assertion -> memory, and the source kind distinguishes these writes from files. Exact duplicate subject/content writes reuse the assertion and active episode; they only add newly requested spaces. Recreating a retired manual memory makes a new episode on the existing assertion. Updates create or reuse a successor and set the old episode's supersession link. An unchanged subject/content update is a no-op apart from requested missing spaces.
-
-Updates are restricted in storage to active memories whose source and extraction provenance are manual. `memory_update` does not rewrite an ingested file or its provenance. Change a document at its source and re-ingest it instead. If a document-derived memory is retired while its source still contains the claim, re-ingesting that unchanged source can recreate the memory.
-
-Writes use SQLite WAL, a five-second busy timeout, and immediate transactions. Lock contention is returned as an error after the timeout; Mindspace does not blindly retry writes. SQLite transactions keep each multi-row write atomic.
-
-`repo_outline` and `repo_ingest` are disabled unless the server is started with `--allow-root <DIR>[:ro|:rw]` (or `MINDSPACE_MCP_ALLOW_ROOTS`, e.g. `/a:ro:/b:rw`). Only absolute paths inside those directories are accepted (ADR-026). `repo_outline` works on any root; `repo_ingest` needs a read-write root, which is also what a root without a suffix is. `repo_ingest` writes to the database and, for git repositories, a repository identity marker into the repository's `.git` directory, so allow specific project directories, not your home directory, and mark directories that an agent should only look at as `:ro`. A root without a suffix is read-write for backward compatibility; that is not least privilege, so always write the suffix. `--ingest-timeout <SECONDS>` (default 30) is a **deadline for the preparation of an ingest, not an end-to-end timeout.** Until the database write starts, `repo_ingest` checks it at every step, kills a git that is still running when it expires, and then fails without changing the database. Once the write has started it always runs to its end, so a call can take much longer than the limit; on a first ingest of a large repository most of the time is spent in that write. A successful result reports `elapsed_ms`, `limit_ms` and `over_limit`: `over_limit: true` only means the call finished after the limit had passed (the ingest is complete and was not rolled back or cut short), and `false` means it finished within it. A client with a shorter tool timeout can still give up on a long first ingest (ADR-026). Do not allow directories that untrusted local processes can modify: a path can be swapped for a symlink while an ingest runs (known limitation, see the ADR-026 addendum).
-
-**Sandbox (Linux).** When roots are configured, `mind mcp` confines itself with Landlock before it serves (ADR-029): it can then read and write only the allowed roots (read-write or read-only), its own database directory and what it needs to run. This stops repositories and directory entries that point outside the roots (a `.git` symlink, a `gitdir:` file, alternates, a linked worktree whose main repository is elsewhere) and swaps of a path while an ingest runs. It needs Linux 6.2 or newer with Landlock enabled (ABI 3), and a database directory of its own that neither contains nor lies inside an allowed root; the default `$XDG_DATA_HOME/mindspace` qualifies. Enforcement is verified by observation at every start, not assumed. If the sandbox cannot be established or verified, `repo_outline` and `repo_ingest` are off with the reason in every error and the other tools keep working. `--insecure-no-sandbox` runs the repository tools without the kernel sandbox, for trusted input only: it warns on every start, every result says `sandbox: DISABLED`, and only the application layer protects, which has documented gaps (ADR-029). On other platforms the repository tools stay off. Before a release, run `scripts/security-profile.sh` (it needs the kernel support above).
-
-An end-to-end agent test drives the real binary through MCP (outline, targeted ingest, symbol search, then opens the reported file at the reported commit). `cargo test --test agent_e2e` runs it on a fixture. `MINDSPACE_E2E_REPO=<repo dir> cargo test --test agent_e2e real_repo -- --nocapture` runs it on any repository; only a copy of its `.git` directory is used.
-
-The server is local-only: it has no HTTP transport or authentication. Anyone who can start or communicate with the configured process can call its tools, including persistent write tools. Review client permissions and confirmations accordingly. Space links organize retrieval; they do not enforce confidentiality. Manual content is an explicit user-authored assertion, not an independently verified fact. No confidence score is inferred.
-
-#### Codex configuration
-
-Codex reads MCP servers from `~/.codex/config.toml`. This local stdio example uses the documented `[mcp_servers.<name>]` table:
-
-```toml
-[mcp_servers.mindspace]
-command = "mind"
-args = ["--db", "/absolute/path/to/mind.db", "mcp", "--allow-root", "/absolute/path/to/your/repos"]
-enabled = true
+```text
+1. function ingest_confined
+   pub fn ingest_confined<S: AsRef<str>>(
+   src/ingest/confined.rs:392-442  @ 5cfacb1c320e in VikingOwl91/mindspace   (file, lines, commit, repository)
+   spaces: demo
 ```
 
-#### OpenCode configuration
+and, for `mind search`, the matching section of the architecture decision
+record with its source file and commit, so you can see where it came from.
+Add `--json` to any command for machine-readable output (unstable format).
 
-OpenCode supports local MCP servers in `opencode.json` (or `opencode.jsonc`) with a `type` of `local` and an argument-array `command`:
+## Use it from Claude Code (MCP)
+
+Mindspace ships an MCP server (`mind mcp`, stdio only). Create the database and
+a space first (`mind init`, `mind space create demo`, using the same
+`--db`/`MINDSPACE_DB` as in the config below), then add a project-level
+`.mcp.json` (or pass the same file with `claude --mcp-config`):
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
+  "mcpServers": {
     "mindspace": {
-      "type": "local",
-      "command": ["mind", "--db", "/absolute/path/to/mind.db", "mcp", "--allow-root", "/absolute/path/to/your/repos"],
-      "enabled": true
+      "command": "/abs/path/to/mind",
+      "args": [
+        "--db", "/abs/path/to/data/mind.db",
+        "mcp",
+        "--allow-root", "/abs/path/to/your/repos:rw",
+        "--allow-root", "/abs/path/to/reference-repos:ro"
+      ]
     }
   }
 }
 ```
 
-These examples use an explicit database path. Mindspace also honors `MINDSPACE_DB` and otherwise uses `$XDG_DATA_HOME/mindspace/mind.db` (falling back to `$HOME/.local/share/mindspace/mind.db`). Configuration syntax was checked against the [Codex MCP guide](https://developers.openai.com/codex/extend/mcp/) and [OpenCode MCP server guide](https://opencode.ai/docs/mcp-servers/).
+Rules that matter:
 
-Intended but not built yet:
+- The **database directory must be its own directory** and must not contain, or
+  lie inside, an allowed root. (The default location qualifies.)
+- `:rw` roots may be ingested; `:ro` roots may only be outlined. Always write
+  the suffix. Allow specific project folders, not your home directory.
+- Without `--allow-root`, `repo_outline` and `repo_ingest` are off; the memory
+  tools still work.
+- Check the sandbox: every `repo_ingest`/`repo_outline` result (visible in the
+  tool-call details of your client) contains a `sandbox` field. It must read `enforced (Landlock, ABI 3 or newer, fully
+  enforced, canary verified)`. If the sandbox cannot be established, the
+  repository tools switch themselves off and say why.
 
-```sh
-mind space use project:owlry
-mind serve
-```
+What was verified: a project-level `.mcp.json` with this content was picked up
+by Claude Code 2.1.319 (headless) as a connected project server and answered a
+tool call. The same configuration (loaded with `--mcp-config`) was exercised with a real Claude Code 2.1.319 client in headless mode by
+[`scripts/mcp-e2e-claude.py`](scripts/mcp-e2e-claude.py): tool discovery,
+ingestion, symbol questions checked against the source, refusal of paths
+outside the roots, restart, re-ingest, repository changes and crash recovery
+(40/40 checks, report in
+[`docs/reviews/mind-21-mcp-e2e.md`](docs/reviews/mind-21-mcp-e2e.md)). Not
+verified: `claude mcp add` (the same settings, entered on the command line),
+the interactive UI, and other MCP clients. A Codex and an OpenCode example are
+in [`docs/reference.md`](docs/reference.md).
 
-Future interfaces may include an HTTP API and SDKs. They should remain adapters over the same core rather than defining the memory architecture themselves.
+Typical agent use: `repo_outline` (see what is there), `repo_ingest` with
+`paths` for the parts you need, `code_search` for definitions,
+`memory_search` for documents and decisions.
 
-## Implementation direction
+## Known limits
 
-Rust is the current implementation choice.
+Please read these; they are the difference between a surprise and a plan.
 
-v0 is built with deliberately boring components:
+- **Only Rust code is indexed.** Other source files are not parsed. A C++
+  repository ingests its Markdown/text documents but yields no code
+  definitions, and `code_search` finds nothing for its functions.
+- **Only committed content is indexed.** Uncommitted and untracked files are not
+  read. Symbolic links are skipped when ingesting a folder (checked with a
+  link to a file outside the folder) and are not read from Git trees.
+- **First ingest of a large repository can take minutes.** `--ingest-timeout`
+  (default 30 s) is a deadline for the *preparation* of an ingest, **not** an
+  end-to-end timeout. Once the database write starts it always runs to its
+  end, so a call can far exceed the limit; the result then says
+  `over_limit: true` and is complete. Observed ([report](docs/reviews/mind-21-mcp-e2e.md)): ingesting `llama.cpp`
+  (3,003 files, 220 documents, 629 MB `.git`) took 96 to 102 s, and the Claude
+  Code client waited for it. There is no progress report, and a client with a short
+  tool timeout may give up. Use `repo_outline` and `paths` to ingest a part.
+- **A crash during an ingest can leave a partial state.** After `SIGKILL` the
+  database stays consistent (SQLite integrity check passes) but may hold Git
+  trees without their code entities; re-running the ingest repairs it.
+- **Re-ingesting a changed repository re-derives all its documents** (they are
+  bound to the commit), which costs time on big repos.
+- **Local and unauthenticated.** MCP is stdio only. Anyone who can start or
+  talk to the process can call all its tools, including writes. Spaces
+  organize retrieval; they are not access control.
+- **Platforms.** The repository tools need Linux 6.2+ with Landlock. They have
+  been tested on one kernel (7.2) and one distribution. Containers, Nix/Guix,
+  overlay, NFS/FUSE, `hidepid` and genuinely old kernels are untested. On
+  other operating systems the repository tools stay off and the code paths
+  have not been compiled.
+- **Pre-alpha.** The database schema has migrations, but formats may change;
+  keep a copy of data you cannot recreate.
 
-- clap for the CLI
-- serde for serialization
-- rusqlite with bundled SQLite (FTS5 guaranteed, no system dependency)
-- pulldown-cmark for deterministic markdown parsing
-- UUIDv7 ids and RFC 3339 timestamps at the edges
-- no async runtime: nothing in v0 benefits from one; a future server can
-  revisit that decision (ADR-001 in docs/decisions.md)
+## Security model
 
-PostgreSQL support should be considered in architectural boundaries from the beginning, but does not need to be implemented before the memory model is proven. The `Store` trait is that boundary; v0 ships exactly one SQLite implementation behind it.
+`mind mcp` is meant to be given to an AI agent, so the agent is not trusted
+with your disk and repositories you ingest are not trusted either.
 
-The repository stays a single crate rather than prematurely splitting every subsystem into its own crate. Stable subsystem boundaries can become workspace crates later.
+1. **Kernel layer (Linux Landlock, ABI 3+).** Before serving, the process
+   restricts its file system access to the allowed roots (read-write or read-only), its own
+   database directory and what it needs to run, re-executes itself, and then
+   *proves* the restriction with probes (reads and writes that must be denied).
+   If any step fails, the repository tools are disabled; there is no silent
+   downgrade.
+2. **Application layer (always on).** Paths are opened and checked as
+   descriptors, Git is pinned to the opened directory, `.git` symlinks,
+   `gitdir:` pointers, alternates and linked worktrees that point outside the
+   roots are refused, and `:ro` roots are never written (not even the
+   repository identity marker that `repo_ingest` normally writes into `.git`).
+3. **Hardened Git.** Git runs with user and system config ignored, hooks and
+   fsmonitor off, replace refs off and `GIT_*` variables from the environment
+   removed.
 
-The actual layout is:
+Opt-out: `--insecure-no-sandbox` runs only layer 2. It prints a warning on
+every start and every result says `sandbox: DISABLED`. Layer 2 alone leaves one
+measured gap: a file that appears in the Git directory *after* the checks
+(for example an alternates file) can be read (1 leak in 5,626 randomized
+attempts, 0 in 700 targeted ones). Use the opt-out only for trusted input.
+
+Not restricted by the sandbox: network access, signals and reading `/proc`.
+The full analysis, test method and residual risks are in ADR-029 (ADR =
+architecture decision record) in
+[`docs/decisions.md`](docs/decisions.md). Before a release, run
+`scripts/security-profile.sh` (about 5 minutes, needs the kernel support).
+
+## Architecture in one page
 
 ```text
-src/
-  core/        domain types, ids/timestamps/hashes, the error type
-  storage/     the Store trait and the SQLite implementation
-  embeddings/  trusted model manifest and management; optional Candle CPU runtime
-  indexing/    incremental backfill of assertion embeddings
-  ingest/      deterministic document and Rust syntax parsing, ingest orchestration
-  retrieval/   lexical and mode-aware search orchestration, directed space traversal
-  mcp/         synchronous JSON-RPC MCP protocol and tool adapter
-  cli/         clap definitions and human/JSON rendering
-
-docs/
-  architecture.md
-  memory-model.md
-  decisions.md
-  v0.5-relationship-design.md
-  future-export-and-composition.md
-  reviews/
-    v0-architecture-review.md  historical adversarial review
-
-migrations/
-  0001_init.sql
-  0002_source_lifecycle.sql
-  0003_git_ingest.sql
-  0004_code_structure.sql
-  0005_code_relationships.sql
-  0006_manual_writes.sql
-  0007_embeddings.sql
-tests/
-  invariants.rs   domain invariants against real SQLite files
-  lifecycle.rs    source identity and lifecycle scenarios
-  cli.rs          end-to-end runs of the mind binary
-  code_structure.rs deterministic syntax structure scenarios
-  embeddings.rs   embedding derivation and storage behavior
-  indexing.rs     incremental assertion embedding indexing
-  git_ingest.rs   Git topology and incremental-ingest scenarios
-  manual_memory.rs manual provenance, deduplication, and lifecycle scenarios
-  models.rs       manifest, model status, and artifact verification
-  mcp.rs          real-binary protocol and process-concurrency scenarios
-  retrieval.rs    retrieval modes, RRF fusion, and fallback scenarios
-
-examples/
-  example.md      sample Markdown source
+ files / Git repos                    MCP client (e.g. Claude Code)
+        |                                      |  stdio, JSON-RPC
+        v                                      v
+  deterministic ingest  ---------->   mind mcp  (Landlock sandbox)
+  (Markdown, Git graph,                        |
+   Tree-sitter for Rust)                       v
+        |                          retrieval: FTS5 | vectors | RRF fusion
+        v                                      |
+ +----------------------- SQLite (WAL) -----------------------+
+ | source -> evidence -> assertion -> memory   (+ spaces)     |
+ | Git objects, refs journal, code derivations & entities     |
+ +-------------------------------------------------------------+
 ```
 
-## Non-goals for the first implementation
+- **Rust, single crate**, `rusqlite` with bundled SQLite (FTS5 included), no
+  async runtime, `clap` CLI, a synchronous MCP server.
+- **Provenance.** The *source* is a file at a commit (or a manual write); the
+  *evidence* is the exact text taken from it; an *assertion* is the statement
+  extracted from that evidence; a *memory* is an assertion with a lifecycle
+  (active, superseded, retired). `mind trace` and
+  `mind inspect` show the chain. Derived code facts record the extractor and
+  grammar versions that produced them.
+- **Temporal memory.** Every state change records its transaction time, so
+  `mind search --at <time>` answers what was active then. Valid time (when a
+  statement was true in the world) is approximated by the ingestion time.
+  Superseded and retired memories stay inspectable, and Git refs are recorded
+  as a journal.
+- **Spaces** group memories by domain, link as directed imports and are
+  traversed cycle-safely.
 
-The first implementation does not need to:
+Details: [`docs/architecture.md`](docs/architecture.md),
+[`docs/memory-model.md`](docs/memory-model.md) and the decision log
+[`docs/decisions.md`](docs/decisions.md).
 
-- support every database
-- require or bundle an LLM
-- require embeddings
-- expose a network or authenticated MCP transport
-- solve every document format
-- automatically infer every relationship
-- become a hosted cloud product
-- prematurely optimize distributed operation
+## Feature matrix
 
-The first job is to establish a durable and inspectable memory model that works locally.
+| Feature | State | Evidence |
+| --- | --- | --- |
+| Markdown/text ingest, lifecycle, supersession, retirement | Implemented | `tests/lifecycle.rs`, `tests/invariants.rs` |
+| Git ingest (objects, refs journal, worktrees) | Implemented | `tests/git_ingest.rs`, `tests/git_hardening.rs` |
+| Rust definitions (Tree-sitter), `mind symbols`, `code_search` | Implemented | `tests/code_structure.rs`, `tests/code_search.rs`, `tests/code_classification.rs` |
+| Lexical search (FTS5), temporal queries (`--at`), conflicts, spaces | Implemented | `tests/retrieval.rs`, `tests/m6_temporal.rs`, `tests/scopes.rs` |
+| MCP server, 14 tools, real-binary protocol tests | Implemented | `tests/mcp*.rs` |
+| Separate read-only and read-write roots | Implemented | `tests/mcp_allowlist_modes.rs` |
+| Landlock sandbox + application layer for repository tools | Implemented (Linux) | `tests/ingest_confinement.rs`, `tests/sandbox_failure_modes.rs`, `scripts/security-profile.sh` |
+| Preparation deadline for ingest (`--ingest-timeout`) | Implemented, see limits | `tests/mcp_ingest_timeout.rs` |
+| Semantic and hybrid search (local Candle model) | Experimental: optional, one model, CPU only | `tests/embeddings.rs`, `docs/retrieval-performance.md` |
+| Code relationships (imports/references as observations) | Experimental: stored, not queryable yet | `tests/code_structure.rs` |
+| Callers / implementors queries | Planned | |
+| More languages (TypeScript, then Python) | Planned | |
+| Asynchronous ingest jobs / interruptible write phase | Planned, not decided | |
+| Document formats beyond Markdown/text, knowledge graph | Planned, scope open | |
+| HTTP transport, authentication, PostgreSQL, GUI | Not planned for now | |
 
-## Status
+"Planned" means intended, not promised, and has no date.
 
-**v0.5.0 explicit manual memories and local MCP server implemented.**
+## Benchmarks
 
-The core data model (sources -> evidence -> assertions -> memories, spaces,
-temporal state, provenance) is specified in `docs/memory-model.md`, built,
-and tested. What works today:
+All numbers come from `scripts/bench-baseline.sh` (ingest, symbol query, DB
+size; median of 5 fresh databases, release build, Linux 7.2.14-zen, one local
+machine, warm file cache, no CPU isolation) and from the notes in
+[`docs/retrieval-performance.md`](docs/retrieval-performance.md). They describe
+this machine on that day, not a guarantee. Reproduce with
+`scripts/bench-baseline.sh` (set `MINDSPACE_BENCH_REPO="<repo>..."` to add your
+own repositories; only a copy of their `.git` is used).
 
-- deterministic ingest of markdown and plain text into a local SQLite
-  database (bundled, FTS5 full-text search), for single files or whole
-  directory trees
-- idempotent re-ingestion with exact reconciliation semantics: reuse,
-  supersession, retirement, space completion
-- logical source identity with full lifecycle: renames, moves, copies,
-  disappearances, and reappearances are deterministic facts, not new
-  knowledge; historical provenance is never rewritten
-- spaces as first-class domains with directed links, cycle-safe traversal,
-  and conflict listing
-- temporal queries (`search --at`) over the stored timeline
-- full provenance chains (`inspect`, `trace`) that never lose history:
-  superseded and retired memories stay inspectable forever
-- git repository ingest: committed objects (commits, trees, blobs, tags)
-  as immutable graph nodes, refs as a transaction-time journal, text blobs
-  at ref tips derived through the normal evidence/assertion pipeline
-- Rust source structure through Tree-sitter: immutable, versioned syntax
-  derivations with entities, containment, ranges, and raw imports. Syntax
-  facts are not Memories; inspect them with `mind structure <path-or-blob>`.
-- a CLI (`mind`) with human and `--json` output
-- explicit manual memory creation, updates, retirement, retrieval, and space membership through the MCP tools; document-derived memory updates are rejected
-- a fourteen-tool MCP server over stdio with real-binary protocol tests
-- SQLite WAL, five-second busy timeout, and `BEGIN IMMEDIATE` write transactions, with no automatic retry
+| Target (at commit) | Git objects | Ingest | Symbol query (net of 3 ms process start) | DB size |
+| --- | ---: | ---: | ---: | ---: |
+| Synthetic: 2,400 Rust files, 6 revisions, 206 tags | 29,976 | 5.5 s | 42 ms | 52 MiB |
+| gpui-shell (`7e6298d`) | 6,575 | 3.7 s | 23 ms | 38 MiB |
+| mindspace (`c6df2a9`) | 469 | 0.7 s | 9 ms | 12 MiB |
 
-What git ingest observes and what it defers: it reads committed objects and
-refs only. Uncommitted working-tree content belongs to no ref and is not
-modeled (a future working-tree observation would be its own session kind,
-not a fake commit). Fast-forward is claimed only when provable by git's own
-ancestor check; rewritten history is recorded as non-fast-forward without
-guessing rebase or force-push. Same blob at two paths or two branches is one
-object with separate derivations; two clones stay two repositories, qualified
-by their own identity markers. See `docs/memory-model.md` section 12.
+Other observations (single runs, not baselines): ingesting this repository at
+`5cfacb1` took 0.9 s on a fresh database. Ingesting `llama.cpp` (documents
+only, no Rust) took about 100 s, see [Known limits](#known-limits); where that time goes has
+not been analyzed. Semantic search: in one MCP session a repeated query took
+about 78 ms after the model was loaded, against about 590 ms before the
+runtime was cached (first query of a process still verifies and loads the
+547 MB model); lexical queries took about 2 ms (fixture of 100 assertions).
+The benchmarks above were taken before the sandbox was added; the effect of the
+sandbox on start-up time has not been measured separately. No comparison with
+other tools has been made.
 
-Embeddings have a trusted local model manifest, optional Candle CPU runtime,
-explicit installation/selection, and manual incremental indexing. CLI search
-and recall, and MCP `memory_search`, accept `--mode` / `mode` with `lexical`,
-`semantic`, `hybrid`, or `auto`:
+## Develop and test
 
-```bash
-mind search "SQLite" --mode lexical
-mind search "borrow checking" --mode semantic --json
-mind search "local storage" --mode hybrid
-mind recall "deployment notes" --mode auto
+```sh
+cargo test                              # about 430 tests, no model download needed
+cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
+cargo deny check && cargo audit         # dependencies: advisories, licenses
+python3 scripts/check-doc-links.py      # relative links in the docs
+scripts/security-profile.sh             # sandbox gate (Linux, ~5 min)
+python3 scripts/mcp-e2e-claude.py       # real Claude Code client (needs `claude`, uses your account)
+scripts/bench-baseline.sh               # benchmarks
 ```
 
-Recall remains ranked retrieval: it presents the top stored memory and related
-evidence, not generated text.
+## More documentation
 
-Omitting the option preserves the legacy lexical path and output: CLI `--json`
-remains an array, and MCP returns `{ "hits": [...] }`. Explicit modes return a
-mode-aware outcome with `requested`, `effective`, `fallback`, lexical and
-semantic candidate counts, and hits. Each hit wraps the existing hit fields in
-`hit`, names the score with `score_kind` (`lexical`, `semantic`, or `fused`),
-and records branch ranks and scores in `provenance`. Mode and score-kind values
-are stable lowercase strings. Fallback is `null` or a tagged object such as
-`{"kind":"no_semantic_candidates"}`. The CLI JSON output is this outcome
-object; MCP puts the same object in `structuredContent` and its JSON text
-content.
+- [`docs/reference.md`](docs/reference.md): design principles, the full command
+  list, MCP details, search modes, Codex/OpenCode configuration.
+- [`docs/architecture.md`](docs/architecture.md), [`docs/memory-model.md`](docs/memory-model.md)
+- [`docs/decisions.md`](docs/decisions.md): decision log (ADR-001 to ADR-029)
+- [`docs/reviews/`](docs/reviews/): architecture review and the MCP end-to-end report
+- [`SECURITY.md`](SECURITY.md) (how to report a vulnerability, scope) and
+  [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Roadmap: there is no public roadmap file yet; the "planned" rows of the
+  feature matrix are the current intent.
 
-Scores are retrieval signals, not confidence or authority, and values of
-different kinds must not be compared. `auto` uses hybrid when semantic search is
-ready and returns candidates. Otherwise it uses lexical and reports the reason,
-including when a positive-limit search has no hits. Explicit `semantic` and
-`hybrid` requests fail with an actionable error when embeddings are unavailable.
-Hybrid and Auto preserve ADR-012 behavior: after query filters, each branch
-deduplicates by assertion and uses the first-ranked eligible memory episode as
-its representative. Legacy lexical and Semantic results remain episode-level;
-the lexical fallback for no semantic candidates also remains episode-level.
+## License
 
-Semantic and Hybrid require embeddings to be enabled, a supported local model
-selected and installed, and vectors indexed for its derivation key (`mind
-embeddings enable`, `mind model install`, `mind model use`, then `mind index
-run`). Search never downloads, installs, indexes, or writes metadata. Lexical
-mode requires no model. Without default features, lexical retrieval still works;
-semantic and hybrid are unavailable, while Auto visibly falls back to lexical.
-
-Semantic, Hybrid, and Auto check current model selection, enablement and index
-readiness on every request. CLI searches verify artifacts independently. An
-MCP session can retain one SHA-verified, loaded runtime on Linux/btrfs when
-artifact and directory identities remain unchanged. First use still hashes
-all 547,649,564 bytes of the current Nomic artifacts. Changes or uncertainty
-invalidate reuse; other filesystems and platforms use the uncached path.
-Metadata detects changes after verification, never proves integrity by size or
-mtime alone. Warm requests still embed queries and scan vectors, and retaining
-weights costs resident memory. See [the lifecycle and performance notes](docs/retrieval-performance.md)
-for the timestamp gate, freshness tradeoff and release measurements.
-
-Explicitly deferred: AI extraction, sync, authentication, HTTP or hosted
-operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only. See
-`docs/decisions.md` for the reasoning behind each choice.
+MIT, see [`LICENSE`](LICENSE).

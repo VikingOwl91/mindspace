@@ -1,4 +1,6 @@
 pub mod code;
+#[cfg(target_os = "linux")]
+pub mod confined;
 pub mod deadline;
 pub mod git;
 pub mod markdown;
@@ -121,6 +123,19 @@ pub fn ingest_path_with_deadline<S: AsRef<str>>(
         )
     };
 
+    record_observed_files(store, root, scope, files, space_ids, deadline)
+}
+
+/// Records an observed set of files (the part of a directory ingest after the
+/// files were read). Shared by the path-based and the anchored directory ingest.
+pub(crate) fn record_observed_files(
+    store: &dyn Store,
+    root: String,
+    scope: IngestScope,
+    files: Vec<ObservedFile>,
+    space_ids: Vec<Uuid>,
+    deadline: &Deadline,
+) -> Result<IngestOutcome> {
     let mut code_inputs = Vec::new();
     for f in &files {
         let Some(language) = code::language_for(Path::new(&f.location)) else {
@@ -305,27 +320,49 @@ pub fn scan_path_with_deadline(
     let root = canonical.display().to_string();
     if git::looks_like_git_repository(&canonical) {
         let reader = git::GitReader::open_with_deadline(&canonical, *deadline)?;
-        let commit = reader.head_commit()?;
-        let files = reader.commit_blob_sizes(&commit)?;
-        return Ok(outline::Outline {
-            root,
-            source: "git".into(),
-            commit: Some(commit),
-            depth,
-            nodes: outline::build_nodes(files, depth),
-        });
+        return scan_git(&reader, root, depth);
     }
+    scan_dir(&canonical, root, depth, deadline)
+}
+
+/// Outline of a git repository at HEAD, through an already opened reader.
+pub(crate) fn scan_git(
+    reader: &git::GitReader,
+    root: String,
+    depth: u32,
+) -> Result<outline::Outline> {
+    let commit = reader.head_commit()?;
+    let files = reader.commit_blob_sizes(&commit)?;
+    Ok(outline::Outline {
+        root,
+        source: "git".into(),
+        commit: Some(commit),
+        depth,
+        nodes: outline::build_nodes(files, depth),
+    })
+}
+
+/// Outline of a plain directory. `base` is where the walk starts; `root` is the
+/// label recorded.
+pub(crate) fn scan_dir(
+    base: &Path,
+    root: String,
+    depth: u32,
+    deadline: &Deadline,
+) -> Result<outline::Outline> {
     let mut files = Vec::new();
-    for file in outline::walk_files(&canonical)? {
+    for file in outline::walk_files(base)? {
         deadline.check("measuring the directory")?;
         let rel = file
-            .strip_prefix(&canonical)
+            .strip_prefix(base)
             .unwrap_or(&file)
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::symlink_metadata(&file)
+            .map(|m| m.len())
+            .unwrap_or(0);
         files.push((rel, size));
     }
     Ok(outline::Outline {
@@ -416,6 +453,28 @@ pub fn ingest_git_repository_selected_with_deadline<S: AsRef<str>>(
     deadline: &Deadline,
 ) -> Result<GitObservationReport> {
     let reader = git::GitReader::open_with_deadline(repo_path, *deadline)?;
+    ingest_git_with_reader(
+        store,
+        reader,
+        repo_path,
+        space_names,
+        selection,
+        scope,
+        deadline,
+    )
+}
+
+/// The body of a git ingest, for a reader that is already bound. `repo_path` is
+/// only the label recorded for the repository and session.
+pub(crate) fn ingest_git_with_reader<S: AsRef<str>>(
+    store: &dyn Store,
+    reader: git::GitReader,
+    repo_path: &Path,
+    space_names: &[S],
+    selection: &outline::PathSelection,
+    scope: GitScope,
+    deadline: &Deadline,
+) -> Result<GitObservationReport> {
     let repository_id = reader.repository_id()?;
     let space_ids = resolve_spaces(store, space_names)?;
 
@@ -828,13 +887,10 @@ fn media_type_of(path: &Path) -> Result<&'static str> {
 
 /// Reads and deterministically parses one file into an observed file.
 fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<ObservedFile> {
-    let media_type = media_type_of(path)?;
+    media_type_of(path)?;
     let bytes = std::fs::read(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
         source: e,
-    })?;
-    let text = String::from_utf8(bytes.clone()).map_err(|_| Error::InvalidEncoding {
-        path: path.display().to_string(),
     })?;
     let location = std::fs::canonicalize(path)
         .map_err(|e| Error::Io {
@@ -843,6 +899,22 @@ fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<ObservedFile> {
         })?
         .display()
         .to_string();
+    observe_bytes(path, bytes, location, space_ids)
+}
+
+/// Builds the observation of one file from bytes that were already read.
+/// `name` decides the media type and title; `location` is what is recorded.
+pub(crate) fn observe_bytes(
+    name: &Path,
+    bytes: Vec<u8>,
+    location: String,
+    space_ids: &[Uuid],
+) -> Result<ObservedFile> {
+    let path = name;
+    let media_type = media_type_of(path)?;
+    let text = String::from_utf8(bytes.clone()).map_err(|_| Error::InvalidEncoding {
+        path: path.display().to_string(),
+    })?;
 
     let stem = file_stem(path);
     let parsed = if media_type == "text/rust" {

@@ -109,6 +109,25 @@ impl Default for McpConfig {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl ingest::confined::PathPolicy for McpConfig {
+    fn governing(&self, real: &Path) -> Option<(PathBuf, ingest::confined::Mode)> {
+        McpConfig::governing(self, real).map(|r| {
+            let mode = match r.access {
+                Access::ReadOnly => ingest::confined::Mode::ReadOnly,
+                Access::ReadWrite => ingest::confined::Mode::ReadWrite,
+            };
+            (r.path.clone(), mode)
+        })
+    }
+
+    fn contains_read_only(&self, dir: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|r| r.access == Access::ReadOnly && r.path != dir && r.path.starts_with(dir))
+    }
+}
+
 /// Parses `--ingest-timeout`: seconds as a decimal number, 0.001 to 3600.
 /// Zero, negative, non-finite and absurdly large values are refused instead
 /// of silently meaning "no limit".
@@ -138,7 +157,11 @@ impl McpConfig {
 
     /// Read-write roots (the behavior of a root without a suffix).
     pub fn new<P: AsRef<Path>>(roots: &[P]) -> Result<Self> {
-        Self::from_roots(roots.iter().map(|r| (r.as_ref().to_path_buf(), Access::ReadWrite)))
+        Self::from_roots(
+            roots
+                .iter()
+                .map(|r| (r.as_ref().to_path_buf(), Access::ReadWrite)),
+        )
     }
 
     /// Roots from `--allow-root` / `MINDSPACE_MCP_ALLOW_ROOTS` values. Each
@@ -231,7 +254,9 @@ impl McpConfig {
     /// Lexical check that a path string lies inside an allowed root, used to
     /// redact paths in responses (it does not touch the filesystem).
     pub fn is_inside(&self, path: &str) -> bool {
-        self.roots.iter().any(|r| Path::new(path).starts_with(&r.path))
+        self.roots
+            .iter()
+            .any(|r| Path::new(path).starts_with(&r.path))
     }
 
     /// Resolves a requested path to a canonical directory inside an allowed
@@ -240,9 +265,11 @@ impl McpConfig {
     /// path, so a symlink cannot move a request into a more permissive root.
     pub fn authorize(&self, raw: &str, need: Access) -> std::result::Result<PathBuf, String> {
         if self.roots.is_empty() {
-            return Err("repository tools are disabled: this server has no allowed roots; \
+            return Err(
+                "repository tools are disabled: this server has no allowed roots; \
                         start it with `mind mcp --allow-root <DIR>` (or MINDSPACE_MCP_ALLOW_ROOTS)"
-                .to_string());
+                    .to_string(),
+            );
         }
         if let SandboxState::Unavailable(reason) = &self.sandbox {
             return Err(format!(
@@ -305,11 +332,9 @@ impl McpConfig {
                     return Err(read_only_message(&root.path));
                 }
             }
-            if let Some(inner) = self
-                .roots
-                .iter()
-                .find(|r| r.access == Access::ReadOnly && r.path != target && r.path.starts_with(&target))
-            {
+            if let Some(inner) = self.roots.iter().find(|r| {
+                r.access == Access::ReadOnly && r.path != target && r.path.starts_with(&target)
+            }) {
                 return Err(format!(
                     "ingesting '{label}' would include the read-only root {}; select paths \
                      that avoid it (see repo_outline) or make that root read-write",
@@ -345,13 +370,15 @@ fn parse_spec(spec: &str) -> Result<Vec<(PathBuf, Access)>> {
         match part {
             "" => return Err(bad("empty path or stray ':' in allowed root")),
             "ro" | "rw" => {
-                let mode = if part == "ro" { Access::ReadOnly } else { Access::ReadWrite };
+                let mode = if part == "ro" {
+                    Access::ReadOnly
+                } else {
+                    Access::ReadWrite
+                };
                 match out.last_mut() {
                     None => {
-                        return Err(bad(
-                            "mode without a path; write PATH:ro or PATH:rw \
-                             (a directory named 'ro' is './ro')",
-                        ))
+                        return Err(bad("mode without a path; write PATH:ro or PATH:rw \
+                             (a directory named 'ro' is './ro')"))
                     }
                     Some((_, Some(_))) => return Err(bad("more than one mode for one path")),
                     Some((_, m)) => *m = Some(mode),
@@ -387,7 +414,20 @@ pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Resu
         .and_then(Value::as_u64)
         .map(|d| d as u32)
         .unwrap_or(2);
-    let mut outline = ingest::scan_path(&path, depth)?;
+    // The authorized directory is opened once and what was opened is checked;
+    // from here on everything goes through that descriptor (ADR-029).
+    #[cfg(target_os = "linux")]
+    let (mut outline, repository) = {
+        let anchor = ingest::confined::Anchor::open(&path, Some(&path), config, false)?;
+        ingest::confined::scan_confined(&anchor, config, depth, &Deadline::none())?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (mut outline, repository): (
+        ingest::outline::Outline,
+        Option<ingest::repo_info::RepoInfo>,
+    ) = return Err(Error::Storage(
+        "the repository tools exist only on Linux".to_string(),
+    ));
     let total = outline.nodes.len();
     let truncated = total > MAX_OUTLINE_NODES;
     if truncated {
@@ -402,17 +442,14 @@ pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Resu
     }
     // Repository facts for choosing a space; worktree paths outside the
     // allowed roots are redacted so the tool cannot be used to learn them.
-    let repository = (outline.source == "git")
-        .then(|| ingest::repo_info::repo_info(&path).ok())
-        .flatten()
-        .map(|mut info| {
-            for w in &mut info.worktrees {
-                if w.path.as_deref().is_some_and(|p| !config.is_inside(p)) {
-                    w.path = None;
-                }
+    let repository = repository.map(|mut info| {
+        for w in &mut info.worktrees {
+            if w.path.as_deref().is_some_and(|p| !config.is_inside(p)) {
+                w.path = None;
             }
-            info
-        });
+        }
+        info
+    });
     Ok(json!({
         "outline": outline,
         "repository": repository,
@@ -451,8 +488,17 @@ pub fn ingest(
         GitScope::Head
     };
 
+    #[cfg(target_os = "linux")]
+    let anchor = ingest::confined::Anchor::open(&path, Some(&path), config, true)?;
+    #[cfg(not(target_os = "linux"))]
+    return Err(Error::Storage(
+        "the repository tools exist only on Linux".to_string(),
+    ));
+
+    #[cfg(target_os = "linux")]
     if selection.is_all() {
-        let total = ingest::scan_path_with_deadline(&path, 0, &deadline)?
+        let total = ingest::confined::scan_confined(&anchor, config, 0, &deadline)?
+            .0
             .nodes
             .first()
             .map(|n| n.ingestable_files)
@@ -466,8 +512,10 @@ pub fn ingest(
         }
     }
 
-    let outcomes =
-        ingest::ingest_paths_with_deadline(store, &path, &selection, scope, &spaces, &deadline)?;
+    #[cfg(target_os = "linux")]
+    let outcomes = ingest::confined::ingest_confined(
+        store, &anchor, config, &selection, scope, &spaces, &deadline,
+    )?;
     // The limit stops the ingest only before it writes; the write itself runs
     // to its end, so a call can finish after the limit. Say so.
     Ok(json!({

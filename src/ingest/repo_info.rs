@@ -70,7 +70,12 @@ pub fn repo_info(path: &Path) -> Result<RepoInfo> {
         });
     }
     let reader = GitReader::open(&canonical)?;
+    repo_info_with_reader(&reader, canonical.display().to_string())
+}
 
+/// Repository facts through an already opened (possibly pinned) reader. `root`
+/// is the label shown.
+pub fn repo_info_with_reader(reader: &GitReader, root: String) -> Result<RepoInfo> {
     let remotes: Vec<RemoteInfo> = reader
         .remotes()?
         .into_iter()
@@ -129,7 +134,7 @@ pub fn repo_info(path: &Path) -> Result<RepoInfo> {
         .collect();
 
     Ok(RepoInfo {
-        root: canonical.display().to_string(),
+        root,
         identity: reader.existing_repository_id()?,
         head,
         slug,

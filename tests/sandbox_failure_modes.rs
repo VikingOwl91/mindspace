@@ -15,6 +15,8 @@
 //! way; its handling (refuse below ABI 3) rests on `HardRequirement` of the
 //! `landlock` crate and the canary probes, which are unit-tested.
 
+#![cfg(target_os = "linux")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};

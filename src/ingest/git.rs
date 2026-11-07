@@ -70,6 +70,20 @@ pub struct GitReader {
     common_dir: PathBuf,
     /// Time limit for every git process this reader starts.
     deadline: Deadline,
+    /// Set for the MCP tools (ADR-029): git is told exactly which directories to
+    /// use and does not look up `.git` again.
+    pin: Option<GitPin>,
+}
+
+/// The repository locations a pinned reader was bound to. The paths go through
+/// `/proc/<pid>/fd/<n>`, so they name the inodes that were checked, whatever the
+/// directory entries are renamed to afterwards. The files keep the descriptors
+/// open for as long as the reader lives.
+#[derive(Debug)]
+pub struct GitPin {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+    pub keep: Vec<std::fs::File>,
 }
 
 impl GitReader {
@@ -80,7 +94,13 @@ impl GitReader {
     /// Like [`open`](Self::open); every git process of the reader is killed
     /// when `deadline` expires.
     pub fn open_with_deadline(path: &Path, deadline: Deadline) -> Result<Self> {
-        let out = run(path, &deadline, &["rev-parse", "--git-common-dir"], None)?;
+        let out = run(
+            path,
+            &deadline,
+            None,
+            &["rev-parse", "--git-common-dir"],
+            None,
+        )?;
         let raw = String::from_utf8_lossy(&out).trim().to_string();
         if raw.is_empty() {
             return Err(Error::GitCommand {
@@ -102,7 +122,20 @@ impl GitReader {
             path: path.to_path_buf(),
             common_dir,
             deadline,
+            pin: None,
         })
+    }
+
+    /// A reader bound to checked locations (see [`GitPin`]). `work` is the
+    /// work tree (the working directory of every git process); the marker lives
+    /// in `pin.common_dir`.
+    pub fn pinned(work: PathBuf, deadline: Deadline, pin: GitPin) -> Self {
+        Self {
+            path: work,
+            common_dir: pin.common_dir.clone(),
+            deadline,
+            pin: Some(pin),
+        }
     }
 
     /// Reads or creates the repository identity marker in the common dir.
@@ -112,7 +145,7 @@ impl GitReader {
     /// fails instead of silently creating a second identity.
     pub fn repository_id(&self) -> Result<Uuid> {
         let marker = self.common_dir.join("mindspace-repository-id");
-        match std::fs::read_to_string(&marker) {
+        match read_marker(&marker) {
             Ok(s) => {
                 let id = s.trim();
                 Uuid::parse_str(id).map_err(|_| Error::RepositoryIdentity {
@@ -122,7 +155,7 @@ impl GitReader {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let id = Uuid::now_v7();
-                std::fs::write(&marker, id.to_string()).map_err(|e| Error::RepositoryIdentity {
+                create_marker(&marker, &id.to_string()).map_err(|e| Error::RepositoryIdentity {
                     path: marker.display().to_string(),
                     reason: format!("cannot write marker: {e}"),
                 })?;
@@ -142,6 +175,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &[
                 "for-each-ref",
                 "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(symref)",
@@ -176,11 +210,18 @@ impl GitReader {
         }
 
         // HEAD: resolved target, plus the symbolic branch when attached.
-        if let Ok(head_oid) = run(&self.path, &self.deadline, &["rev-parse", "HEAD"], None) {
+        if let Ok(head_oid) = run(
+            &self.path,
+            &self.deadline,
+            self.pin.as_ref(),
+            &["rev-parse", "HEAD"],
+            None,
+        ) {
             let oid = String::from_utf8_lossy(&head_oid).trim().to_string();
             let symbolic_target = match run(
                 &self.path,
                 &self.deadline,
+                self.pin.as_ref(),
                 &["symbolic-ref", "-q", "HEAD"],
                 None,
             ) {
@@ -227,7 +268,7 @@ impl GitReader {
         }
         let mut args: Vec<&str> = vec!["rev-list", "--objects", "--no-object-names"];
         args.extend(tips.iter().map(|s| s.as_str()));
-        let out = run(&self.path, &self.deadline, &args, None)?;
+        let out = run(&self.path, &self.deadline, self.pin.as_ref(), &args, None)?;
         let text = String::from_utf8_lossy(&out);
         let mut set = std::collections::BTreeSet::new();
         for line in text.lines() {
@@ -248,6 +289,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["cat-file", "--batch-check"],
             Some(&input),
         )?;
@@ -289,6 +331,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["cat-file", "--batch"],
             Some(&input),
         )?;
@@ -347,6 +390,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["ls-tree", "-r", "-z", commit],
             None,
         )?;
@@ -373,6 +417,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["rev-parse", "--verify", "HEAD^{commit}"],
             None,
         )?;
@@ -401,6 +446,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["worktree", "list", "--porcelain"],
             None,
         )?;
@@ -448,6 +494,7 @@ impl GitReader {
         let out = run_codes(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["config", "--null", "--get-regexp", r"^remote\..*\.url$"],
             None,
             &[0, 1],
@@ -473,7 +520,7 @@ impl GitReader {
     /// The repository identity if a marker already exists; never creates one.
     pub fn existing_repository_id(&self) -> Result<Option<Uuid>> {
         let marker = self.common_dir.join("mindspace-repository-id");
-        match std::fs::read_to_string(&marker) {
+        match read_marker(&marker) {
             Ok(s) => Uuid::parse_str(s.trim())
                 .map(Some)
                 .map_err(|_| Error::RepositoryIdentity {
@@ -494,6 +541,7 @@ impl GitReader {
         let out = run(
             &self.path,
             &self.deadline,
+            self.pin.as_ref(),
             &["ls-tree", "-r", "-l", "-z", commit],
             None,
         )?;
@@ -520,7 +568,7 @@ impl GitReader {
     /// Deterministic ancestor check: is `old` an ancestor of `new`?
     /// Exit code 0 means provably yes; exit 1 means provably no.
     pub fn is_ancestor(&self, old: &str, new: &str) -> Result<bool> {
-        let mut cmd = git_command(&self.path);
+        let mut cmd = git_command(&self.path, self.pin.as_ref());
         cmd.args(["merge-base", "--is-ancestor", old, new])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -542,6 +590,38 @@ impl GitReader {
         }
     }
 }
+
+/// Reads the identity marker without following a symlink at the marker itself:
+/// a marker that was replaced by a link must not make us read elsewhere.
+fn read_marker(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW)
+        .open(path)?;
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// Creates the marker. `create_new` (O_EXCL) never follows a symlink, so a link
+/// planted under the marker name cannot redirect the write.
+fn create_marker(path: &Path, id: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(NOFOLLOW)
+        .open(path)?;
+    f.write_all(id.as_bytes())
+}
+
+#[cfg(target_os = "linux")]
+const NOFOLLOW: i32 = libc::O_NOFOLLOW;
+#[cfg(not(target_os = "linux"))]
+const NOFOLLOW: i32 = 0;
 
 /// Environment variables that must never reach git: every `GIT_*` entry of the
 /// caller is dropped, then the pinned values below are set.
@@ -571,7 +651,7 @@ const PINNED_CONFIG: &[&str] = &[
 
 /// The single place a `git` process is created. `dir` becomes the working
 /// directory; discovery of the repository is therefore based on it alone.
-fn git_command(dir: &Path) -> Command {
+fn git_command(dir: &Path, pin: Option<&GitPin>) -> Command {
     let mut cmd = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
@@ -585,11 +665,23 @@ fn git_command(dir: &Path) -> Command {
         cmd.arg("-c").arg(c);
     }
     cmd.current_dir(dir);
+    if let Some(pin) = pin {
+        // Set after the scrub above: git must not discover `.git` again, because
+        // a directory entry may have been swapped since it was checked.
+        cmd.env("GIT_DIR", &pin.git_dir);
+        cmd.env("GIT_COMMON_DIR", &pin.common_dir);
+    }
     cmd
 }
 
-fn run(path: &Path, deadline: &Deadline, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-    run_codes(path, deadline, args, stdin, &[0])
+fn run(
+    path: &Path,
+    deadline: &Deadline,
+    pin: Option<&GitPin>,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    run_codes(path, deadline, pin, args, stdin, &[0])
 }
 
 /// Like [`run`], but exit codes in `ok_codes` count as success (for commands
@@ -597,12 +689,13 @@ fn run(path: &Path, deadline: &Deadline, args: &[&str], stdin: Option<&[u8]>) ->
 fn run_codes(
     path: &Path,
     deadline: &Deadline,
+    pin: Option<&GitPin>,
     args: &[&str],
     stdin: Option<&[u8]>,
     ok_codes: &[i32],
 ) -> Result<Vec<u8>> {
     deadline.check(&format!("starting `git {}`", args.first().unwrap_or(&"")))?;
-    let mut cmd = git_command(path);
+    let mut cmd = git_command(path, pin);
     cmd.args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -721,10 +814,11 @@ pub fn sandbox_probe(dir: &Path) -> Result<()> {
     // A hung or broken git must not block the start of the server.
     let limit = Deadline::after(std::time::Duration::from_secs(10));
     let result = (|| -> Result<()> {
-        run(&repo, &limit, &["init", "-q"], None)?;
+        run(&repo, &limit, None, &["init", "-q"], None)?;
         let oid = run(
             &repo,
             &limit,
+            None,
             &["hash-object", "-w", "--stdin"],
             Some(b"probe\n"),
         )?;
@@ -732,6 +826,7 @@ pub fn sandbox_probe(dir: &Path) -> Result<()> {
         let out = run(
             &repo,
             &limit,
+            None,
             &["cat-file", "--batch-check"],
             Some(format!("{oid}\n").as_bytes()),
         )?;
@@ -1047,6 +1142,7 @@ mod tests {
             let out = run(
                 &path,
                 &Deadline::none(),
+                None,
                 &["cat-file", "--batch-check"],
                 Some(input.as_bytes()),
             );
@@ -1073,5 +1169,30 @@ mod tests {
         assert_eq!(t.tagger_email, "tag@example.com");
         assert_eq!(t.tag_time, Some(Ts(1_700_000_000_000_000)));
         assert_eq!(t.message, "release one");
+    }
+
+    #[test]
+    fn the_marker_is_never_read_or_created_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.txt");
+        let link = dir.path().join("marker");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // A dangling link: creating "through" it would create the target.
+        assert!(create_marker(&link, "id").is_err());
+        assert!(!target.exists(), "the marker was created through a link");
+        // A link to an existing file: reading "through" it would read the target.
+        std::fs::write(&target, "11111111-1111-1111-1111-111111111111").unwrap();
+        assert!(
+            read_marker(&link).is_err(),
+            "the marker was read through a link"
+        );
+        // The normal path still works, once.
+        let plain = dir.path().join("plain");
+        create_marker(&plain, "abc").unwrap();
+        assert_eq!(read_marker(&plain).unwrap(), "abc");
+        assert!(
+            create_marker(&plain, "again").is_err(),
+            "an existing marker must not be overwritten"
+        );
     }
 }

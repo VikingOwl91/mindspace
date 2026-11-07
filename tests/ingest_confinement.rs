@@ -18,10 +18,14 @@
 //! blind to markdown leaks, which was verified); (2) the tool responses;
 //! (3) a content fingerprint of every tree that must not change.
 //!
-//! STATUS: the attack tests are `#[ignore]`d because they FAIL against the code
-//! as of MIND-4 (observed, see MIND-18). When the fix is in, remove the
-//! attribute: they must then pass reliably. The control tests run normally.
-//! Everything uses temporary directories; no real repository is touched.
+//! RUNNING THEM. All tests run in `cargo test`, with few race attempts (a smoke
+//! check). The mandatory gate is the security profile, `scripts/security-profile.sh`,
+//! which runs the full number of attempts, in both modes (kernel sandbox plus
+//! application layer, and the application layer alone with
+//! `MINDSPACE_TEST_MCP_ARGS=--insecure-no-sandbox`). Everything uses temporary
+//! directories; no real repository is touched.
+
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -35,13 +39,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// Race attempts per test; override with MINDSPACE_RACE_ATTEMPTS (used to
-/// calibrate). Calibrated against the code as of MIND-4 (12 runs of each of the
-/// 9 race tests, 108 samples): the first leak came after 1 to 67 attempts, mean
-/// about 15 to 20, roughly geometric. With 150 attempts a regression escapes one
-/// test with a probability of about 0.1 per cent (100 would be about 1 per cent).
-/// Passing is deterministic for a protected implementation: any leak fails.
-const DEFAULT_ATTEMPTS: usize = 150;
+/// Race attempts per test. `MINDSPACE_RACE_ATTEMPTS` overrides it; the security
+/// profile sets 150. The default is a smoke check only: calibrated against the
+/// code as of MIND-4 (12 runs of each of the 9 race tests, 108 samples) the first
+/// leak came after 1 to 67 attempts, mean about 15 to 20, roughly geometric, so
+/// 40 attempts miss a regression in about one test run in ten, and 150 in about
+/// one in a thousand. Passing is deterministic for a protected implementation:
+/// any leak fails.
+const DEFAULT_ATTEMPTS: usize = 40;
 const REPO_FILES: usize = 8;
 /// Files in a plain-directory fixture. This matters: the directory walk checks
 /// an entry and the file is read later, and the window between the two grows
@@ -83,6 +88,11 @@ impl Server {
             .arg("mcp");
         for s in specs {
             cmd.arg("--allow-root").arg(s);
+        }
+        // MINDSPACE_TEST_MCP_ARGS adds server flags, for example to run the same
+        // invariants with `--insecure-no-sandbox` (the application layer alone).
+        if let Ok(extra) = std::env::var("MINDSPACE_TEST_MCP_ARGS") {
+            cmd.args(extra.split_whitespace());
         }
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -128,7 +138,23 @@ impl Server {
     }
 
     fn call(&mut self, name: &str, args: Value) -> Value {
-        let r = self.rpc("tools/call", json!({"name": name, "arguments": args}))["result"].clone();
+        self.start_call(name, args);
+        self.finish_call()
+    }
+
+    /// Sends a request without waiting for the answer, so a test can act while
+    /// the server works. Pair with [`finish_call`](Self::finish_call).
+    fn start_call(&mut self, name: &str, args: Value) {
+        self.next_id += 1;
+        let req = json!({"jsonrpc":"2.0","id":self.next_id,"method":"tools/call",
+                         "params":{"name": name, "arguments": args}});
+        writeln!(self.stdin, "{req}").unwrap();
+    }
+
+    fn finish_call(&mut self) -> Value {
+        let mut line = String::new();
+        self.out.read_line(&mut line).unwrap();
+        let r = serde_json::from_str::<Value>(&line).unwrap_or(Value::Null)["result"].clone();
         self.seen.push(r.to_string());
         r
     }
@@ -569,7 +595,6 @@ fn static_scenario(build: impl FnOnce(&World), forbidden_tag: &str) {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn s1_git_entry_symlink_to_outside_repo() {
     static_scenario(
         |w| {
@@ -581,7 +606,6 @@ fn s1_git_entry_symlink_to_outside_repo() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn s2_gitdir_pointer_file_to_outside_repo() {
     static_scenario(
         |w| {
@@ -597,7 +621,6 @@ fn s2_gitdir_pointer_file_to_outside_repo() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn s3_alternates_pointing_to_outside_objects() {
     static_scenario(
         |w| {
@@ -617,7 +640,6 @@ fn s3_alternates_pointing_to_outside_objects() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn s4_linked_worktree_whose_main_repo_is_outside_all_roots() {
     // Decision: linked worktrees with an external common dir are refused.
     static_scenario(
@@ -639,7 +661,6 @@ fn s4_linked_worktree_whose_main_repo_is_outside_all_roots() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn s5_git_entry_pointing_into_a_read_only_root() {
     let w = World::new();
     repo(&w.ro_root.join("repo"), "RO5");
@@ -655,7 +676,6 @@ fn s5_git_entry_pointing_into_a_read_only_root() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn s6_git_entry_pointing_into_a_nested_read_only_area_of_the_same_rw_root() {
     let mut w = World::new();
     let protected = w.root.join("protected");
@@ -668,6 +688,248 @@ fn s6_git_entry_pointing_into_a_nested_read_only_area_of_the_same_rw_root() {
     s.ingest(&w.root.join("work"));
     w.assert_confined(&s, &tokens("NEST6"), &[(&protected, &before)]);
     w.assert_liveness(&mut s);
+}
+
+/// Adversarial review (MIND-18): more places inside a repository from which git
+/// reads, each made to point outside. They hold under the kernel sandbox, and the
+/// application layer alone must hold them too, so they run in both modes.
+fn symlink_every_object_dir(w: &World, work: &Path) {
+    // Loose objects of the outside repository, reached through links inside the
+    // repository that is allowed. The ref names an outside commit.
+    let outside_objects = w.outside.join(".git/objects");
+    for e in std::fs::read_dir(&outside_objects).unwrap().flatten() {
+        let name = e.file_name();
+        let n = name.to_string_lossy();
+        if n.len() == 2 {
+            symlink(e.path(), work.join(".git/objects").join(&*n)).unwrap();
+        }
+    }
+    let head = git(&w.outside, &["rev-parse", "HEAD"]);
+    std::fs::write(work.join(".git/refs/heads/main"), format!("{head}\n")).unwrap();
+}
+
+#[test]
+fn s8_object_directories_inside_the_git_dir_that_are_links_to_outside() {
+    static_scenario(
+        |w| {
+            let work = w.root.join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            git(&work, &["init", "-q", "-b", "main"]);
+            symlink_every_object_dir(w, &work);
+        },
+        "OUT8",
+    );
+}
+
+#[test]
+fn s9_a_relative_gitdir_pointer_that_climbs_out_of_the_root() {
+    static_scenario(
+        |w| {
+            std::fs::create_dir_all(w.root.join("work")).unwrap();
+            // root/work/.git -> ../../outside/.git
+            std::fs::write(w.root.join("work/.git"), "gitdir: ../../outside/.git\n").unwrap();
+        },
+        "OUT9",
+    );
+}
+
+#[test]
+fn s10_a_commondir_file_that_points_outside() {
+    static_scenario(
+        |w| {
+            // A linked worktree of a repository inside the root, then its
+            // `commondir` is rewritten to the outside repository.
+            repo(&w.root.join("main"), "MAIN10");
+            git(
+                &w.root.join("main"),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    w.root.join("work").to_str().unwrap(),
+                    "-b",
+                    "wt",
+                ],
+            );
+            let gitdir_file = std::fs::read_to_string(w.root.join("work/.git")).unwrap();
+            let gitdir = gitdir_file
+                .trim()
+                .trim_start_matches("gitdir:")
+                .trim()
+                .to_string();
+            // The outside repository has the branch the worktree's HEAD names, so a
+            // redirect would succeed instead of failing on a missing branch.
+            git(&w.outside, &["branch", "wt"]);
+            std::fs::write(
+                Path::new(&gitdir).join("commondir"),
+                format!("{}/.git\n", w.outside.display()),
+            )
+            .unwrap();
+        },
+        "OUT10",
+    );
+}
+
+/// The identity marker is only ever created exclusively and never through a
+/// link: a link planted under its name must not make the ingest write to the
+/// link's target.
+#[test]
+fn s11_a_symlink_planted_under_the_identity_marker_name() {
+    let w = World::new();
+    repo(&w.outside, "OUT11");
+    // A DANGLING link: a careless "read, then create" would write through it and
+    // create the target outside the roots.
+    let target = w.outside.join("created-through-the-marker-link.txt");
+    repo(&w.root.join("work"), "W11");
+    symlink(&target, w.root.join("work/.git/mindspace-repository-id")).unwrap();
+    let outside_before = fingerprint(&w.outside);
+    let mut s = w.server();
+    s.ingest(&w.root.join("work"));
+    w.assert_confined(&s, &tokens("OUT11"), &[(&w.outside, &outside_before)]);
+    assert!(
+        !target.exists(),
+        "the identity marker was written through a link"
+    );
+    w.assert_liveness(&mut s);
+}
+
+/// A FIFO put in place of a listed file, after the walk saw a regular file, must
+/// not hang the ingest (opening it for reading blocks until a writer appears).
+#[test]
+fn r8_a_fifo_swapped_in_during_a_directory_ingest_does_not_hang() {
+    let w = World::new();
+    docs(&w.root.join("docs"), DIR_FILES);
+    let file = w.root.join("docs").join(DIR_TARGET);
+    let parked = PathBuf::from(format!("{}.parked", file.display()));
+    let (f1, p1) = (file.clone(), parked.clone());
+    let on = move || {
+        std::fs::rename(&f1, &p1).is_ok() && {
+            let c = std::ffi::CString::new(f1.to_str().unwrap()).unwrap();
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) == 0 }
+        }
+    };
+    let off = move || {
+        if std::fs::symlink_metadata(&file)
+            .map(|m| !m.is_file())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&file);
+        }
+        if parked.exists() && !file.exists() {
+            let _ = std::fs::rename(&parked, &file);
+        }
+    };
+    let mut s = w.server();
+    // Watchdog: a hang must fail the test instead of blocking the suite.
+    let pid = s.child.id();
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    let dog = std::thread::spawn(move || {
+        let start = Instant::now();
+        while !flag.load(Ordering::Relaxed) {
+            if start.elapsed() > Duration::from_secs(60) {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    });
+    {
+        let _attacker = Attacker::start(on, off);
+        for _ in 0..attempts().min(60) {
+            s.ingest(&w.root.join("docs"));
+            if dog.is_finished() {
+                break;
+            }
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    assert!(!dog.join().unwrap(), "the ingest hung on a FIFO");
+    w.assert_liveness(&mut s);
+}
+
+/// A race with a CHOSEN time: the ingest starts clean (so every check at its
+/// start sees an honest repository), then, `delay` milliseconds later, `install`
+/// puts the redirection in place and it STAYS until the answer is in. A random
+/// swap rarely lands after the checks; this does it on purpose, which is what
+/// separates "checked once" from "bound to what was checked".
+fn late_swap(
+    w: &World,
+    victim: &Path,
+    forbidden: &[String],
+    install: &dyn Fn() -> bool,
+    undo: &dyn Fn(),
+    step_us: u64,
+    span: u64,
+) -> Option<usize> {
+    let mut s = w.server();
+    for n in 1..=attempts() {
+        s.start_call(
+            "repo_ingest",
+            json!({"path": victim.display().to_string(), "spaces": ["p"]}),
+        );
+        std::thread::sleep(Duration::from_micros((n as u64 * 7 % span) * step_us));
+        install();
+        s.finish_call();
+        undo();
+        if forbidden.iter().any(|t| db_has(&w.db, t)) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+#[test]
+fn r3b_the_git_entry_is_swapped_after_the_ingest_started_and_stays_swapped() {
+    let w = World::new();
+    repo(&w.outside, "OUTR3B");
+    repo(&w.root.join("work"), "W3B");
+    let outside_before = fingerprint(&w.outside);
+    let (on, off) = leaf_swap(w.root.join("work/.git"), w.outside.join(".git"));
+    let forbidden = tokens("OUTR3B");
+    let leak = late_swap(&w, &w.root.join("work"), &forbidden, &on, &off, 3000, 15);
+    assert_eq!(
+        leak, None,
+        "outside content reached the database (attempt {leak:?})"
+    );
+    let mut s = w.server();
+    w.assert_confined(&s, &forbidden, &[(&w.outside, &outside_before)]);
+    w.assert_liveness(&mut s);
+}
+
+/// The same with an alternates file. Under the kernel sandbox this must hold. With
+/// the application layer alone it cannot be excluded (the file can be created
+/// after the check), so the security profile runs it only in sandbox mode and
+/// reports the rate for the other mode.
+#[test]
+fn r4b_an_alternates_file_appears_after_the_ingest_started_and_stays() {
+    let w = World::new();
+    repo(&w.outside, "OUTR4B");
+    let work = w.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    let head = git(&w.outside, &["rev-parse", "HEAD"]);
+    std::fs::write(work.join(".git/refs/heads/main"), format!("{head}\n")).unwrap();
+    let alt = work.join(".git/objects/info/alternates");
+    let content = format!("{}/.git/objects\n", w.outside.display());
+    let (alt2, c2) = (alt.clone(), content.clone());
+    let forbidden = tokens("OUTR4B");
+    let leak = late_swap(
+        &w,
+        &work,
+        &forbidden,
+        &move || std::fs::write(&alt2, &c2).is_ok(),
+        &move || {
+            let _ = std::fs::remove_file(&alt);
+        },
+        250,
+        60,
+    );
+    assert_eq!(
+        leak, None,
+        "outside content reached the database (attempt {leak:?})"
+    );
 }
 
 /// Positive scenario: a linked worktree whose main repo is inside the roots
@@ -743,7 +1005,6 @@ fn boxed(victim: PathBuf, link: PathBuf, target: PathBuf) -> Plan {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r1_leaf_swap_of_the_authorized_directory_to_an_outside_repo() {
     race_scenario(
         "OUTR1",
@@ -757,7 +1018,6 @@ fn r1_leaf_swap_of_the_authorized_directory_to_an_outside_repo() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r2_swap_of_an_ancestor_directory() {
     race_scenario(
         "OUTR2",
@@ -776,7 +1036,6 @@ fn r2_swap_of_an_ancestor_directory() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r3_swap_of_the_git_entry_inside_the_authorized_directory() {
     race_scenario(
         "OUTR3",
@@ -794,7 +1053,6 @@ fn r3_swap_of_the_git_entry_inside_the_authorized_directory() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r4_alternates_file_appearing_during_the_ingest() {
     race_scenario(
         "OUTR4",
@@ -820,7 +1078,6 @@ fn r4_alternates_file_appearing_during_the_ingest() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r5_file_swapped_during_a_plain_directory_ingest() {
     race_scenario(
         "OUTR5",
@@ -839,7 +1096,6 @@ fn r5_file_swapped_during_a_plain_directory_ingest() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r6_swap_to_a_repo_in_a_read_only_root() {
     race_scenario(
         "RO6",
@@ -858,7 +1114,6 @@ fn r6_swap_to_a_repo_in_a_read_only_root() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r6b_file_swapped_to_a_file_in_a_read_only_root() {
     race_scenario(
         "RO6B",
@@ -877,7 +1132,6 @@ fn r6b_file_swapped_to_a_file_in_a_read_only_root() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r7_swap_to_a_nested_read_only_area_of_the_same_rw_root() {
     race_scenario(
         "NEST7",
@@ -899,7 +1153,6 @@ fn r7_swap_to_a_nested_read_only_area_of_the_same_rw_root() {
 }
 
 #[test]
-#[ignore = "MIND-18: reproduces an open vulnerability; remove when fixed"]
 fn r7b_file_swapped_to_a_file_in_a_nested_read_only_area() {
     race_scenario(
         "NEST7B",

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use landlock::{
     Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 
 /// Minimum Landlock ABI. ABI 3 (Linux 6.2) adds truncate control; with ABI 1
@@ -56,7 +56,7 @@ pub const DECLARED: Declared = Declared {
     tcp: false,
     unix_path_sockets: false,
     unix_abstract_sockets: false,
-    signals: false,
+    signals: true,
     udp: false,
     seccomp: true,
 };
@@ -80,6 +80,124 @@ pub struct Report {
     pub description: String,
     /// The socket-deny seccomp policy as established in this process.
     pub seccomp: seccomp::Status,
+    /// Whether signals to processes outside the sandbox are refused.
+    pub signal_scope: SignalScope,
+}
+
+/// Landlock's signal scope (ABI 6, Linux 6.12): a sandboxed process can then
+/// signal only itself, its descendants and processes in its own domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalScope {
+    /// Applied, and a process outside the sandbox answered `EPERM` to a signal.
+    Enforced,
+    /// The kernel offers no signal scope (Landlock below ABI 6); nothing was applied.
+    NotAvailable,
+    /// Applied, but no outside process was left to ask.
+    Unverified,
+    /// Not a sandboxed start.
+    NotEvaluated,
+}
+
+impl SignalScope {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SignalScope::Enforced => "enforced",
+            SignalScope::NotAvailable => "not_available",
+            SignalScope::Unverified => "unverified",
+            SignalScope::NotEvaluated => "not_evaluated",
+        }
+    }
+}
+
+/// Highest Landlock ABI the kernel reports (0: none).
+pub fn landlock_abi() -> u32 {
+    // SAFETY: the version query takes no pointer and installs nothing.
+    let r = unsafe {
+        libc::syscall(
+            444,
+            std::ptr::null::<u8>(),
+            0usize,
+            1 as libc::c_ulong, // LANDLOCK_CREATE_RULESET_VERSION
+        )
+    };
+    if r < 0 {
+        0
+    } else {
+        r as u32
+    }
+}
+
+/// The ABI that introduced `Scope::Signal`.
+const SIGNAL_SCOPE_ABI: u32 = 6;
+
+pub(crate) const ENV_SIGNAL_CANARY: &str = "MINDSPACE_SANDBOX_SIGNAL_CANARY";
+
+/// A process OUTSIDE the sandbox-to-be, reparented to init (double fork), that
+/// sleeps for a while. After the restriction, signalling it must fail with
+/// `EPERM`: the observable proof that the scope is in effect. Returns its pid.
+fn spawn_signal_canary() -> Option<i32> {
+    let server = std::process::id();
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe/fork/_exit and friends in a single-threaded process (the seccomp
+    // installation just verified one thread); the children only use async-signal-safe calls.
+    unsafe {
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return None;
+        }
+        let a = libc::fork();
+        if a < 0 {
+            return None;
+        }
+        if a == 0 {
+            let b = libc::fork();
+            if b == 0 {
+                // the canary: no inherited stdio (it must not hold the client's pipes open)
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                for fd in 0..3 {
+                    libc::dup2(null, fd);
+                }
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                // Lives as long as the server (this pid survives the exec into stage 2),
+                // so that nothing is left behind after it; never longer than a minute.
+                for _ in 0..1200 {
+                    let gone = match std::fs::read_to_string(format!("/proc/{server}/stat")) {
+                        Ok(stat) => stat.contains(") Z ") || stat.contains(") X "),
+                        Err(_) => true,
+                    };
+                    if gone {
+                        break;
+                    }
+                    libc::usleep(50_000);
+                }
+                libc::_exit(0);
+            }
+            let bytes = (b as i32).to_ne_bytes();
+            libc::write(fds[1], bytes.as_ptr() as *const _, 4);
+            libc::_exit(0);
+        }
+        libc::close(fds[1]);
+        let mut buf = [0u8; 4];
+        let n = libc::read(fds[0], buf.as_mut_ptr() as *mut _, 4);
+        libc::close(fds[0]);
+        let mut st = 0;
+        libc::waitpid(a, &mut st, 0);
+        let pid = i32::from_ne_bytes(buf);
+        (n == 4 && pid > 0).then_some(pid)
+    }
+}
+
+/// `EPERM` from signal 0 to `pid` means the signal scope keeps us out; success
+/// means we can signal it; `ESRCH` means it is gone (no evidence either way).
+fn probe_signal_scope(pid: i32) -> Option<bool> {
+    // SAFETY: signal 0 only asks for permission.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(false);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => Some(true),
+        _ => None,
+    }
 }
 
 /// One filesystem rule of the sandbox.
@@ -464,10 +582,18 @@ fn build_ruleset(
 ) -> Result<landlock::RulesetCreated, String> {
     let all: BitFlags<AccessFs> = AccessFs::from_all(MIN_ABI);
     let read: BitFlags<AccessFs> = AccessFs::from_read(MIN_ABI);
-    let mut rs = Ruleset::default()
+    let mut builder = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(all)
-        .map_err(|e| format!("Landlock ABI {:?} or newer is required: {e}", MIN_ABI))?
+        .map_err(|e| format!("Landlock ABI {:?} or newer is required: {e}", MIN_ABI))?;
+    // Signals to processes outside the sandbox: only where the kernel has the scope
+    // (the ruleset then stays "fully enforced"; below ABI 6 nothing is added).
+    if landlock_abi() >= SIGNAL_SCOPE_ABI {
+        builder = builder
+            .scope(Scope::Signal)
+            .map_err(|e| format!("the signal scope: {e}"))?;
+    }
+    let mut rs = builder
         .create()
         .map_err(|e| format!("Landlock is not available: {e}"))?;
     for rule in rules {
@@ -535,6 +661,15 @@ pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
         Ok(d) => d,
         Err(e) => return Outcome::Unavailable(e),
     };
+    // An outsider to signal after the restriction (only where the scope applies).
+    let signal_canary = if landlock_abi() >= SIGNAL_SCOPE_ABI {
+        match spawn_signal_canary() {
+            Some(pid) => Some(pid),
+            None => return Outcome::Unavailable("cannot create the signal canary process".into()),
+        }
+    } else {
+        None
+    };
     let ruleset = match build_ruleset(&rules, &plan.identities) {
         Ok(r) => r,
         Err(e) => return Outcome::Unavailable(e),
@@ -556,7 +691,17 @@ pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
         die(&format!("sandbox self-test failed: {failures:?}"));
     }
 
+    if let Some(pid) = signal_canary {
+        if probe_signal_scope(pid) != Some(true) {
+            die(
+                "the signal scope is not in effect: a process outside the sandbox can be signalled",
+            );
+        }
+    }
     let mut cmd = std::process::Command::new(&plan.exe);
+    if let Some(pid) = signal_canary {
+        cmd.env(ENV_SIGNAL_CANARY, pid.to_string());
+    }
     cmd.args(std::env::args_os().skip(1))
         .args(extra_args)
         .env(ENV_STAGE2, "1")
@@ -596,9 +741,26 @@ pub fn verify_stage2(private_tmp: &Path) -> Result<Option<Report>, String> {
     // The socket policy is re-derived here (architecture and kernel), not read
     // from an environment variable: where it is required it must demonstrably be active.
     let seccomp = seccomp::verify_stage2()?;
+    let signal_scope = if landlock_abi() < SIGNAL_SCOPE_ABI {
+        SignalScope::NotAvailable
+    } else {
+        match std::env::var(ENV_SIGNAL_CANARY)
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .and_then(probe_signal_scope)
+        {
+            Some(true) => SignalScope::Enforced,
+            Some(false) => return Err(
+                "the signal scope is not in effect: a process outside the sandbox can be signalled"
+                    .into(),
+            ),
+            None => SignalScope::Unverified,
+        }
+    };
     Ok(Some(Report {
         description: "Landlock, ABI 3 or newer, fully enforced, canary verified".to_string(),
         seccomp,
+        signal_scope,
     }))
 }
 
@@ -649,7 +811,7 @@ mod tests {
             tcp: false,
             unix_path_sockets: false,
             unix_abstract_sockets: false,
-            signals: false,
+            signals: true,
             udp: false,
             seccomp: true,
         };

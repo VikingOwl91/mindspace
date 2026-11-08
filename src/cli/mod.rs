@@ -1073,8 +1073,11 @@ fn sandbox_state(
     extra_args: &[std::ffi::OsString],
     grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
 ) -> (crate::mcp::SandboxState, serde_json::Value) {
-    let (state, seccomp) = sandbox_state_inner(cli, config, extra_args, grant_ids);
-    (state, seccomp.to_json())
+    let (state, seccomp, scope) = sandbox_state_inner(cli, config, extra_args, grant_ids);
+    // `seccomp` is the socket-deny report; the Landlock signal scope travels next to it.
+    let mut report = seccomp.to_json();
+    report["signal_scope"] = serde_json::json!(scope.label());
+    (state, report)
 }
 
 #[cfg(target_os = "linux")]
@@ -1083,14 +1086,19 @@ fn sandbox_state_inner(
     config: &crate::mcp::McpConfig,
     extra_args: &[std::ffi::OsString],
     grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
-) -> (crate::mcp::SandboxState, crate::sandbox::seccomp::Status) {
+) -> (
+    crate::mcp::SandboxState,
+    crate::sandbox::seccomp::Status,
+    crate::sandbox::SignalScope,
+) {
     use crate::mcp::{Access, SandboxState};
     use crate::sandbox::seccomp::Status;
     use crate::sandbox::{self, Outcome, Plan};
     let na = Status::NotEvaluated;
+    let no_scope = crate::sandbox::SignalScope::NotEvaluated;
     let db = match db_path(cli) {
         Ok(db) => db,
-        Err(e) => return (SandboxState::Unavailable(e.to_string()), na),
+        Err(e) => return (SandboxState::Unavailable(e.to_string()), na, no_scope),
     };
     let Some(db_dir) = db
         .parent()
@@ -1101,6 +1109,7 @@ fn sandbox_state_inner(
         return (
             SandboxState::Unavailable("cannot determine the database directory".into()),
             na,
+            no_scope,
         );
     };
     let db_dir = match std::fs::canonicalize(&db_dir) {
@@ -1109,6 +1118,7 @@ fn sandbox_state_inner(
             return (
                 SandboxState::Unavailable(format!("database directory {}: {e}", db_dir.display())),
                 na,
+                no_scope,
             )
         }
     };
@@ -1118,6 +1128,7 @@ fn sandbox_state_inner(
             return (
                 SandboxState::Unavailable(format!("cannot locate the mind binary: {e}")),
                 na,
+                no_scope,
             )
         }
     };
@@ -1160,10 +1171,15 @@ fn sandbox_state_inner(
             }
             let seccomp = report.seccomp.clone();
             return match crate::ingest::git::sandbox_probe(&plan.tmp_dir()) {
-                Ok(()) => (SandboxState::Enforced(report.description), seccomp),
+                Ok(()) => (
+                    SandboxState::Enforced(report.description),
+                    seccomp,
+                    report.signal_scope,
+                ),
                 Err(e) => (
                     SandboxState::Unavailable(format!("Git does not work inside the sandbox: {e}")),
                     seccomp,
+                    report.signal_scope,
                 ),
             };
         }
@@ -1174,8 +1190,8 @@ fn sandbox_state_inner(
         }
     }
     match sandbox::enter_with_args(&plan, extra_args) {
-        Outcome::NotNeeded => (SandboxState::NotNeeded, na),
-        Outcome::Unavailable(reason) => (SandboxState::Unavailable(reason), na),
+        Outcome::NotNeeded => (SandboxState::NotNeeded, na, no_scope),
+        Outcome::Unavailable(reason) => (SandboxState::Unavailable(reason), na, no_scope),
     }
 }
 

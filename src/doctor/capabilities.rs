@@ -97,11 +97,31 @@ pub enum SeccompEvidence {
     Unknown,
 }
 
+/// Whether the self-test child showed the Landlock signal scope in effect: it
+/// asked a process outside the sandbox and got `EPERM` (typed `signal_scope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignalEvidence {
+    Enforced,
+    /// The kernel has no signal scope (Landlock below ABI 6): nothing to enforce.
+    NotAvailable,
+    #[default]
+    Unknown,
+}
+
+pub fn parse_signal_evidence(v: Option<&Value>) -> SignalEvidence {
+    match v.and_then(|v| v["signal_scope"].as_str()) {
+        Some("enforced") => SignalEvidence::Enforced,
+        Some("not_available") => SignalEvidence::NotAvailable,
+        _ => SignalEvidence::Unknown,
+    }
+}
+
 /// Everything the self-test proved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Proven {
     pub sandbox: Evidence,
     pub seccomp: SeccompEvidence,
+    pub signals: SignalEvidence,
 }
 
 pub fn parse_seccomp_evidence(v: Option<&Value>) -> SeccompEvidence {
@@ -272,6 +292,9 @@ struct Channel {
     /// Declared through Landlock rights / through the seccomp filter.
     declared_landlock: bool,
     declared_seccomp: bool,
+    /// Landlock enforcement of this channel needs its own runtime evidence (the
+    /// signal scope exists only on newer kernels).
+    needs_signal_evidence: bool,
     basis: &'static str,
 }
 
@@ -288,7 +311,9 @@ fn level_for(c: &Channel, seccomp_ok: Tri, proven: Proven) -> (Level, Vec<&'stat
     if sec == Tri::Yes {
         via.push("seccomp");
     }
-    let enforced_by_landlock = c.declared_landlock && proven.sandbox == Evidence::Active;
+    let enforced_by_landlock = c.declared_landlock
+        && proven.sandbox == Evidence::Active
+        && (!c.needs_signal_evidence || proven.signals == SignalEvidence::Enforced);
     // The filter counts only with typed evidence from the active sandbox.
     let enforced_by_seccomp = c.declared_seccomp
         && proven.sandbox == Evidence::Active
@@ -321,6 +346,7 @@ pub fn assess(facts: &KernelFacts, declared: &Declared, proven: Proven) -> Value
             seccomp: Tri::No,
             declared_landlock: declared.filesystem,
             declared_seccomp: false,
+            needs_signal_evidence: false,
             basis: "Landlock filesystem rights (ABI 3 or newer) restrict path access; only the self-test of `mind mcp` can show it active, and only while `mind mcp` runs with an allowed root",
         },
         Channel {
@@ -329,6 +355,7 @@ pub fn assess(facts: &KernelFacts, declared: &Declared, proven: Proven) -> Value
             seccomp: Tri::Yes,
             declared_landlock: declared.tcp,
             declared_seccomp: declared.seccomp,
+            needs_signal_evidence: false,
             basis: "Landlock TCP bind/connect rights (ABI 4+) exist but Mindspace does not use them; the seccomp socket-deny filter stops creating NEW sockets, not the use of inherited ones",
         },
         Channel {
@@ -337,6 +364,7 @@ pub fn assess(facts: &KernelFacts, declared: &Declared, proven: Proven) -> Value
             seccomp: Tri::Yes,
             declared_landlock: declared.udp,
             declared_seccomp: declared.seccomp,
+            needs_signal_evidence: false,
             basis: "no Landlock right covers UDP (measured on ABI 10 in spike M7.2b-2); only the seccomp socket-deny filter on socket creation does; inherited sockets stay usable",
         },
         Channel {
@@ -345,6 +373,7 @@ pub fn assess(facts: &KernelFacts, declared: &Declared, proven: Proven) -> Value
             seccomp: Tri::Yes,
             declared_landlock: declared.unix_path_sockets,
             declared_seccomp: declared.seccomp,
+            needs_signal_evidence: false,
             basis: "Landlock pathname-socket right (a late ABI) exists but is not used; at ABI 3 any reachable socket path could be connected, which the seccomp filter prevents for NEW sockets; inherited sockets stay usable",
         },
         Channel {
@@ -353,6 +382,7 @@ pub fn assess(facts: &KernelFacts, declared: &Declared, proven: Proven) -> Value
             seccomp: Tri::Yes,
             declared_landlock: declared.unix_abstract_sockets,
             declared_seccomp: declared.seccomp,
+            needs_signal_evidence: false,
             basis: "Landlock abstract-unix-socket scope (ABI 6+) exists but is not used; the seccomp filter prevents NEW sockets; inherited sockets stay usable",
         },
         Channel {
@@ -361,7 +391,8 @@ pub fn assess(facts: &KernelFacts, declared: &Declared, proven: Proven) -> Value
             seccomp: Tri::No,
             declared_landlock: declared.signals,
             declared_seccomp: false,
-            basis: "Landlock signal scope (ABI 6+) exists but is not used; the socket filter does not restrict signals",
+            needs_signal_evidence: true,
+            basis: "Landlock signal scope (ABI 6+, Linux 6.12): used where the kernel has it and shown by asking a process outside the sandbox; below ABI 6 nothing restricts signals",
         },
     ];
     let mut ch = serde_json::Map::new();
@@ -489,7 +520,11 @@ mod tests {
     }
 
     fn proven(sandbox: Evidence, seccomp: SeccompEvidence) -> Proven {
-        Proven { sandbox, seccomp }
+        Proven {
+            sandbox,
+            seccomp,
+            ..Default::default()
+        }
     }
 
     const ALL_SOCKET_CHANNELS: [&str; 4] =

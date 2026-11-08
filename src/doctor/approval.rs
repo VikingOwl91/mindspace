@@ -554,6 +554,7 @@ mod tests {
             server_sandbox: Proven {
                 sandbox: Evidence::Active,
                 seccomp: SeccompEvidence::Enforced,
+                ..Default::default()
             },
         }
     }
@@ -589,6 +590,7 @@ mod tests {
         f.server_sandbox = Proven {
             sandbox: Evidence::Active,
             seccomp: SeccompEvidence::Enforced,
+            ..Default::default()
         };
         assert_eq!(decide(&f).verified, Level::A0);
     }

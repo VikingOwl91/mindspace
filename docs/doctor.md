@@ -99,6 +99,25 @@ what the self-test proved: per channel (`filesystem`, `tcp`, `udp`, `unix_path_s
 (`available_via`) and the basis. The probes are read-only; the doctor process is not confined. The socket channels are `enforced` only with the typed `seccomp` evidence of the self-test child ([sandbox-seccomp.md](sandbox-seccomp.md)). The status of the check
 and the exit codes do not depend on it. Details and limits: [sandbox-capabilities.md](sandbox-capabilities.md).
 
+## Approval assurance (additive, M7.3a.1)
+
+`checks[id=sandbox].details.approval` (Linux) answers: who may create repository grants here, and how much of that is **verified**?
+Every capability has `supported`, `configured` and `verified`, each `yes`, `no` or `unknown`; they are never merged. The reported level
+(`assurance.effective`, equal to `verified`) is **A0** unless the assumptions of a level were actually checked:
+
+* `agent_isolation` is `unknown`: nothing in Mindspace verifies that an agent cannot run `mind grant`, read the store or reach the approval
+  channel. Client settings are not read and would not count, a terminal prompt is not an authority, and the Mindspace server's own sandbox
+  confines the server, not the agent's shell. So A1 is `supported` and `configured` but not `verified`.
+* `polkit` and `hardware_token` are not implemented (A2, A3 are never reported).
+* `host_input` lists passive facts: `/dev/uinput` writable, `/dev/input/event*` readable, an X11 socket writable (all by `access(2)`; no
+  device is opened, no input is read or written), the session sockets, Yama `ptrace_scope`, and the state of the grant store (read-only). They only
+  annotate or lower an assessment, never raise it. `none_observed` means "no inspected interface is usable", not "safe".
+* A0 is a statement about approval only (`assurance.meaning`): no trustworthy approval authority has been proven. It does not say that the host is secure or insecure.
+* The facts are diagnostics. The code that creates, validates or applies grants never reads them (a test guards this); a grant is accepted or refused on its own rules.
+* `assurance.blockers` and `open_limits` say in words what stands between the reported and the next level.
+
+Nothing is written, created or locked for writing; exit codes and the other fields are unchanged. See [grants.md](grants.md) and ADR-030.
+
 ## Limits
 
 - The self-test kills the server it started and waits for it, but it does not track everything that server started

@@ -965,6 +965,199 @@ mod linux {
         }
     }
 
+    fn approval(r: &Value) -> Value {
+        check(r, "sandbox")["details"]["approval"].clone()
+    }
+
+    #[test]
+    fn approval_assurance_is_added_additively_and_defaults_to_a0() {
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let (code, r, _) = doctor_with_xdg(&xdg, &[]);
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(r["format"], "mind-doctor/1");
+        let s = check(&r, "sandbox");
+        assert_eq!(s["status"], "pass");
+        // everything that existed before is still there
+        for k in [
+            "elapsed_ms",
+            "kernel_evidence",
+            "application_validation",
+            "capabilities",
+        ] {
+            assert!(s["details"].get(k).is_some(), "{k} missing: {s}");
+        }
+        let a = approval(&r);
+        assert_eq!(a["assurance"]["effective"], "A0", "{a}");
+        assert_eq!(a["assurance"]["verified"], "A0");
+        assert_eq!(a["assurance"]["supported"], "A1");
+        assert_eq!(a["assurance"]["configured"], "A1");
+        // client isolation is unknown, not "no" and not "yes"
+        assert_eq!(a["agent_isolation"]["state"], "unknown");
+        assert_eq!(a["agent_isolation"]["verified"], "no");
+        assert_eq!(a["assurance"]["unknown"]["agent_isolation"], true);
+        // the terminal prompt is available but unverified; nothing else is implemented
+        let term = &a["authorities"]["terminal_cli"]["capability"];
+        assert_eq!(
+            (
+                term["supported"].as_str(),
+                term["configured"].as_str(),
+                term["verified"].as_str()
+            ),
+            (Some("yes"), Some("yes"), Some("no"))
+        );
+        for other in ["polkit", "hardware_token"] {
+            let c = &a["authorities"][other]["capability"];
+            assert_eq!(
+                (c["supported"].as_str(), c["verified"].as_str()),
+                (Some("no"), Some("no")),
+                "{other}"
+            );
+        }
+        assert!(a["open_limits"]
+            .to_string()
+            .contains("human consent is not established"));
+        assert!(!a.to_string().contains("\"safe\""));
+    }
+
+    #[test]
+    fn the_reported_host_input_facts_match_what_the_kernel_says_and_never_raise_the_level() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let (_, r, _) = doctor_with_xdg(&xdg, &[]);
+        let a = approval(&r);
+        let access = |p: &str, mode: libc::c_int| -> &'static str {
+            let c = std::ffi::CString::new(std::ffi::OsStr::new(p).as_bytes()).unwrap();
+            if !Path::new(p).exists() {
+                "absent"
+            } else if unsafe { libc::access(c.as_ptr(), mode) } == 0 {
+                "accessible"
+            } else {
+                "inaccessible"
+            }
+        };
+        let facts = &a["host_input"]["facts"];
+        assert_eq!(
+            facts["uinput"],
+            access("/dev/uinput", libc::W_OK),
+            "{facts}"
+        );
+        // whatever the host exposes, the level stays where the evidence puts it
+        assert_eq!(a["assurance"]["effective"], "A0");
+        let path = a["host_input"]["injection_or_observation_path"]
+            .as_str()
+            .unwrap();
+        assert!(["accessible", "none_observed", "unknown"].contains(&path));
+        if path == "accessible" {
+            assert!(a["open_limits"].to_string().contains("inject input"));
+        }
+        // with the environment cleared the session sockets cannot even be located
+        assert_eq!(facts["session_bus"], "unknown");
+    }
+
+    #[test]
+    fn the_doctor_changes_nothing_on_disk_for_the_approval_diagnosis() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tmp();
+        let root = t.path().canonicalize().unwrap();
+        let xdg = root.join("xdg");
+        initialized(&xdg);
+        let state = root.join("state");
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let with_state = |args: &[&str]| {
+            let mut c = mind(args);
+            c.env("XDG_DATA_HOME", &xdg)
+                .env("XDG_STATE_HOME", &state)
+                .env("HOME", &root);
+            c
+        };
+        // 1. no store: doctor must not create the state directory or the store
+        let (code, r, _) = doctor_json(with_state(&["doctor", "--json"]));
+        assert_eq!(code, 0);
+        assert_eq!(approval(&r)["grant_core"]["store"]["state"], "absent");
+        assert!(!state.exists(), "the doctor created {}", state.display());
+        // 2. a valid store: untouched (content, inode, mtime), counted
+        assert!(run(with_state(&[
+            "grant",
+            "add",
+            project.to_str().unwrap(),
+            "--yes"
+        ]))
+        .status
+        .success());
+        let file = state.join("mindspace/grants.jsonl");
+        let snap = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (
+                std::fs::read(p).unwrap(),
+                m.ino(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.len(),
+            )
+        };
+        let before = snap(&file);
+        let entries_before = std::fs::read_dir(state.join("mindspace")).unwrap().count();
+        let (code, r, _) = doctor_json(with_state(&["doctor", "--json"]));
+        assert_eq!(code, 0);
+        let st = &approval(&r)["grant_core"]["store"];
+        assert_eq!(
+            (
+                st["state"].as_str(),
+                st["grants"].as_u64(),
+                st["active"].as_u64()
+            ),
+            (Some("valid"), Some(1), Some(1))
+        );
+        assert_eq!(approval(&r)["grant_core"]["capability"]["verified"], "yes");
+        assert_eq!(snap(&file), before, "the doctor changed the store");
+        assert_eq!(
+            std::fs::read_dir(state.join("mindspace")).unwrap().count(),
+            entries_before
+        );
+        // a valid, active grant does not raise the assurance
+        assert_eq!(approval(&r)["assurance"]["effective"], "A0");
+        // 3. a tampered store: reported, exit code unchanged, store untouched
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, text.replacen("\"ro\"", "\"rw\"", 1)).unwrap();
+        let tampered = snap(&file);
+        let (code, r, _) = doctor_json(with_state(&["doctor", "--json"]));
+        assert_eq!(
+            code, 0,
+            "an invalid store is a finding, not a failed diagnosis"
+        );
+        let a = approval(&r);
+        assert_eq!(a["grant_core"]["store"]["state"], "invalid");
+        assert_eq!(a["assurance"]["configured"], "A0");
+        assert_eq!(a["assurance"]["effective"], "A0");
+        assert_eq!(snap(&file), tampered);
+    }
+
+    #[test]
+    fn the_text_report_shows_the_approval_assurance() {
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let out = run({
+            let mut c = mind(&["doctor"]);
+            c.env("XDG_DATA_HOME", &xdg);
+            c
+        });
+        let text = String::from_utf8_lossy(&out.stdout);
+        for needle in [
+            "approval.assurance.effective: A0",
+            "approval.assurance.verified: A0",
+            "approval.agent_isolation.state: unknown",
+            "approval.authorities.terminal_cli.capability.verified: no",
+        ] {
+            assert!(text.contains(needle), "{needle} missing in:\n{text}");
+        }
+    }
+
     #[test]
     fn temporary_files_are_removed_after_a_normal_run() {
         let t = tmp();

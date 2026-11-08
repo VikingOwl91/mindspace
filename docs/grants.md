@@ -16,7 +16,7 @@ Implements the first step of [ADR-030](adr-030-jit-authorization.md): approval a
 | Request | a line in `grant-requests.jsonl` (untrusted text from the agent). It changes nothing. |
 | Grant | a verified `granted` event in the store, created by `mind grant add` or `approve`. |
 | Human consent | **not established**. A grant means "someone ran the command as this user", nothing more. |
-| Host assurance | **not measured** in this step (`mind doctor` does not report it yet; ADR-030, section 5a). |
+| Host assurance | measured passively and reported by `mind doctor` under `approval` (see [doctor.md](doctor.md)); it is A0 unless agent isolation is verified, which nothing does yet. |
 | Agent isolation | an assumption about the client, **not verified**. |
 | Running server vs. restart | a running server never gains or loses access; grants, expiry and revocation act when `mind mcp --grants` starts. |
 
@@ -92,4 +92,4 @@ program running as your user: that program can rewrite the whole chain or simply
 
 ## Not in this step
 Mid-session grants, per-grant workers, polkit, hardware tokens, a desktop dialog, client configuration, network approval services,
-persistence of sessions, and `mind doctor` reporting of approval assurance (ADR-030, section 5a).
+and persistence of sessions.

@@ -25,6 +25,8 @@ use crate::paths::Located;
 use crate::storage::sqlite::{inspect_database, DatabaseInspection};
 
 #[cfg(target_os = "linux")]
+pub mod approval;
+#[cfg(target_os = "linux")]
 pub mod capabilities;
 #[cfg(target_os = "linux")]
 pub mod selftest;
@@ -729,6 +731,8 @@ fn check_sandbox(i: &Inputs) -> Check {
         c.details = json!({});
     }
     c.details["capabilities"] = capabilities::report(proven);
+    // Who may create repository grants here, computed conservatively (M7.3b).
+    c.details["approval"] = approval::report(proven);
     c
 }
 

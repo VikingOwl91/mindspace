@@ -248,3 +248,193 @@ migration: none found. If queryable skip reasons are wanted later, a dedicated c
 migration; the identity suffix avoids it at the cost of parsing a version string.
 Compatibility: older binaries keep reading the database (skip rows look like failed derivations),
 and, unaware of the cap, replace a skip by a parse when they ingest the same input.
+
+## 9. Pre-implementation validation (results; added after approval of `p1` defaults)
+
+Approved: `p1` defaults (2 MiB / depth 256 / 32 MiB output), additive `skipped` counter, skip rows
+stored as `failed` with a policy-bearing identity, no automatic blacklist, explicit retry/skip.
+
+1. **Budget accounting and allocation order (checked against `code.rs` at `6791b4a`).** The
+   allocations in `visit`, in the order they happen, and what must be charged before each:
+   * on **every** node: `parent` and `parent_q` are cloned to `String`s from the shared `Rc<str>`.
+     Uncharged and O(depth x name length) per node; the implementation should borrow (`&str`).
+   * `call_expression`: `raw_target = text(function)` copies the *whole callee expression*.
+     **Measured quadratic**, new finding: `a.b().b()...` (40 KB, 10,000 calls) peaks at 205 MiB
+     (2,000 calls 14 MiB; 5,000 calls 57 MiB; the memory is the retained `raw_target`s). A 2 MiB
+     file of this shape reaches hundreds of GiB (Reasoned, quadratic extrapolation). So the output
+     budget must charge `raw_target` by node length (`end_byte - start_byte`) **before** `text()`.
+   * `impl_item`: two `text()` copies and two `format!`s: charge by node length and formula.
+   * entity: `name` copy, `path` and `q` (`format!`; length `parent_q.len() + 2 + name.len()` is
+     known first), and `raw = text(n)`, a copy of the *whole entity* only to read its first
+     line and prefix; it can be a borrowed slice (no allocation, and it removes a per-nesting-level
+     copy). `use`: `raw` is stored twice (import and signature) plus the targets: charge 2 x length
+     before copying.
+   Rule for the implementation: `charge(bytes) -> Err(Skip)` is called with the exact or an upper
+   bound of each allocation before it is made; a failed charge aborts the walk and drops the draft.
+   Budgets constrain the output, not RSS (the tree is outside them).
+2. **Skip idempotency (Measured).** A throwaway program wrote a policy-skip row (`failed`,
+   `extractor_version` `3+skip(p1:source_bytes>2097152)`) through the real store API twice: the first
+   write inserted one derivation, the second reported `reused: 1` and the row count stayed at one.
+   `has_code_derivation` compares all four identity columns exactly, so probing a skip identity
+   needs no storage change.
+3. **Complete-derivation reuse across policy changes (Reasoned from the code).**
+   `has_code_derivation(I)` ignores status and policy and runs first; the skip rows have another
+   identity and never satisfy it. A lowered budget therefore cannot remove or hide a complete row.
+4. **Old entities after a parser-version change (code read, Measured on the compat database).**
+   Entity and relationship queries keep, per input, only the derivation with the greatest
+   `created_at` across all identities: a newer skip row hides the older version's entities there.
+   `structure <path>` lists every derivation of the input: it showed the old `complete` one with its
+   entities **and** the new row as `(failed, 0 errors)`. Expected and to be documented: symbols and
+   relationships lose the file after the upgrade, `structure` shows both.
+5. **Older binaries (Measured).** With the skip row in a real database, `mind structure` and
+   `mind symbols` (this build has no skip logic) ran without error, printed the skip as
+   `rust <hash> (failed, 0 errors)`, and an ingest with it re-derived normally. No decode failure.
+6. **Interrupted or failed extraction.** The stream consumer returns an `Extracted` only after a
+   valid closing record (tested on the stream branches), so a worker killed or cancelled mid-parse
+   persists nothing. Within persistence, a derivation row and its entities are written in one
+   SQLite transaction (`record_code_observation`); the Git observation and the code observation
+   are two transactions, so a crash between them leaves text without derivations, which the next
+   ingest completes (`known(I)` false). A discarded structural result never reaches the store, so
+   partial entities cannot be exposed.
+
+Blockers before implementing the cap: (a) the borrowed/charged allocation rewrite of `visit`
+described in 1, including the `raw_target` charge, (b) the three tests listed in 2 of section 6 for
+the method-chain and wide-callee shapes, (c) the decision on how `structure` should present a
+file whose old entities are hidden (section 4 of this list), (d) confirmation of the
+`--skip-structure` CLI shape.
+
+## 10. Final policy decisions (recorded)
+
+| Decision | Value |
+|---|---|
+| Source size budget | 2 MiB (`> 2,097,152` bytes skips; exactly 2 MiB parses) |
+| Entity nesting depth | 256 (`> 256` skips) |
+| Structural output budget | 32 MiB (accounting in 2 and 9) |
+| On any violation | the **entire** structural derivation is discarded; the text path is untouched |
+| Reporting | additive `skipped` counter in the ingest report, a line in the ingest output, `structure` marker |
+| Storage of a skip | existing status `failed`, `error_count` 0, no entities, identity `I` + policy suffix (`P`); no new status, no migration |
+| Blacklisting | none automatic; only the explicit `--skip-structure` below creates a manual skip |
+
+### The effective derivation (one rule for every reader)
+Per code input, the **effective derivation** is the row with the greatest `(created_at, id)` over
+all its derivations, whatever the identity; `id` (UUIDv7) breaks ties, so exactly one row is
+effective. Today the readers disagree at the edges: entity, symbol and relationship queries use
+`d.created_at = (SELECT MAX(created_at) ...)`, which returns *several* rows on a tie; `structure
+<path>` ignores the rule and prints every derivation. Design:
+* One shared SQL fragment (a constant used by every reader):
+  `d.id = (SELECT d2.id FROM code_derivations d2 WHERE d2.input_id = d.input_id ORDER BY d2.created_at DESC, d2.id DESC LIMIT 1)`.
+  `symbols`, relationship observations/resolution and `structure` all use it.
+* `structure` keeps listing every derivation of the input (history stays visible, which is what
+  it does today) but marks exactly one `effective` and prints, for a skip, `skipped (<reason>)`
+  from the identity suffix (reasons: `source_bytes>N`, `entity_depth>N`, `output_bytes>N`,
+  `requested`). Old derivations keep their entity list, marked `superseded`.
+* A newer skip hides older entities from `symbols`/relationships (they are not effective); it
+  never deletes them; `structure` still shows them.
+* Test: for a database with complete, then skip, then complete rows of one input, the three
+  readers return the same derivation id; with equal `created_at` they still return one.
+
+## 11. Manual `--skip-structure <path>` and `--retry-structure <path>` (design only)
+
+Both are options of `mind ingest` (CLI only, repeatable, **explicit paths**: no globs, no
+directories, no implicit "last crashed file"). They are not available through MCP.
+
+**Path normalization.** Git: repository-relative, `/` separators, no leading `/`, no `.`/`..`/empty
+components, at most 4,096 bytes, matched exactly against the source files (blob entries that are
+ingestable) of the commits the operation derives (HEAD and worktree heads, or every tip with
+`--history`). Directory: relative to the ingested root, or absolute and then required to lie below
+the canonical root; canonicalized the same way the walk does (no symlink following). A path that
+matches no ingestable source file of the operation is an error, never ignored. In history scope a
+path may resolve to several blobs (different commits); the decision applies to every distinct blob
+it resolves to, and the report lists them.
+
+**Unit and identity.** The decision attaches to the **code input** (the existing key): `(repository
+id, blob oid)` for Git (the repository id is the marker UUID, so it survives moving the
+repository; a fresh clone has another id and carries no decisions), `(NULL, content hash)` for
+directories. The path only selects; the same blob under another path is skipped too (content
+addressed), and a changed file (new blob) is a new input with no decision.
+
+**Persistence.** `--skip-structure` appends a skip derivation with identity `I` + `skip(p1:requested)`
+(status `failed`, 0 entities), in the same observation as the text, so text ingestion proceeds
+unchanged. No limit value in the suffix: a manual decision is independent of budgets.
+
+**Precedence in the producer** (each step an existence probe, no new context method):
+1. `known(I)` (a derivation exists for the current parser identity): reuse. A manual skip is not
+   applied over an existing complete/recovered/failed derivation: `--skip-structure` on such a
+   blob is a no-op with the message "structure already derived; nothing to skip". Reason: rows are
+   append-only and keyed uniquely per identity, so a skip could not be made effective over an
+   older `I` row, and a derivation that exists cannot crash the worker (it is not re-run).
+2. `known(I + requested)`: skip (reuse the row), report reason `requested`.
+3. policy probes and evaluation (sections 3 and 2).
+`--retry-structure <path>` runs the operation with step 2 disabled for the resolved blob(s): the
+parse is attempted under the policy. Outcomes: complete/recovered/failed derivation `I` appended
+(newest, effective); policy skip appended (effective, reason now the budget); the worker dies
+again: nothing is stored and the requested skip row stays as it was (the user can retry again or
+leave it).
+
+**Interaction table**
+| Situation | `--skip-structure` | `--retry-structure` |
+|---|---|---|
+| no derivation yet | appends `requested` skip | parses under the policy (default behaviour) |
+| complete/recovered/failed `I` exists | no-op, says so | no-op (nothing to retry), says so |
+| policy skip exists | appends `requested` skip (stays skipped if a budget is later raised) | re-evaluates; a raised budget now parses, otherwise a new policy skip row if the limit changed, else reuse |
+| requested skip exists | idempotent no-op | parses; outcome as above |
+**Parser upgrade.** `I` and the skip identities embed `extractor_version`, so a manual skip
+recorded under the old parser no longer matches: the blob is evaluated again with the new parser.
+This is deliberate (the new parser may not crash); if it does, the failed stream names the file
+again (progress record) and the user repeats the explicit skip. Carrying manual skips across
+versions was rejected: it would silently hide a fixed problem.
+**Idempotency.** `--skip-structure` twice: second run reuses the row (`reused`), no new row.
+`--retry-structure` twice: the second finds either a derivation (no-op) or repeats the attempt.
+Neither option changes anything for other files, and neither is remembered between runs except
+through the stored rows. Tests: the matrix above, path errors, history-scope multi-blob paths,
+copy of the same blob under another path, repository move (marker), two runs.
+
+## 12. Implementation plan for the structural cap (not started)
+
+Order of work, each step with its tests first:
+1. **Reference and policy type.** `ParsePolicy{max_source_bytes, max_entity_depth, max_output_bytes}`
+   with `unlimited()` for tests; `SkipReason`; `code::parse_with_policy`. Keep the current
+   `code::parse` and the test-only recursive reference.
+2. **Allocation hardening of `visit`** (behaviour-preserving for accepted input):
+   * `raw` becomes a borrowed `&str` slice (`&s[start..end]`) for the signature line, `pub`/`async`
+     prefix checks and the `use` handling; only the first line (signature) and, for `use`, the
+     stored `raw` are copied.
+   * `Ctx` is passed by reference; `parent`/`parent_q` are used as `&str` (no per-node `String`
+     clones); strings are built only where an entity or relationship is produced.
+   * `charge(n)` is called before each allocation with an exact or upper-bound length: names,
+     `path` and `q` (computed from lengths), `signature`, the `use` raw (twice) and its targets,
+     `raw_target` (callee text length, `end_byte - start_byte`) and the impl targets; plus 64 per
+     record. First failure returns `Err(SkipReason)`; the traversal stops; the draft is dropped.
+   * Depth counter in `Ctx`, checked on entering a level (entity or `impl`).
+   * Differential test: for every accepted input the result equals `code::parse` (all real sources,
+     corrupted variants, nested fixtures); the 85-file corpus stays the equivalence oracle.
+3. **Source-size check** before the parser is created.
+4. **Producer wiring** (stream and in-process): precedence of section 11, `P` identities, skip
+   `code_input` records, the `skipped` counter, `structure` marker and the shared effective-derivation
+   SQL (section 10). Progress record (section 5).
+5. **CLI options** `--skip-structure` / `--retry-structure` (section 11).
+
+**Planned regression fixtures** (each runs in a child process with a modest `RLIMIT_AS` and asserts
+a typed skip or a normal result, never a crash):
+| Fixture | Expected |
+|---|---|
+| method chain `a.b().b()...` 2,000 / 10,000 / 100,000 calls | accepted while the charged `raw_target` total stays under 32 MiB; skipped (`output_bytes`) beyond; memory far below the unbounded 205 MiB at 10,000 |
+| wide callee: `f(...)(...)` chains and `x.y.z...` field chains | same accounting |
+| nested entities: `fn`, `mod`, `impl` chains at depth 255 / 256 / 257 / 20,000 | 256 parses, 257 and 20,000 skip (`entity_depth`) |
+| large identifier: one 1 MiB name at depth 3; 2 MiB name | qualified-name growth charged before `format!`; skip when over budget |
+| large import list: `use a::{b0, b1, ...}` with 2 MiB of items; many imports | raw counted twice plus targets; skip over budget |
+| boundaries: source 2,097,152 and 2,097,153 bytes; output S and S-1 bytes where S is the accounted size of the unlimited run; depth 256 / 257 | exact |
+| the existing parser-safety fixtures (braces, parentheses, chain, modules) | still parse |
+| ordinary 2 MiB code, 76k entities | accepted, equal to `code::parse` |
+Acceptance for the allocation work: no peak-RSS regression on accepted inputs (compare the 85-file
+corpus and the wgpu ingest before/after), and the method-chain 10,000 fixture drops from 205 MiB.
+
+## 13. Remaining blockers before implementation
+1. Agreement that `structure` marks `effective`/`superseded` rather than listing only the effective
+   derivation (section 10).
+2. The no-op rule for `--skip-structure` over an existing derivation (section 11) and the choice not
+   to carry manual skips across parser versions.
+3. The exact byte accounting constants (the fixed 64 per record) are provisional; they are only
+   tested for self-consistency, not calibrated against RSS (the budgets do not bound RSS).
+4. Section 4 of the earlier list: how hidden entities are presented after a parser upgrade (covered by
+   the marker in section 10, to be confirmed).

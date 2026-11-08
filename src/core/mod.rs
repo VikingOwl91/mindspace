@@ -901,7 +901,7 @@ impl IngestScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionDraft {
     pub root: String,
     pub scope: IngestScope,
@@ -912,7 +912,7 @@ pub struct SessionDraft {
 /// deterministic parse into evidence and assertion drafts with requested
 /// spaces. Parsing happens before the store call; the store owns all
 /// identity, lifecycle, and reconciliation decisions.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservedFile {
     pub location: String,
     pub content: String,
@@ -1110,7 +1110,7 @@ pub struct CodeDerivation {
     pub entities: Vec<CodeEntity>,
     pub imports: Vec<CodeImport>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeInputDraft {
     pub language: CodeLanguage,
     pub content_hash: String,
@@ -1120,12 +1120,12 @@ pub struct CodeInputDraft {
     pub contexts: Vec<CodeContextDraft>,
     pub derivation: CodeDerivationDraft,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeContextDraft {
     pub path: String,
     pub commit_oid: Option<String>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeDerivationDraft {
     pub identity: CodeParserIdentity,
     pub status: CodeParseStatus,
@@ -1134,7 +1134,7 @@ pub struct CodeDerivationDraft {
     pub imports: Vec<CodeImportDraft>,
     pub relationships: Vec<CodeRelationshipDraft>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeEntityDraft {
     pub kind: CodeEntityKind,
     pub name: Option<String>,
@@ -1146,7 +1146,7 @@ pub struct CodeEntityDraft {
     pub visibility: Option<String>,
     pub is_async: bool,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeImportDraft {
     pub raw: String,
     pub target: String,
@@ -1198,7 +1198,7 @@ impl CodeResolutionState {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeRelationshipDraft {
     pub kind: CodeRelationshipKind,
     pub source_syntax_path: Option<String>,
@@ -1230,7 +1230,7 @@ pub struct CodeObservationReport {
 /// Everything one ingest operation observed, handed to the store in a
 /// single call. The store owns the transaction, the lifecycle rules, and
 /// the reconciliation rules.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestObservation {
     pub session: SessionDraft,
     pub files: Vec<ObservedFile>,
@@ -1238,7 +1238,7 @@ pub struct IngestObservation {
     pub spaces: Vec<Uuid>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceDraft {
     pub kind: EvidenceKind,
     pub heading_path: Option<String>,
@@ -1249,7 +1249,7 @@ pub struct EvidenceDraft {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssertionDraft {
     /// Index into the observed file's `evidences`.
     pub evidence_idx: usize,
@@ -1261,7 +1261,7 @@ pub struct AssertionDraft {
     pub extraction: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemorySpec {
     /// Index into the observed file's `assertions`.
     pub assertion_idx: usize,
@@ -1431,7 +1431,7 @@ pub struct GitTagData {
 
 /// One text file derived at a ref tip: a git blob routed through the
 /// existing evidence/assertion pipeline with git extraction rule ids.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDerivedFile {
     pub source_kind: SourceKind,
     pub path: String,
@@ -1479,7 +1479,7 @@ pub struct GitRefEventDraft {
 
 /// Everything one git observation saw, handed to the store in a single
 /// call. The store owns the transaction, identity decisions, and counters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitObservation {
     pub session: SessionDraft,
     pub repository_id: Uuid,
@@ -1511,7 +1511,7 @@ pub struct GitObservation {
 }
 
 /// One configured remote of a repository. `url` never contains credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRemoteDraft {
     pub name: String,
     pub url: String,

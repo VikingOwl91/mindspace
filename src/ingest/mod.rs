@@ -2,6 +2,7 @@ pub mod code;
 #[cfg(target_os = "linux")]
 pub mod confined;
 pub mod deadline;
+pub mod extract;
 pub mod git;
 pub mod markdown;
 pub mod outline;
@@ -20,6 +21,7 @@ use crate::core::{
 };
 use crate::storage::Store;
 use deadline::Deadline;
+use extract::{Extracted, ExtractedFiles, ExtractedGit, ExtractionContext, StoreContext};
 
 /// Which ref classes beyond HEAD and worktrees are interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,6 +77,18 @@ pub fn ingest_path_with_deadline<S: AsRef<str>>(
     space_names: &[S],
     deadline: &Deadline,
 ) -> Result<IngestOutcome> {
+    let extracted = extract_path_with_deadline(&StoreContext(store), path, space_names, deadline)?;
+    extract::persist(store, extracted, deadline)
+}
+
+/// The extraction half of [`ingest_path_with_deadline`]: reads and parses, never
+/// writes (the context is read-only). See [`extract`].
+pub fn extract_path_with_deadline<S: AsRef<str>>(
+    ctx: &dyn ExtractionContext,
+    path: &Path,
+    space_names: &[S],
+    deadline: &Deadline,
+) -> Result<Extracted> {
     deadline.check("starting")?;
     let canonical = std::fs::canonicalize(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
@@ -88,9 +102,9 @@ pub fn ingest_path_with_deadline<S: AsRef<str>>(
     // A git repository wins over directory ingest: committed history is
     // what it observes, not the working tree.
     if metadata.is_dir() && git::looks_like_git_repository(&canonical) {
-        return Ok(IngestOutcome::Git(
-            ingest_git_repository_selected_with_deadline(
-                store,
+        return Ok(Extracted::Git(
+            extract_git_repository_selected_with_deadline(
+                ctx,
                 &canonical,
                 space_names,
                 &outline::PathSelection::all(),
@@ -106,7 +120,7 @@ pub fn ingest_path_with_deadline<S: AsRef<str>>(
     }
 
     // Spaces must pre-exist; the first missing one fails the ingest.
-    let space_ids = resolve_spaces(store, space_names)?;
+    let space_ids = resolve_spaces_with(ctx, space_names)?;
 
     let (root, scope, files) = if metadata.is_dir() {
         (
@@ -123,19 +137,19 @@ pub fn ingest_path_with_deadline<S: AsRef<str>>(
         )
     };
 
-    record_observed_files(store, root, scope, files, space_ids, deadline)
+    prepare_observed_files(ctx, root, scope, files, space_ids, deadline).map(Extracted::Files)
 }
 
-/// Records an observed set of files (the part of a directory ingest after the
-/// files were read). Shared by the path-based and the anchored directory ingest.
-pub(crate) fn record_observed_files(
-    store: &dyn Store,
+/// Parses the source files among `files` and assembles the observation (shared by
+/// the path-based and the anchored directory ingest). Writes nothing.
+pub(crate) fn prepare_observed_files(
+    ctx: &dyn ExtractionContext,
     root: String,
     scope: IngestScope,
     files: Vec<ObservedFile>,
     space_ids: Vec<Uuid>,
     deadline: &Deadline,
-) -> Result<IngestOutcome> {
+) -> Result<ExtractedFiles> {
     let mut code_inputs = Vec::new();
     for f in &files {
         let Some(language) = code::language_for(Path::new(&f.location)) else {
@@ -143,7 +157,7 @@ pub(crate) fn record_observed_files(
         };
         deadline.check("parsing source files")?;
         let identity = code::identity();
-        let known = store.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
+        let known = ctx.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
         code_inputs.push(crate::core::CodeInputDraft {
             language,
             content_hash: f.content_hash.clone(),
@@ -177,15 +191,10 @@ pub(crate) fn record_observed_files(
         files,
         spaces: space_ids.clone(),
     };
-    // The last point where the limit can stop the ingest cleanly.
-    deadline.check("preparing to write")?;
-    let report = store.record_observation(observation)?;
-    if !code_inputs.is_empty() {
-        let _ = store.record_code_observation(crate::core::CodeObservation {
-            inputs: code_inputs,
-        })?;
-    }
-    Ok(IngestOutcome::Files(report))
+    Ok(ExtractedFiles {
+        observation,
+        code_inputs,
+    })
 }
 
 /// Ingests only the selected paths below `path`.
@@ -390,9 +399,16 @@ pub fn ingest_file<S: AsRef<str>>(
 }
 
 fn resolve_spaces<S: AsRef<str>>(store: &dyn Store, space_names: &[S]) -> Result<Vec<Uuid>> {
+    resolve_spaces_with(&StoreContext(store), space_names)
+}
+
+pub(crate) fn resolve_spaces_with<S: AsRef<str>>(
+    ctx: &dyn ExtractionContext,
+    space_names: &[S],
+) -> Result<Vec<Uuid>> {
     let mut space_ids = Vec::with_capacity(space_names.len());
     for name in space_names {
-        space_ids.push(store.get_space(name.as_ref())?.id);
+        space_ids.push(ctx.space_id(name.as_ref())?);
     }
     Ok(space_ids)
 }
@@ -452,9 +468,29 @@ pub fn ingest_git_repository_selected_with_deadline<S: AsRef<str>>(
     scope: GitScope,
     deadline: &Deadline,
 ) -> Result<GitObservationReport> {
+    let extracted = extract_git_repository_selected_with_deadline(
+        &StoreContext(store),
+        repo_path,
+        space_names,
+        selection,
+        scope,
+        deadline,
+    )?;
+    extract::persist_git(store, extracted, deadline)
+}
+
+/// The extraction half of [`ingest_git_repository_selected_with_deadline`].
+pub fn extract_git_repository_selected_with_deadline<S: AsRef<str>>(
+    ctx: &dyn ExtractionContext,
+    repo_path: &Path,
+    space_names: &[S],
+    selection: &outline::PathSelection,
+    scope: GitScope,
+    deadline: &Deadline,
+) -> Result<ExtractedGit> {
     let reader = git::GitReader::open_with_deadline(repo_path, *deadline)?;
-    ingest_git_with_reader(
-        store,
+    extract_git_with_reader(
+        ctx,
         reader,
         repo_path,
         space_names,
@@ -464,19 +500,20 @@ pub fn ingest_git_repository_selected_with_deadline<S: AsRef<str>>(
     )
 }
 
-/// The body of a git ingest, for a reader that is already bound. `repo_path` is
-/// only the label recorded for the repository and session.
-pub(crate) fn ingest_git_with_reader<S: AsRef<str>>(
-    store: &dyn Store,
+/// The body of a git ingest for a reader that is already bound: everything up
+/// to, and not including, the database write. The context is read-only.
+/// `repo_path` is only the label recorded for the repository and session.
+pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
+    ctx: &dyn ExtractionContext,
     reader: git::GitReader,
     repo_path: &Path,
     space_names: &[S],
     selection: &outline::PathSelection,
     scope: GitScope,
     deadline: &Deadline,
-) -> Result<GitObservationReport> {
+) -> Result<ExtractedGit> {
     let repository_id = reader.repository_id()?;
-    let space_ids = resolve_spaces(store, space_names)?;
+    let space_ids = resolve_spaces_with(ctx, space_names)?;
 
     // Refs: heads, remotes, tags, and HEAD, sorted by name.
     let refs = reader.refs()?;
@@ -642,7 +679,7 @@ pub(crate) fn ingest_git_with_reader<S: AsRef<str>>(
     // force-push. A symbolic HEAD is a view of its branch, not an
     // independent pointer: it is observed in the ref state but produces no
     // events of its own. A detached HEAD is a real pointer and is journalled.
-    let current = store.git_refs_current(repository_id)?;
+    let current = ctx.git_refs_current(repository_id)?;
     let current_by_name: std::collections::HashMap<String, &crate::core::GitRefObservation> =
         current.iter().map(|r| (r.name.clone(), r)).collect();
     let mut ref_events: Vec<GitRefEventDraft> = Vec::new();
@@ -700,13 +737,8 @@ pub(crate) fn ingest_git_with_reader<S: AsRef<str>>(
         }
     }
 
-    let code_inputs = tip_files_to_code_inputs(
-        store,
-        repository_id,
-        &derivations,
-        &content_by_oid,
-        deadline,
-    )?;
+    let code_inputs =
+        tip_files_to_code_inputs(ctx, repository_id, &derivations, &content_by_oid, deadline)?;
 
     // Releases: every tag ref is a document-shaped memory, independent of
     // which commits are current views. A targeted (`--path`) ingest skips
@@ -759,27 +791,14 @@ pub(crate) fn ingest_git_with_reader<S: AsRef<str>>(
         current_commits: (scope != GitScope::History)
             .then(|| tip_commits.iter().cloned().collect()),
     };
-    // The last point where the limit can stop the ingest cleanly.
-    deadline.check("preparing to write")?;
-    let mut report = store.record_git_observation(observation)?;
-    if !code_inputs.is_empty() {
-        report.code = store.record_code_observation(crate::core::CodeObservation {
-            inputs: code_inputs,
-        })?;
-        for commit in tip_commits {
-            let _ = store.resolve_git_code_relationships(
-                repository_id,
-                &commit,
-                "mind-rust-resolver",
-                "1",
-            )?;
-        }
-    }
-    Ok(report)
+    Ok(ExtractedGit {
+        observation,
+        code_inputs,
+    })
 }
 
 fn tip_files_to_code_inputs(
-    store: &dyn Store,
+    ctx: &dyn ExtractionContext,
     repository_id: Uuid,
     derivations: &[GitDerivedFile],
     contents: &std::collections::HashMap<String, String>,
@@ -802,7 +821,7 @@ fn tip_files_to_code_inputs(
                 repository_id: Some(repository_id),
                 blob_oid: Some(d.blob_oid.clone()),
                 contexts: vec![],
-                derivation: if store
+                derivation: if ctx
                     .has_code_derivation(
                         language,
                         &sha256_hex(content.as_bytes()),

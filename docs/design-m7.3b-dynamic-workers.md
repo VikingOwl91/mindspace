@@ -26,8 +26,9 @@ starts a worker for a new directory must therefore be **outside** the server's L
     `store.record_code_observation`.
   * Git: `ingest_git_with_reader` reads objects through a `GitReader` (Git child processes), builds a `GitObservation`, then calls
     `store.record_git_observation` and `store.resolve_git_code_relationships`.
-  * The only database **reads** during extraction are `resolve_spaces`/`get_space` (names -> ids) and `has_code_derivation` (an optimization
-    that skips parsing a known blob). Everything else before the `record_*` calls is pure.
+  * The database **reads** during extraction are `get_space` (names -> ids), `has_code_derivation` (an optimization that skips parsing a known
+    blob) and, for Git, `git_refs_current` (the previous ref state, needed to classify ref movements as fast-forward or not; found while
+    implementing task 2, the first version of this note missed it). Everything else before the `record_*` calls is pure.
 * The transfer types (`ObservedFile`, `IngestObservation`, `GitObservation`, `CodeObservation` and what they contain) derive `Debug`/`Clone`
   but not `Serialize`/`Deserialize`; a wire format needs serde derives on that tree.
 * `sandbox::enter` (stage 1) restricts itself and **replaces** itself by `exec`; there is no surviving parent. `verify_stage2` rejects any
@@ -68,8 +69,11 @@ starts a worker for a new directory must therefore be **outside** the server's L
 
 ## 4. Answers
 
-1. **Where extraction and persistence separate.** Introduce `extract_*` (reads and parses, returns a plain `Extracted` value) and `persist(store,
-   Extracted)` next to `record_observed_files` / `ingest_git_with_reader`; the in-process path (static roots) is `persist(extract(..))`
+1. **Where extraction and persistence separate.** *(Implemented as tasks 1 and 2, `src/ingest/extract.rs`.)* `extract_*` reads and parses and returns an
+   `Extracted` value; it receives a read-only `ExtractionContext` (`space_id`, `git_refs_current`, `has_code_derivation`; no write method exists, so extraction
+   cannot write). `persist(store, Extracted, deadline)` is the only writer and keeps the old order and the single deadline check before the first write. For a
+   later worker the context becomes request/response calls to the process that owns the database (the Git ref state depends on the repository id that only the
+   worker can compute, so it is a round trip, not a precomputed input). Previously: the in-process path (static roots) is `persist(extract(..))`
    and keeps today's behaviour and tests. Space names are resolved to ids by the frontend and passed in; the `has_code_derivation` shortcut is
    dropped in the worker (it parses every code blob; the store already ignores a known derivation), a cost to measure.
 2. **Who owns database write rights.** The frontend only (as today). The worker's Landlock domain has no rule for the database directory.

@@ -22,6 +22,10 @@ pub enum Error {
     #[error("{0}")]
     Setup(String),
 
+    /// An extraction result failed validation (it is dropped whole).
+    #[error("invalid extraction result: {0}")]
+    InvalidExtraction(String),
+
     /// A problem with the repository grant store or a grant command (M7.3a).
     #[error("{0}")]
     Grant(String),

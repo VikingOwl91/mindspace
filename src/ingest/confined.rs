@@ -26,6 +26,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use super::deadline::Deadline;
+use super::extract::{ExtractedFiles, ExtractedGit, ExtractionContext, StoreContext};
 use super::git::{GitPin, GitReader};
 use super::outline::{self, Outline, PathSelection};
 use super::repo_info::{self, RepoInfo};
@@ -400,16 +401,16 @@ pub fn ingest_confined<S: AsRef<str>>(
 ) -> Result<Vec<IngestOutcome>> {
     deadline.check("starting")?;
     if has_git(anchor) {
-        let reader = open_git_reader(anchor, policy, true, deadline)?;
-        let report = super::ingest_git_with_reader(
-            store,
-            reader,
-            anchor.real(),
-            space_names,
+        let extracted = extract_confined_git(
+            &StoreContext(store),
+            anchor,
+            policy,
             selection,
             scope,
+            space_names,
             deadline,
         )?;
+        let report = super::extract::persist_git(store, extracted, deadline)?;
         return Ok(vec![IngestOutcome::Git(report)]);
     }
     let space_ids = super::resolve_spaces(store, space_names)?;
@@ -441,6 +442,29 @@ pub fn ingest_confined<S: AsRef<str>>(
     Ok(outcomes)
 }
 
+/// Extraction of an anchored Git repository: everything up to, and not
+/// including, the database write (see [`super::extract`]).
+pub fn extract_confined_git<S: AsRef<str>>(
+    ctx: &dyn ExtractionContext,
+    anchor: &Anchor,
+    policy: &dyn PathPolicy,
+    selection: &PathSelection,
+    scope: GitScope,
+    space_names: &[S],
+    deadline: &Deadline,
+) -> Result<ExtractedGit> {
+    let reader = open_git_reader(anchor, policy, true, deadline)?;
+    super::extract_git_with_reader(
+        ctx,
+        reader,
+        anchor.real(),
+        space_names,
+        selection,
+        scope,
+        deadline,
+    )
+}
+
 fn ingest_directory(
     store: &dyn Store,
     anchor: &Anchor,
@@ -448,6 +472,19 @@ fn ingest_directory(
     space_ids: &[Uuid],
     deadline: &Deadline,
 ) -> Result<IngestOutcome> {
+    let extracted = extract_directory(&StoreContext(store), anchor, policy, space_ids, deadline)?;
+    super::extract::persist_files(store, extracted, deadline).map(IngestOutcome::Files)
+}
+
+/// Extraction of one anchored directory: reads every ingestable file beneath
+/// the anchor and parses it; writes nothing.
+pub fn extract_directory(
+    ctx: &dyn ExtractionContext,
+    anchor: &Anchor,
+    policy: &dyn PathPolicy,
+    space_ids: &[Uuid],
+    deadline: &Deadline,
+) -> Result<ExtractedFiles> {
     let base = anchor.proc_path();
     let mut paths: Vec<PathBuf> = outline::walk_files(&base)?
         .into_iter()
@@ -472,8 +509,8 @@ fn ingest_directory(
         let location = anchor.real().join(&rel).display().to_string();
         files.push(super::observe_bytes(&rel, bytes, location, space_ids)?);
     }
-    super::record_observed_files(
-        store,
+    super::prepare_observed_files(
+        ctx,
         anchor.real().display().to_string(),
         IngestScope::Directory,
         files,

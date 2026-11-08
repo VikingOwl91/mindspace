@@ -17,3 +17,10 @@ REASONED / UNKNOWN. No rule was widened by this audit.
 1. Narrow `/proc` to `/proc/<own pid>`; check canary, Git pinned paths, `doctor`.
 2. Narrow the Git directory rule to the binary plus exec-path.
 3. Remove `/sys/fs/cgroup` after an embedding run in the sandbox.
+
+## Update: Git binary rule
+
+* The binary is granted as one file (`FileExec`), not its directory. VERIFIED by kernel test (copy under a fake home,
+  symlink to a second directory, replaced executable that fails closed). Before: a sibling file in the Git directory
+  was readable. The exec-path directory is still granted as a directory (helpers live there); a Git whose own shared
+  libraries sit outside `/usr` is not covered (UNKNOWN).

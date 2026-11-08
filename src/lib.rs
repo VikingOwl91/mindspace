@@ -20,6 +20,7 @@ pub mod retrieval;
 pub mod sandbox;
 pub mod setup;
 pub mod storage;
+pub mod worker;
 
 pub use core::{Error, Result};
 pub use storage::sqlite::SqliteStore;

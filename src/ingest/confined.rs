@@ -118,6 +118,26 @@ impl Anchor {
         &self.real
     }
 
+    /// An anchor around a descriptor that the caller already verified (the extraction worker
+    /// receives its root this way). It checks that the descriptor really is a directory at `real`.
+    pub fn from_verified_fd(fd: std::os::fd::OwnedFd, real: PathBuf) -> Result<Anchor> {
+        let file = File::from(fd);
+        if !file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(refuse("the root descriptor is not a directory"));
+        }
+        if real_path_of(&file)? != real {
+            return Err(refuse(
+                "the root descriptor does not name the announced directory",
+            ));
+        }
+        Ok(Anchor { file, real })
+    }
+
+    /// A duplicate of the directory descriptor (to hand it to a child process).
+    pub fn dup_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.file.try_clone().map(Into::into)
+    }
+
     /// A path that names this inode for as long as the descriptor is open.
     pub fn proc_path(&self) -> PathBuf {
         PathBuf::from(format!(

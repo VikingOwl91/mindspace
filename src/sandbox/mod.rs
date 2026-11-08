@@ -771,6 +771,194 @@ pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
     die(&format!("cannot restart under the sandbox: {err}"));
 }
 
+// ---------------------------------------------------------------------------
+// The extraction worker (M7.3b.2a)
+// ---------------------------------------------------------------------------
+
+/// What the extraction worker found out about its own confinement.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct WorkerSandbox {
+    pub landlock_abi: u32,
+    /// Landlock signal scope active (needs ABI 6); `false` is reported, not hidden.
+    pub signal_scope: bool,
+    /// `enforced` or the reason it is not.
+    pub seccomp: String,
+    /// Each probe and what the kernel answered; all of them were as required.
+    pub probes: Vec<(String, String)>,
+}
+
+/// The rules of a worker: system libraries and the few files the runtime reads, its own `/proc`
+/// entry, `/dev/null`. No data directory, no database, no models, no Git, no `/etc`. The data
+/// root is added separately, as a descriptor.
+fn worker_rules() -> Vec<Rule> {
+    let mut r = Vec::new();
+    for p in ["/usr", "/lib", "/lib64"] {
+        r.push(Rule {
+            path: PathBuf::from(p),
+            rights: Rights::Read,
+        });
+    }
+    for p in ["/etc/ld.so.cache", "/dev/urandom"] {
+        r.push(Rule {
+            path: PathBuf::from(p),
+            rights: Rights::FileRead,
+        });
+    }
+    r.push(Rule {
+        path: PathBuf::from("/dev/null"),
+        rights: Rights::FileReadWrite,
+    });
+    if let Some(own) = own_proc_dir() {
+        r.push(Rule {
+            path: own,
+            rights: Rights::Read,
+        });
+    }
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        for d in library_dirs_from_maps(&maps) {
+            if let Ok(c) = std::fs::canonicalize(d) {
+                r.push(Rule {
+                    path: c,
+                    rights: Rights::Read,
+                });
+            }
+        }
+    }
+    r
+}
+
+/// Closes every descriptor above stderr except `keep`.
+pub fn close_all_except(keep: &[i32]) {
+    for fd in open_fds_above_stderr() {
+        if !keep.contains(&fd) {
+            // SAFETY: closing a descriptor number that was just listed.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Confines the calling (single-threaded) process as an extraction worker: no new privileges, not
+/// dumpable, the socket-deny seccomp filter, and a Landlock ruleset that allows [`worker_rules`]
+/// and read access (files and directory listing, no execute, no write) beneath `root`, a
+/// descriptor the parent verified. Then it checks by observation that the confinement is real. Any
+/// failure is an error; the caller must exit. `keep` are the descriptors the worker is meant to
+/// hold (channel, root).
+pub fn enter_extraction_worker(
+    root: &std::os::fd::OwnedFd,
+    keep: &[i32],
+) -> Result<WorkerSandbox, String> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain prctl calls on this process.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err("cannot set no_new_privs".into());
+        }
+    }
+    close_all_except(keep);
+    let root_raw = root.as_raw_fd();
+    let seccomp = match seccomp::apply_allowing(keep)? {
+        seccomp::Status::Enforced(_) => "enforced".to_string(),
+        seccomp::Status::NotApplied(why) => {
+            return Err(format!(
+                "the socket filter is not applied: {}",
+                why.reason()
+            ))
+        }
+        other => return Err(format!("the socket filter is not enforced: {other:?}")),
+    };
+    let rs = build_ruleset(&worker_rules(), &Default::default())?
+        .add_rule(PathBeneath::new(
+            root,
+            AccessFs::ReadFile | AccessFs::ReadDir,
+        ))
+        .map_err(|e| format!("rule for the root descriptor: {e}"))?;
+    let status = rs
+        .restrict_self()
+        .map_err(|e| format!("restricting the process failed: {e}"))?;
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        return Err(format!("the sandbox is only {:?}", status.ruleset));
+    }
+    let probes = worker_self_test(root_raw)?;
+    Ok(WorkerSandbox {
+        landlock_abi: landlock_abi(),
+        signal_scope: landlock_abi() >= SIGNAL_SCOPE_ABI,
+        seccomp,
+        probes,
+    })
+}
+
+/// Observations after confinement: what must be refused is refused, what the worker needs works.
+fn worker_self_test(root_fd: i32) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    let mut fail = Vec::new();
+    let mut check = |name: &str, got: Probe, want_denied: bool| {
+        let denied = matches!(got, Probe::Denied);
+        out.push((name.to_string(), format!("{got:?}")));
+        if denied != want_denied {
+            fail.push(format!("{name}: {got:?}"));
+        }
+    };
+    let via_root = format!("/proc/{}/fd/{root_fd}", std::process::id());
+    check(
+        "read /etc/passwd",
+        classify(std::fs::read("/etc/passwd")),
+        true,
+    );
+    check(
+        "list /home",
+        classify(std::fs::read_dir("/home").map(|_| ())),
+        true,
+    );
+    check(
+        "list /tmp",
+        classify(std::fs::read_dir("/tmp").map(|_| ())),
+        true,
+    );
+    check(
+        "write inside the root",
+        classify(std::fs::File::create(format!("{via_root}/.mindspace-write-probe")).map(|_| ())),
+        true,
+    );
+    check(
+        "climb out of the root",
+        classify(std::fs::read_dir(format!("{via_root}/..")).map(|_| ())),
+        true,
+    );
+    // SAFETY: socket creation attempts; the descriptor (if any) is closed at once.
+    let sock = |domain: i32| {
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            Probe::Allowed
+        } else {
+            classify::<()>(Err(std::io::Error::last_os_error()))
+        }
+    };
+    check("socket(AF_INET)", sock(libc::AF_INET), true);
+    check("socket(AF_UNIX)", sock(libc::AF_UNIX), true);
+    check(
+        "list the root",
+        classify(std::fs::read_dir(&via_root).map(|_| ())),
+        false,
+    );
+    check(
+        "write /dev/null",
+        classify(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .map(|_| ()),
+        ),
+        false,
+    );
+    if fail.is_empty() {
+        Ok(out)
+    } else {
+        Err(format!("the confinement does not hold: {fail:?}"))
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("mind: sandbox: {msg}");
     std::process::exit(78);

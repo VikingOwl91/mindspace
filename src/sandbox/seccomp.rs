@@ -408,6 +408,23 @@ pub fn apply() -> Result<Status, String> {
     )
 }
 
+/// As [`apply`], for a process that was started with a few descriptors it is meant to keep (the
+/// extraction worker's channel and root): those numbers are not counted as stray descriptors; any
+/// other one above stderr still refuses the installation.
+pub fn apply_allowing(allowed: &[i32]) -> Result<Status, String> {
+    apply_with(
+        expectation(),
+        &|| {
+            super::open_fds_above_stderr()
+                .into_iter()
+                .filter(|fd| !allowed.contains(fd))
+                .collect()
+        },
+        &thread_count,
+        &install,
+    )
+}
+
 /// Stage 2: the expectation is derived locally again. A required filter that is
 /// not demonstrably active is an error (the start is refused), whatever any
 /// environment variable says.

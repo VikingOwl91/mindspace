@@ -241,6 +241,11 @@ pub enum Command {
         #[command(subcommand)]
         command: grant::GrantCommand,
     },
+    /// EXPERIMENT (M7.3b.2a): one confined extraction worker, started by a parent process
+    /// that hands it a root directory descriptor and a channel. Not for users.
+    #[cfg(unix)]
+    #[command(hide = true, name = "extraction-worker")]
+    ExtractionWorker,
     /// Run the local MCP server over stdio
     Mcp {
         /// Directory the repo_outline and repo_ingest tools may use, as
@@ -891,6 +896,9 @@ License: {}",
         },
         #[cfg(unix)]
         Command::Grant { command } => grant::run(cli, command)?,
+        // handled at the top of `run`, before anything else happens
+        #[cfg(unix)]
+        Command::ExtractionWorker => unreachable!("the worker is started by `run`"),
         Command::Mcp {
             allow_roots,
             ingest_timeout,
@@ -1214,6 +1222,11 @@ fn sandbox_state(
 /// contract of its own (0 / 1 / 2); every other command is 0 on success and an
 /// error otherwise.
 pub fn run(cli: &Cli) -> Result<i32> {
+    // The worker does nothing before it confines itself: no database, no configuration.
+    #[cfg(unix)]
+    if let Command::ExtractionWorker = &cli.command {
+        return Ok(crate::worker::run::main());
+    }
     if let Command::Doctor { json } = &cli.command {
         return Ok(doctor_command(cli, *json).unwrap_or_else(|e| {
             eprintln!("error: {e}");

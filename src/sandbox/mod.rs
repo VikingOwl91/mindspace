@@ -827,13 +827,21 @@ fn worker_rules() -> Vec<Rule> {
     r
 }
 
-/// Closes every descriptor above stderr except `keep`.
+/// Closes every descriptor above stderr except `keep`, without reading `/proc` (a process that
+/// inherited a sandbox may not list its own descriptors): the gaps between the kept numbers are
+/// closed with `close_range`.
 pub fn close_all_except(keep: &[i32]) {
-    for fd in open_fds_above_stderr() {
-        if !keep.contains(&fd) {
-            // SAFETY: closing a descriptor number that was just listed.
-            unsafe { libc::close(fd) };
+    let mut kept: Vec<u32> = keep.iter().filter(|f| **f > 2).map(|f| *f as u32).collect();
+    kept.sort_unstable();
+    kept.dedup();
+    let mut from = 3u32;
+    for k in kept.iter().copied().chain(std::iter::once(u32::MAX)) {
+        if k > from {
+            let last = if k == u32::MAX { u32::MAX } else { k - 1 };
+            // SAFETY: closing a range of descriptor numbers that are not ours to keep.
+            unsafe { libc::syscall(libc::SYS_close_range, from, last, 0u32) };
         }
+        from = k.saturating_add(1);
     }
 }
 

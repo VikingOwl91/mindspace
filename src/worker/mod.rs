@@ -12,6 +12,8 @@
 //! the broker are later slices.
 
 pub mod client;
+#[cfg(all(unix, feature = "spawn-gate"))]
+pub mod gate;
 pub mod run;
 
 use serde::{Deserialize, Serialize};

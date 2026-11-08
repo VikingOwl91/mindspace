@@ -40,6 +40,13 @@ pub struct WorkerConfig {
     /// Refuse a worker whose hello and `/proc` status do not show the confinement. Only tests
     /// that stand in a fake worker turn this off.
     pub require_sandbox_evidence: bool,
+    /// Also check the worker's confinement in `/proc/<pid>/status` (seccomp mode, no-new-privs,
+    /// no tracer). A parent that is itself confined cannot read another process's `/proc` entry
+    /// and must turn this off, leaving the worker's own report as the only evidence. That is NOT
+    /// independent confinement verification: a worker compromised before its hello could lie.
+    /// Default true; only the tested frontend-spawn path (docs/m7.3b-frontend-spawn-gate.md) may
+    /// turn it off, until a broker verifies from outside the frontend's domain.
+    pub verify_via_proc: bool,
     /// Receives the worker's pid as soon as it exists (so a caller or a test can watch the
     /// process even when the call ends in an error).
     pub observe_pid: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
@@ -57,6 +64,7 @@ impl WorkerConfig {
             stream: StreamLimits::default(),
             producer: ProducerLimits::default(),
             require_sandbox_evidence: true,
+            verify_via_proc: true,
             observe_pid: None,
         }
     }
@@ -287,12 +295,9 @@ fn spawn(
                 }
             }
             place(&[(chan, CHANNEL_FD), (rootfd, ROOT_FD)])?;
-            // every other descriptor above the two: closed
-            if libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0u32) != 0 {
-                for fd in 5..1024 {
-                    libc::close(fd);
-                }
-            }
+            // Other inherited descriptors are NOT closed here: closing them would also close the
+            // pipe that std uses to report a failed exec (the child would abort and the parent would
+            // think the worker started). The worker closes everything above 4 itself, first thing.
             Ok(())
         });
     }
@@ -356,11 +361,26 @@ pub fn extract_directory(
     stats.worker_peak_rss_kb = ru.ru_maxrss;
     stats.exit = describe(status);
     stats.total = begun.elapsed();
+    // What the worker said, at most 8 KiB, without waiting: a descendant that left the process
+    // group may still hold the write end of the pipe, and waiting for its end would hang us.
     let mut err_text = String::new();
     if let Some(mut e) = stderr {
-        let mut buf = Vec::new();
-        let _ = (&mut e).take(8192).read_to_end(&mut buf);
-        err_text = String::from_utf8_lossy(&buf).trim().to_string();
+        use std::os::fd::AsRawFd;
+        // SAFETY: switching our own pipe end to non-blocking mode.
+        unsafe {
+            let fl = libc::fcntl(e.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(e.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let mut buf = vec![0u8; 8192];
+        let mut got = 0;
+        while got < buf.len() {
+            match e.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break, // would block: nothing more right now
+            }
+        }
+        err_text = String::from_utf8_lossy(&buf[..got]).trim().to_string();
     }
     match outcome {
         Ok(extracted) => {
@@ -380,6 +400,11 @@ pub fn extract_directory(
                 stderr: err_text,
             })
         }
+        // the session itself saw the worker go: add how the process ended and what it said
+        Err(WorkerError::Died { status, .. }) => Err(WorkerError::Died {
+            status: format!("{status} [{}]", stats.exit),
+            stderr: err_text,
+        }),
         Err(e) => Err(e),
     }
 }
@@ -443,7 +468,7 @@ fn run_session(
     if cfg.require_sandbox_evidence {
         let hello: Hello = serde_json::from_slice(&line)
             .map_err(|e| WorkerError::Sandbox(format!("unreadable hello: {e}")))?;
-        verify_hello(&hello, pid)?;
+        verify_hello(&hello, pid, cfg.verify_via_proc)?;
         stats.hello = Some(hello);
     }
     stats.startup = begun.elapsed();
@@ -485,7 +510,7 @@ fn run_session(
     }
 }
 
-fn verify_hello(h: &Hello, pid: u32) -> Result<(), WorkerError> {
+fn verify_hello(h: &Hello, pid: u32, via_proc: bool) -> Result<(), WorkerError> {
     let bad = |m: String| Err(WorkerError::Sandbox(m));
     if h.v != PROTOCOL {
         return bad(format!("protocol {}", h.v));
@@ -498,6 +523,9 @@ fn verify_hello(h: &Hello, pid: u32) -> Result<(), WorkerError> {
     }
     if h.sandbox.seccomp != "enforced" || h.sandbox.probes.is_empty() {
         return bad("the worker does not report an enforced socket filter".into());
+    }
+    if !via_proc {
+        return Ok(());
     }
     // observed from outside, not taken from the worker's word
     match proc_status_field(pid, "Seccomp:").as_deref() {

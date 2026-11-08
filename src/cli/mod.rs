@@ -1012,6 +1012,12 @@ fn mcp_command(
     }
     let config = config.with_sandbox(state).with_seccomp(seccomp_report);
     let store = open(cli)?;
+    // Test harness only (feature `spawn-gate`, enabled for `cargo test` builds, absent from a plain build):
+    // run the worker from this sandboxed frontend.
+    #[cfg(all(unix, feature = "spawn-gate"))]
+    if let Ok(root) = std::env::var("MINDSPACE_SPAWN_GATE") {
+        return crate::worker::gate::run(&store, &config, &root);
+    }
     crate::mcp::serve_with_config(&store, &config)?;
     Ok(())
 }

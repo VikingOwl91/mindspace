@@ -20,6 +20,9 @@ path = "src/main.rs"
 
 [features]
 default = ["embeddings"]
+# Test harness only: compiles the spawn-gate entrypoint (`MINDSPACE_SPAWN_GATE`). Never enabled by a
+# plain `cargo build`; the dev-dependency below turns it on for `cargo test` builds only.
+spawn-gate = []
 embeddings = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:ureq", "dep:rustix"]
 
 [dependencies]
@@ -51,4 +54,5 @@ landlock = "0.4.7"
 libc = "0.2"
 
 [dev-dependencies]
+mindspace = { path = ".", features = ["spawn-gate"] }
 tempfile = "3.27.0"

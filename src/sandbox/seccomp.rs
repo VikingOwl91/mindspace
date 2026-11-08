@@ -168,6 +168,31 @@ pub fn install(prog: &[libc::sock_filter]) -> Result<(), i32> {
     Ok(())
 }
 
+/// As [`install`] but for every thread of the process (`SECCOMP_FILTER_FLAG_TSYNC`), so that no
+/// reading of `/proc` is needed to know how many threads exist.
+pub fn install_tsync(prog: &[libc::sock_filter]) -> Result<(), i32> {
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut _,
+    };
+    // SAFETY: valid program that outlives the calls.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(errno());
+        }
+        let r = libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_TSYNC,
+            &fprog as *const libc::sock_fprog,
+        );
+        if r != 0 {
+            return Err(errno());
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- policy
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,11 +280,20 @@ fn thread_count() -> Option<usize> {
 fn seccomp_mode() -> Option<u32> {
     // The calling thread: a filter is per thread, and `/proc/self` would show
     // the main thread of the process.
-    std::fs::read_to_string("/proc/thread-self/status")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("Seccomp:"))
-        .and_then(|v| v.trim().parse().ok())
+    let from_proc = std::fs::read_to_string("/proc/thread-self/status")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("Seccomp:"))
+                .and_then(|v| v.trim().parse().ok())
+        });
+    // A process that inherited a sandbox may not read /proc/<own pid>: ask the kernel directly
+    // (PR_GET_SECCOMP answers 2 in filter mode for the calling thread).
+    from_proc.or_else(|| {
+        // SAFETY: PR_GET_SECCOMP takes no pointer and changes nothing.
+        let r = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
+        (r >= 0).then_some(r as u32)
+    })
 }
 
 fn close_if_open(fd: libc::c_long) {
@@ -420,8 +454,10 @@ pub fn apply_allowing(allowed: &[i32]) -> Result<Status, String> {
                 .filter(|fd| !allowed.contains(fd))
                 .collect()
         },
-        &thread_count,
-        &install,
+        // Where /proc cannot be read (the worker inherits a sandbox that only allows its parent's
+        // /proc entry) the thread count is unknown; the filter is installed for all threads then.
+        &|| thread_count().or(Some(1)),
+        &install_tsync,
     )
 }
 

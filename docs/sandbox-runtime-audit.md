@@ -5,7 +5,7 @@ REASONED / UNKNOWN. No rule was widened by this audit.
 
 | Rule | Rights | Why it exists | Exposure | Class |
 |---|---|---|---|---|
-| `/proc` (whole) | read | Own `/proc/self/{maps,fd,status,task}`; Git children are addressed via `/proc/<pid>/fd/N` (pinned roots); canary reads `/proc/<server>/stat`. | Every process of the same user: `cmdline`, `environ`, `maps`, `fd` listings readable if the kernel's ptrace check passes (same uid and dumpable). VERIFIED that the same-uid `environ` of a running shell is readable outside the sandbox; REASONED that the rule keeps it readable inside (Landlock does not filter by pid). | **Overbroad.** Needed: `/proc/<own pid>` only. A rule beneath `/proc/<own pid>` is expressible at restrict time. Not tried; the canary and thread-self paths must be re-checked first. A non-dumpable process (see findings D1) closes the same-uid read of its own entries but not of others. |
+| `/proc` (whole) | read | Own `/proc/self/{maps,fd,status,task}`; Git children are addressed via `/proc/<pid>/fd/N` (pinned roots); canary reads `/proc/<server>/stat`. | Every process of the same user: `cmdline`, `environ`, `maps`, `fd` listings readable if the kernel's ptrace check passes (same uid and dumpable). Correction (kernel-tested, see the update below): another process's `environ` and `maps` were already refused inside the sandbox by the kernel's Landlock ptrace scoping; `cmdline`, `fd` listings, `/proc/1/status` and the process list were readable. | **Overbroad.** Needed: `/proc/<own pid>` only. A rule beneath `/proc/<own pid>` is expressible at restrict time. Not tried; the canary and thread-self paths must be re-checked first. A non-dumpable process (see findings D1) closes the same-uid read of its own entries but not of others. |
 | `/sys/fs/cgroup` | read | No justification in the code or docs; introduced with the first sandbox (707c481). Likely CPU-count discovery (`available_parallelism`), REASONED. | Cgroup limits and process lists of the user slice. | **Unknown, probably unnecessary.** VERIFIED: removing it keeps all 659 tests green, but no test exercises embedding/thread-pool sizing. Remove only after a real embedding run in the sandbox. |
 | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin` | read | Executables, libraries, Git, `/usr/local` (which is inside `/usr`). | Everything installed system-wide, including anything a package left world-readable. | **Necessary** for exec of Git and dynamic loading; broad by nature. `/usr/local` has no rule of its own: it is covered by `/usr` (VERIFIED by the layout, `ls /usr/local`), so it is not a separate exposure. |
 | `extra_runtime_dirs()` | read | Directories of mapped shared libraries plus the Git binary's directory and `git --exec-path`. | After F1 it never takes `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/tmp`, `/var`, `/`, `/home`, `/root` (VERIFIED by tests). Under a standard layout all of it is inside `/usr`. **Git in the home directory** (e.g. `~/.local/bin/git`, a nix profile) puts that whole `bin` directory under a read rule, which can contain unrelated user programs and scripts. | **Necessary for non-standard layouts, overbroad when the layout puts Git in the home directory.** Not fixed (would break those users silently). Proposal: grant the Git binary itself as `FileExec` plus its exec-path, not the parent directory; verify with the Git probe. |
@@ -17,3 +17,16 @@ REASONED / UNKNOWN. No rule was widened by this audit.
 1. Narrow `/proc` to `/proc/<own pid>`; check canary, Git pinned paths, `doctor`.
 2. Narrow the Git directory rule to the binary plus exec-path.
 3. Remove `/sys/fs/cgroup` after an embedding run in the sandbox.
+
+## Update after the narrowing tasks (kernel-tested, uncommitted on the task branches)
+
+* `/proc` (branch `feat/m7.3b-proc-narrowing`): the rule is now `/proc/<own pid>`. Corrects the table above:
+  VERIFIED that the kernel already refuses another process's `environ` and `maps` to a process in a different
+  Landlock domain (EACCES before our change); what the whole-`/proc` rule did expose was other processes'
+  `cmdline`, `fd` listings, `/proc/1/status` and the process list. All of these are EACCES now
+  (`sandbox::tests::the_kernel_hides_other_processes_from_a_sandboxed_process`, before and after values asserted).
+  If the mounted `/proc` is not the one of this pid namespace, no `/proc` rule is made (fail closed, no fallback);
+  VERIFIED by hand with `unshare -Upf` (the automated test does not cover it). No new ABI needed (fs rules, ABI 3).
+* Scope of the rule: `/proc/<own pid>` names this process only. It does not cover the pid directories of children
+  started later (a Git child has its own `/proc/<child pid>`); the child reaches the pinned roots through the
+  parent's `/proc/<parent pid>/fd/N`, which the rule does cover. VERIFIED by the Git ingestion tests passing.

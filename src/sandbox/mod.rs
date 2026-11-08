@@ -275,17 +275,23 @@ impl Plan {
             path: self.models_dir.clone(),
             rights: Rights::Read,
         });
-        for p in [
-            "/usr",
-            "/lib",
-            "/lib64",
-            "/bin",
-            "/sbin",
-            "/proc",
-            "/sys/fs/cgroup",
-        ] {
+        for p in ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/sys/fs/cgroup"] {
             r.push(Rule {
                 path: PathBuf::from(p),
+                rights: Rights::Read,
+            });
+        }
+        // Only this process's own `/proc` entries (`self`, `thread-self`, the pid
+        // path Git children use to reach the pinned roots). Not `/proc` as a whole:
+        // that would let the process list other processes and read their command
+        // lines and status. The kernel already refuses another process's
+        // `environ`/`maps` to a different Landlock domain; this closes the rest.
+        // If `/proc` does not belong to this pid namespace (`/proc/self` is not our
+        // pid), `/proc/<pid>` would name some other process: no rule at all then.
+        // There is deliberately no fallback to the whole `/proc`.
+        if let Some(own) = own_proc_dir() {
+            r.push(Rule {
+                path: own,
                 rights: Rights::Read,
             });
         }
@@ -316,6 +322,14 @@ impl Plan {
         }
         r
     }
+}
+
+/// `/proc/<pid>` of this process, if the mounted `/proc` is the one of this pid
+/// namespace (`/proc/self` resolves to our pid).
+fn own_proc_dir() -> Option<PathBuf> {
+    let pid = std::process::id().to_string();
+    (std::fs::read_link("/proc/self").ok()? == Path::new(&pid))
+        .then(|| PathBuf::from(format!("/proc/{pid}")))
 }
 
 /// Is this file name a shared library or the dynamic loader (`libc.so.6`,
@@ -1062,6 +1076,143 @@ mod tests {
                 Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
             }
         );
+    }
+
+    /// Child half of the `/proc` kernel test: prints what the process can read in
+    /// `/proc` before and after the product's rules. `MINDSPACE_PROC_FOREIGN` is
+    /// the pid of a process of the same user that the parent started.
+    #[test]
+    fn proc_child() {
+        let Some(foreign) = std::env::var_os("MINDSPACE_PROC_FOREIGN") else {
+            return;
+        };
+        let foreign = foreign.to_string_lossy().into_owned();
+        println!();
+        let own_file = std::fs::File::open("/dev/null").unwrap();
+        let own_fd = std::os::fd::AsRawFd::as_raw_fd(&own_file);
+        let probe_all = |tag: &str| {
+            let me = std::process::id();
+            let ppid = unsafe { libc::getppid() };
+            let read = |p: String| match std::fs::read(&p) {
+                Ok(b) => format!("ok {}", b.len().min(1)),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            };
+            let list =
+                |p: String| match std::fs::read_dir(&p).and_then(|mut d| d.next().transpose()) {
+                    Ok(Some(_)) => "ok".to_string(),
+                    Ok(None) => "empty".to_string(),
+                    Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+                };
+            let link = |p: String| match std::fs::read_link(&p) {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            };
+            let thread = std::thread::spawn(|| match std::fs::read("/proc/thread-self/status") {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            })
+            .join()
+            .unwrap();
+            let rows: Vec<(&str, String)> = vec![
+                ("self_status", read("/proc/self/status".into())),
+                ("self_maps", read("/proc/self/maps".into())),
+                ("self_cgroup", read("/proc/self/cgroup".into())),
+                ("self_fd_list", list("/proc/self/fd".into())),
+                ("self_fd_link", link(format!("/proc/self/fd/{own_fd}"))),
+                ("pid_fd_link", link(format!("/proc/{me}/fd/{own_fd}"))),
+                ("pid_fd_open", read(format!("/proc/{me}/fd/{own_fd}"))),
+                ("thread_self", thread),
+                ("foreign_environ", read(format!("/proc/{foreign}/environ"))),
+                ("foreign_cmdline", read(format!("/proc/{foreign}/cmdline"))),
+                ("foreign_fd_list", list(format!("/proc/{foreign}/fd"))),
+                ("foreign_maps", read(format!("/proc/{foreign}/maps"))),
+                ("parent_environ", read(format!("/proc/{ppid}/environ"))),
+                ("init_status", read("/proc/1/status".into())),
+                ("proc_listing", list("/proc".into())),
+            ];
+            for (k, v) in rows {
+                println!("RESULT {tag}_{k} {v}");
+            }
+        };
+        probe_all("before");
+        let plan = plan(&[("/nonexistent-root", true)], "/nonexistent-db");
+        let rs = build_ruleset(&plan.rules(), &Default::default()).expect("ruleset");
+        let st = rs.restrict_self().expect("restrict");
+        assert_eq!(st.ruleset, RulesetStatus::FullyEnforced);
+        probe_all("after");
+    }
+
+    /// The kernel's answer to the `/proc` audit: after the rules, the process still
+    /// reads its own `/proc` entries, but no other process's environment, command
+    /// line, descriptors or maps, and cannot list `/proc`.
+    #[test]
+    fn the_kernel_hides_other_processes_from_a_sandboxed_process() {
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .env("MINDSPACE_SECRET_PROBE", "x")
+            .spawn()
+            .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox::tests::proc_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MINDSPACE_PROC_FOREIGN", other.id().to_string())
+            .output()
+            .unwrap();
+        let _ = other.kill();
+        let _ = other.wait();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("{text}");
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("RESULT {k} ")))
+                .unwrap_or_else(|| panic!("no {k} in {text}"))
+                .to_string()
+        };
+        // the probes are meaningful: before the rules everything is readable
+        for k in [
+            "foreign_environ",
+            "foreign_cmdline",
+            "foreign_fd_list",
+            "parent_environ",
+            "init_status",
+            "proc_listing",
+        ] {
+            assert!(get(&format!("before_{k}")).starts_with("ok"), "before {k}");
+        }
+        // what the product needs stays available
+        for k in [
+            "self_status",
+            "self_maps",
+            "self_cgroup",
+            "self_fd_list",
+            "self_fd_link",
+            "pid_fd_link",
+            "pid_fd_open",
+            "thread_self",
+        ] {
+            assert!(get(&format!("after_{k}")).starts_with("ok"), "after {k}");
+        }
+        // other processes are closed
+        for k in [
+            "foreign_environ",
+            "foreign_cmdline",
+            "foreign_fd_list",
+            "foreign_maps",
+            "parent_environ",
+            "init_status",
+            "proc_listing",
+        ] {
+            assert_eq!(get(&format!("after_{k}")), "errno 13", "after {k}");
+        }
     }
 
     /// The kernel's answer to F1: with the product's rules, /etc is not readable

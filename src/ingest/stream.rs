@@ -18,6 +18,14 @@
 //! trial decoding. Unknown types, versions, operations and sequence numbers are
 //! errors.
 //!
+//! A record whose JSON does not fit a frame (a huge commit message or tree, an
+//! assertion over a whole file, ...) is sent as `Spill{record_type,len}` followed by
+//! `SpillPiece` records that carry its JSON text in pieces of at most [`CHUNK`]
+//! bytes; nothing else may come in between, the declared length is exact, the
+//! reassembled record must decode as the declared type, and it is then handled as
+//! if it had arrived whole. Beyond [`MAX_RECORD`] bytes the operation is refused;
+//! nothing is truncated.
+//!
 //! Limits apply to the whole operation: [`MAX_FRAME`] per frame, [`MAX_TOTAL`]
 //! bytes and [`MAX_FRAMES`] frames in total. The length is checked before the
 //! payload is allocated.
@@ -77,6 +85,9 @@ pub const FRAME_TARGET: usize = 512 * 1024;
 pub const CHUNK: usize = 128 * 1024;
 /// A `Part` record is split until its encoding is at most this size.
 pub const PART_TARGET: usize = 256 * 1024;
+/// The largest single record (as JSON). A record that does not fit a frame is sent
+/// as an oversized record in pieces; beyond this size the operation is refused.
+pub const MAX_RECORD: usize = 32 * 1024 * 1024;
 /// Blob contents are fetched from Git in batches of at most this many bytes.
 const BLOB_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 const BLOB_BATCH_COUNT: usize = 512;
@@ -210,6 +221,15 @@ pub enum Record {
         data: String,
     },
     Part(Part),
+    /// Announces a record too big for a frame: `len` bytes of its JSON follow in
+    /// `SpillPiece` records, nothing else in between.
+    Spill {
+        record_type: String,
+        len: u64,
+    },
+    SpillPiece {
+        data: String,
+    },
     End {
         counts: Counts,
     },
@@ -237,6 +257,8 @@ impl Record {
             Record::CodeInput { .. } => "code_input",
             Record::Chunk { .. } => "chunk",
             Record::Part(_) => "part",
+            Record::Spill { .. } => "spill",
+            Record::SpillPiece { .. } => "spill_piece",
             Record::End { .. } => "end",
         }
     }
@@ -253,6 +275,13 @@ pub trait RecordSink {
         let json = serde_json::to_vec(record)
             .map_err(|e| Error::InvalidExtraction(format!("record stream: encode: {e}")))?;
         self.emit_encoded(record.name(), json)
+    }
+
+    /// Sends one piece of content (a `chunk` record).
+    fn emit_chunk(&mut self, piece: &str) -> Result<()> {
+        self.emit(&Record::Chunk {
+            data: piece.to_string(),
+        })
     }
 }
 
@@ -363,23 +392,78 @@ pub struct WriterStats {
     pub bytes: u64,
 }
 
-impl<W: Write> RecordSink for FrameWriter<'_, W> {
-    fn emit_encoded(&mut self, name: &'static str, json: Vec<u8>) -> Result<()> {
-        // A record has to fit a frame of its own.
-        if json.len() + 128 > MAX_FRAME {
-            return bad(format!(
-                "a `{name}` record of {} bytes does not fit a frame",
-                json.len()
-            ));
-        }
-        if self.in_buf > 0 && self.buf.len() + json.len() + 3 > FRAME_TARGET {
-            self.flush_frame()?;
-        }
+impl<W: Write> FrameWriter<'_, W> {
+    /// Appends one record, written by `write` straight into the frame buffer (no
+    /// intermediate allocation or copy). If it does not fit the current frame, the
+    /// frame is closed first and the record is written again into a new one.
+    fn push_in_place(
+        &mut self,
+        name: &'static str,
+        write: &dyn Fn(&mut Vec<u8>) -> serde_json::Result<()>,
+    ) -> Result<()> {
+        let start = self.buf.len();
         if self.in_buf > 0 {
             self.buf.push(b',');
         }
-        self.buf.extend_from_slice(&json);
+        let body = self.buf.len();
+        write(&mut self.buf)
+            .map_err(|e| Error::InvalidExtraction(format!("record stream: encode: {e}")))?;
+        let size = self.buf.len() - body;
+        if size + 128 > MAX_FRAME {
+            let json = self.buf[body..].to_vec();
+            self.buf.truncate(start);
+            return self.spill(name, &json);
+        }
+        if self.in_buf > 0 && self.buf.len() + 3 > FRAME_TARGET {
+            self.buf.truncate(start);
+            self.flush_frame()?;
+            return self.push_in_place(name, write);
+        }
         self.in_buf += 1;
+        self.count(name);
+        Ok(())
+    }
+
+    /// Sends a record that does not fit a frame as `Spill` + pieces of its JSON.
+    fn spill(&mut self, name: &'static str, json: &[u8]) -> Result<()> {
+        if json.len() > MAX_RECORD {
+            return bad(format!(
+                "a `{name}` record of {} bytes exceeds the largest record ({MAX_RECORD})",
+                json.len()
+            ));
+        }
+        // JSON text is valid UTF-8; pieces are cut at character boundaries.
+        let text = std::str::from_utf8(json).map_err(|_| {
+            Error::InvalidExtraction("record stream: encoded record is not UTF-8".into())
+        })?;
+        let spill = Record::Spill {
+            record_type: name.to_string(),
+            len: json.len() as u64,
+        };
+        self.push_in_place("spill", &|b| serde_json::to_writer(b, &spill))?;
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(CHUNK);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (piece, tail) = rest.split_at(end);
+            self.push_in_place("spill_piece", &|b| {
+                b.extend_from_slice(b"{\"type\":\"spill_piece\",\"data\":");
+                serde_json::to_writer(&mut *b, piece)?;
+                b.push(b'}');
+                Ok(())
+            })?;
+            rest = tail;
+        }
+        self.count(name);
+        Ok(())
+    }
+
+    fn count(&mut self, name: &'static str) {
+        if name == "spill" || name == "spill_piece" {
+            return;
+        }
         let c = &mut self.counts;
         c.records += 1;
         match name {
@@ -393,6 +477,37 @@ impl<W: Write> RecordSink for FrameWriter<'_, W> {
             "code_input" => c.code_inputs += 1,
             _ => {}
         }
+    }
+}
+
+impl<W: Write> RecordSink for FrameWriter<'_, W> {
+    fn emit(&mut self, record: &Record) -> Result<()> {
+        self.push_in_place(record.name(), &|b| serde_json::to_writer(b, record))
+    }
+
+    fn emit_chunk(&mut self, piece: &str) -> Result<()> {
+        self.push_in_place("chunk", &|b| {
+            b.extend_from_slice(b"{\"type\":\"chunk\",\"data\":");
+            serde_json::to_writer(&mut *b, piece)?;
+            b.push(b'}');
+            Ok(())
+        })
+    }
+
+    fn emit_encoded(&mut self, name: &'static str, json: Vec<u8>) -> Result<()> {
+        // A record that cannot fit a frame of its own is sent in pieces.
+        if json.len() + 128 > MAX_FRAME {
+            return self.spill(name, &json);
+        }
+        if self.in_buf > 0 && self.buf.len() + json.len() + 3 > FRAME_TARGET {
+            self.flush_frame()?;
+        }
+        if self.in_buf > 0 {
+            self.buf.push(b',');
+        }
+        self.buf.extend_from_slice(&json);
+        self.in_buf += 1;
+        self.count(name);
         Ok(())
     }
 }
@@ -405,9 +520,7 @@ fn emit_chunks(sink: &mut dyn RecordSink, content: &str) -> Result<()> {
             end -= 1;
         }
         let (piece, tail) = rest.split_at(end);
-        sink.emit(&Record::Chunk {
-            data: piece.to_string(),
-        })?;
+        sink.emit_chunk(piece)?;
         rest = tail;
     }
     Ok(())
@@ -1099,6 +1212,7 @@ pub struct StreamLimits {
     pub max_frame: usize,
     pub max_total: u64,
     pub max_frames: u64,
+    pub max_record: usize,
     pub extraction: ExtractionLimits,
 }
 
@@ -1108,6 +1222,7 @@ impl Default for StreamLimits {
             max_frame: MAX_FRAME,
             max_total: MAX_TOTAL,
             max_frames: MAX_FRAMES,
+            max_record: MAX_RECORD,
             extraction: ExtractionLimits::default(),
         }
     }
@@ -1229,6 +1344,78 @@ pub fn consume<R: Read>(
     Ok((extracted, stats))
 }
 
+/// Reads ahead on a thread: a producer that writes in bursts is not held up by the
+/// consumer's decoding, and the consumer is not held up by a slow producer, at a
+/// fixed cost of `depth` buffers of [`PREFETCH_BUFFER`] bytes. The thread ends at
+/// end of input, on a read error, or when this reader is dropped and the source
+/// next returns (a source that blocks forever keeps its thread: close the
+/// source, e.g. by killing the peer process).
+pub struct Prefetch {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+pub const PREFETCH_BUFFER: usize = 256 * 1024;
+
+impl Prefetch {
+    pub fn new<R: Read + Send + 'static>(mut source: R, depth: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(depth.max(1));
+        std::thread::spawn(move || loop {
+            let mut buf = vec![0u8; PREFETCH_BUFFER];
+            match source.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    if tx.send(Ok(buf)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        });
+        Self {
+            rx,
+            current: Vec::new(),
+            pos: 0,
+            done: false,
+        }
+    }
+}
+
+impl Read for Prefetch {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.current.len() {
+            if self.done {
+                return Ok(0);
+            }
+            match self.rx.recv() {
+                Ok(Ok(b)) => {
+                    self.current = b;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = out.len().min(self.current.len() - self.pos);
+        out[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 /// Like `read_exact` but reports how much was read (EOF is not an error here).
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<usize> {
     let mut n = 0;
@@ -1331,6 +1518,8 @@ struct Assembler<'a> {
     keys: HashSet<(&'static str, String)>,
     slot: Option<Slot>,
     owner: Option<Owner>,
+    /// An oversized record being received: (record type, announced length, text so far).
+    spill: Option<(String, usize, String)>,
 }
 
 impl<'a> Assembler<'a> {
@@ -1364,6 +1553,7 @@ impl<'a> Assembler<'a> {
             keys: HashSet::new(),
             slot: None,
             owner: None,
+            spill: None,
         }
     }
 
@@ -1437,6 +1627,56 @@ impl<'a> Assembler<'a> {
         if self.ended {
             return bad("a record after the closing record");
         }
+        if self.phase == Phase::Start && !matches!(record, Record::Begin { .. }) {
+            return bad(format!("`{}` before the opening record", record.name()));
+        }
+        if let Some((kind, len, text)) = self.spill.as_mut() {
+            let Record::SpillPiece { data } = record else {
+                return bad(format!(
+                    "`{}` inside an oversized `{kind}` record",
+                    record.name()
+                ));
+            };
+            if text.len() + data.len() > *len {
+                return bad("an oversized record is longer than announced");
+            }
+            text.push_str(&data);
+            if text.len() == *len {
+                let (kind, _, text) = self.spill.take().unwrap_or_default();
+                let inner: Record = serde_json::from_str(&text).map_err(|e| {
+                    Error::InvalidExtraction(format!(
+                        "record stream: an oversized `{kind}` record does not decode: {e}"
+                    ))
+                })?;
+                if inner.name() != kind
+                    || matches!(inner, Record::Spill { .. } | Record::SpillPiece { .. })
+                {
+                    return bad(format!(
+                        "an oversized record announced as `{kind}` is `{}`",
+                        inner.name()
+                    ));
+                }
+                return self.accept_logical(inner);
+            }
+            return Ok(());
+        }
+        match record {
+            Record::Spill { record_type, len } => {
+                if len == 0 || len > self.limits.max_record as u64 {
+                    return bad(format!(
+                        "an oversized record of {len} bytes is outside 1..={}",
+                        self.limits.max_record
+                    ));
+                }
+                self.spill = Some((record_type, len as usize, String::new()));
+                Ok(())
+            }
+            Record::SpillPiece { .. } => bad("a `spill_piece` without a `spill`"),
+            other => self.accept_logical(other),
+        }
+    }
+
+    fn accept_logical(&mut self, record: Record) -> Result<()> {
         self.seen.records += 1;
         let name = record.name();
         if self.phase == Phase::Start && !matches!(record, Record::Begin { .. }) {
@@ -1716,6 +1956,9 @@ impl<'a> Assembler<'a> {
                 }
             }
             Record::Part(part) => self.part(part)?,
+            Record::Spill { .. } | Record::SpillPiece { .. } => {
+                return bad("an oversized record inside an oversized record")
+            }
             Record::End { counts } => {
                 self.close_owner()?;
                 if self.phase < Phase::Header {

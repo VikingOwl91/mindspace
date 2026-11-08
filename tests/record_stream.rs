@@ -23,7 +23,7 @@ use mindspace::ingest::extract::{persist, Extracted, ExtractionLimits, StoreCont
 use mindspace::ingest::outline::PathSelection;
 use mindspace::ingest::stream::{
     consume, emit_extracted, stream_confined_git, stream_directory, FrameWriter, Kind, Record,
-    RecordSink, StreamLimits, MAX_FRAME,
+    RecordSink, StreamLimits, MAX_FRAME, MAX_RECORD,
 };
 use mindspace::ingest::GitScope;
 use mindspace::mcp::McpConfig;
@@ -1010,14 +1010,14 @@ fn the_root_and_the_content_budget_are_checked() {
 }
 
 #[test]
-fn a_record_that_cannot_fit_a_frame_is_refused_by_the_producer() {
+fn a_record_beyond_the_largest_record_is_refused_by_the_producer() {
     let (mut recs, _f, _k) = git_records();
     let commit = recs
         .iter()
         .position(|r| matches!(r, Record::Commit { .. }))
         .unwrap();
     if let Record::Commit { item } = &mut recs[commit] {
-        item.message = "x".repeat(2 * 1024 * 1024);
+        item.message = "x".repeat(MAX_RECORD + 1);
     }
     let mut out = Vec::new();
     let mut w = FrameWriter::new(&mut out, Uuid::now_v7(), None);
@@ -1028,7 +1028,233 @@ fn a_record_that_cannot_fit_a_frame_is_refused_by_the_producer() {
             break;
         }
     }
-    assert!(failed.unwrap().contains("does not fit a frame"));
+    assert!(failed.unwrap().contains("exceeds the largest record"));
+}
+
+// ------------------------------------------------- oversized records (Part C)
+
+/// A multi-byte-rich text of about `n` bytes (cut points must respect characters).
+fn big_text(n: usize) -> String {
+    let unit = "word \u{e4}\u{20ac}\u{1f600} \"quoted\" \\ \t\n";
+    unit.repeat(n / unit.len() + 1)
+}
+
+#[test]
+fn oversized_fields_of_a_directory_round_trip_unchanged() {
+    let d = tempfile::tempdir().unwrap();
+    let text = big_text(3 * 1024 * 1024);
+    // one section of 3 MiB: its evidence and assertion are each larger than a frame
+    write(d.path(), "plain.txt", &text);
+    write(
+        d.path(),
+        "docs/one.md",
+        &format!("# Title\n\n{}\n", big_text(2_500_000)),
+    );
+    // a heading of 1.5 MiB: the derived title and subject are larger than a frame
+    write(
+        d.path(),
+        "docs/two.md",
+        &format!("# {}\n\nbody\n", big_text(1_500_000).replace('\n', " ")),
+    );
+    write(d.path(), "ok.md", "# Small\n\nfine\n");
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let ids = vec![store.get_space("p").unwrap().id];
+    let direct = Extracted::Files(
+        extract_directory(
+            &StoreContext(&store),
+            &anchor(&f),
+            &f.cfg,
+            &ids,
+            &Deadline::none(),
+        )
+        .unwrap(),
+    );
+    let (bytes, op) = stream_dir(&f, &store);
+    let got = read(&bytes, op, Kind::Files, Some(&f.root)).unwrap();
+    assert_eq!(text_of(&direct), text_of(&got));
+    let wire = String::from_utf8_lossy(&bytes);
+    assert!(wire.contains("\"type\":\"spill\""), "nothing was oversized");
+    // every frame stays within the limit
+    let mut i = 0;
+    while i < bytes.len() {
+        let n = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        assert!(n <= MAX_FRAME);
+        i += n + 4;
+    }
+}
+
+fn text_of(e: &Extracted) -> String {
+    normalize(&format!("{e:#?}"))
+}
+
+#[test]
+fn oversized_commit_messages_trees_and_tag_messages_round_trip_unchanged() {
+    let d = tempfile::tempdir().unwrap();
+    git(d.path(), &["init", "-q", "-b", "main", "."]);
+    write(d.path(), "README.md", "# R\n\nx\n");
+    // 25,000 files in one tree: the tree record is about 3 MB
+    for i in 0..25_000 {
+        write(
+            d.path(),
+            &format!("many/file_with_a_longish_name_{i:06}.bin"),
+            "x",
+        );
+    }
+    git(d.path(), &["add", "."]);
+    std::fs::write(d.path().join("../msg.txt"), big_text(2_000_000)).ok();
+    let msg = d
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("msg-{}.txt", Uuid::now_v7()));
+    std::fs::write(&msg, big_text(2_000_000)).unwrap();
+    git(d.path(), &["commit", "-q", "-F", msg.to_str().unwrap()]);
+    git(d.path(), &["tag", "-a", "big", "-F", msg.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&msg);
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let direct = Extracted::Git(
+        extract_confined_git(
+            &StoreContext(&store),
+            &anchor(&f),
+            &f.cfg,
+            &PathSelection::all(),
+            GitScope::History,
+            &["p"],
+            &Deadline::none(),
+        )
+        .unwrap(),
+    );
+    let (bytes, op) = stream_git(&f, &store, &PathSelection::all(), GitScope::History);
+    let got = read(&bytes, op, Kind::Git, None).unwrap();
+    assert_eq!(text_of(&direct), text_of(&got));
+    let wire = String::from_utf8_lossy(&bytes);
+    for kind in ["commit", "tree", "tag"] {
+        assert!(
+            wire.contains(&format!("\"record_type\":\"{kind}\"")),
+            "no oversized {kind}"
+        );
+    }
+}
+
+fn spill_stream(op: Uuid, header: &str, pieces: &[&str]) -> Vec<u8> {
+    let frame = |seq: u64, recs: String| {
+        raw_frame(&format!(
+            r#"{{"v":1,"op":"{op}","seq":{seq},"records":[{recs}]}}"#
+        ))
+    };
+    let mut out = frame(0, format!(r#"{{"type":"begin","kind":"git"}},{header}"#));
+    for (i, p) in pieces.iter().enumerate() {
+        out.extend(frame(
+            i as u64 + 1,
+            format!(
+                r#"{{"type":"spill_piece","data":{}}}"#,
+                serde_json::to_string(p).unwrap()
+            ),
+        ));
+    }
+    out
+}
+
+#[test]
+fn malformed_oversized_record_sequences_are_refused() {
+    let op = Uuid::now_v7();
+    let spill =
+        |ty: &str, len: u64| format!(r#"{{"type":"spill","record_type":"{ty}","len":{len}}}"#);
+    let go = |bytes: Vec<u8>| err(read(&bytes, op, Kind::Git, None));
+    // longer than the largest record, zero length
+    let e = go(spill_stream(
+        op,
+        &spill("commit", (MAX_RECORD + 1) as u64),
+        &[],
+    ));
+    assert!(e.contains("outside 1.."), "{e}");
+    let e = go(spill_stream(op, &spill("commit", 0), &[]));
+    assert!(e.contains("outside 1.."), "{e}");
+    // a piece beyond the announced length
+    let e = go(spill_stream(op, &spill("commit", 5), &["123456"]));
+    assert!(e.contains("longer than announced"), "{e}");
+    // a piece with no spill
+    let e = go(spill_stream(
+        op,
+        r#"{"type":"spill_piece","data":"x"}"#,
+        &[],
+    ));
+    assert!(e.contains("without a `spill`"), "{e}");
+    // another record in the middle of an oversized one
+    let e = go(spill_stream(
+        op,
+        &format!(
+            "{},{}",
+            spill("commit", 50),
+            r#"{"type":"chunk","data":"x"}"#
+        ),
+        &[],
+    ));
+    assert!(e.contains("inside an oversized"), "{e}");
+    // truncated inside an oversized record
+    let e = go(spill_stream(op, &spill("commit", 50), &["abc"]));
+    assert!(e.contains("ended"), "{e}");
+    // complete but not decodable, not the announced type, nested
+    let e = go(spill_stream(op, &spill("commit", 3), &["{ab"]));
+    assert!(e.contains("does not decode"), "{e}");
+    let inner = r#"{"type":"chunk","data":"x"}"#;
+    let e = go(spill_stream(
+        op,
+        &spill("commit", inner.len() as u64),
+        &[inner],
+    ));
+    assert!(e.contains("announced as `commit`"), "{e}");
+    let nested = r#"{"type":"spill","record_type":"commit","len":4}"#;
+    let e = go(spill_stream(
+        op,
+        &spill("spill", nested.len() as u64),
+        &[nested],
+    ));
+    assert!(e.contains("announced as"), "{e}");
+    // the closing record inside an oversized one
+    let e = go(spill_stream(
+        op,
+        &format!(
+            "{},{}",
+            spill("commit", 50),
+            r#"{"type":"end","counts":{"records":0,"files":0,"refs":0,"commits":0,"trees":0,"tags":0,"blobs":0,"derivations":0,"code_inputs":0}}"#
+        ),
+        &[],
+    ));
+    assert!(e.contains("inside an oversized"), "{e}");
+}
+
+#[test]
+fn oversized_records_still_count_against_the_budgets() {
+    let (mut recs, _f, _k) = git_records();
+    let commit = recs
+        .iter()
+        .position(|r| matches!(r, Record::Commit { .. }))
+        .unwrap();
+    if let Record::Commit { item } = &mut recs[commit] {
+        item.message = big_text(3 * 1024 * 1024);
+    }
+    let op = Uuid::now_v7();
+    let bytes = encode(op, &recs);
+    let mut l = StreamLimits::default();
+    l.max_total = (bytes.len() / 2) as u64;
+    assert!(consume(&bytes[..], op, Kind::Git, None, &l, None).is_err());
+    let mut l = StreamLimits::default();
+    l.max_record = 1024 * 1024;
+    let e = consume(&bytes[..], op, Kind::Git, None, &l, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("outside 1.."), "{e}");
+    let mut l = StreamLimits::default();
+    l.max_frames = 3;
+    assert!(consume(&bytes[..], op, Kind::Git, None, &l, None).is_err());
+    // and with the defaults the same stream is accepted
+    read(&bytes, op, Kind::Git, None).unwrap();
 }
 
 #[test]

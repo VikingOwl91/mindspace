@@ -57,17 +57,25 @@ fn main() {
         } else {
             Kind::Files
         };
-        let stdin = std::io::stdin().lock();
+        if let Ok(n) = std::env::var("PIPE_SIZE") {
+            // a bigger pipe lets the producer run while the consumer decodes a frame
+            unsafe {
+                libc::fcntl(0, libc::F_SETPIPE_SZ, n.parse::<i32>().unwrap());
+            }
+        }
         let root_arg = (k == Kind::Files).then_some(root.as_path());
-        let (ex, st) = consume(
-            std::io::BufReader::with_capacity(1 << 20, stdin),
-            op,
-            k,
-            root_arg,
-            &StreamLimits::default(),
-            None,
-        )
-        .unwrap();
+        // PREFETCH=<buffers of 256 KiB> reads ahead on a thread
+        let reader: Box<dyn std::io::Read> = match std::env::var("PREFETCH") {
+            Ok(d) => Box::new(mindspace::ingest::stream::Prefetch::new(
+                std::io::stdin(),
+                d.parse().unwrap(),
+            )),
+            Err(_) => Box::new(std::io::BufReader::with_capacity(
+                1 << 20,
+                std::io::stdin().lock(),
+            )),
+        };
+        let (ex, st) = consume(reader, op, k, root_arg, &StreamLimits::default(), None).unwrap();
         out.insert(
             "consume_ms".into(),
             (t0.elapsed().as_secs_f64() * 1e3).into(),

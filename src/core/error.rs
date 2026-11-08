@@ -22,6 +22,10 @@ pub enum Error {
     #[error("{0}")]
     Setup(String),
 
+    /// A problem with the repository grant store or a grant command (M7.3a).
+    #[error("{0}")]
+    Grant(String),
+
     #[error("space '{name}' already exists")]
     SpaceExists { name: String },
 

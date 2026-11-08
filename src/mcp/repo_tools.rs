@@ -98,6 +98,9 @@ pub struct McpConfig {
     /// Typed report of the socket-deny seccomp policy (`state`: `enforced`,
     /// `not_applied`, `failed` or `not_evaluated`); additive next to `sandbox`.
     seccomp: Value,
+    /// Where `repo_request_access` records requests (a log next to the
+    /// database); `None` disables the tool. A request is never a permission.
+    request_log: Option<PathBuf>,
 }
 
 impl Default for McpConfig {
@@ -109,6 +112,7 @@ impl Default for McpConfig {
                 "no sandbox has been set up for this configuration".to_string(),
             ),
             seccomp: json!({"state": "not_evaluated"}),
+            request_log: None,
         }
     }
 }
@@ -221,7 +225,13 @@ impl McpConfig {
                 "no sandbox has been set up for this configuration".to_string(),
             ),
             seccomp: json!({"state": "not_evaluated"}),
+            request_log: None,
         })
+    }
+
+    pub fn with_request_log(mut self, file: PathBuf) -> Self {
+        self.request_log = Some(file);
+        self
     }
 
     pub fn with_sandbox(mut self, state: SandboxState) -> Self {
@@ -417,6 +427,48 @@ fn parse_spec(spec: &str) -> Result<Vec<(PathBuf, Access)>> {
         .into_iter()
         .map(|(p, m)| (p, m.unwrap_or(Access::ReadWrite)))
         .collect())
+}
+
+/// `repo_request_access`: records that the agent would like access. It changes
+/// nothing about what this server may read or write: a request is not a
+/// permission, and the answer says so.
+pub fn request_access(
+    config: &McpConfig,
+    path: &str,
+    access: Option<&str>,
+    reason: Option<&str>,
+) -> Result<Value> {
+    #[cfg(unix)]
+    {
+        let file = config.request_log.as_deref().ok_or_else(|| {
+            Error::Grant("access requests are not enabled in this configuration".into())
+        })?;
+        let access = crate::grants::parse_access(access.unwrap_or("ro")).map_err(Error::Grant)?;
+        let (id, new) = crate::grants::append_request(
+            file,
+            path,
+            access,
+            reason,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        Ok(json!({
+            "status": "pending",
+            "granted": false,
+            "request_id": id,
+            "already_pending": !new,
+            "message": format!(
+                "This is a REQUEST, not a permission: nothing was granted and this server's \
+                 access is unchanged. A human has to run `mind grant approve {id}` in their own \
+                 terminal, and this MCP server has to be restarted (it must be started with \
+                 --grants) before the directory can be used. Do not try to approve it yourself."
+            ),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (config, path, access, reason);
+        Err(Error::Grant("access requests need a Unix platform".into()))
+    }
 }
 
 pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Result<Value> {

@@ -532,6 +532,7 @@ fn check_config(i: &Inputs) -> Check {
                             db_dir: dir,
                             models_dir: PathBuf::new(),
                             exe: PathBuf::new(),
+                            identities: Default::default(),
                         };
                         if let Err(e) = plan.validate_layout() {
                             warnings.push(format!(

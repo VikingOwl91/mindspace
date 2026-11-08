@@ -326,7 +326,7 @@ fn the_sandboxed_server_installs_the_filter_and_real_workloads_work() {
     let tools = s.rpc("tools/list", json!({}));
     assert_eq!(
         tools["result"]["tools"].as_array().map(|a| a.len()),
-        Some(14)
+        Some(15)
     );
     let created = s.call(
         "memory_create",
@@ -655,11 +655,7 @@ fn inherited_descriptors_do_not_reach_the_filtered_server() {
         // SAFETY: dup2 only, between fork and exec.
         unsafe {
             c.pre_exec(move || {
-                for &(from, to) in &fds {
-                    if libc::dup2(from, to) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
+                common::place_fds(&fds)?;
                 Ok(())
             });
         }

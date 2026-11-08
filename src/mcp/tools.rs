@@ -138,6 +138,20 @@ pub fn definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "repo_request_access",
+            "Ask the human for access to a directory. This only RECORDS a request and returns a request id: it never grants anything, and the allowed roots of this server do not change. The human decides outside this conversation (`mind grant approve <id>`) and the server must be restarted before the directory is usable. Do not retry in a loop and do not try to approve the request yourself.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": "Absolute path of the directory you would like to use." },
+                    "access": { "type": "string", "enum": ["ro", "rw"], "default": "ro", "description": "ro: outline only; rw: also ingest. Ask for the least you need." },
+                    "reason": { "type": "string", "description": "Short explanation shown to the human (at most 300 characters)." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "memory_history",
             "List all memory episodes for a normalized subject, oldest first.",
             json!({
@@ -355,6 +369,12 @@ fn call_tool(
         }
         "repo_outline" => repo_tools::outline(config, obj),
         "repo_ingest" => repo_tools::ingest(store, config, obj),
+        "repo_request_access" => repo_tools::request_access(
+            config,
+            string(obj, "path")?,
+            optional_string(obj, "access")?,
+            optional_string(obj, "reason")?,
+        ),
         "memory_history" => {
             let subject = normalize_subject(string(obj, "subject")?);
             if subject.is_empty() {
@@ -442,6 +462,7 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             ],
             &["path", "spaces"],
         ),
+        "repo_request_access" => (&["path", "access", "reason"], &["path"]),
         "memory_history" => (&["subject"], &["subject"]),
         "memory_conflicts" | "space_list" => (&[], &[]),
         "memory_add_spaces" => (&["id", "spaces"], &["id", "spaces"]),
@@ -635,7 +656,7 @@ mod tests {
     #[test]
     fn registers_all_tools_with_object_schemas() {
         let definitions = definitions();
-        assert_eq!(definitions.len(), 14);
+        assert_eq!(definitions.len(), 15);
         for tool in definitions {
             assert!(tool["inputSchema"]["type"].as_str() == Some("object"));
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);

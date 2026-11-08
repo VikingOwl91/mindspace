@@ -115,6 +115,59 @@ pub fn data_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> Result<Lo
     Err(Error::DataDirUnresolved { reason })
 }
 
+/// The state directory from explicit inputs (`XDG_STATE_HOME`, `HOME`): where the
+/// repository grant store lives. Deliberately NOT under the data directory,
+/// which the sandboxed MCP server may write.
+pub fn state_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> Result<Located> {
+    let mut notes = Vec::new();
+    if let Some(x) = &xdg {
+        if x.is_empty() {
+        } else if !usable(x) {
+            notes.push(format!(
+                "XDG_STATE_HOME={} is not an absolute path and was ignored",
+                x.to_string_lossy()
+            ));
+        } else {
+            return Ok(Located {
+                path: PathBuf::from(x).join("mindspace"),
+                source: Source::Environment("XDG_STATE_HOME"),
+                is_default: true,
+                notes,
+            });
+        }
+    }
+    if let Some(h) = &home {
+        if h.is_empty() {
+            notes.push("HOME is empty and was ignored".to_string());
+        } else if !usable(h) {
+            notes.push(format!(
+                "HOME={} is not an absolute path and was ignored",
+                h.to_string_lossy()
+            ));
+        } else {
+            return Ok(Located {
+                path: PathBuf::from(h).join(".local/state/mindspace"),
+                source: Source::Environment("HOME"),
+                is_default: true,
+                notes,
+            });
+        }
+    }
+    let reason = if notes.is_empty() {
+        "neither XDG_STATE_HOME nor HOME is set".to_string()
+    } else {
+        notes.join("; ")
+    };
+    Err(Error::Grant(format!(
+        "cannot determine where to keep the grant store: {reason}"
+    )))
+}
+
+/// The state directory from the process environment.
+pub fn state_dir() -> Result<Located> {
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
 /// The data directory from the process environment.
 pub fn data_dir() -> Result<Located> {
     data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))

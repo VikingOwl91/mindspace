@@ -132,3 +132,33 @@ pub fn seccomp_command(c: &mut Command, prog: Vec<libc::sock_filter>) {
 pub fn socket_deny_filter() -> Option<Vec<libc::sock_filter>> {
     mindspace::sandbox::seccomp::program()
 }
+
+/// Makes each `(source, target)` pair true in the child: the source descriptor
+/// appears at the fixed number `target` and stays open across `exec`.
+///
+/// The sources are first copied to numbers far above any target, so a source
+/// that happens to sit at another pair's target number (likely in a big parallel
+/// test run) is not overwritten, and a source that already equals its target
+/// still loses its close-on-exec flag. Call only between fork and exec.
+pub fn place_fds(pairs: &[(i32, i32)]) -> std::io::Result<()> {
+    let mut staged = Vec::with_capacity(pairs.len());
+    for &(from, _) in pairs {
+        // SAFETY: fcntl(F_DUPFD) on a descriptor of this process.
+        let tmp = unsafe { libc::fcntl(from, libc::F_DUPFD, 500) };
+        if tmp < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        staged.push(tmp);
+    }
+    for (tmp, &(_, to)) in staged.iter().zip(pairs) {
+        // SAFETY: dup2 onto the target number; dup2 clears close-on-exec.
+        if unsafe { libc::dup2(*tmp, to) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    for tmp in staged {
+        // SAFETY: closing the staging copies made above.
+        unsafe { libc::close(tmp) };
+    }
+    Ok(())
+}

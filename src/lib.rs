@@ -8,6 +8,8 @@ pub mod cli;
 pub mod core;
 pub mod doctor;
 pub mod embeddings;
+#[cfg(unix)]
+pub mod grants;
 pub mod indexing;
 pub mod ingest;
 pub mod mcp;

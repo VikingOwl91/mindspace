@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod grant;
 pub mod render;
 
 use std::path::PathBuf;
@@ -231,6 +233,14 @@ pub enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Repository grants: what `mind mcp --grants` may use besides --allow-root
+    /// directories (ADR-030). A request from an agent is never a grant; only
+    /// these commands, run by you, create one
+    #[cfg(unix)]
+    Grant {
+        #[command(subcommand)]
+        command: grant::GrantCommand,
+    },
     /// Run the local MCP server over stdio
     Mcp {
         /// Directory the repo_outline and repo_ingest tools may use, as
@@ -264,6 +274,12 @@ pub enum Command {
         /// start and every result says so. Use only for trusted input.
         #[arg(long = "insecure-no-sandbox")]
         insecure_no_sandbox: bool,
+        /// Also use the directories you granted with `mind grant` (read at
+        /// start, validated again, expired and revoked ones skipped). Without
+        /// this flag the grant store is not read. A running server never gains
+        /// access: restart it after `mind grant approve`
+        #[arg(long)]
+        grants: bool,
     },
 }
 
@@ -873,11 +889,20 @@ License: {}",
                 println!("indexing_available: {}", enabled && selected.is_some());
             }
         },
+        #[cfg(unix)]
+        Command::Grant { command } => grant::run(cli, command)?,
         Command::Mcp {
             allow_roots,
             ingest_timeout,
             insecure_no_sandbox,
-        } => mcp_command(cli, allow_roots, *ingest_timeout, *insecure_no_sandbox)?,
+            grants,
+        } => mcp_command(
+            cli,
+            allow_roots,
+            *ingest_timeout,
+            *insecure_no_sandbox,
+            *grants,
+        )?,
     }
     Ok(())
 }
@@ -890,6 +915,7 @@ fn mcp_command(
     allow_roots: &[String],
     ingest_timeout: std::time::Duration,
     insecure: bool,
+    use_grants: bool,
 ) -> Result<()> {
     use crate::mcp::{McpConfig, SandboxState};
     #[cfg(target_os = "linux")]
@@ -902,7 +928,58 @@ fn mcp_command(
             path: db.display().to_string(),
         });
     }
-    let config = McpConfig::from_specs(allow_roots)?.with_ingest_timeout(ingest_timeout);
+    // Granted directories (ADR-030, M7.3a): read and validated HERE, in stage 1,
+    // while the process can still read the store. Stage 2 is already confined; it
+    // gets the resolved roots as extra arguments and never reads the store.
+    let mut specs: Vec<String> = allow_roots.to_vec();
+    let mut grant_args: Vec<std::ffi::OsString> = Vec::new();
+    let mut grant_ids: std::collections::BTreeMap<PathBuf, (u64, u64)> = Default::default();
+    #[cfg(unix)]
+    let store_dir = if use_grants {
+        grant_roots_for_start(cli, &db, &mut specs, &mut grant_args, &mut grant_ids)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if use_grants {
+        return Err(Error::Grant("--grants needs a Unix platform".into()));
+    }
+    let config = McpConfig::from_specs(&specs)?.with_ingest_timeout(ingest_timeout);
+    // Each granted directory must still be the very path that was approved; if
+    // canonicalization now leads somewhere else, the directory was swapped while
+    // starting: refuse instead of allowing the new target.
+    for path in grant_ids.keys() {
+        if !config.roots().iter().any(|r| &r.path == path) {
+            return Err(Error::Grant(format!(
+                "the granted directory {} changed while the server was starting; nothing was allowed. Start again",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(unix)]
+    {
+        // A root over the grant store would let the sandboxed server write grants.
+        if let Some(store) = &store_dir {
+            for r in config.roots() {
+                if r.path.starts_with(store) || store.starts_with(&r.path) {
+                    return Err(Error::Grant(format!(
+                        "the allowed root {} overlaps the grant store {}; with --grants a root there \
+                         would let the sandboxed server forge grants. Choose a different root",
+                        r.path.display(),
+                        store.display()
+                    )));
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    let config = {
+        let dir = db.parent().filter(|p| !p.as_os_str().is_empty());
+        let file = dir
+            .map(|d| d.join(crate::grants::REQUEST_FILE))
+            .unwrap_or_else(|| PathBuf::from(crate::grants::REQUEST_FILE));
+        config.with_request_log(file)
+    };
     let mut seccomp_report = serde_json::json!({"state": "not_evaluated"});
     let state = if config.roots().is_empty() {
         SandboxState::NotNeeded
@@ -918,7 +995,7 @@ fn mcp_command(
         #[cfg(not(target_os = "linux"))]
         SandboxState::Unavailable("--insecure-no-sandbox is only supported on Linux".to_string())
     } else {
-        let (state, seccomp) = sandbox_state(cli, &config);
+        let (state, seccomp) = sandbox_state(cli, &config, &grant_args, &grant_ids);
         seccomp_report = seccomp;
         state
     };
@@ -931,12 +1008,72 @@ fn mcp_command(
     Ok(())
 }
 
+/// Resolves the grants for `mind mcp --grants` and appends them to `specs`
+/// (and, as `--allow-root` pairs, to `grant_args` for the stage-2 re-exec).
+/// Returns the grant store directory when it could be determined. Every problem
+/// is reported on stderr and means FEWER roots, never more.
+#[cfg(unix)]
+fn grant_roots_for_start(
+    cli: &Cli,
+    db: &std::path::Path,
+    specs: &mut Vec<String>,
+    grant_args: &mut Vec<std::ffi::OsString>,
+    grant_ids: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>,
+) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(crate::sandbox::ENV_STAGE2).is_some() {
+        // Stage 2: the resolved roots arrived as arguments; the store is neither
+        // readable (Landlock) nor to be trusted again.
+        return None;
+    }
+    let _ = cli;
+    let state = match crate::paths::state_dir() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mind: grants: {e}; no grant is used");
+            return None;
+        }
+    };
+    let store = crate::grants::Store::in_dir(&state.path);
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute());
+    let policy = crate::grants::PathPolicy::standard(&state.path, db.parent(), home.as_deref());
+    let now = time::OffsetDateTime::now_utc();
+    let res = crate::grants::resolve_for_start(&store, &policy, now);
+    if let Some(why) = &res.store_error {
+        eprintln!("mind: grants: {why}");
+    }
+    for (id, why) in &res.skipped {
+        eprintln!(
+            "mind: grants: NOT using {id}: {}",
+            crate::grants::sanitize_display(why, 300)
+        );
+    }
+    crate::grants::record_skips(&store, &res, now);
+    for (path, access) in &res.roots {
+        let spec = format!(
+            "{}:{}",
+            path.display(),
+            crate::grants::access_label(*access)
+        );
+        eprintln!("mind: grants: using {spec}");
+        grant_args.push("--allow-root".into());
+        grant_args.push(spec.clone().into());
+        specs.push(spec);
+    }
+    grant_ids.extend(res.identities.iter().map(|(k, v)| (k.clone(), *v)));
+    Some(std::fs::canonicalize(&state.path).unwrap_or(state.path))
+}
+
 #[cfg(target_os = "linux")]
 fn sandbox_state(
     cli: &Cli,
     config: &crate::mcp::McpConfig,
+    extra_args: &[std::ffi::OsString],
+    grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
 ) -> (crate::mcp::SandboxState, serde_json::Value) {
-    let (state, seccomp) = sandbox_state_inner(cli, config);
+    let (state, seccomp) = sandbox_state_inner(cli, config, extra_args, grant_ids);
     (state, seccomp.to_json())
 }
 
@@ -944,6 +1081,8 @@ fn sandbox_state(
 fn sandbox_state_inner(
     cli: &Cli,
     config: &crate::mcp::McpConfig,
+    extra_args: &[std::ffi::OsString],
+    grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
 ) -> (crate::mcp::SandboxState, crate::sandbox::seccomp::Status) {
     use crate::mcp::{Access, SandboxState};
     use crate::sandbox::seccomp::Status;
@@ -994,6 +1133,22 @@ fn sandbox_state_inner(
         models_dir: crate::embeddings::manager::models_dir()
             .unwrap_or_else(|_| PathBuf::from("/nonexistent/mindspace-models")),
         exe,
+        identities: {
+            use std::os::unix::fs::MetadataExt;
+            // Static roots: the identity at this moment. Granted roots: the
+            // identity that was approved (this overrides, it never trusts the path).
+            let mut ids: std::collections::BTreeMap<PathBuf, (u64, u64)> = config
+                .roots()
+                .iter()
+                .filter_map(|r| {
+                    std::fs::metadata(&r.path)
+                        .ok()
+                        .map(|m| (r.path.clone(), (m.dev(), m.ino())))
+                })
+                .collect();
+            ids.extend(grant_ids.iter().map(|(k, v)| (k.clone(), *v)));
+            ids
+        },
     };
     match sandbox::verify_stage2(&plan.tmp_dir()) {
         Ok(Some(report)) => {
@@ -1018,7 +1173,7 @@ fn sandbox_state_inner(
             std::process::exit(78);
         }
     }
-    match sandbox::enter(&plan) {
+    match sandbox::enter_with_args(&plan, extra_args) {
         Outcome::NotNeeded => (SandboxState::NotNeeded, na),
         Outcome::Unavailable(reason) => (SandboxState::Unavailable(reason), na),
     }
@@ -1028,6 +1183,8 @@ fn sandbox_state_inner(
 fn sandbox_state(
     _cli: &Cli,
     _config: &crate::mcp::McpConfig,
+    _extra_args: &[std::ffi::OsString],
+    _grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
 ) -> (crate::mcp::SandboxState, serde_json::Value) {
     (
         crate::mcp::SandboxState::Unavailable(

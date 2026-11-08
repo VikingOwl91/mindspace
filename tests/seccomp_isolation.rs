@@ -646,13 +646,12 @@ fn run_child(w: &World, mode: &str) -> Run {
     // SAFETY: dup2 only, between fork and exec; clears CLOEXEC on the copies.
     unsafe {
         c.pre_exec(move || {
-            if libc::dup2(u, PRE_UNIX_FD) < 0
-                || libc::dup2(t, PRE_TCP_FD) < 0
-                || libc::dup2(d, DORMANT_FD) < 0
-                || libc::dup2(pass, PASSING_FD) < 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
+            common::place_fds(&[
+                (u, PRE_UNIX_FD),
+                (t, PRE_TCP_FD),
+                (d, DORMANT_FD),
+                (pass, PASSING_FD),
+            ])?;
             Ok(())
         });
     }

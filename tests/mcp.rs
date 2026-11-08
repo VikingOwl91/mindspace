@@ -140,7 +140,7 @@ fn real_binary_exposes_all_fourteen_tools_and_runs_the_memory_lifecycle() {
 
     let list = process.request(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool.get("outputSchema").is_none());
@@ -161,6 +161,7 @@ fn real_binary_exposes_all_fourteen_tools_and_runs_the_memory_lifecycle() {
         "code_search",
         "repo_outline",
         "repo_ingest",
+        "repo_request_access",
         "space_create",
         "space_list",
         "space_link",

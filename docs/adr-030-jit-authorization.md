@@ -1,6 +1,6 @@
 # ADR-030: Just-in-time repository authorization (M7.3)
 
-Status: **proposed**, 2026-11-08. Not implemented. No product change. Basis: `main` at `ea5e651`; spike #1 `49c027a`
+Status: **accepted for M7.3a** (grant core, level A1, documented in [grants.md](grants.md)); M7.3b and A2/A3 remain proposed. 2026-11-08. Basis: `main` at `ea5e651`; spike #1 `49c027a`
 (`docs/spikes/m7.2b-jit-permissions.md` on that branch), spike #2 `b38ef3b` (`docs/spikes/m7.2b-elicitation-sandbox.md`), seccomp
 compatibility spike `c8d30b0`, the real-client run (Claude Code 2.1.319, headless), and the probes of this ADR
 (`scripts/spike/m73_identity_probe.py`).
@@ -128,7 +128,7 @@ Practical properties:
      `repo_request_access` that only *records a pending request* and tells the agent to ask the human. Smallest step; no worker refactor.
    * **M7.3b** mid-session grants: broker + per-grant workers (spike #1) and the extract/persist split of ingest. This is the large part.
 3. **`mind doctor` reports the approval assurance this host can actually give** and says when a shell agent could approve itself
-   (section 6.4). The documentation claims protection for **T0 and T1 only**.
+   (section 6.4). The documentation claims protection for **T0** (no shell) and, conditionally, **T1** (only where the client confines the shell, which Mindspace does not verify).
 4. **No claim for T2** until A2 or A3 exists *and* its prerequisites hold on the host. That is a stated limit, not a gap to hide.
 5. Elicitation is allowed as a *convenience channel for A1-level requests* only if a client demonstrably shows a dialog and cannot
    answer it by hook; it is never sufficient for T2.
@@ -165,7 +165,7 @@ and agents whose shell the client confines"; it does not say "protects against a
 | Level | Authority | May claim | May not claim |
 | --- | --- | --- | --- |
 | A0 | static roots chosen by the human at registration | nothing is granted at run time | n/a |
-| A1 | human in a terminal or user-level dialog; the grant store written by the human's CLI | a request alone never creates a grant; grants are validated, expire and can be revoked; protects T0 and T1 | protection against T2; authenticity of the human |
+| A1 | human in a terminal or user-level dialog; the grant store written by the human's CLI | a request alone never creates a grant; grants are validated, expire and can be revoked; protects T0 (no shell). T1 only if the client really confines the shell, which Mindspace does not verify | protection against T2; authenticity of the human; any T1 claim without verified shell isolation |
 | A2 | root-owned authority (polkit) with an authentication the agent cannot observe | T2 protection on a host whose facts above are clean | T2 protection when input devices are exposed (a typed password can be read) |
 | A3 | A2 or A1 plus a hardware presence proof | T2 protection even with exposed input devices, limited by blind-touch | what the token's missing display cannot show |
 

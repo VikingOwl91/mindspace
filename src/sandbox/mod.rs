@@ -110,6 +110,11 @@ pub struct Plan {
     pub db_dir: PathBuf,
     pub models_dir: PathBuf,
     pub exe: PathBuf,
+    /// Device and inode each root had when it was approved (a grant) or when the
+    /// plan was made (a static root). The rule for such a root is created from a
+    /// descriptor opened WITHOUT following symlinks and compared with this
+    /// identity, so a directory swapped after validation is refused, not trusted.
+    pub identities: std::collections::BTreeMap<PathBuf, (u64, u64)>,
 }
 
 impl Plan {
@@ -393,7 +398,70 @@ pub fn canary_failures(canary_dir: &Path, private_tmp: Option<&Path>) -> Vec<Str
     bad
 }
 
-fn build_ruleset(rules: &[Rule]) -> Result<landlock::RulesetCreated, String> {
+/// `open_how` for `openat2(2)`.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// Opens `path` as a directory descriptor (`O_PATH`) with NO symlink anywhere
+/// in the path and no magic links, then checks that it is the directory with the
+/// expected device and inode. The Landlock rule is made from this descriptor, so
+/// what was checked is what is allowed: there is no window between the check and
+/// the rule.
+pub(crate) fn open_verified_dir(
+    path: &Path,
+    expected: (u64, u64),
+) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("{}: path contains NUL", path.display()))?;
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    };
+    // SAFETY: openat2 with a valid NUL-terminated path and a correctly sized struct.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "{}: cannot open without following symlinks: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the kernel just returned this descriptor; it is owned here.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let meta = std::fs::File::from(owned.try_clone().map_err(|e| e.to_string())?)
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if (meta.dev(), meta.ino()) != expected {
+        return Err(format!(
+            "{} is not the directory that was approved (device/inode changed since validation); refusing to create a rule for it",
+            path.display()
+        ));
+    }
+    Ok(owned)
+}
+
+fn build_ruleset(
+    rules: &[Rule],
+    identities: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
+) -> Result<landlock::RulesetCreated, String> {
     let all: BitFlags<AccessFs> = AccessFs::from_all(MIN_ABI);
     let read: BitFlags<AccessFs> = AccessFs::from_read(MIN_ABI);
     let mut rs = Ruleset::default()
@@ -403,7 +471,8 @@ fn build_ruleset(rules: &[Rule]) -> Result<landlock::RulesetCreated, String> {
         .create()
         .map_err(|e| format!("Landlock is not available: {e}"))?;
     for rule in rules {
-        if !rule.path.exists() {
+        let strict = identities.get(&rule.path);
+        if strict.is_none() && !rule.path.exists() {
             continue;
         }
         let rights: BitFlags<AccessFs> = match rule.rights {
@@ -413,6 +482,14 @@ fn build_ruleset(rules: &[Rule]) -> Result<landlock::RulesetCreated, String> {
             Rights::FileReadWrite => AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
             Rights::FileExec => AccessFs::Execute | AccessFs::ReadFile,
         };
+        if let Some(identity) = strict {
+            // A root: the rule comes from the verified descriptor itself.
+            let fd = open_verified_dir(&rule.path, *identity)?;
+            rs = rs
+                .add_rule(PathBeneath::new(fd, rights))
+                .map_err(|e| format!("rule for {}: {e}", rule.path.display()))?;
+            continue;
+        }
         let fd = PathFd::new(&rule.path).map_err(|e| format!("{}: {e}", rule.path.display()))?;
         rs = rs
             .add_rule(PathBeneath::new(fd, rights))
@@ -424,6 +501,13 @@ fn build_ruleset(rules: &[Rule]) -> Result<landlock::RulesetCreated, String> {
 /// Stage 1. Returns only when no confined process was produced; on success it
 /// does not return (it `exec`s). A confined-but-unverified process exits.
 pub fn enter(plan: &Plan) -> Outcome {
+    enter_with_args(plan, &[])
+}
+
+/// As [`enter`], and stage 2 is started with `extra_args` appended to this
+/// process's arguments (roots that stage 1 resolved, for example granted ones,
+/// which stage 2 could no longer read from disk once confined).
+pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
     if plan.roots.is_empty() {
         return Outcome::NotNeeded;
     }
@@ -451,7 +535,7 @@ pub fn enter(plan: &Plan) -> Outcome {
         Ok(d) => d,
         Err(e) => return Outcome::Unavailable(e),
     };
-    let ruleset = match build_ruleset(&rules) {
+    let ruleset = match build_ruleset(&rules, &plan.identities) {
         Ok(r) => r,
         Err(e) => return Outcome::Unavailable(e),
     };
@@ -474,6 +558,7 @@ pub fn enter(plan: &Plan) -> Outcome {
 
     let mut cmd = std::process::Command::new(&plan.exe);
     cmd.args(std::env::args_os().skip(1))
+        .args(extra_args)
         .env(ENV_STAGE2, "1")
         .env(ENV_CANARY, &canary_dir)
         .env("TMPDIR", &tmp);
@@ -530,6 +615,7 @@ mod tests {
             db_dir: PathBuf::from(db),
             models_dir: PathBuf::from("/nonexistent/models"),
             exe: PathBuf::from("/nonexistent/mind"),
+            identities: Default::default(),
         }
     }
 
@@ -622,5 +708,61 @@ mod tests {
             .iter()
             .all(|r| r.path != Path::new("/") && r.path != Path::new("/home")));
         assert_eq!(p.tmp_dir(), Path::new("/d/.mindspace-tmp"));
+    }
+
+    #[test]
+    fn a_root_is_opened_without_symlinks_and_must_be_the_approved_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().canonicalize().unwrap();
+        let real = base.join("real");
+        let other = base.join("other");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let id = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.dev(), m.ino())
+        };
+        // the approved directory
+        assert!(open_verified_dir(&real, id(&real)).is_ok());
+        // another directory at the same path (replaced after approval)
+        let approved = id(&real);
+        std::fs::remove_dir(&real).unwrap();
+        std::fs::create_dir(&real).unwrap();
+        let err = open_verified_dir(&real, (approved.0, approved.1 + 1_000_003)).unwrap_err();
+        assert!(err.contains("not the directory that was approved"), "{err}");
+        // a symlink as the last component, and a symlink in the middle
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert!(open_verified_dir(&link, id(&other)).is_err());
+        let via = base.join("via");
+        std::os::unix::fs::symlink(&base, &via).unwrap();
+        assert!(open_verified_dir(&via.join("other"), id(&other)).is_err());
+        // a plain file is not a root
+        let f = base.join("f");
+        std::fs::write(&f, "x").unwrap();
+        assert!(open_verified_dir(&f, id(&f)).is_err());
+        // and the ruleset refuses to be built for a swapped root (nothing is restricted)
+        let rules = vec![Rule {
+            path: real.clone(),
+            rights: Rights::All,
+        }];
+        let mut ids = std::collections::BTreeMap::new();
+        ids.insert(real.clone(), (approved.0, approved.1 + 1_000_003));
+        assert!(build_ruleset(&rules, &ids).is_err());
+        ids.insert(real.clone(), id(&real));
+        assert!(build_ruleset(&rules, &ids).is_ok());
+        // a root that vanished is an error, not a skipped rule
+        let gone = base.join("gone");
+        let mut ids = std::collections::BTreeMap::new();
+        ids.insert(gone.clone(), (1, 1));
+        assert!(build_ruleset(
+            &[Rule {
+                path: gone,
+                rights: Rights::All
+            }],
+            &ids
+        )
+        .is_err());
     }
 }

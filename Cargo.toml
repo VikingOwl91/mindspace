@@ -45,6 +45,9 @@ ureq = { version = "2", optional = true, features = ["tls"] }
 rustix = { version = "1.1.4", features = ["fs"], optional = true }
 # Kernel sandbox for the MCP repository tools (ADR-029). Linux only.
 landlock = "0.4.7"
+
+[target.'cfg(unix)'.dependencies]
+# Descriptor-level file access for the grant store (O_NOFOLLOW, fstat checks) and the Linux sandbox.
 libc = "0.2"
 
 [dev-dependencies]

@@ -200,6 +200,48 @@ impl Plan {
     }
 }
 
+/// Is this file name a shared library or the dynamic loader (`libc.so.6`,
+/// `libz.so.1`, `ld-linux-x86-64.so.2`)? Data files with `.so` in the name, such
+/// as the loader cache `ld.so.cache`, are not.
+fn is_shared_object_name(name: &str) -> bool {
+    (name.starts_with("lib") || name.starts_with("ld-") || name.starts_with("ld64"))
+        && (name.ends_with(".so") || name.contains(".so."))
+}
+
+/// Top-level directories that are never granted as a library directory, whatever
+/// is mapped from them: they hold configuration, devices, state or user data.
+const NEVER_A_LIBRARY_DIR: &[&str] = &["/", "/home", "/root"];
+
+/// Nor anything below these (a library mapped from `/dev/shm`, `/tmp` or `/etc`
+/// is not a reason to read that tree).
+const NEVER_BELOW: &[&str] = &["/etc", "/proc", "/sys", "/dev", "/run", "/tmp", "/var"];
+
+/// The parent directories of the shared libraries named in a `/proc/<pid>/maps`
+/// listing (pure, for tests).
+fn library_dirs_from_maps(maps: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for line in maps.lines() {
+        let Some(path) = line.split_whitespace().nth(5) else {
+            continue;
+        };
+        let p = Path::new(path);
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !path.starts_with('/') || !is_shared_object_name(name) {
+            continue;
+        }
+        if let Some(parent) = p.parent() {
+            let exact = NEVER_A_LIBRARY_DIR.iter().any(|d| parent == Path::new(d));
+            let below = NEVER_BELOW.iter().any(|d| parent.starts_with(d));
+            if !exact && !below {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+    dirs
+}
+
 /// Directories of shared libraries this process has mapped, and of the Git
 /// binary. Under a standard layout they are inside `/usr`; on other layouts
 /// (store-based distributions) they are not, and the Git probe shows whether
@@ -207,15 +249,7 @@ impl Plan {
 fn extra_runtime_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-        for line in maps.lines() {
-            if let Some(path) = line.split_whitespace().nth(5) {
-                if path.starts_with('/') && (path.contains(".so")) {
-                    if let Some(parent) = Path::new(path).parent() {
-                        dirs.push(parent.to_path_buf());
-                    }
-                }
-            }
-        }
+        dirs.extend(library_dirs_from_maps(&maps));
     }
     if let Some(git) = find_in_path("git") {
         if let Some(parent) = git.parent() {
@@ -764,5 +798,151 @@ mod tests {
             &ids
         )
         .is_err());
+    }
+
+    /// Regression (M7.3b, finding F1): the loader cache `/etc/ld.so.cache` is
+    /// mapped into every dynamically linked process and its name contains `.so`;
+    /// the runtime directories once included its parent, which made ALL of `/etc`
+    /// readable inside the sandbox.
+    #[test]
+    fn the_runtime_directories_never_include_etc() {
+        let dirs = extra_runtime_dirs();
+        assert!(
+            !dirs.iter().any(|d| d == Path::new("/etc")),
+            "all of /etc would be readable: {dirs:?}"
+        );
+        let plan = plan(&[("/data/repos", true)], "/data/state");
+        let wide: Vec<_> = plan
+            .rules()
+            .into_iter()
+            .filter(|r| r.path == Path::new("/etc") || r.path == Path::new("/"))
+            .collect();
+        assert!(wide.is_empty(), "{wide:?}");
+    }
+
+    #[test]
+    fn only_libraries_count_and_data_files_with_so_in_the_name_do_not() {
+        for ok in [
+            "libc.so.6",
+            "libz.so.1",
+            "libstdc++.so.6",
+            "ld-linux-x86-64.so.2",
+            "libfoo.so",
+            "ld64.so.2",
+        ] {
+            assert!(is_shared_object_name(ok), "{ok}");
+        }
+        for no in [
+            "ld.so.cache",
+            "ld.so.preload",
+            "ld.so.conf",
+            "libfoo.conf",
+            "socket",
+            "foo.so",
+            "mind",
+            "libfoo.sock",
+            "xlib.so.1",
+        ] {
+            assert!(!is_shared_object_name(no), "{no}");
+        }
+        let maps = "\
+7f00 r--p 00000000 00:00 1 /usr/lib/libc.so.6\n\
+7f01 r--p 00000000 00:00 2 /etc/ld.so.cache\n\
+7f02 r--p 00000000 00:00 3 /opt/rocm/lib/libamdhip64.so.6\n\
+7f03 r--p 00000000 00:00 4 /etc/libsomething.so.1\n\
+7f04 r--p 00000000 00:00 5 /dev/shm/libx.so.1\n\
+7f05 r--p 00000000 00:00 6 [vdso]\n\
+7f06 r--p 00000000 00:00 7 /tmp/libtmp.so\n\
+7f07 r--p 00000000 00:00 8 /home/u/.cache/libcache.so.1\n";
+        let dirs = library_dirs_from_maps(maps);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/opt/rocm/lib"),
+                PathBuf::from("/home/u/.cache"),
+            ]
+        );
+    }
+
+    /// Child half of the kernel test below: applies the product's rules to itself
+    /// and reports what the kernel allows. Does nothing in a normal test run.
+    #[test]
+    fn rules_child() {
+        if std::env::var_os("MINDSPACE_RULES_CHILD").is_none() {
+            return;
+        }
+        // the test harness prints "test ... " without a newline first
+        println!();
+        let plan = plan(&[("/nonexistent-root", true)], "/nonexistent-db");
+        let rs = build_ruleset(&plan.rules(), &Default::default()).expect("ruleset");
+        let st = rs.restrict_self().expect("restrict");
+        assert_eq!(st.ruleset, RulesetStatus::FullyEnforced);
+        let probe = |p: &str| match std::fs::read(p) {
+            Ok(b) => format!("ok {}", b.len()),
+            Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+        };
+        println!("RESULT etc_hostname {}", probe("/etc/hostname"));
+        println!("RESULT etc_passwd {}", probe("/etc/passwd"));
+        println!("RESULT etc_ld_cache {}", probe("/etc/ld.so.cache"));
+        println!("RESULT etc_os_release {}", probe("/etc/os-release"));
+        println!(
+            "RESULT usr_bin_listing {}",
+            match std::fs::read_dir("/usr/bin") {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            }
+        );
+        println!(
+            "RESULT dev_null {}",
+            match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            }
+        );
+    }
+
+    /// The kernel's answer to F1: with the product's rules, /etc is not readable
+    /// (except the loader files that have their own rules); libraries and /dev/null still work.
+    #[test]
+    fn the_kernel_does_not_let_a_sandboxed_process_read_etc() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox::tests::rules_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MINDSPACE_RULES_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("RESULT {k} ")))
+                .unwrap_or_else(|| panic!("no {k} in {text}"))
+                .to_string()
+        };
+        eprintln!("{text}");
+        // (/etc/os-release is a symlink into /usr/lib and stays readable through its target)
+        for (key, path) in [
+            ("etc_hostname", "/etc/hostname"),
+            ("etc_passwd", "/etc/passwd"),
+        ] {
+            if Path::new(path).exists() {
+                assert_eq!(get(key), "errno 13", "{path}");
+            }
+        }
+        assert!(
+            get("etc_ld_cache").starts_with("ok"),
+            "the loader cache keeps its own rule"
+        );
+        assert_eq!(get("usr_bin_listing"), "ok");
+        assert_eq!(get("dev_null"), "ok");
     }
 }

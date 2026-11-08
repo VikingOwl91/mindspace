@@ -14,7 +14,7 @@ verified with probes that must be denied. That is the only isolation Mindspace a
 | --- | --- | --- |
 | Filesystem | `enforced` (when the self-test shows the sandbox active) | Landlock ABI 3 rules; canary probes at every start. VERIFIED by the self-test and `tests/doctor.rs`. |
 | TCP, UDP, unix pathname sockets, unix abstract sockets | `enforced` on x86_64 with typed evidence from the self-test child; otherwise `supported_not_enforced` / `not_supported` / `unknown` | the seccomp filter denies creating NEW sockets (`src/sandbox/seccomp.rs`); already open descriptors (stdio) stay usable. Not network or IPC isolation. |
-| Signals | `supported_not_enforced` / `not_supported` / `unknown` | no Landlock scope and no filter for signals. |
+| Signals | `enforced` where the kernel has Landlock ABI 6 (Linux 6.12) and the self-test child showed it (a process outside the sandbox answers `EPERM`); `not_supported` below ABI 6 | `Scope::Signal`, added to the ruleset only where available (M7.3b F2). A sandboxed process, its descendants and itself stay signalable; everything outside the sandbox is not. A seccomp filter on the signal calls was measured and rejected: it also stops the server from killing its own timed-out Git, and `F_SETOWN`+`O_ASYNC` (SIGIO) still arrives. See `tests/signal_isolation.rs`. |
 
 Landlock at the project's minimum rule set alone would let a confined process connect to any unix socket path or abstract socket
 it can name, connect to TCP and send UDP (VERIFIED for an equivalent rule set by `tests/seccomp_isolation.rs`,

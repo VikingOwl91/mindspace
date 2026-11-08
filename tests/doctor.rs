@@ -845,12 +845,14 @@ mod linux {
         assert_eq!(caps["product"]["uses_seccomp"], true);
         assert_eq!(caps["product"]["landlock_filesystem_abi"], 3);
         assert_eq!(caps["channels"]["filesystem"]["status"], "enforced");
-        // Landlock-only channels: the product handles none of them.
+        // Signals: enforced exactly when the kernel has Landlock's signal scope (ABI 6)
+        // and the self-test child showed it (an outside process answered EPERM).
         let st = caps["channels"]["signals"]["status"].as_str().unwrap();
-        assert!(
-            ["supported_not_enforced", "not_supported", "unknown"].contains(&st),
-            "signals must not be reported as enforced: {caps}"
-        );
+        if mindspace::sandbox::landlock_abi() >= 6 {
+            assert_eq!(st, "enforced", "{caps}");
+        } else {
+            assert_ne!(st, "enforced", "no signal scope on this kernel: {caps}");
+        }
         // The socket channels are enforced exactly when the self-test child
         // reported the typed seccomp evidence (x86_64); never by kernel support alone.
         let evidence = caps["seccomp_evidence"]["state"].as_str().unwrap();

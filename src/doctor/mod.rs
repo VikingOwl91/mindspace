@@ -787,6 +787,7 @@ fn check_sandbox_selftest(i: &Inputs, proven: &mut capabilities::Proven) -> Chec
             if ok {
                 proven.sandbox = capabilities::Evidence::Active;
                 proven.seccomp = capabilities::parse_seccomp_evidence(result.seccomp.as_ref());
+                proven.signals = capabilities::parse_signal_evidence(result.seccomp.as_ref());
                 Check::new(id, title, Status::Pass, "kernel sandbox enforced (server-reported, probe-verified); access inside the root works, outside access is refused").details(d)
             } else {
                 Check::new(id, title, Status::Fail, "inconsistent: the server reports an enforced sandbox but the tool behaviour does not match (an outside path was not refused, or the root was not usable)")

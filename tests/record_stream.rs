@@ -1367,6 +1367,7 @@ fn _unused(_: &mut dyn Write, _: Error) {}
 fn limited(max: u64) -> ProducerLimits {
     ProducerLimits {
         max_blob_bytes: max,
+        ..Default::default()
     }
 }
 

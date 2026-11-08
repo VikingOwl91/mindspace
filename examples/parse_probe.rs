@@ -28,6 +28,21 @@ fn main() {
             kb("VmHWM:") >> 10,
             tree.root_node().child_count()
         );
+    } else if a[2] == "policy" {
+        let o = mindspace::ingest::code::parse_with_policy(
+            mindspace::core::CodeLanguage::Rust,
+            &text,
+            &mindspace::ingest::code::ParsePolicy::default(),
+        );
+        println!(
+            "parse_with_policy(p1): {} ms, peak rss {} MiB, entities {} rels {} skipped {:?} accounted {} B",
+            t.elapsed().as_millis(),
+            kb("VmHWM:") >> 10,
+            o.derivation.entities.len(),
+            o.derivation.relationships.len(),
+            o.skipped.map(|r| r.label()),
+            o.accounted_bytes
+        );
     } else {
         let d = mindspace::ingest::code::parse(mindspace::core::CodeLanguage::Rust, &text);
         println!(

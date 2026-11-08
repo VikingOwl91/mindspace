@@ -58,11 +58,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{
-    sha256_hex, AssertionDraft, CodeContextDraft, CodeDerivationDraft, CodeEntityDraft,
-    CodeImportDraft, CodeInputDraft, CodeRelationshipDraft, Error, EvidenceDraft, GitBlobData,
-    GitCommitData, GitDerivedFile, GitObjectKind, GitObservation, GitRefEventDraft,
-    GitRefEventKind, GitRefObservation, GitRemoteDraft, GitTagData, GitTreeData, IngestObservation,
-    IngestScope, MemorySpec, ObservedFile, Result, SessionDraft, Uuid,
+    sha256_hex, AssertionDraft, CodeContextDraft, CodeEntityDraft, CodeImportDraft, CodeInputDraft,
+    CodeRelationshipDraft, Error, EvidenceDraft, GitBlobData, GitCommitData, GitDerivedFile,
+    GitObjectKind, GitObservation, GitRefEventDraft, GitRefEventKind, GitRefObservation,
+    GitRemoteDraft, GitTagData, GitTreeData, IngestObservation, IngestScope, MemorySpec,
+    ObservedFile, Result, SessionDraft, Uuid,
 };
 
 use super::deadline::Deadline;
@@ -97,12 +97,16 @@ pub const DEFAULT_MAX_BLOB: u64 = 32 * 1024 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct ProducerLimits {
     pub max_blob_bytes: u64,
+    /// Structural-parse resource policy (`p1` defaults): a source over a budget keeps its text
+    /// and is reported as skipped.
+    pub parse_policy: super::code::ParsePolicy,
 }
 
 impl Default for ProducerLimits {
     fn default() -> Self {
         Self {
             max_blob_bytes: DEFAULT_MAX_BLOB,
+            parse_policy: super::code::ParsePolicy::default(),
         }
     }
 }
@@ -726,7 +730,7 @@ pub fn stream_directory(
             })?;
         let location = anchor.real().join(&rel).display().to_string();
         let file = super::observe_bytes(&rel, bytes, location, space_ids)?;
-        let code = super::code_input_for_file(ctx, &file, deadline)?;
+        let code = super::code_input_for_file(ctx, &file, deadline, &limits.parse_policy)?;
         emit_file(sink, file)?;
         if let Some(input) = code {
             emit_code_input(sink, input, true)?;
@@ -1043,7 +1047,6 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     }
 
     // ---- bodies: blob batches
-    let identity = code::identity();
     let mut batch: Vec<String> = Vec::new();
     let mut batch_bytes = 0u64;
     let oids: Vec<String> = by_blob.keys().cloned().collect();
@@ -1135,35 +1138,30 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
                     continue;
                 };
                 deadline.check("parsing source files")?;
-                let entry = code_input.get_or_insert_with(|| CodeInputDraft {
-                    language,
-                    content_hash: content_hash.clone(),
-                    content: String::new(),
-                    repository_id: Some(repository_id),
-                    blob_oid: Some(blob_oid.clone()),
-                    contexts: vec![],
-                    derivation: if ctx
-                        .has_code_derivation(
-                            language,
-                            &content_hash,
-                            Some(repository_id),
-                            Some(&blob_oid),
-                            &identity,
-                        )
-                        .unwrap_or(false)
-                    {
-                        CodeDerivationDraft {
-                            identity: code::identity(),
-                            status: crate::core::CodeParseStatus::Complete,
-                            error_count: 0,
-                            entities: vec![],
-                            imports: vec![],
-                            relationships: vec![],
-                        }
-                    } else {
-                        code::parse(language, &content)
-                    },
-                });
+                if code_input.is_none() {
+                    let derivation = super::structural_derivation(
+                        ctx,
+                        language,
+                        &content,
+                        &content_hash,
+                        Some(repository_id),
+                        Some(&blob_oid),
+                        &limits.parse_policy,
+                        false,
+                    )?;
+                    code_input = Some(CodeInputDraft {
+                        language,
+                        content_hash: content_hash.clone(),
+                        content: String::new(),
+                        repository_id: Some(repository_id),
+                        blob_oid: Some(blob_oid.clone()),
+                        contexts: vec![],
+                        derivation,
+                    });
+                }
+                let Some(entry) = code_input.as_mut() else {
+                    continue;
+                };
                 entry.contexts.push(CodeContextDraft {
                     path: path.clone(),
                     commit_oid: Some(commit.clone()),

@@ -1106,6 +1106,13 @@ pub struct CodeDerivation {
     pub identity: CodeParserIdentity,
     pub status: CodeParseStatus,
     pub error_count: u32,
+    /// The derivation every reader uses for its code input: the one with the greatest
+    /// `(created_at, id)`. Exactly one per input; the others are superseded.
+    #[serde(default)]
+    pub effective: bool,
+    /// Why the structural parse was skipped (`p1:source_bytes>2097152`), for a policy skip row.
+    #[serde(default)]
+    pub skip_reason: Option<String>,
     pub content_hash: String,
     pub entities: Vec<CodeEntity>,
     pub imports: Vec<CodeImport>,
@@ -1225,6 +1232,14 @@ pub struct CodeObservationReport {
     pub reused: u64,
     pub entities: u64,
     pub parse_errors: u64,
+    /// Inputs whose structural parse was skipped by the resource policy in this observation
+    /// (new skip rows and reused ones; they are not counted in `parsed` or `parse_errors`).
+    /// The text of these files is ingested as usual.
+    #[serde(default)]
+    pub skipped: u64,
+    /// `skipped` by reason, e.g. `p1:source_bytes>2097152` -> 3.
+    #[serde(default)]
+    pub skip_reasons: std::collections::BTreeMap<String, u64>,
 }
 
 /// Everything one ingest operation observed, handed to the store in a
@@ -1323,6 +1338,9 @@ pub struct ObservationReport {
     pub scope: IngestScope,
     pub files: Vec<FileObservation>,
     pub events: Vec<SourceEvent>,
+    /// Structural (code) observation of the same ingest; all zero when no source files took part.
+    #[serde(default)]
+    pub code: CodeObservationReport,
 }
 
 // ---------------------------------------------------------------------------

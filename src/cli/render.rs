@@ -153,19 +153,49 @@ pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
     }
 }
 
+/// One line when the structural-parse policy skipped sources: their text was ingested, their
+/// structure was not.
+fn code_skips(code: &crate::core::CodeObservationReport) {
+    if code.skipped == 0 {
+        return;
+    }
+    let reasons: Vec<String> = code
+        .skip_reasons
+        .iter()
+        .map(|(r, n)| format!("{r}: {n}"))
+        .collect();
+    println!(
+        "structure skipped for {} source file(s) ({}); their text was ingested",
+        code.skipped,
+        reasons.join(", ")
+    );
+}
+
 pub fn code_structure(items: &[CodeDerivation], as_json: bool) {
     if as_json {
         json(items);
         return;
     }
     for d in items {
-        println!(
-            "{} {} ({}, {} errors)",
-            d.language.as_str(),
-            d.content_hash,
-            d.status.as_str(),
-            d.error_count
-        );
+        let state = if d.effective {
+            "effective"
+        } else {
+            "superseded"
+        };
+        match &d.skip_reason {
+            Some(reason) => println!(
+                "{} {} (skipped: {reason}; {state})",
+                d.language.as_str(),
+                d.content_hash
+            ),
+            None => println!(
+                "{} {} ({}, {} errors; {state})",
+                d.language.as_str(),
+                d.content_hash,
+                d.status.as_str(),
+                d.error_count
+            ),
+        }
         for e in &d.entities {
             println!(
                 "  {} {} [{}:{}-{}:{}]",
@@ -242,6 +272,7 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
             ),
         }
     }
+    code_skips(&report.code);
 }
 
 /// Human and JSON output of one git repository observation. The counters
@@ -275,6 +306,7 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
         report.code.entities,
         report.code.parse_errors
     );
+    code_skips(&report.code);
     for event in &report.events {
         match event.kind {
             crate::core::GitRefEventKind::Created => {

@@ -118,9 +118,9 @@ pub fn persist_files(
 ) -> Result<crate::core::ObservationReport> {
     // The last point where the limit can stop the ingest cleanly.
     deadline.check("preparing to write")?;
-    let report = store.record_observation(extracted.observation)?;
+    let mut report = store.record_observation(extracted.observation)?;
     if !extracted.code_inputs.is_empty() {
-        let _ = store.record_code_observation(CodeObservation {
+        report.code = store.record_code_observation(CodeObservation {
             inputs: extracted.code_inputs,
         })?;
     }

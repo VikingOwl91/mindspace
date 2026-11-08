@@ -438,3 +438,28 @@ corpus and the wgpu ingest before/after), and the method-chain 10,000 fixture dr
    tested for self-consistency, not calibrated against RSS (the budgets do not bound RSS).
 4. Section 4 of the earlier list: how hidden entities are presented after a parser upgrade (covered by
    the marker in section 10, to be confirmed).
+
+## 14. Implementation notes (M7.3b.1p, uncommitted)
+
+* `code::ParsePolicy` (`p1` defaults), `code::parse_with_policy` -> `ParseOutcome{derivation, skipped,
+  accounted_bytes, transient}`, `code::skip_identity` / `skip_derivation` / `skip_reason_of`;
+  `code::parse` is the unlimited form. `ingest::structural_derivation` implements the producer order of
+  section 3 (known identity, known skip, size, parse under policy) and is used by the in-process
+  directory and Git paths (default policy) and by the stream producers (`ProducerLimits.parse_policy`).
+* Budgets are enforced inside `visit`: the depth when an entity or `impl` level is entered, the size
+  before the parser exists, the output by `Budget::charge` before each stored or context string is
+  allocated. `raw` is a borrowed slice; the parent/qualified-name context is a shared `Rc<str>`.
+  A function's `signature` is its first *line*; on a one-line file that is the rest of the file, and
+  it is charged as such (this is what stops deeply nested one-line input).
+* A parser that cannot run (no grammar, no tree) is an error of the operation, not a stored derivation.
+* Skip rows: status `failed`, 0 errors, no entities, `extractor_version` `3+skip(p1:<reason>)`. No new
+  status, no migration.
+* `EFFECTIVE_DERIVATION` (`ORDER BY created_at DESC, id DESC LIMIT 1`) is used by entity listing,
+  symbol search, relationship observation/resolution and `structure`.
+* Reporting (additive): `CodeObservationReport.skipped` and `.skip_reasons`; `ObservationReport.code`
+  (directory ingests now return their code report instead of dropping it); `CodeDerivation.effective`
+  and `.skip_reason`; ingest output line "structure skipped for N source file(s) (...)"; `structure`
+  prints `effective`/`superseded` and `skipped: <reason>`.
+* Known gaps: the in-process paths cannot be configured (default policy); the stream producer can.
+  Each not-yet-known source costs up to two extra existence probes (depth, output): in the worker
+  design these are context requests. No CLI options, progress record or retry (excluded).

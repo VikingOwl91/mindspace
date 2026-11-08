@@ -485,7 +485,7 @@ fn rust_module_index(
         syntax: String,
         qualified: Option<String>,
     }
-    let mut stmt = tx.prepare("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND d.created_at=(SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id=d.input_id) ORDER BY c.path,e.syntax_path,e.id").map_err(dberr)?;
+    let mut stmt = tx.prepare(&format!("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND {EFFECTIVE_DERIVATION} ORDER BY c.path,e.syntax_path,e.id")).map_err(dberr)?;
     let rows = stmt
         .query_map(
             rusqlite::params![repository_id.to_string(), commit_oid],
@@ -936,6 +936,12 @@ const FENCED_TABLES: &[&str] = &[
     "m6_repository_history",
     "m6_git_ref_history",
 ];
+
+/// The one rule for which derivation of a code input is current: the greatest `(created_at, id)`
+/// over all of its derivations, whatever their identity. Exactly one row matches (the id breaks
+/// ties), so symbol search, relationship observation/resolution, entity listing and `structure`
+/// agree. `d` is the derivation alias of the enclosing query.
+const EFFECTIVE_DERIVATION: &str = "d.id = (SELECT d2.id FROM code_derivations d2 WHERE d2.input_id = d.input_id ORDER BY d2.created_at DESC, d2.id DESC LIMIT 1)";
 
 const IMMUTABLE_TABLES: &[&str] = &[
     "sources",
@@ -1962,15 +1968,25 @@ impl Store for SqliteStore {
             }
             let d = &input.derivation;
             let derivation_id:Option<String>=tx.query_row("SELECT id FROM code_derivations WHERE input_id=?1 AND extractor=?2 AND extractor_version=?3 AND grammar=?4 AND grammar_version=?5",rusqlite::params![input_id,d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?;
+            // A policy skip (status `failed`, identity with a `+skip(` suffix) is counted
+            // whether the row is new or already there.
+            let skip_reason = crate::ingest::code::skip_reason_of(&d.identity);
+            if let Some(reason) = &skip_reason {
+                report.skipped += 1;
+                *report.skip_reasons.entry(reason.clone()).or_default() += 1;
+            }
             if derivation_id.is_some() {
                 report.reused += 1;
                 continue;
             }
             let did = Uuid::now_v7();
             tx.execute("INSERT INTO code_derivations(id,input_id,language,extractor,extractor_version,grammar,grammar_version,status,error_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",rusqlite::params![did.to_string(),input_id,input.language.as_str(),d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version,d.status.as_str(),d.error_count,Ts::now().0]).map_err(dberr)?;
-            report.parsed += 1;
-            report.entities += d.entities.len() as u64;
-            report.parse_errors += u64::from(d.status != crate::core::CodeParseStatus::Complete);
+            if skip_reason.is_none() {
+                report.parsed += 1;
+                report.entities += d.entities.len() as u64;
+                report.parse_errors +=
+                    u64::from(d.status != crate::core::CodeParseStatus::Complete);
+            }
             for e in &d.entities {
                 tx.execute("INSERT INTO code_entities(id,derivation_id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),e.kind.as_str(),e.name,e.qualified_name,e.syntax_path,e.parent_syntax_path,e.range.start_byte as i64,e.range.end_byte as i64,e.range.start_line,e.range.start_column,e.range.end_line,e.range.end_column,e.signature,e.visibility,e.is_async]).map_err(dberr)?;
             }
@@ -1987,7 +2003,7 @@ impl Store for SqliteStore {
 
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>> {
         let conn = self.connection()?;
-        let mut stmt=conn.prepare("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path=?1 OR i.blob_oid=?1 ORDER BY d.created_at").map_err(dberr)?;
+        let mut stmt=conn.prepare(&format!("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash,d.created_at,(CASE WHEN {EFFECTIVE_DERIVATION} THEN 1 ELSE 0 END) AS effective FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path=?1 OR i.blob_oid=?1 ORDER BY d.created_at, d.id")).map_err(dberr)?;
         let rows = stmt
             .query_map(rusqlite::params![target], |r| {
                 Ok((
@@ -2000,6 +2016,7 @@ impl Store for SqliteStore {
                     enum_col(r, "status", crate::core::CodeParseStatus::parse)?,
                     r.get::<_, u32>("error_count")?,
                     r.get::<_, String>("content_hash")?,
+                    r.get::<_, i64>("effective")? == 1,
                 ))
             })
             .map_err(dberr)?;
@@ -2015,6 +2032,7 @@ impl Store for SqliteStore {
                 status,
                 error_count,
                 content_hash,
+                effective,
             ) = row.map_err(dberr)?;
             let mut es=conn.prepare("SELECT id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async FROM code_entities WHERE derivation_id=?1 ORDER BY start_byte").map_err(dberr)?;
             let entities = es
@@ -2062,17 +2080,21 @@ impl Store for SqliteStore {
                 .map_err(dberr)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(dberr)?;
+            let identity = crate::core::CodeParserIdentity {
+                extractor,
+                extractor_version,
+                grammar,
+                grammar_version,
+            };
+            let skip_reason = crate::ingest::code::skip_reason_of(&identity);
             out.push(CodeDerivation {
                 id,
                 language,
-                identity: crate::core::CodeParserIdentity {
-                    extractor,
-                    extractor_version,
-                    grammar,
-                    grammar_version,
-                },
+                identity,
                 status,
                 error_count,
+                effective,
+                skip_reason,
                 content_hash,
                 entities,
                 imports,
@@ -2126,10 +2148,7 @@ impl Store for SqliteStore {
                                 ORDER BY s.ingested_at DESC, s.rowid DESC LIMIT 1) = i.content_hash) \
              END)";
 
-        let mut wheres: Vec<String> = vec![
-            "d.created_at = (SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id = d.input_id)"
-                .to_string(),
-        ];
+        let mut wheres: Vec<String> = vec![EFFECTIVE_DERIVATION.to_string()];
         for t in &terms {
             let n = push(&mut params, t);
             wheres.push(format!(
@@ -2346,7 +2365,7 @@ impl Store for SqliteStore {
             ..Default::default()
         };
         let module_index = rust_module_index(&tx, repository_id, commit_oid)?;
-        let mut stmt=tx.prepare("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND d.created_at=(SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id=d.input_id) ORDER BY o.id,c.path").map_err(dberr)?;
+        let mut stmt=tx.prepare(&format!("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND {EFFECTIVE_DERIVATION} ORDER BY o.id,c.path")).map_err(dberr)?;
         let rows = stmt
             .query_map(
                 rusqlite::params![repository_id.to_string(), commit_oid],
@@ -3583,6 +3602,7 @@ fn record_observation_tx(
         scope: session.scope,
         files: report_files,
         events,
+        code: Default::default(),
     })
 }
 
@@ -5148,4 +5168,52 @@ fn load_git_provenance(conn: &Connection, source_id: &Uuid) -> Result<Option<Git
         commit_message: message,
         refs,
     }))
+}
+
+#[cfg(test)]
+mod effective_derivation_tests {
+    use super::EFFECTIVE_DERIVATION;
+
+    /// The shared rule picks exactly one derivation per input, the greatest `(created_at, id)`,
+    /// also when timestamps are equal; every reader that uses the constant agrees by construction.
+    #[test]
+    fn exactly_one_derivation_is_effective_per_input_even_with_equal_timestamps() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE code_derivations (id TEXT PRIMARY KEY, input_id TEXT NOT NULL, created_at INTEGER NOT NULL);").unwrap();
+        for (id, input, at) in [
+            ("a", "i1", 5),
+            ("b", "i1", 5), // tie with a: the greater id wins
+            ("c", "i1", 4),
+            ("d", "i2", 1),
+            ("e", "i2", 9),
+            ("f", "i3", 7), // a single derivation
+            ("g", "i4", 3),
+            ("h", "i4", 3),
+            ("i", "i4", 3), // three-way tie
+        ] {
+            c.execute(
+                "INSERT INTO code_derivations VALUES (?1,?2,?3)",
+                rusqlite::params![id, input, at],
+            )
+            .unwrap();
+        }
+        let sql = format!("SELECT d.input_id, d.id FROM code_derivations d WHERE {EFFECTIVE_DERIVATION} ORDER BY d.input_id");
+        let rows: Vec<(String, String)> = c
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        let want: Vec<(String, String)> = [("i1", "b"), ("i2", "e"), ("i3", "f"), ("i4", "i")]
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        assert_eq!(rows, want);
+        // the old rule (MAX(created_at)) returns both rows of a tie
+        let old: i64 = c
+            .query_row("SELECT COUNT(*) FROM code_derivations d WHERE d.input_id='i1' AND d.created_at=(SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id=d.input_id)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old, 2);
+    }
 }

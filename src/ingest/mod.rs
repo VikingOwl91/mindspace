@@ -9,6 +9,7 @@ pub mod outline;
 pub mod release;
 pub mod remote;
 pub mod repo_info;
+pub mod stream;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -140,6 +141,108 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
     prepare_observed_files(ctx, root, scope, files, space_ids, deadline).map(Extracted::Files)
 }
 
+/// The code input of one observed file: `None` for files that are not source code.
+/// A blob already parsed with this parser identity gets an empty, complete
+/// derivation instead of a new parse.
+pub(crate) fn code_input_for_file(
+    ctx: &dyn ExtractionContext,
+    f: &ObservedFile,
+    deadline: &Deadline,
+    policy: &code::ParsePolicy,
+) -> Result<Option<crate::core::CodeInputDraft>> {
+    let Some(language) = code::language_for(Path::new(&f.location)) else {
+        return Ok(None);
+    };
+    deadline.check("parsing source files")?;
+    let derivation = structural_derivation(
+        ctx,
+        language,
+        &f.content,
+        &f.content_hash,
+        None,
+        None,
+        policy,
+        true,
+    )?;
+    Ok(Some(crate::core::CodeInputDraft {
+        language,
+        content_hash: f.content_hash.clone(),
+        content: f.content.clone(),
+        repository_id: None,
+        blob_oid: None,
+        contexts: vec![crate::core::CodeContextDraft {
+            path: f.location.clone(),
+            commit_oid: None,
+        }],
+        derivation,
+    }))
+}
+
+/// The structural derivation of one source, under the resource policy (design:
+/// `docs/design-m7.3b-structural-parse-policy.md`). The order is fixed:
+///  1. a derivation with the current parser identity already exists: an empty placeholder with
+///     that identity (persistence finds the row and reuses it); the policy is not consulted, so
+///     lowering a budget never removes or re-derives existing structure;
+///  2. a skip row for a reason that still applies under the current limits exists: the same, with
+///     the skip identity;
+///  3. the source is over the size budget: a skip derivation (nothing is parsed);
+///  4. the source is parsed under the policy: its derivation, or a skip derivation if the depth
+///     or output budget was exceeded (the whole structural result is discarded).
+///
+/// `strict` makes a failing existence probe an error (directory ingest); otherwise it counts as
+/// "not known" (Git ingest). A parser that cannot run is an error, never a stored derivation.
+#[allow(clippy::too_many_arguments)]
+pub fn structural_derivation(
+    ctx: &dyn ExtractionContext,
+    language: crate::core::CodeLanguage,
+    content: &str,
+    content_hash: &str,
+    repository_id: Option<Uuid>,
+    blob_oid: Option<&str>,
+    policy: &code::ParsePolicy,
+    strict: bool,
+) -> Result<crate::core::CodeDerivationDraft> {
+    let known = |identity: &crate::core::CodeParserIdentity| -> Result<bool> {
+        let r = ctx.has_code_derivation(language, content_hash, repository_id, blob_oid, identity);
+        if strict {
+            r
+        } else {
+            Ok(r.unwrap_or(false))
+        }
+    };
+    let identity = code::identity();
+    if known(&identity)? {
+        return Ok(crate::core::CodeDerivationDraft {
+            identity,
+            status: crate::core::CodeParseStatus::Complete,
+            error_count: 0,
+            entities: vec![],
+            imports: vec![],
+            relationships: vec![],
+        });
+    }
+    let oversized = content.len() as u64 > policy.max_source_bytes;
+    for reason in policy.reasons() {
+        // a source within the size budget cannot have been skipped for its size
+        if matches!(reason, code::SkipReason::SourceBytes { .. }) && !oversized {
+            continue;
+        }
+        if oversized && !matches!(reason, code::SkipReason::SourceBytes { .. }) {
+            continue;
+        }
+        if known(&code::skip_identity(reason))? {
+            return Ok(code::skip_derivation(reason));
+        }
+    }
+    let outcome = code::parse_with_policy(language, content, policy);
+    if let Some(why) = outcome.transient {
+        return Err(Error::InvalidExtraction(format!(
+            "structural parsing could not run: {why}"
+        )));
+    }
+    Ok(outcome.derivation)
+}
+
 /// Parses the source files among `files` and assembles the observation (shared by
 /// the path-based and the anchored directory ingest). Writes nothing.
 pub(crate) fn prepare_observed_files(
@@ -152,35 +255,9 @@ pub(crate) fn prepare_observed_files(
 ) -> Result<ExtractedFiles> {
     let mut code_inputs = Vec::new();
     for f in &files {
-        let Some(language) = code::language_for(Path::new(&f.location)) else {
-            continue;
-        };
-        deadline.check("parsing source files")?;
-        let identity = code::identity();
-        let known = ctx.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
-        code_inputs.push(crate::core::CodeInputDraft {
-            language,
-            content_hash: f.content_hash.clone(),
-            content: f.content.clone(),
-            repository_id: None,
-            blob_oid: None,
-            contexts: vec![crate::core::CodeContextDraft {
-                path: f.location.clone(),
-                commit_oid: None,
-            }],
-            derivation: if known {
-                crate::core::CodeDerivationDraft {
-                    identity,
-                    status: crate::core::CodeParseStatus::Complete,
-                    error_count: 0,
-                    entities: vec![],
-                    imports: vec![],
-                    relationships: vec![],
-                }
-            } else {
-                code::parse(language, &f.content)
-            },
-        });
+        if let Some(input) = code_input_for_file(ctx, f, deadline, &code::ParsePolicy::default())? {
+            code_inputs.push(input);
+        }
     }
     let observation = IngestObservation {
         session: SessionDraft {
@@ -737,8 +814,14 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         }
     }
 
-    let code_inputs =
-        tip_files_to_code_inputs(ctx, repository_id, &derivations, &content_by_oid, deadline)?;
+    let code_inputs = tip_files_to_code_inputs(
+        ctx,
+        repository_id,
+        &derivations,
+        &content_by_oid,
+        deadline,
+        &code::ParsePolicy::default(),
+    )?;
 
     // Releases: every tag ref is a document-shaped memory, independent of
     // which commits are current views. A targeted (`--path`) ingest skips
@@ -803,6 +886,7 @@ fn tip_files_to_code_inputs(
     derivations: &[GitDerivedFile],
     contents: &std::collections::HashMap<String, String>,
     deadline: &Deadline,
+    policy: &code::ParsePolicy,
 ) -> Result<Vec<crate::core::CodeInputDraft>> {
     let mut grouped: std::collections::BTreeMap<String, crate::core::CodeInputDraft> =
         std::collections::BTreeMap::new();
@@ -812,42 +896,38 @@ fn tip_files_to_code_inputs(
             continue;
         };
         deadline.check("parsing source files")?;
-        let entry = grouped.entry(d.blob_oid.clone()).or_insert_with(|| {
+        if !grouped.contains_key(&d.blob_oid) {
             let content = contents.get(&d.blob_oid).cloned().unwrap_or_default();
-            crate::core::CodeInputDraft {
+            let content_hash = sha256_hex(content.as_bytes());
+            let derivation = structural_derivation(
+                ctx,
                 language,
-                content_hash: sha256_hex(content.as_bytes()),
-                content: content.clone(),
-                repository_id: Some(repository_id),
-                blob_oid: Some(d.blob_oid.clone()),
-                contexts: vec![],
-                derivation: if ctx
-                    .has_code_derivation(
-                        language,
-                        &sha256_hex(content.as_bytes()),
-                        Some(repository_id),
-                        Some(&d.blob_oid),
-                        &code::identity(),
-                    )
-                    .unwrap_or(false)
-                {
-                    crate::core::CodeDerivationDraft {
-                        identity: code::identity(),
-                        status: crate::core::CodeParseStatus::Complete,
-                        error_count: 0,
-                        entities: vec![],
-                        imports: vec![],
-                        relationships: vec![],
-                    }
-                } else {
-                    code::parse(language, &content)
+                &content,
+                &content_hash,
+                Some(repository_id),
+                Some(&d.blob_oid),
+                policy,
+                false,
+            )?;
+            grouped.insert(
+                d.blob_oid.clone(),
+                crate::core::CodeInputDraft {
+                    language,
+                    content_hash,
+                    content,
+                    repository_id: Some(repository_id),
+                    blob_oid: Some(d.blob_oid.clone()),
+                    contexts: vec![],
+                    derivation,
                 },
-            }
-        });
-        entry.contexts.push(crate::core::CodeContextDraft {
-            path: d.path.clone(),
-            commit_oid: Some(d.commit_oid.clone()),
-        });
+            );
+        }
+        if let Some(entry) = grouped.get_mut(&d.blob_oid) {
+            entry.contexts.push(crate::core::CodeContextDraft {
+                path: d.path.clone(),
+                commit_oid: Some(d.commit_oid.clone()),
+            });
+        }
     }
     Ok(grouped.into_values().collect())
 }

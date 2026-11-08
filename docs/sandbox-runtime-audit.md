@@ -30,3 +30,10 @@ REASONED / UNKNOWN. No rule was widened by this audit.
 * Scope of the rule: `/proc/<own pid>` names this process only. It does not cover the pid directories of children
   started later (a Git child has its own `/proc/<child pid>`); the child reaches the pinned roots through the
   parent's `/proc/<parent pid>/fd/N`, which the rule does cover. VERIFIED by the Git ingestion tests passing.
+
+## Update: Git binary rule
+
+* The binary is granted as one file (`FileExec`), not its directory. VERIFIED by kernel test (copy under a fake home,
+  symlink to a second directory, replaced executable that fails closed). Before: a sibling file in the Git directory
+  was readable. The exec-path directory is still granted as a directory (helpers live there); a Git whose own shared
+  libraries sit outside `/usr` is not covered (UNKNOWN).

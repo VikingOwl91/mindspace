@@ -320,6 +320,12 @@ impl Plan {
                 rights: Rights::Read,
             });
         }
+        if let Some(git) = git_binary() {
+            r.push(Rule {
+                path: git,
+                rights: Rights::FileExec,
+            });
+        }
         r
     }
 }
@@ -383,10 +389,9 @@ fn extra_runtime_dirs() -> Vec<PathBuf> {
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
         dirs.extend(library_dirs_from_maps(&maps));
     }
-    if let Some(git) = find_in_path("git") {
-        if let Some(parent) = git.parent() {
-            dirs.push(parent.to_path_buf());
-        }
+    if let Some(git) = git_binary() {
+        // The binary itself gets a file rule (see `rules`), not its directory: Git
+        // under `$HOME/bin` must not make everything in `$HOME/bin` readable.
         if let Some(p) = git_exec_path(&git) {
             dirs.push(p);
         }
@@ -428,6 +433,13 @@ fn git_exec_path(git: &Path) -> Option<PathBuf> {
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     let p = out.trim();
     p.starts_with('/').then(|| PathBuf::from(p))
+}
+
+/// The `git` that `Command::new("git")` will run: the first executable file
+/// named `git` on `PATH`, symlinks resolved (a rule names the inode it was made
+/// for, so the resolved file is what must be granted).
+fn git_binary() -> Option<PathBuf> {
+    find_in_path("git")
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -1213,6 +1225,143 @@ mod tests {
         ] {
             assert_eq!(get(&format!("after_{k}")), "errno 13", "after {k}");
         }
+    }
+
+    /// Child half of the Git binary rule test. Layout (all under `MINDSPACE_GIT_HOME`):
+    /// `bin/git` (a copy of the real Git) next to `bin/secret.txt`, `real/git` plus
+    /// `link/git -> ../real/git` next to `link/secret.txt`, `repo/` (a rw root).
+    /// `MINDSPACE_GIT_CASE` is `copy`, `symlink`, or `replaced` (the file is renamed
+    /// over after the rules were built).
+    #[test]
+    fn git_rules_child() {
+        let (Some(home), Some(case)) = (
+            std::env::var_os("MINDSPACE_GIT_HOME"),
+            std::env::var_os("MINDSPACE_GIT_CASE"),
+        ) else {
+            return;
+        };
+        let (home, case) = (PathBuf::from(home), case.to_string_lossy().into_owned());
+        println!();
+        let bindir = if case == "symlink" { "link" } else { "bin" };
+        let path = format!("{}:/nonexistent", home.join(bindir).display());
+        std::env::set_var("PATH", &path);
+        let repo = home.join("repo");
+        let plan = plan(&[(repo.to_str().unwrap(), true)], "/nonexistent-db");
+        let rs = build_ruleset(&plan.rules(), &Default::default()).expect("ruleset");
+        if case == "replaced" {
+            let b = home.join("bin");
+            std::fs::copy(b.join("git"), b.join("git.new")).unwrap();
+            std::fs::rename(b.join("git.new"), b.join("git")).unwrap();
+        }
+        let st = rs.restrict_self().expect("restrict");
+        assert_eq!(st.ruleset, RulesetStatus::FullyEnforced);
+        fn res<T>(r: std::io::Result<T>) -> String {
+            match r {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            }
+        }
+        println!(
+            "RESULT secret {}",
+            res(std::fs::read(home.join(bindir).join("secret.txt")))
+        );
+        println!(
+            "RESULT listing {}",
+            res(std::fs::read_dir(home.join(bindir)).map(|_| ()))
+        );
+        println!(
+            "RESULT home_file {}",
+            res(std::fs::read(home.join("other.txt")))
+        );
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("HOME", "/nonexistent")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output();
+            match o {
+                Ok(o) if o.status.success() => "ok".to_string(),
+                Ok(o) => format!(
+                    "exit {} {}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim().replace('\n', " ")
+                ),
+                Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+            }
+        };
+        println!("RESULT git_version {}", git(&["--version"]));
+        println!("RESULT git_init {}", git(&["init", "-q", "."]));
+        println!("RESULT git_refs {}", git(&["for-each-ref"]));
+        println!("RESULT git_exec_path {}", git(&["--exec-path"]));
+    }
+
+    /// Git outside `/usr`: the binary is granted by itself, not through its directory.
+    #[test]
+    fn the_kernel_grants_a_git_under_home_only_the_binary() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let Some(real_git) = find_in_path("git") else {
+            return;
+        };
+        let run = |case: &str| -> String {
+            let h = tempfile::tempdir().unwrap();
+            let home = h.path();
+            for d in ["bin", "real", "link", "repo"] {
+                std::fs::create_dir(home.join(d)).unwrap();
+            }
+            for (d, f) in [("bin", "git"), ("real", "git")] {
+                let t = home.join(d).join(f);
+                std::fs::copy(&real_git, &t).unwrap();
+                std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            symlink("../real/git", home.join("link/git")).unwrap();
+            for f in ["bin/secret.txt", "link/secret.txt", "other.txt"] {
+                std::fs::write(home.join(f), "SECRET").unwrap();
+            }
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::tests::git_rules_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MINDSPACE_GIT_HOME", home)
+                .env("MINDSPACE_GIT_CASE", case)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(
+                out.status.success(),
+                "{text}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            eprintln!("--- {case}\n{text}");
+            text
+        };
+        let get = |text: &str, k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("RESULT {k} ")))
+                .unwrap_or_else(|| panic!("no {k} in {text}"))
+                .to_string()
+        };
+        for case in ["copy", "symlink"] {
+            let t = run(case);
+            assert_eq!(
+                get(&t, "secret"),
+                "errno 13",
+                "{case}: sibling file readable"
+            );
+            assert_eq!(get(&t, "listing"), "errno 13", "{case}: directory listable");
+            assert_eq!(get(&t, "home_file"), "errno 13", "{case}");
+            for k in ["git_version", "git_init", "git_refs", "git_exec_path"] {
+                assert_eq!(get(&t, k), "ok", "{case}: {k}");
+            }
+        }
+        // a replaced executable is a different inode: fail closed, not a silent regrant
+        let t = run("replaced");
+        assert_eq!(get(&t, "secret"), "errno 13");
+        assert_eq!(get(&t, "git_version"), "errno 13", "{t}");
     }
 
     /// The kernel's answer to F1: with the product's rules, /etc is not readable

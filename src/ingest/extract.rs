@@ -188,7 +188,7 @@ const RELEASE_PREFIX: &str = "/refs/tags/";
 
 /// A repository-relative path: not empty, not absolute, no `..`, no NUL (or the
 /// virtual release path, with the same rules for the rest).
-fn check_relative(path: &str, limits: &ExtractionLimits) -> Result<()> {
+pub(crate) fn check_relative(path: &str, limits: &ExtractionLimits) -> Result<()> {
     if path.is_empty() || path.len() > limits.max_path_bytes || path.contains('\0') {
         return reject(format!("bad path length or NUL in `{}`", short(path)));
     }
@@ -209,11 +209,11 @@ fn check_relative(path: &str, limits: &ExtractionLimits) -> Result<()> {
     Ok(())
 }
 
-fn short(s: &str) -> String {
+pub(crate) fn short(s: &str) -> String {
     s.chars().take(80).collect()
 }
 
-fn is_oid(s: &str) -> bool {
+pub(crate) fn is_oid(s: &str) -> bool {
     matches!(s.len(), 40 | 64)
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

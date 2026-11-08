@@ -9,6 +9,7 @@ pub mod outline;
 pub mod release;
 pub mod remote;
 pub mod repo_info;
+pub mod stream;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -140,6 +141,45 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
     prepare_observed_files(ctx, root, scope, files, space_ids, deadline).map(Extracted::Files)
 }
 
+/// The code input of one observed file: `None` for files that are not source code.
+/// A blob already parsed with this parser identity gets an empty, complete
+/// derivation instead of a new parse.
+pub(crate) fn code_input_for_file(
+    ctx: &dyn ExtractionContext,
+    f: &ObservedFile,
+    deadline: &Deadline,
+) -> Result<Option<crate::core::CodeInputDraft>> {
+    let Some(language) = code::language_for(Path::new(&f.location)) else {
+        return Ok(None);
+    };
+    deadline.check("parsing source files")?;
+    let identity = code::identity();
+    let known = ctx.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
+    Ok(Some(crate::core::CodeInputDraft {
+        language,
+        content_hash: f.content_hash.clone(),
+        content: f.content.clone(),
+        repository_id: None,
+        blob_oid: None,
+        contexts: vec![crate::core::CodeContextDraft {
+            path: f.location.clone(),
+            commit_oid: None,
+        }],
+        derivation: if known {
+            crate::core::CodeDerivationDraft {
+                identity,
+                status: crate::core::CodeParseStatus::Complete,
+                error_count: 0,
+                entities: vec![],
+                imports: vec![],
+                relationships: vec![],
+            }
+        } else {
+            code::parse(language, &f.content)
+        },
+    }))
+}
+
 /// Parses the source files among `files` and assembles the observation (shared by
 /// the path-based and the anchored directory ingest). Writes nothing.
 pub(crate) fn prepare_observed_files(
@@ -152,35 +192,9 @@ pub(crate) fn prepare_observed_files(
 ) -> Result<ExtractedFiles> {
     let mut code_inputs = Vec::new();
     for f in &files {
-        let Some(language) = code::language_for(Path::new(&f.location)) else {
-            continue;
-        };
-        deadline.check("parsing source files")?;
-        let identity = code::identity();
-        let known = ctx.has_code_derivation(language, &f.content_hash, None, None, &identity)?;
-        code_inputs.push(crate::core::CodeInputDraft {
-            language,
-            content_hash: f.content_hash.clone(),
-            content: f.content.clone(),
-            repository_id: None,
-            blob_oid: None,
-            contexts: vec![crate::core::CodeContextDraft {
-                path: f.location.clone(),
-                commit_oid: None,
-            }],
-            derivation: if known {
-                crate::core::CodeDerivationDraft {
-                    identity,
-                    status: crate::core::CodeParseStatus::Complete,
-                    error_count: 0,
-                    entities: vec![],
-                    imports: vec![],
-                    relationships: vec![],
-                }
-            } else {
-                code::parse(language, &f.content)
-            },
-        });
+        if let Some(input) = code_input_for_file(ctx, f, deadline)? {
+            code_inputs.push(input);
+        }
     }
     let observation = IngestObservation {
         session: SessionDraft {

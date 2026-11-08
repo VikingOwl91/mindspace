@@ -26,6 +26,11 @@ pub enum Error {
     #[error("invalid extraction result: {0}")]
     InvalidExtraction(String),
 
+    /// A text file or blob that extraction would read is larger than the configured
+    /// limit. The operation fails; nothing is truncated or skipped.
+    #[error("`{path}` is {size} bytes, over the limit of {limit} bytes for one text file or blob; exclude it with --path or raise the limit")]
+    BlobTooLarge { path: String, size: u64, limit: u64 },
+
     /// A problem with the repository grant store or a grant command (M7.3a).
     #[error("{0}")]
     Grant(String),

@@ -873,7 +873,8 @@ fn parse_batch_stream(out: &[u8]) -> Result<Vec<(String, GitObjectKind, Vec<u8>)
                     stderr: format!("bad size in header '{header}'"),
                 })?;
         let start = nl + 1;
-        let end = start + size;
+        // A hostile size must not overflow the sum.
+        let end = start.saturating_add(size);
         if end > out.len() {
             return Err(Error::GitCommand {
                 command: "cat-file --batch".into(),
@@ -1058,6 +1059,17 @@ pub fn parse_tag(oid: &str, bytes: &[u8]) -> Result<GitTagData> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_batch_header_with_a_hostile_size_is_an_error_not_a_panic() {
+        for size in ["18446744073709551615", "9223372036854775807", "99999999"] {
+            let out = format!("{} blob {size}\nabc\n", "a".repeat(40));
+            let err = parse_batch_stream(out.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains("truncated batch output"), "{size}: {err}");
+        }
+        let out = format!("{} blob 3\nabc\n", "a".repeat(40));
+        assert_eq!(parse_batch_stream(out.as_bytes()).unwrap().len(), 1);
+    }
+
     use super::*;
 
     #[test]

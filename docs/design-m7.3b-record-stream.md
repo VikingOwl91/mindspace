@@ -14,7 +14,7 @@ a run named below), **Estimated** (derived, not run).
 * Content once per blob in chunks (128 KiB), shared by derivations and the code
   input; large vectors in parts (256 KiB); anything else too big for a frame is
   sent oversized (`spill`) in pieces and reconstructed exactly; at most
-  `MAX_RECORD` = 32 MiB per record.
+  `MAX_RECORD` = 96 MiB per record (3x the blob limit, see resource safety doc).
 * Nothing reaches the store before `consume` returns; `persist` is unchanged.
 
 ## Which records can exceed 1 MiB (audit of variable-length fields)
@@ -40,7 +40,7 @@ the in-process result.
 * **Estimated** bound: structural identifiers and the derivation key list
   (O(objects and derivations), roughly 100-200 bytes each), plus 3 copies of
   one blob batch (8 MiB, so about 24 MiB), plus the largest single record
-  (up to 32 MiB, 2-3 copies while it is spilled: about 100 MiB).
+  (up to 96 MiB, 2-3 copies while it is spilled).
 * **Not bounded today:** one very large text blob. Git's output for it and its
   `String` are held whole (and chunks copy it), so the producer needs about 3x the
   largest blob. A per-blob size limit (decision needed: skip with a recorded
@@ -55,12 +55,12 @@ the in-process result.
 * **Estimated worst case:** about 6-7x `content_bytes` plus structure. At the default
   limit of 512 MiB of content that is above 3 GiB, which is why the limit that
   matters in practice is the frontend's own memory budget, not the transfer limit.
-* **Spill reassembly:** at most `max_record` (32 MiB) of text plus its decoded
-  form (estimated 2-3x): about 100 MiB transient.
+* **Spill reassembly:** at most `max_record` (96 MiB) of text plus its decoded
+  form (estimated 2-3x): up to about 300 MiB transient (estimated).
 * **Prefetch** (optional reader thread): `depth` x 256 KiB; no effect on the bound.
 ### Worst-case deserialization and reconstruction risks
 * A declared length is trusted only up to its limit; `serde_json` allocates what a
-  record contains, so one record is bounded by 32 MiB x small factor.
+  record contains, so one record is bounded by 96 MiB x small factor.
 * Many small records are bounded by the 100,000-frame budget only indirectly
   (a frame holds many records): the 512 MiB byte budget is what limits them;
   127k records were 168 MB.

@@ -22,8 +22,8 @@ use mindspace::ingest::deadline::Deadline;
 use mindspace::ingest::extract::{persist, Extracted, ExtractionLimits, StoreContext};
 use mindspace::ingest::outline::PathSelection;
 use mindspace::ingest::stream::{
-    consume, emit_extracted, stream_confined_git, stream_directory, FrameWriter, Kind, Record,
-    RecordSink, StreamLimits, MAX_FRAME, MAX_RECORD,
+    consume, emit_extracted, stream_confined_git, stream_directory, FrameWriter, Kind,
+    ProducerLimits, Record, RecordSink, StreamLimits, MAX_FRAME, MAX_RECORD,
 };
 use mindspace::ingest::GitScope;
 use mindspace::mcp::McpConfig;
@@ -298,6 +298,7 @@ fn stream_git(
             scope,
             &["p"],
             &Deadline::none(),
+            &ProducerLimits::default(),
             &mut w,
         )
         .unwrap();
@@ -318,6 +319,7 @@ fn stream_dir(f: &Fixture, store: &SqliteStore) -> (Vec<u8>, Uuid) {
             &f.cfg,
             &ids,
             &Deadline::none(),
+            &ProducerLimits::default(),
             &mut w,
         )
         .unwrap();
@@ -1306,6 +1308,7 @@ fn a_cancelled_producer_stops_and_writes_no_complete_stream() {
         GitScope::Head,
         &["p"],
         &Deadline::none(),
+        &ProducerLimits::default(),
         &mut w,
     )
     .and_then(|_| w.finish().map(|_| ()));
@@ -1358,3 +1361,212 @@ fn no_failure_leaves_a_partial_database_state() {
 
 #[allow(dead_code)]
 fn _unused(_: &mut dyn Write, _: Error) {}
+
+// ------------------------------------------------------------ blob policy
+
+fn limited(max: u64) -> ProducerLimits {
+    ProducerLimits {
+        max_blob_bytes: max,
+    }
+}
+
+fn dir_with_limit(f: &Fixture, store: &SqliteStore, max: u64) -> (Result<()>, Vec<u8>, Uuid) {
+    let op = Uuid::now_v7();
+    let ids = vec![store.get_space("p").unwrap().id];
+    let mut out = Vec::new();
+    let r = {
+        let mut w = FrameWriter::new(&mut out, op, None);
+        stream_directory(
+            &StoreContext(store),
+            &anchor(f),
+            &f.cfg,
+            &ids,
+            &Deadline::none(),
+            &limited(max),
+            &mut w,
+        )
+        .and_then(|_| w.finish().map(|_| ()))
+    };
+    (r, out, op)
+}
+
+fn git_with_limit(f: &Fixture, store: &SqliteStore, max: u64) -> (Result<()>, Vec<u8>, Uuid) {
+    let op = Uuid::now_v7();
+    let mut out = Vec::new();
+    let r = {
+        let mut w = FrameWriter::new(&mut out, op, None);
+        stream_confined_git(
+            &StoreContext(store),
+            &anchor(f),
+            &f.cfg,
+            &PathSelection::all(),
+            GitScope::Head,
+            &["p"],
+            &Deadline::none(),
+            &limited(max),
+            &mut w,
+        )
+        .and_then(|_| w.finish().map(|_| ()))
+    };
+    (r, out, op)
+}
+
+fn too_large(r: Result<()>) -> (String, u64, u64) {
+    match r {
+        Err(Error::BlobTooLarge { path, size, limit }) => (path, size, limit),
+        other => panic!("wanted BlobTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_text_file_exactly_at_the_limit_is_read_and_one_byte_more_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "ok.txt", &"a".repeat(100_000));
+    write(d.path(), "small.md", "# S\n\nx\n");
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let ids = vec![store.get_space("p").unwrap().id];
+    let direct = Extracted::Files(
+        extract_directory(
+            &StoreContext(&store),
+            &anchor(&f),
+            &f.cfg,
+            &ids,
+            &Deadline::none(),
+        )
+        .unwrap(),
+    );
+    let (r, bytes, op) = dir_with_limit(&f, &store, 100_000);
+    r.unwrap();
+    assert_eq!(
+        text_of(&direct),
+        text_of(&read(&bytes, op, Kind::Files, Some(&f.root)).unwrap())
+    );
+    let (r, _, _) = dir_with_limit(&f, &store, 99_999);
+    let (path, size, limit) = too_large(r);
+    assert_eq!((path.as_str(), size, limit), ("ok.txt", 100_000, 99_999));
+    // the message names the way out
+    let e = Error::BlobTooLarge { path, size, limit }.to_string();
+    assert!(e.contains("--path") && e.contains("100000 bytes"), "{e}");
+}
+
+#[test]
+fn a_blob_exactly_at_the_limit_is_read_and_one_byte_more_fails_the_operation() {
+    let d = tempfile::tempdir().unwrap();
+    git(d.path(), &["init", "-q", "-b", "main", "."]);
+    write(d.path(), "ok.txt", &"b".repeat(100_000));
+    write(d.path(), "note.md", "# N\n\nsmall\n");
+    git(d.path(), &["add", "."]);
+    git(d.path(), &["commit", "-q", "-m", "c"]);
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let direct = Extracted::Git(
+        extract_confined_git(
+            &StoreContext(&store),
+            &anchor(&f),
+            &f.cfg,
+            &PathSelection::all(),
+            GitScope::Head,
+            &["p"],
+            &Deadline::none(),
+        )
+        .unwrap(),
+    );
+    let (r, bytes, op) = git_with_limit(&f, &store, 100_000);
+    r.unwrap();
+    assert_eq!(
+        text_of(&direct),
+        text_of(&read(&bytes, op, Kind::Git, None).unwrap())
+    );
+    let (r, bytes, op) = git_with_limit(&f, &store, 99_999);
+    let (path, size, limit) = too_large(r);
+    assert_eq!((path.as_str(), size, limit), ("ok.txt", 100_000, 99_999));
+    // what was written before the failure is not a complete stream
+    assert!(read(&bytes, op, Kind::Git, None).is_err());
+}
+
+#[test]
+fn many_small_blobs_and_repeated_references_pass_a_per_blob_limit() {
+    let d = tempfile::tempdir().unwrap();
+    git(d.path(), &["init", "-q", "-b", "main", "."]);
+    for i in 0..1500 {
+        write(
+            d.path(),
+            &format!("small/f{i}.md"),
+            &format!("# F{i}\n\ntext {i}\n"),
+        );
+    }
+    // one blob at the limit, referenced from 40 paths
+    for i in 0..40 {
+        write(d.path(), &format!("same/copy{i}.txt"), &"c".repeat(50_000));
+    }
+    // a binary-looking blob far over the limit is not a text blob: never read
+    write(d.path(), "data.bin", &"z".repeat(300_000));
+    git(d.path(), &["add", "."]);
+    git(d.path(), &["commit", "-q", "-m", "c"]);
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let (r, bytes, op) = git_with_limit(&f, &store, 50_000);
+    r.unwrap();
+    let got = read(&bytes, op, Kind::Git, None).unwrap();
+    let Extracted::Git(g) = &got else { panic!() };
+    assert_eq!(g.observation.derivations.len(), 1540);
+    // each distinct blob's text was sent once: 1500 small files plus the one shared blob
+    let wire = String::from_utf8_lossy(&bytes);
+    assert_eq!(wire.matches("\"type\":\"blob_content\"").count(), 1501);
+}
+
+#[test]
+fn an_extremely_large_blob_is_refused_without_being_read() {
+    let d = tempfile::tempdir().unwrap();
+    git(d.path(), &["init", "-q", "-b", "main", "."]);
+    write(d.path(), "huge.txt", &"x".repeat(150 * 1024 * 1024));
+    write(d.path(), "note.md", "# N\n\nsmall\n");
+    git(d.path(), &["add", "."]);
+    git(d.path(), &["commit", "-q", "-m", "c"]);
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let t = std::time::Instant::now();
+    let (r, _, _) = git_with_limit(&f, &store, mindspace::ingest::stream::DEFAULT_MAX_BLOB);
+    let (path, size, limit) = too_large(r);
+    assert_eq!(path, "huge.txt");
+    assert_eq!(size, 150 * 1024 * 1024);
+    assert_eq!(limit, 32 * 1024 * 1024);
+    assert!(t.elapsed().as_secs() < 20, "it must not read the blob");
+    // selecting the rest makes the repository ingestable again
+    let op = Uuid::now_v7();
+    let mut out = Vec::new();
+    {
+        let mut w = FrameWriter::new(&mut out, op, None);
+        stream_confined_git(
+            &StoreContext(&store),
+            &anchor(&f),
+            &f.cfg,
+            &PathSelection::new(&["note.md"]).unwrap(),
+            GitScope::Head,
+            &["p"],
+            &Deadline::none(),
+            &ProducerLimits::default(),
+            &mut w,
+        )
+        .unwrap();
+        w.finish().unwrap();
+    }
+    read(&out, op, Kind::Git, None).unwrap();
+}
+
+#[test]
+fn a_file_over_the_default_limit_is_refused_by_the_directory_producer() {
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "big.txt", &"y".repeat(32 * 1024 * 1024 + 1));
+    let f = fixture(d.path());
+    let db = db();
+    let store = db.store();
+    let (r, _, _) = dir_with_limit(&f, &store, mindspace::ingest::stream::DEFAULT_MAX_BLOB);
+    let (_, size, limit) = too_large(r);
+    assert_eq!((size, limit), (32 * 1024 * 1024 + 1, 32 * 1024 * 1024));
+}

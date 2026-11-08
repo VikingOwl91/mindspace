@@ -87,7 +87,25 @@ pub const CHUNK: usize = 128 * 1024;
 pub const PART_TARGET: usize = 256 * 1024;
 /// The largest single record (as JSON). A record that does not fit a frame is sent
 /// as an oversized record in pieces; beyond this size the operation is refused.
-pub const MAX_RECORD: usize = 32 * 1024 * 1024;
+pub const MAX_RECORD: usize = 96 * 1024 * 1024;
+/// The default limit for one text file or blob that extraction reads (raw bytes,
+/// not encoded size). Its JSON form can be several times larger (escaping), which
+/// is why [`MAX_RECORD`] is three times this.
+pub const DEFAULT_MAX_BLOB: u64 = 32 * 1024 * 1024;
+
+/// What a producer refuses to read.
+#[derive(Debug, Clone, Copy)]
+pub struct ProducerLimits {
+    pub max_blob_bytes: u64,
+}
+
+impl Default for ProducerLimits {
+    fn default() -> Self {
+        Self {
+            max_blob_bytes: DEFAULT_MAX_BLOB,
+        }
+    }
+}
 /// Blob contents are fetched from Git in batches of at most this many bytes.
 const BLOB_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 const BLOB_BATCH_COUNT: usize = 512;
@@ -655,6 +673,7 @@ pub fn stream_directory(
     policy: &dyn super::confined::PathPolicy,
     space_ids: &[Uuid],
     deadline: &Deadline,
+    limits: &ProducerLimits,
     sink: &mut dyn RecordSink,
 ) -> Result<()> {
     use super::outline;
@@ -679,8 +698,26 @@ pub fn stream_directory(
             .strip_prefix(&base)
             .map_err(|_| Error::InvalidExtraction("walk escaped the anchored directory".into()))?
             .to_path_buf();
+        // The size is checked before the file is read, and the read itself is capped
+        // (the file may grow in between).
+        let too_large = |size: u64| Error::BlobTooLarge {
+            path: rel.display().to_string(),
+            size,
+            limit: limits.max_blob_bytes,
+        };
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > limits.max_blob_bytes {
+                return Err(too_large(meta.len()));
+            }
+        }
         let bytes = anchor
-            .read_beneath(&rel, policy, true, None)?
+            .read_beneath(&rel, policy, true, Some(limits.max_blob_bytes as usize))
+            .map_err(|e| match e {
+                Error::Storage(m) if m.ends_with("is unexpectedly large") => {
+                    too_large(limits.max_blob_bytes + 1)
+                }
+                other => other,
+            })?
             .ok_or_else(|| {
                 Error::InvalidExtraction(format!(
                     "{} disappeared while it was being read",
@@ -709,6 +746,7 @@ pub fn stream_confined_git<S: AsRef<str>>(
     scope: super::GitScope,
     space_names: &[S],
     deadline: &Deadline,
+    limits: &ProducerLimits,
     sink: &mut dyn RecordSink,
 ) -> Result<()> {
     let reader = super::confined::open_git_reader(anchor, policy, true, deadline)?;
@@ -720,6 +758,7 @@ pub fn stream_confined_git<S: AsRef<str>>(
         selection,
         scope,
         deadline,
+        limits,
         sink,
     )
 }
@@ -737,6 +776,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     selection: &super::outline::PathSelection,
     scope: super::GitScope,
     deadline: &Deadline,
+    limits: &ProducerLimits,
     sink: &mut dyn RecordSink,
 ) -> Result<()> {
     use super::{code, is_ingestable, media_type_of, parse_material, ParsedMaterial};
@@ -869,6 +909,21 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     let mut by_blob: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (commit, path, blob) in keys {
         by_blob.entry(blob).or_default().push((commit, path));
+    }
+
+    // A blob over the limit fails the operation before any content is read.
+    for (oid, uses) in &by_blob {
+        let size = size_of.get(oid).copied().unwrap_or(0);
+        if size > limits.max_blob_bytes {
+            return Err(Error::BlobTooLarge {
+                path: uses
+                    .first()
+                    .map(|u| u.1.clone())
+                    .unwrap_or_else(|| oid.clone()),
+                size,
+                limit: limits.max_blob_bytes,
+            });
+        }
     }
 
     // ---- releases (small, own content), before the commits are complete
@@ -1014,6 +1069,18 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             let Some(content) = blob.content else {
                 continue;
             };
+            // The declared size was checked; the bytes Git returned are too.
+            if content.len() as u64 > limits.max_blob_bytes {
+                return Err(Error::BlobTooLarge {
+                    path: by_blob
+                        .get(&blob.oid)
+                        .and_then(|u| u.first())
+                        .map(|u| u.1.clone())
+                        .unwrap_or_else(|| blob.oid.clone()),
+                    size: content.len() as u64,
+                    limit: limits.max_blob_bytes,
+                });
+            }
             let blob_oid = blob.oid;
             let Some(uses) = by_blob.get(&blob_oid) else {
                 continue;

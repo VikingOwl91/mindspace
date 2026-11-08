@@ -125,3 +125,10 @@ pub fn seccomp_command(c: &mut Command, prog: Vec<libc::sock_filter>) {
         c.pre_exec(move || install_seccomp(&prog));
     }
 }
+
+/// The PRODUCT's socket-deny program (`mindspace::sandbox::seccomp::program`),
+/// so the tests exercise the real filter and not a copy. `None` on
+/// architectures without a verified audit constant.
+pub fn socket_deny_filter() -> Option<Vec<libc::sock_filter>> {
+    mindspace::sandbox::seccomp::program()
+}

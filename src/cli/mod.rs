@@ -903,6 +903,7 @@ fn mcp_command(
         });
     }
     let config = McpConfig::from_specs(allow_roots)?.with_ingest_timeout(ingest_timeout);
+    let mut seccomp_report = serde_json::json!({"state": "not_evaluated"});
     let state = if config.roots().is_empty() {
         SandboxState::NotNeeded
     } else if insecure {
@@ -917,24 +918,40 @@ fn mcp_command(
         #[cfg(not(target_os = "linux"))]
         SandboxState::Unavailable("--insecure-no-sandbox is only supported on Linux".to_string())
     } else {
-        sandbox_state(cli, &config)
+        let (state, seccomp) = sandbox_state(cli, &config);
+        seccomp_report = seccomp;
+        state
     };
     if let SandboxState::Unavailable(reason) = &state {
         eprintln!("mind: the repository tools are OFF: {reason}");
     }
-    let config = config.with_sandbox(state);
+    let config = config.with_sandbox(state).with_seccomp(seccomp_report);
     let store = open(cli)?;
     crate::mcp::serve_with_config(&store, &config)?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::SandboxState {
+fn sandbox_state(
+    cli: &Cli,
+    config: &crate::mcp::McpConfig,
+) -> (crate::mcp::SandboxState, serde_json::Value) {
+    let (state, seccomp) = sandbox_state_inner(cli, config);
+    (state, seccomp.to_json())
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_state_inner(
+    cli: &Cli,
+    config: &crate::mcp::McpConfig,
+) -> (crate::mcp::SandboxState, crate::sandbox::seccomp::Status) {
     use crate::mcp::{Access, SandboxState};
+    use crate::sandbox::seccomp::Status;
     use crate::sandbox::{self, Outcome, Plan};
+    let na = Status::NotEvaluated;
     let db = match db_path(cli) {
         Ok(db) => db,
-        Err(e) => return SandboxState::Unavailable(e.to_string()),
+        Err(e) => return (SandboxState::Unavailable(e.to_string()), na),
     };
     let Some(db_dir) = db
         .parent()
@@ -942,20 +959,28 @@ fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::Sandb
         .map(|p| p.to_path_buf())
         .or_else(|| Some(PathBuf::from(".")))
     else {
-        return SandboxState::Unavailable("cannot determine the database directory".into());
+        return (
+            SandboxState::Unavailable("cannot determine the database directory".into()),
+            na,
+        );
     };
     let db_dir = match std::fs::canonicalize(&db_dir) {
         Ok(d) => d,
         Err(e) => {
-            return SandboxState::Unavailable(format!(
-                "database directory {}: {e}",
-                db_dir.display()
-            ))
+            return (
+                SandboxState::Unavailable(format!("database directory {}: {e}", db_dir.display())),
+                na,
+            )
         }
     };
     let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {
         Ok(e) => e,
-        Err(e) => return SandboxState::Unavailable(format!("cannot locate the mind binary: {e}")),
+        Err(e) => {
+            return (
+                SandboxState::Unavailable(format!("cannot locate the mind binary: {e}")),
+                na,
+            )
+        }
     };
     let plan = Plan {
         roots: config
@@ -972,11 +997,19 @@ fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::Sandb
     };
     match sandbox::verify_stage2(&plan.tmp_dir()) {
         Ok(Some(report)) => {
+            if let Status::NotApplied(why) = &report.seccomp {
+                eprintln!(
+                    "mind: sandbox: the seccomp socket filter is NOT applied: {}",
+                    why.reason()
+                );
+            }
+            let seccomp = report.seccomp.clone();
             return match crate::ingest::git::sandbox_probe(&plan.tmp_dir()) {
-                Ok(()) => SandboxState::Enforced(report.description),
-                Err(e) => {
-                    SandboxState::Unavailable(format!("Git does not work inside the sandbox: {e}"))
-                }
+                Ok(()) => (SandboxState::Enforced(report.description), seccomp),
+                Err(e) => (
+                    SandboxState::Unavailable(format!("Git does not work inside the sandbox: {e}")),
+                    seccomp,
+                ),
             };
         }
         Ok(None) => {}
@@ -986,14 +1019,22 @@ fn sandbox_state(cli: &Cli, config: &crate::mcp::McpConfig) -> crate::mcp::Sandb
         }
     }
     match sandbox::enter(&plan) {
-        Outcome::NotNeeded => SandboxState::NotNeeded,
-        Outcome::Unavailable(reason) => SandboxState::Unavailable(reason),
+        Outcome::NotNeeded => (SandboxState::NotNeeded, na),
+        Outcome::Unavailable(reason) => (SandboxState::Unavailable(reason), na),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sandbox_state(_cli: &Cli, _config: &crate::mcp::McpConfig) -> crate::mcp::SandboxState {
-    crate::mcp::SandboxState::Unavailable("the kernel sandbox exists only on Linux".to_string())
+fn sandbox_state(
+    _cli: &Cli,
+    _config: &crate::mcp::McpConfig,
+) -> (crate::mcp::SandboxState, serde_json::Value) {
+    (
+        crate::mcp::SandboxState::Unavailable(
+            "the kernel sandbox exists only on Linux".to_string(),
+        ),
+        serde_json::json!({"state": "not_evaluated"}),
+    )
 }
 
 /// Runs a command and returns the process exit code. `mind doctor` has a

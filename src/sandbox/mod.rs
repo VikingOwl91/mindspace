@@ -14,6 +14,8 @@
 //!
 //! This module only exists on Linux. See [`Outcome`] for what callers get.
 
+pub mod seccomp;
+
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -28,7 +30,7 @@ use landlock::{
 /// stays allowed (measured), so those kernels are refused.
 pub const MIN_ABI: ABI = ABI::V3;
 
-/// What the sandbox of `mind mcp` handles TODAY, as a declaration for
+/// What the sandbox of `mind mcp` handles, as a declaration for
 /// `mind doctor`. `build_ruleset` handles filesystem rights of [`MIN_ABI`] only
 /// (no network, no scope, no pathname-socket right) and no seccomp filter is
 /// installed. The doctor reports a channel as `enforced` only if it is declared
@@ -46,6 +48,9 @@ pub struct Declared {
     pub seccomp: bool,
 }
 
+/// `seccomp` is declared: a sandboxed `mind mcp` installs the socket-deny
+/// filter (`seccomp.rs`) on supported platforms, and reports honestly where it
+/// does not. The socket channels are declared through it, never through Landlock.
 pub const DECLARED: Declared = Declared {
     filesystem: true,
     tcp: false,
@@ -53,7 +58,7 @@ pub const DECLARED: Declared = Declared {
     unix_abstract_sockets: false,
     signals: false,
     udp: false,
-    seccomp: false,
+    seccomp: true,
 };
 
 pub(crate) const ENV_STAGE2: &str = "MINDSPACE_SANDBOX_STAGE2";
@@ -73,6 +78,8 @@ pub enum Outcome {
 #[derive(Debug, Clone)]
 pub struct Report {
     pub description: String,
+    /// The socket-deny seccomp policy as established in this process.
+    pub seccomp: seccomp::Status,
 }
 
 /// One filesystem rule of the sandbox.
@@ -420,6 +427,15 @@ pub fn enter(plan: &Plan) -> Outcome {
     if plan.roots.is_empty() {
         return Outcome::NotNeeded;
     }
+    // The socket-deny filter FIRST, before any other work (even the Git child that
+    // `plan.rules()` starts to learn Git's exec path): if it is required and cannot
+    // be established nothing has been restricted yet, and the repository tools stay
+    // off. It is installed on this thread, which is the one that execs below, so
+    // stage 2 inherits it. Descriptors were closed at the start of `mind mcp`.
+    // (A "not applied" platform is reported once, by stage 2.)
+    if let Err(e) = seccomp::apply() {
+        return Outcome::Unavailable(format!("seccomp: {e}"));
+    }
     if let Err(e) = plan.validate_layout() {
         return Outcome::Unavailable(e);
     }
@@ -492,8 +508,12 @@ pub fn verify_stage2(private_tmp: &Path) -> Result<Option<Report>, String> {
             "unexpected open file descriptors in the sandboxed process: {stray:?}"
         ));
     }
+    // The socket policy is re-derived here (architecture and kernel), not read
+    // from an environment variable: where it is required it must demonstrably be active.
+    let seccomp = seccomp::verify_stage2()?;
     Ok(Some(Report {
         description: "Landlock, ABI 3 or newer, fully enforced, canary verified".to_string(),
+        seccomp,
     }))
 }
 
@@ -545,7 +565,7 @@ mod tests {
             unix_abstract_sockets: false,
             signals: false,
             udp: false,
-            seccomp: false,
+            seccomp: true,
         };
         assert_eq!(DECLARED, today);
     }

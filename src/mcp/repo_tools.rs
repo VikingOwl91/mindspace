@@ -95,6 +95,9 @@ pub struct McpConfig {
     roots: Vec<AllowRoot>,
     ingest_timeout: Duration,
     sandbox: SandboxState,
+    /// Typed report of the socket-deny seccomp policy (`state`: `enforced`,
+    /// `not_applied`, `failed` or `not_evaluated`); additive next to `sandbox`.
+    seccomp: Value,
 }
 
 impl Default for McpConfig {
@@ -105,6 +108,7 @@ impl Default for McpConfig {
             sandbox: SandboxState::Unavailable(
                 "no sandbox has been set up for this configuration".to_string(),
             ),
+            seccomp: json!({"state": "not_evaluated"}),
         }
     }
 }
@@ -216,12 +220,22 @@ impl McpConfig {
             sandbox: SandboxState::Unavailable(
                 "no sandbox has been set up for this configuration".to_string(),
             ),
+            seccomp: json!({"state": "not_evaluated"}),
         })
     }
 
     pub fn with_sandbox(mut self, state: SandboxState) -> Self {
         self.sandbox = state;
         self
+    }
+
+    pub fn with_seccomp(mut self, report: Value) -> Self {
+        self.seccomp = report;
+        self
+    }
+
+    pub fn seccomp(&self) -> &Value {
+        &self.seccomp
     }
 
     pub fn sandbox(&self) -> &SandboxState {
@@ -456,6 +470,7 @@ pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Resu
         "node_count": total,
         "truncated": truncated,
         "sandbox": config.sandbox().label(),
+        "seccomp": config.seccomp(),
         "hint": "Pick directories with ingestable_files > 0 and pass them as `paths` to repo_ingest."
     }))
 }
@@ -523,6 +538,7 @@ pub fn ingest(
         "elapsed_ms": deadline.elapsed().as_millis() as u64,
         "limit_ms": config.ingest_timeout().as_millis() as u64,
         "sandbox": config.sandbox().label(),
+        "seccomp": config.seccomp(),
         "over_limit": deadline.expired(),
         "next": "Use code_search for definitions and memory_search for documents."
     }))

@@ -7,16 +7,19 @@ enforces today, not what the kernel could do.
 ## What is enforced today
 
 `mind mcp` with at least one allowed root restricts itself (ADR-029, `src/sandbox/`) with **Landlock filesystem rights of
-ABI 3** and verifies this with probes that must be denied. That is the only isolation Mindspace applies.
+ABI 3** and, since M7.2e, on x86_64 with a **socket-deny seccomp filter** ([sandbox-seccomp.md](sandbox-seccomp.md)); both are
+verified with probes that must be denied. That is the only isolation Mindspace applies.
 
 | Channel | Status in `mind doctor` | Basis |
 | --- | --- | --- |
 | Filesystem | `enforced` (when the self-test shows the sandbox active) | Landlock ABI 3 rules; canary probes at every start. VERIFIED by the self-test and `tests/doctor.rs`. |
-| TCP, UDP, unix pathname sockets, unix abstract sockets, signals | `supported_not_enforced` where the kernel could do it, `not_supported` otherwise, `unknown` if it cannot be determined | `src/sandbox` handles no network, scope or pathname-socket right and installs no seccomp filter (`sandbox::DECLARED`, pinned by a unit test; REASONED from `build_ruleset`). |
+| TCP, UDP, unix pathname sockets, unix abstract sockets | `enforced` on x86_64 with typed evidence from the self-test child; otherwise `supported_not_enforced` / `not_supported` / `unknown` | the seccomp filter denies creating NEW sockets (`src/sandbox/seccomp.rs`); already open descriptors (stdio) stay usable. Not network or IPC isolation. |
+| Signals | `supported_not_enforced` / `not_supported` / `unknown` | no Landlock scope and no filter for signals. |
 
-So a confined `mind mcp` can still, at the project's minimum rule set: connect to any unix socket path or abstract socket
-it can name, connect to TCP and send UDP, and signal same-user processes. VERIFIED for an equivalent rule set by
-`tests/seccomp_isolation.rs` (`landlock_alone_fences_files_but_not_sockets`) and by spike M7.2b-2 (commit `b38ef3b`).
+Landlock at the project's minimum rule set alone would let a confined process connect to any unix socket path or abstract socket
+it can name, connect to TCP and send UDP (VERIFIED for an equivalent rule set by `tests/seccomp_isolation.rs`,
+`landlock_alone_fences_files_but_not_sockets`, and spike M7.2b-2, commit `b38ef3b`). The seccomp filter closes the creation of
+new sockets; it can still signal same-user processes and use descriptors it already has.
 Without allowed roots no sandbox is applied (there is nothing to protect; the repository tools are off).
 
 `mind doctor` itself is **not** confined: it applies no Landlock rule and no seccomp filter to its own process. The
@@ -50,22 +53,11 @@ Landlock restricts access rights of one process tree to kernel objects it mediat
 does not isolate the network namespace, does not cover UDP, and, below the newest ABIs, does not cover unix sockets or
 signals. It is a filesystem fence plus whatever further rights the rule set handles.
 
-## Why seccomp is not enabled in `mind mcp`
+## Why seccomp is not a full isolation
 
-`tests/seccomp_isolation.rs` shows in an isolated child that Landlock (ABI 3 class) plus a filter that fails `socket()` and
-`io_uring_setup()` closes new sockets of all families including UDP and netlink, and still allows files inside the root,
-pipes, anonymous `socketpair`, threads and spawning a process (VERIFIED, x86_64 Linux 7.2.14, ABI 10, one run). A failed
-installation (policy forbids it, invalid program) aborts the child before any probe (VERIFIED).
-
-It is not in the product because these are missing:
-
-1. Does `mind mcp` itself need new sockets (embedding download, Git over network, `ureq`)? The self-test and ingest paths were
-   not run under the filter. UNKNOWN.
-2. Git as a child process: its start-up and hooks under the filter. UNKNOWN.
-3. Architectures other than x86_64 and aarch64 (no audit constant verified), 32-bit (`socketcall`), kernels with different
-   defaults: UNKNOWN. Containers that already carry a seccomp profile: UNKNOWN.
-4. Failure policy for the product (refuse to start vs. degrade) and its user-visible text.
-5. A real `mind mcp` run with an MCP client under the filter (the existing `tests/mcp*.rs` suites).
+The filter denies new sockets, `io_uring_setup`, `pidfd_getfd`, `ptrace` and `process_vm_*`, and kills foreign-architecture and x32
+calls. It is not a syscall allowlist, does not cover inherited descriptors, signals or `/proc` reads, and is x86_64 only
+(other architectures: explicitly not applied and reported). Details, error policy and evidence: [sandbox-seccomp.md](sandbox-seccomp.md).
 
 ## Not examined (UNKNOWN)
 

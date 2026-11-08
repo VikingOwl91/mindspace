@@ -842,28 +842,36 @@ mod linux {
         assert_eq!(s["details"]["kernel_evidence"]["state"], "enforced");
         let caps = &s["details"]["capabilities"];
         assert_eq!(caps["doctor_process_confined_by_mindspace"], false);
-        assert_eq!(caps["product"]["uses_seccomp"], false);
+        assert_eq!(caps["product"]["uses_seccomp"], true);
         assert_eq!(caps["product"]["landlock_filesystem_abi"], 3);
         assert_eq!(caps["channels"]["filesystem"]["status"], "enforced");
-        // Kernel support is not product isolation: whatever the kernel offers,
-        // the product enforces none of these today.
-        for ch in [
-            "tcp",
-            "udp",
-            "unix_path_sockets",
-            "unix_abstract_sockets",
-            "signals",
-        ] {
+        // Landlock-only channels: the product handles none of them.
+        let st = caps["channels"]["signals"]["status"].as_str().unwrap();
+        assert!(
+            ["supported_not_enforced", "not_supported", "unknown"].contains(&st),
+            "signals must not be reported as enforced: {caps}"
+        );
+        // The socket channels are enforced exactly when the self-test child
+        // reported the typed seccomp evidence (x86_64); never by kernel support alone.
+        let evidence = caps["seccomp_evidence"]["state"].as_str().unwrap();
+        for ch in ["tcp", "udp", "unix_path_sockets", "unix_abstract_sockets"] {
             let st = caps["channels"][ch]["status"].as_str().unwrap();
-            assert!(
-                ["supported_not_enforced", "not_supported", "unknown"].contains(&st),
-                "{ch} must never be reported as enforced: {caps}"
-            );
+            if evidence == "enforced" {
+                assert_eq!(st, "enforced", "{ch}: {caps}");
+                assert!(caps["channels"][ch]["limits"]
+                    .as_str()
+                    .unwrap()
+                    .contains("NEW sockets only"));
+            } else {
+                assert_ne!(st, "enforced", "{ch} without evidence: {caps}");
+            }
         }
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(evidence, "enforced", "{caps}");
         assert!(caps["limits"]
             .as_str()
             .unwrap()
-            .contains("not process isolation"));
+            .contains("process, network or IPC isolation"));
     }
 
     #[test]
@@ -893,8 +901,10 @@ mod linux {
         assert!(text.contains("capabilities.doctor_process_confined_by_mindspace: false"));
     }
 
+    /// A policy that blocks the `seccomp` query looks like an unsupported
+    /// kernel but is not: the doctor says "unknown", never "no".
     #[test]
-    fn without_seccomp_support_the_doctor_says_so_and_keeps_its_exit_code() {
+    fn a_blocked_seccomp_query_is_unknown_not_unsupported() {
         let Some(prog) = common::seccomp_denier(&[(libc::SYS_seccomp, None)], libc::ENOSYS) else {
             eprintln!("skipped: no verified seccomp audit constant for this architecture");
             return;
@@ -908,12 +918,51 @@ mod linux {
         let (code, r, _) = doctor_json(c);
         assert_eq!(code, 0, "{r}");
         let caps = &check(&r, "sandbox")["details"]["capabilities"];
-        assert_eq!(caps["kernel"]["seccomp_filter_supported"], "no", "{caps}");
-        assert_eq!(caps["channels"]["udp"]["status"], "not_supported", "{caps}");
         assert_eq!(
-            caps["channels"]["udp"]["available_via"],
-            serde_json::json!([])
+            caps["kernel"]["seccomp_filter_supported"], "unknown",
+            "{caps}"
         );
+    }
+
+    /// An installation failure must never end in a running sandboxed server
+    /// that merely lacks the filter: the repository tools stay off.
+    #[test]
+    fn a_filter_that_cannot_be_installed_makes_the_sandbox_unavailable() {
+        let Some(prog) = common::seccomp_denier(
+            &[(libc::SYS_prctl, Some(libc::PR_SET_SECCOMP as u32))],
+            libc::EPERM,
+        ) else {
+            eprintln!("skipped: no verified seccomp audit constant for this architecture");
+            return;
+        };
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let mut c = mind(&["doctor", "--json"]);
+        c.env("XDG_DATA_HOME", &xdg);
+        common::seccomp_command(&mut c, prog);
+        let (code, r, _) = doctor_json(c);
+        assert_eq!(
+            code, 0,
+            "unavailable is safe (fail closed), not blocking: {r}"
+        );
+        let s = check(&r, "sandbox");
+        assert_eq!(s["status"], "warn", "{s}");
+        assert_eq!(s["details"]["kernel_evidence"]["state"], "unavailable");
+        assert!(s["details"]["kernel_evidence"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("seccomp"));
+        let caps = &s["details"]["capabilities"];
+        for ch in [
+            "filesystem",
+            "tcp",
+            "udp",
+            "unix_path_sockets",
+            "unix_abstract_sockets",
+        ] {
+            assert_ne!(caps["channels"][ch]["status"], "enforced", "{ch}: {caps}");
+        }
     }
 
     #[test]

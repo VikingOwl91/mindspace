@@ -1122,3 +1122,13 @@ kernel layer. Use the opt-out only for trusted input.
 whole process cost no functionality, and the application layer closes what the
 kernel cannot. It stays an option for hardening against bugs in git or the
 parsers (not shown to exist).
+
+**Addendum (M7.2e): socket-deny seccomp filter.** On Linux x86_64 the sandboxed
+`mind mcp` additionally installs a seccomp filter (first thing in `sandbox::enter`,
+inherited by stage 2 and Git) that denies new sockets, `io_uring_setup`,
+`pidfd_getfd`, `ptrace` and `process_vm_*` and kills foreign-architecture and
+x32 calls. It is not network or IPC isolation (inherited descriptors, stdio
+sockets, signals and `/proc` stay); a required filter that cannot be installed
+or verified turns the repository tools off or refuses the start; other
+architectures are explicitly "not applied". Threat model, error table and
+evidence: `docs/sandbox-seccomp.md`.

@@ -55,6 +55,8 @@ pub struct Selftest {
     pub traversal_refused: Option<bool>,
     /// The refusal text of the outside request (application-layer message).
     pub outside_message: Option<String>,
+    /// The typed `seccomp` field of the server's `repo_outline` result, if any.
+    pub seccomp: Option<Value>,
     pub elapsed_ms: u128,
 }
 
@@ -326,6 +328,7 @@ pub fn run_in(tmp_base: &Path, exe: &Path, timeout: Duration) -> Result<Selftest
         outside_refused: None,
         traversal_refused: None,
         outside_message: None,
+        seccomp: None,
         elapsed_ms: started.elapsed().as_millis(),
     };
 
@@ -342,6 +345,14 @@ pub fn run_in(tmp_base: &Path, exe: &Path, timeout: Duration) -> Result<Selftest
 
     let Some((inside_err, inside_text)) = outline(&mut c, &probe)? else {
         return Ok(early_exit(&c, "repo_outline"));
+    };
+    let seccomp = if inside_err {
+        None
+    } else {
+        serde_json::from_str::<Value>(&inside_text)
+            .ok()
+            .map(|v| v["seccomp"].clone())
+            .filter(|v| !v.is_null())
     };
     let kernel = if inside_err {
         if inside_text.contains("repository tools are disabled") {
@@ -379,6 +390,7 @@ pub fn run_in(tmp_base: &Path, exe: &Path, timeout: Duration) -> Result<Selftest
         outside_refused,
         traversal_refused,
         outside_message,
+        seccomp,
         elapsed_ms: started.elapsed().as_millis(),
     })
 }

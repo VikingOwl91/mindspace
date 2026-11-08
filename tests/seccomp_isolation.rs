@@ -36,9 +36,61 @@ use mindspace::doctor::capabilities::{probe_kernel, LandlockState, Tri};
 
 const PRE_UNIX_FD: i32 = 100;
 const PRE_TCP_FD: i32 = 101;
-const EACCES: i32 = libc::EACCES;
+/// A TCP socket created but never connected before the filter.
+const DORMANT_FD: i32 = 102;
+/// One end of a socketpair that carries a connected TCP socket (SCM_RIGHTS).
+const PASSING_FD: i32 = 103;
 
 // ------------------------------------------------------------------ child
+
+/// A descriptor to pass over a unix socket (SCM_RIGHTS), sent by the parent.
+fn send_fd(sock: i32, fd: i32) {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut _,
+        iov_len: 1,
+    };
+    // SAFETY: the buffers outlive the call; the structures are zeroed first.
+    unsafe {
+        let mut cbuf = vec![0u8; libc::CMSG_SPACE(4) as usize];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut _;
+        msg.msg_controllen = cbuf.len() as _;
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        *(libc::CMSG_DATA(c) as *mut i32) = fd;
+        assert!(libc::sendmsg(sock, &msg, 0) >= 0, "sendmsg");
+    }
+}
+
+fn recv_fd(sock: i32) -> std::io::Result<i32> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut _,
+        iov_len: 1,
+    };
+    // SAFETY: as above.
+    unsafe {
+        let mut cbuf = vec![0u8; libc::CMSG_SPACE(4) as usize];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut _;
+        msg.msg_controllen = cbuf.len() as _;
+        if libc::recvmsg(sock, &mut msg, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        if c.is_null() || (*c).cmsg_type != libc::SCM_RIGHTS {
+            return Err(std::io::Error::other("no descriptor received"));
+        }
+        Ok(*(libc::CMSG_DATA(c) as *const i32))
+    }
+}
 
 fn errno_of(e: &std::io::Error) -> String {
     match e.raw_os_error() {
@@ -102,13 +154,8 @@ fn apply_landlock(allowed: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The experimental filter: every new socket (any family) and io_uring (which
-/// could create sockets behind the filter's back) fail with EACCES.
 fn socket_filter() -> Option<Vec<libc::sock_filter>> {
-    common::seccomp_denier(
-        &[(libc::SYS_socket, None), (libc::SYS_io_uring_setup, None)],
-        EACCES,
-    )
+    common::socket_deny_filter()
 }
 
 fn env(name: &str) -> String {
@@ -132,6 +179,79 @@ fn child_entry() {
     let tcp4: u16 = env("M72C_TCP4").parse().unwrap_or(0);
     let tcp6: u16 = env("M72C_TCP6").parse().unwrap_or(0);
     let udp: u16 = env("M72C_UDP").parse().unwrap_or(0);
+
+    // Modes that exercise the PRODUCT's verification and ABI special cases.
+    match mode.as_str() {
+        "verify_none" | "verify_partial" | "verify_full" => {
+            match mode.as_str() {
+                "verify_partial" => {
+                    // only `socket` is denied: the mode is 2, but not the policy
+                    let p =
+                        common::seccomp_denier(&[(libc::SYS_socket, None)], libc::EACCES).unwrap();
+                    common::install_seccomp(&p).unwrap();
+                }
+                "verify_full" => common::install_seccomp(&socket_filter().unwrap()).unwrap(),
+                _ => {}
+            }
+            match mindspace::sandbox::seccomp::verify_active() {
+                Ok(e) => println!("VERIFY ok probes={}", e.probes.len()),
+                Err(e) => println!("VERIFY err {e}"),
+            }
+            std::process::exit(0);
+        }
+        "x32_plain"
+        | "x32_filtered"
+        | "x32_naive"
+        | "x32_getpid_filtered"
+        | "int80_plain"
+        | "int80_filtered" => {
+            if mode.ends_with("_filtered") {
+                common::install_seccomp(&socket_filter().unwrap()).unwrap();
+            }
+            if mode == "x32_naive" {
+                // the M7.2d experiment: architecture value + the number of `socket`
+                let p = common::seccomp_denier(&[(libc::SYS_socket, None)], libc::EACCES).unwrap();
+                common::install_seccomp(&p).unwrap();
+            }
+            if mode == "x32_getpid_filtered" {
+                common::install_seccomp(&socket_filter().unwrap()).unwrap();
+                // SAFETY: getpid has no arguments and no side effects.
+                unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
+                println!("X32 getpid survived");
+                std::process::exit(0);
+            }
+            if mode.starts_with("x32") {
+                // x86_64 syscall number with the x32 bit set: `socket` in x32 numbering
+                // SAFETY: a plain syscall with constant arguments.
+                let r = unsafe {
+                    libc::syscall(
+                        0x4000_0000 | libc::SYS_socket,
+                        libc::AF_INET,
+                        libc::SOCK_STREAM,
+                        0,
+                    )
+                };
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if r >= 0 {
+                    println!("X32 CREATED-A-SOCKET");
+                } else {
+                    println!("X32 errno {e}");
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // 32-bit `int 0x80` getpid (eax = 20)
+                    // SAFETY: the 32-bit getpid takes no arguments and has no side effects.
+                    unsafe {
+                        core::arch::asm!("int 0x80", inlateout("eax") 20 => _);
+                    }
+                    println!("INT80 returned");
+                }
+            }
+            std::process::exit(0);
+        }
+        _ => {}
+    }
 
     let want_landlock = mode == "landlock" || mode == "both";
     let want_seccomp = mode == "seccomp" || mode == "both";
@@ -267,6 +387,87 @@ fn child_entry() {
             TcpStream::from_raw_fd(PRE_TCP_FD)
         }),
     );
+    // Descriptor-based ways around a socket-creation filter:
+    // 1. a socket that exists but is not connected yet can still be connected
+    report("dormant_tcp_fd_connect", unsafe {
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: tcp4.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        let r = libc::connect(
+            DORMANT_FD,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        );
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    // 2. taking a socket out of another process of the same user (the parent)
+    let parent_fd: i32 = env("M72C_PARENT_FD").parse().unwrap_or(-1);
+    report("pidfd_getfd_from_parent", unsafe {
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getppid(), 0);
+        if pidfd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let got = libc::syscall(libc::SYS_pidfd_getfd, pidfd as i32, parent_fd, 0);
+            if got < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    });
+    // 3. a socket handed over AFTER the filter, over a channel that already exists
+    report(
+        "scm_rights_received_tcp_read",
+        (|| {
+            use std::os::unix::io::FromRawFd;
+            let fd = recv_fd(PASSING_FD)?;
+            // SAFETY: the descriptor was just received and is owned here.
+            read_banner(unsafe { TcpStream::from_raw_fd(fd) })
+        })(),
+    );
+    // 4. acting on another process of the same user (a victim the parent started)
+    let victim: i32 = env("M72C_VICTIM").parse().unwrap_or(0);
+    report("ptrace_attach_victim", unsafe {
+        let r = libc::syscall(
+            libc::SYS_ptrace,
+            0x4206, /* PTRACE_SEIZE */
+            victim,
+            0,
+            0,
+        );
+        if r < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            libc::syscall(libc::SYS_ptrace, 17 /* PTRACE_DETACH */, victim, 0, 0);
+            Ok(())
+        }
+    });
+    report("process_vm_readv_victim", unsafe {
+        let mut buf = [0u8; 8];
+        let local = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut _,
+            iov_len: 8,
+        };
+        let remote = libc::iovec {
+            iov_base: 0x1000 as *mut _,
+            iov_len: 8,
+        };
+        let r = libc::process_vm_readv(victim, &local, 1, &remote, 1, 0);
+        if r < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
     // IPC a normal run needs
     report("pipe", unsafe {
         let mut fds = [0i32; 2];
@@ -323,6 +524,15 @@ struct World {
     _udp: UdpSocket,
     pre_unix: UnixStream,
     pre_tcp: TcpStream,
+    dormant: i32,
+    victim: std::process::Child,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        let _ = self.victim.kill();
+        let _ = self.victim.wait();
+    }
 }
 
 fn serve_hello<L, S>(listener: L, accept: fn(&L) -> std::io::Result<S>)
@@ -382,11 +592,19 @@ fn world() -> World {
         _udp: u,
         pre_unix,
         pre_tcp,
+        // SAFETY: a plain socket(2) call; the fd is owned by the World until process end.
+        dormant: unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) },
+        victim: Command::new("sleep")
+            .arg("120")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
     }
 }
 
 struct Run {
     code: i32,
+    signal: Option<i32>,
     lines: Vec<String>,
 }
 
@@ -414,14 +632,25 @@ fn run_child(w: &World, mode: &str) -> Run {
         .env("M72C_TCP4", w.tcp4.to_string())
         .env("M72C_TCP6", w.tcp6.to_string())
         .env("M72C_UDP", w.udp.to_string())
+        .env("M72C_PARENT_FD", w.pre_tcp.as_raw_fd().to_string())
+        .env("M72C_VICTIM", w.victim.id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let (u, t) = (w.pre_unix.as_raw_fd(), w.pre_tcp.as_raw_fd());
+    // a fresh connected TCP socket, queued for the child on a socketpair
+    let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+    let handed = TcpStream::connect(("127.0.0.1", w.tcp4)).unwrap();
+    send_fd(tx.as_raw_fd(), handed.as_raw_fd());
+    let pass = rx.as_raw_fd();
+    let (u, t, d) = (w.pre_unix.as_raw_fd(), w.pre_tcp.as_raw_fd(), w.dormant);
     // SAFETY: dup2 only, between fork and exec; clears CLOEXEC on the copies.
     unsafe {
         c.pre_exec(move || {
-            if libc::dup2(u, PRE_UNIX_FD) < 0 || libc::dup2(t, PRE_TCP_FD) < 0 {
+            if libc::dup2(u, PRE_UNIX_FD) < 0
+                || libc::dup2(t, PRE_TCP_FD) < 0
+                || libc::dup2(d, DORMANT_FD) < 0
+                || libc::dup2(pass, PASSING_FD) < 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -451,9 +680,14 @@ fn run_child(w: &World, mode: &str) -> Run {
     let text = reader.join().unwrap();
     Run {
         code: status.code().unwrap_or(-1),
+        signal: std::os::unix::process::ExitStatusExt::signal(&status),
         lines: text
             .lines()
-            .filter(|l| l.starts_with("PROBE ") || l.starts_with("ABORT"))
+            .filter(|l| {
+                ["PROBE ", "ABORT", "VERIFY", "X32", "INT80"]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
             .map(str::to_string)
             .collect(),
     }
@@ -516,8 +750,13 @@ fn the_unconfined_baseline_reaches_everything() {
     ] {
         expect(&r, p, "ok");
     }
+    for p in ["ptrace_attach_victim", "process_vm_readv_victim"] {
+        assert_ne!(r.get(p).as_deref(), Some(DENIED), "{p}");
+    }
     // io_uring may be disabled by the host; only the filter answers EACCES
     assert_ne!(r.get("io_uring_setup").as_deref(), Some(DENIED));
+    // without the filter pidfd_getfd is stopped (if at all) by Yama, not with EACCES
+    assert_ne!(r.get("pidfd_getfd_from_parent").as_deref(), Some(DENIED));
 }
 
 #[test]
@@ -565,7 +804,10 @@ fn seccomp_alone_stops_new_sockets_but_not_existing_ones_or_files() {
     if w.tcp6 != 0 {
         expect(&r, "tcp6_connect", DENIED);
     }
-    // remaining boundary: descriptors that already exist keep working
+    // remaining boundary: descriptors that already exist keep working, even a
+    // socket that was created but not connected before the filter
+    expect(&r, "dormant_tcp_fd_connect", "ok");
+    expect(&r, "pidfd_getfd_from_parent", DENIED); // by the filter, not by Yama
     expect(&r, "preconnected_unix_read", "ok");
     expect(&r, "preconnected_tcp_read", "ok");
     // seccomp is not a filesystem fence
@@ -589,12 +831,18 @@ fn landlock_plus_seccomp_closes_both_and_normal_work_continues() {
         "udp_send",
         "netlink_socket",
         "io_uring_setup",
+        "pidfd_getfd_from_parent",
+        "ptrace_attach_victim",
+        "process_vm_readv_victim",
     ] {
         expect(&r, p, DENIED);
     }
     if w.tcp6 != 0 {
         expect(&r, "tcp6_connect", DENIED);
     }
+    // REMAINING BOUNDARY: a socket received over a channel that already exists
+    // is fully usable. SCM_RIGHTS cannot be told apart from ordinary reads.
+    expect(&r, "scm_rights_received_tcp_read", "ok");
     // what a normal run still needs
     for p in [
         "pipe",
@@ -640,4 +888,93 @@ fn the_parent_is_not_affected_by_the_childs_filters() {
     assert_eq!(r.code, 0, "{:?}", r.lines);
     assert!(UdpSocket::bind("127.0.0.1:0").is_ok());
     assert!(std::fs::read(&_w.outside_file).is_ok());
+}
+
+#[test]
+fn the_verification_checks_the_policy_not_just_the_filter_mode() {
+    let Some(w) = prerequisites(false, true) else {
+        return;
+    };
+    // no filter: the mode check fails
+    let r = run_child(&w, "verify_none");
+    assert!(
+        r.lines.iter().any(|l| l.starts_with("VERIFY err")),
+        "{:?}",
+        r.lines
+    );
+    // a filter (mode 2!) that denies only `socket`: the other probes catch it
+    let r = run_child(&w, "verify_partial");
+    let line = r.lines.iter().find(|l| l.starts_with("VERIFY")).unwrap();
+    assert!(
+        line.starts_with("VERIFY err") && line.contains("io_uring_setup"),
+        "{line}"
+    );
+    // the product program: verified, with the negative probes and the controls
+    let r = run_child(&w, "verify_full");
+    let line = r.lines.iter().find(|l| l.starts_with("VERIFY")).unwrap();
+    assert!(line.starts_with("VERIFY ok"), "{line}");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn x32_and_32_bit_entry_points_are_killed_not_filtered_around() {
+    let Some(w) = prerequisites(false, true) else {
+        return;
+    };
+    const SIGSYS: i32 = 31;
+    // Without a filter an x32-numbered `socket` is served if the kernel has the
+    // x32 ABI enabled. Kernel-dependent: recorded, not asserted either way. On
+    // the development host (7.2.14-zen) it CREATES a socket, which is why a
+    // filter that checks only the architecture value and `socket`'s number
+    // (as the M7.2d experiment did) is bypassable there.
+    let plain = run_child(&w, "x32_plain");
+    assert_eq!(plain.signal, None, "{:?}", plain.lines);
+    eprintln!("x32 socket without filter: {:?}", plain.lines);
+    // Negative control: a filter that checks only the architecture value and
+    // the number of `socket` does not see the x32 number (this is the
+    // M7.2d experiment's filter). If the plain call created a socket, so does this.
+    let naive = run_child(&w, "x32_naive");
+    if plain.lines.iter().any(|l| l.contains("CREATED-A-SOCKET")) {
+        assert!(
+            naive.lines.iter().any(|l| l.contains("CREATED-A-SOCKET")),
+            "{:?}",
+            naive.lines
+        );
+    }
+    // Not only `socket`: ANY x32-numbered call ends the process (getpid is harmless).
+    let g = run_child(&w, "x32_getpid_filtered");
+    assert_eq!(g.signal, Some(31), "{:?}", g.lines);
+    // With the product filter, any x32-numbered call ends the process.
+    let f = run_child(&w, "x32_filtered");
+    assert_eq!(f.signal, Some(SIGSYS), "{:?}", f.lines);
+    // 32-bit `int 0x80`: where the kernel serves it at all, the filter kills it.
+    let plain = run_child(&w, "int80_plain");
+    let f = run_child(&w, "int80_filtered");
+    eprintln!(
+        "int 0x80: plain signal={:?}, filtered signal={:?}",
+        plain.signal, f.signal
+    );
+    if plain.signal.is_none() {
+        assert_eq!(f.signal, Some(SIGSYS), "{:?}", f.lines);
+    } else {
+        // the kernel does not serve int 0x80 for this process: nothing to filter
+        assert!(f.signal.is_some());
+    }
+}
+
+/// Writes the product program for the independent check in
+/// `scripts/check_seccomp_bpf.py` (`M72E_DUMP_BPF=<file>`); a no-op otherwise.
+#[test]
+fn dump_the_program_for_the_independent_check() {
+    let Some(path) = std::env::var_os("M72E_DUMP_BPF") else {
+        return;
+    };
+    let Some(prog) = socket_filter() else {
+        return;
+    };
+    let mut out = String::new();
+    for i in &prog {
+        out.push_str(&format!("{} {} {} {}\n", i.code, i.jt, i.jf, i.k));
+    }
+    std::fs::write(path, out).unwrap();
 }

@@ -96,7 +96,7 @@ On other platforms the check is `skip`: the repository tools are always off ther
 `checks[id=sandbox].details.capabilities` (Linux) separates what the kernel supports from what Mindspace declares and
 what the self-test proved: per channel (`filesystem`, `tcp`, `udp`, `unix_path_sockets`, `unix_abstract_sockets`,
 `signals`) a `status` of `enforced`, `supported_not_enforced`, `not_supported` or `unknown`, the mechanisms
-(`available_via`) and the basis. The probes are read-only; the doctor process is not confined. The status of the check
+(`available_via`) and the basis. The probes are read-only; the doctor process is not confined. The socket channels are `enforced` only with the typed `seccomp` evidence of the self-test child ([sandbox-seccomp.md](sandbox-seccomp.md)). The status of the check
 and the exit codes do not depend on it. Details and limits: [sandbox-capabilities.md](sandbox-capabilities.md).
 
 ## Limits

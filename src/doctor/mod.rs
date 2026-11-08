@@ -25,6 +25,8 @@ use crate::paths::Located;
 use crate::storage::sqlite::{inspect_database, DatabaseInspection};
 
 #[cfg(target_os = "linux")]
+pub mod capabilities;
+#[cfg(target_os = "linux")]
 pub mod selftest;
 
 /// Format tag of the JSON report; bumped when the structure changes.
@@ -714,8 +716,25 @@ fn check_embeddings(
 
 // ---------------------------------------------------------------- sandbox
 
+/// The existing self-test check plus, additively, `details.capabilities`
+/// (kernel support vs. what the product declares vs. proven active). The
+/// evidence is a typed value set by the self-test code itself, not parsed back
+/// out of the JSON text.
 #[cfg(target_os = "linux")]
 fn check_sandbox(i: &Inputs) -> Check {
+    let mut evidence = capabilities::Evidence::None;
+    let mut c = check_sandbox_selftest(i, &mut evidence);
+    if c.details.is_null() {
+        c.details = json!({});
+    }
+    c.details["capabilities"] = capabilities::report(evidence);
+    c
+}
+
+/// `evidence` is raised above `None` only on the two paths that establish it:
+/// an enforced report whose application checks also pass, or an `unavailable` report.
+#[cfg(target_os = "linux")]
+fn check_sandbox_selftest(i: &Inputs, evidence: &mut capabilities::Evidence) -> Check {
     use selftest::KernelEvidence;
     let (id, title) = ("sandbox", "Sandbox");
     if !i.run_selftest {
@@ -761,6 +780,7 @@ fn check_sandbox(i: &Inputs) -> Check {
                 && result.outside_refused == Some(true)
                 && result.traversal_refused == Some(true);
             if ok {
+                *evidence = capabilities::Evidence::Active;
                 Check::new(id, title, Status::Pass, "kernel sandbox enforced (server-reported, probe-verified); access inside the root works, outside access is refused").details(d)
             } else {
                 Check::new(id, title, Status::Fail, "inconsistent: the server reports an enforced sandbox but the tool behaviour does not match (an outside path was not refused, or the root was not usable)")
@@ -769,6 +789,7 @@ fn check_sandbox(i: &Inputs) -> Check {
             }
         }
         KernelEvidence::Unavailable(reason) => {
+            *evidence = capabilities::Evidence::Unavailable;
             d["kernel_evidence"]["state"] = json!("unavailable");
             d["kernel_evidence"]["reason"] = json!(reason);
             Check::new(id, title, Status::Warn, "kernel sandbox NOT available: the repository tools (repo_outline, repo_ingest) are off; memory tools and search are unaffected")

@@ -783,6 +783,27 @@ mod linux {
             false
         );
         assert!(s["details"]["application_validation"]["outside_root_refused"].is_null());
+        // Capabilities: no Landlock means nothing is supported, and the report says why.
+        let caps = &s["details"]["capabilities"];
+        assert_eq!(caps["kernel"]["landlock"]["state"], "unavailable", "{caps}");
+        assert!(caps["kernel"]["seccomp_mode_of_doctor_process"]
+            .as_str()
+            .unwrap()
+            .starts_with("filter"));
+        for ch in [
+            "filesystem",
+            "tcp",
+            "unix_path_sockets",
+            "unix_abstract_sockets",
+            "signals",
+        ] {
+            let st = &caps["channels"][ch]["status"];
+            if ch == "filesystem" || ch == "signals" {
+                assert_eq!(st, "not_supported", "{ch}: {caps}");
+            } else {
+                assert_ne!(st, "enforced", "{ch}: {caps}");
+            }
+        }
         let hint = s["remedy"].as_str().unwrap();
         assert!(
             !hint.contains("--insecure-no-sandbox"),
@@ -803,6 +824,96 @@ mod linux {
     #[test]
     fn with_landlock_disabled_eopnotsupp_the_sandbox_check_warns_and_says_why() {
         unavailable_case(95);
+    }
+
+    #[test]
+    fn capabilities_are_added_without_changing_the_existing_fields() {
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let (code, r, _) = doctor_with_xdg(&xdg, &[]);
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(r["format"], "mind-doctor/1");
+        let s = check(&r, "sandbox");
+        // every field that existed before is still there
+        for k in ["elapsed_ms", "kernel_evidence", "application_validation"] {
+            assert!(s["details"].get(k).is_some(), "{k} missing: {s}");
+        }
+        assert_eq!(s["details"]["kernel_evidence"]["state"], "enforced");
+        let caps = &s["details"]["capabilities"];
+        assert_eq!(caps["doctor_process_confined_by_mindspace"], false);
+        assert_eq!(caps["product"]["uses_seccomp"], false);
+        assert_eq!(caps["product"]["landlock_filesystem_abi"], 3);
+        assert_eq!(caps["channels"]["filesystem"]["status"], "enforced");
+        // Kernel support is not product isolation: whatever the kernel offers,
+        // the product enforces none of these today.
+        for ch in [
+            "tcp",
+            "udp",
+            "unix_path_sockets",
+            "unix_abstract_sockets",
+            "signals",
+        ] {
+            let st = caps["channels"][ch]["status"].as_str().unwrap();
+            assert!(
+                ["supported_not_enforced", "not_supported", "unknown"].contains(&st),
+                "{ch} must never be reported as enforced: {caps}"
+            );
+        }
+        assert!(caps["limits"]
+            .as_str()
+            .unwrap()
+            .contains("not process isolation"));
+    }
+
+    #[test]
+    fn the_text_report_shows_the_capability_status_of_each_channel() {
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let out = run({
+            let mut c = mind(&["doctor"]);
+            c.env("XDG_DATA_HOME", &xdg);
+            c
+        });
+        let text = String::from_utf8_lossy(&out.stdout);
+        for ch in [
+            "filesystem",
+            "tcp",
+            "udp",
+            "unix_path_sockets",
+            "unix_abstract_sockets",
+            "signals",
+        ] {
+            assert!(
+                text.contains(&format!("capabilities.channels.{ch}.status: ")),
+                "{ch} missing in:\n{text}"
+            );
+        }
+        assert!(text.contains("capabilities.doctor_process_confined_by_mindspace: false"));
+    }
+
+    #[test]
+    fn without_seccomp_support_the_doctor_says_so_and_keeps_its_exit_code() {
+        let Some(prog) = common::seccomp_denier(&[(libc::SYS_seccomp, None)], libc::ENOSYS) else {
+            eprintln!("skipped: no verified seccomp audit constant for this architecture");
+            return;
+        };
+        let t = tmp();
+        let xdg = t.path().join("xdg");
+        initialized(&xdg);
+        let mut c = mind(&["doctor", "--json"]);
+        c.env("XDG_DATA_HOME", &xdg);
+        common::seccomp_command(&mut c, prog);
+        let (code, r, _) = doctor_json(c);
+        assert_eq!(code, 0, "{r}");
+        let caps = &check(&r, "sandbox")["details"]["capabilities"];
+        assert_eq!(caps["kernel"]["seccomp_filter_supported"], "no", "{caps}");
+        assert_eq!(caps["channels"]["udp"]["status"], "not_supported", "{caps}");
+        assert_eq!(
+            caps["channels"]["udp"]["available_via"],
+            serde_json::json!([])
+        );
     }
 
     #[test]

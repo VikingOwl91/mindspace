@@ -28,6 +28,34 @@ use landlock::{
 /// stays allowed (measured), so those kernels are refused.
 pub const MIN_ABI: ABI = ABI::V3;
 
+/// What the sandbox of `mind mcp` handles TODAY, as a declaration for
+/// `mind doctor`. `build_ruleset` handles filesystem rights of [`MIN_ABI`] only
+/// (no network, no scope, no pathname-socket right) and no seccomp filter is
+/// installed. The doctor reports a channel as `enforced` only if it is declared
+/// here AND evidence shows the sandbox is active; a kernel ABI number alone never
+/// makes a channel "enforced". Whoever adds a right to `build_ruleset` must flip
+/// the matching flag here (a unit test pins the filesystem part).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Declared {
+    pub filesystem: bool,
+    pub tcp: bool,
+    pub unix_path_sockets: bool,
+    pub unix_abstract_sockets: bool,
+    pub signals: bool,
+    pub udp: bool,
+    pub seccomp: bool,
+}
+
+pub const DECLARED: Declared = Declared {
+    filesystem: true,
+    tcp: false,
+    unix_path_sockets: false,
+    unix_abstract_sockets: false,
+    signals: false,
+    udp: false,
+    seccomp: false,
+};
+
 pub(crate) const ENV_STAGE2: &str = "MINDSPACE_SANDBOX_STAGE2";
 pub(crate) const ENV_CANARY: &str = "MINDSPACE_SANDBOX_CANARY";
 
@@ -500,6 +528,26 @@ mod tests {
         assert!(plan(&[("/data/repo", true)], "/data/repo-state")
             .validate_layout()
             .is_ok());
+    }
+
+    #[test]
+    fn the_declaration_matches_the_rights_the_ruleset_handles() {
+        // Filesystem rights of the project minimum only: bits 0..=14 of the
+        // kernel's handled_access_fs. Network, scopes and the pathname-socket
+        // right (bit 16, a later ABI) are not handled; `DECLARED` says so.
+        let bits = AccessFs::from_all(MIN_ABI).bits();
+        assert_eq!(bits & !((1u64 << 15) - 1), 0, "a newer right is handled");
+        assert_eq!(bits.count_ones(), 15);
+        let today = Declared {
+            filesystem: true,
+            tcp: false,
+            unix_path_sockets: false,
+            unix_abstract_sockets: false,
+            signals: false,
+            udp: false,
+            seccomp: false,
+        };
+        assert_eq!(DECLARED, today);
     }
 
     #[test]

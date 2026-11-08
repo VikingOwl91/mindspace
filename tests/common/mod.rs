@@ -49,3 +49,79 @@ pub fn block_landlock(c: &mut Command, errno: i32) {
         });
     }
 }
+
+/// Audit architecture of the filter below; `None` where this harness has no
+/// verified constant (tests then skip instead of guessing).
+pub fn audit_arch() -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    return Some(0xC000_003E);
+    #[cfg(target_arch = "aarch64")]
+    return Some(0xC000_00B7);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    return None;
+}
+
+/// seccomp filter: each `(syscall number, optional value of argument 0)` fails
+/// with `errno`; everything else is allowed. A foreign architecture is killed.
+/// Numbers come from the `libc` crate for the build architecture (never
+/// hard-coded). Returns `None` on architectures without a verified audit constant.
+pub fn seccomp_denier(
+    rules: &[(libc::c_long, Option<u32>)],
+    errno: i32,
+) -> Option<Vec<libc::sock_filter>> {
+    let arch = audit_arch()?;
+    let f = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    const LD_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    const JEQ: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const RET: u16 = 0x06;
+    let deny = 0x0005_0000 | errno as u32;
+    let mut p = vec![
+        f(LD_ABS, 0, 0, 4),
+        f(JEQ, 1, 0, arch),
+        f(RET, 0, 0, 0x8000_0000), // KILL_PROCESS
+    ];
+    for (nr, arg0) in rules {
+        match arg0 {
+            None => {
+                p.push(f(LD_ABS, 0, 0, 0));
+                p.push(f(JEQ, 0, 1, *nr as u32));
+                p.push(f(RET, 0, 0, deny));
+            }
+            Some(a) => {
+                p.push(f(LD_ABS, 0, 0, 0));
+                p.push(f(JEQ, 0, 3, *nr as u32));
+                p.push(f(LD_ABS, 0, 0, 16)); // args[0], low 32 bits
+                p.push(f(JEQ, 0, 1, *a));
+                p.push(f(RET, 0, 0, deny));
+            }
+        }
+    }
+    p.push(f(RET, 0, 0, 0x7FFF_0000));
+    Some(p)
+}
+
+/// Installs `prog` on the calling thread (and its later children). Test-only.
+pub fn install_seccomp(prog: &[libc::sock_filter]) -> std::io::Result<()> {
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut _,
+    };
+    // SAFETY: prctl with a valid program that outlives the call.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Starts `c` with `prog` installed between fork and exec.
+pub fn seccomp_command(c: &mut Command, prog: Vec<libc::sock_filter>) {
+    // SAFETY: only prctl, on data prepared before the fork.
+    unsafe {
+        c.pre_exec(move || install_seccomp(&prog));
+    }
+}

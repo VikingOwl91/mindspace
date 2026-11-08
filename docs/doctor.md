@@ -91,6 +91,14 @@ refused, a `DISABLED` report, or no usable report is a `fail`. The doctor never 
 The result is a snapshot of this machine now; the authoritative check is the one `mind mcp` does at every start.
 On other platforms the check is `skip`: the repository tools are always off there.
 
+## Sandbox capabilities (additive)
+
+`checks[id=sandbox].details.capabilities` (Linux) separates what the kernel supports from what Mindspace declares and
+what the self-test proved: per channel (`filesystem`, `tcp`, `udp`, `unix_path_sockets`, `unix_abstract_sockets`,
+`signals`) a `status` of `enforced`, `supported_not_enforced`, `not_supported` or `unknown`, the mechanisms
+(`available_via`) and the basis. The probes are read-only; the doctor process is not confined. The status of the check
+and the exit codes do not depend on it. Details and limits: [sandbox-capabilities.md](sandbox-capabilities.md).
+
 ## Limits
 
 - The self-test kills the server it started and waits for it, but it does not track everything that server started

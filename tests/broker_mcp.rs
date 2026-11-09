@@ -660,9 +660,11 @@ fn cleanup_after_normal_exit_frontend_crash_and_broker_crash() {
         eprintln!("normal exit: frontend {fp}, broker {bp}, broker cgroup {cg}");
         fe.finish();
         assert!(gone(bp), "the broker did not exit with the frontend");
+        // the tree is removed by the WATCHDOG, a few milliseconds after the broker is gone:
+        // wait for it, and still fail if it never happens
         let tree = cg_dir(&cg).parent().unwrap().to_path_buf();
         assert!(
-            !tree.exists(),
+            settle(&[bp], &tree, Duration::from_secs(5)).is_some(),
             "the broker left its cgroup tree {} behind",
             tree.display()
         );
@@ -695,10 +697,9 @@ fn cleanup_after_normal_exit_frontend_crash_and_broker_crash() {
         assert!(gone(d), "the setsid descendant survived the frontend crash");
         assert!(gone(bp), "the broker did not exit after the frontend died");
         let _ = fe.child.wait();
-        std::thread::sleep(Duration::from_millis(200));
         let tree = cg_dir(&bcg).parent().unwrap().to_path_buf();
         assert!(
-            !tree.exists(),
+            settle(&[bp], &tree, Duration::from_secs(5)).is_some(),
             "the broker left its cgroup tree {} behind",
             tree.display()
         );

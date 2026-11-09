@@ -315,19 +315,34 @@ fn name(n: Node, s: &str) -> Option<String> {
 /// path, which contains that entity's *name*, so a function nested in
 /// `fn impl_helper()` or `mod traits` was reported as a method.
 ///
-/// Only `declaration_list` (the body of an impl or trait) is looked through;
-/// any other ancestor, such as a function body, a module, a closure or a parser
-/// `ERROR` node, means the item is not associated. Looking through `ERROR` was
-/// considered and left out: no corrupted variant of the project's own sources
-/// (600+ malformed files, 3,000+ entities, `tests/code_classification.rs`)
-/// needed it, so it would be untested code.
+/// The nearest enclosing *entity-defining* node decides, which is exactly how the traversal derives
+/// `parent_syntax_path`: nodes that are not entities (blocks, declaration lists, closures, and
+/// the wrappers tree-sitter's error recovery inserts, such as `ERROR` or a MISSING-`extern`
+/// `foreign_mod_item`) share their parent's context. So the walk goes up through every such node
+/// and stops at the first impl, trait or other entity. In a tree that parsed cleanly the only
+/// node between an associated item and its impl or trait is the `declaration_list` of its body,
+/// and the result is the same as before; in a recovered tree the answer now agrees with the
+/// parent path of the same record. (Until `tests/code_classification.rs` found a counterexample
+/// the walk looked through `declaration_list` only; a recovery wrapper in an impl body then gave
+/// a record that said "function" and "my parent is an impl" at once.)
 fn is_associated_item(n: Node) -> bool {
     let mut cur = n.parent();
     while let Some(p) = cur {
         match p.kind() {
-            "declaration_list" => cur = p.parent(),
             "impl_item" | "trait_item" => return true,
-            _ => return false,
+            // the entity kinds of `visit`: an item below one of these belongs to it, not to an
+            // impl further out
+            "mod_item"
+            | "struct_item"
+            | "enum_item"
+            | "type_item"
+            | "function_item"
+            | "function_signature_item"
+            | "const_item"
+            | "static_item"
+            | "field_declaration"
+            | "use_declaration" => return false,
+            _ => cur = p.parent(),
         }
     }
     false

@@ -365,3 +365,82 @@ fn methods_are_exactly_the_items_directly_inside_impl_or_trait_on_real_sources()
         "oracle saw too little: {methods} methods, {functions} functions"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Recovered trees (found by `corrupted_real_sources_keep_the_name_independent_invariant`)
+// ---------------------------------------------------------------------------------------------
+
+/// A 96-byte reduction (delta debugging against the invariant) of a corrupted copy of
+/// `src/ingest/confined.rs`. Tree-sitter's error recovery inserts a `foreign_mod_item` (with a
+/// MISSING `extern`) into the `impl` body and `read_beneath` becomes a `function_signature_item`
+/// inside it. The traversal context passes through that wrapper, so `parent_syntax_path` was
+/// `impl:Anchor@0`, while `is_associated_item` stopped at the wrapper and answered "no": one entity
+/// record that contradicted itself (`Function` with an impl parent).
+const RECOVERED_FOREIGN_MOD_IN_IMPL: &str =
+    include_str!("fixtures/code/recovered_foreign_mod_in_impl.rs");
+
+fn in_container(e: &mindspace::core::CodeEntityDraft) -> bool {
+    e.parent_syntax_path
+        .as_deref()
+        .is_some_and(|p| p.starts_with("impl:") || p.starts_with("trait:"))
+}
+
+#[test]
+fn a_recovery_wrapper_inside_an_impl_does_not_make_the_record_contradict_itself() {
+    let d = code::parse(CodeLanguage::Rust, RECOVERED_FOREIGN_MOD_IN_IMPL);
+    // the premise: this really is a recovered tree with the three entities
+    assert_eq!(d.status, CodeParseStatus::Recovered);
+    let by_name = |n: &str| {
+        d.entities
+            .iter()
+            .find(|e| e.name.as_deref() == Some(n))
+            .unwrap_or_else(|| panic!("no entity {n}"))
+    };
+    for n in ["dup_fd", "proc_path", "read_beneath"] {
+        let e = by_name(n);
+        assert_eq!(
+            e.parent_syntax_path.as_deref(),
+            Some("impl:Anchor@0"),
+            "{n}"
+        );
+        // the invariant, entity by entity
+        assert_eq!(e.kind == Method, in_container(e), "{n} is {:?}", e.kind);
+    }
+    // and the decision this implies: the item sits in the impl with no entity in between
+    assert_eq!(by_name("read_beneath").kind, Method);
+}
+
+/// What must NOT change: for sources that parse, the nearest enclosing entity decides, exactly as
+/// before. (The corpus comparison over thousands of real files is recorded in the commit message.)
+#[test]
+fn associated_items_are_still_decided_by_the_nearest_enclosing_entity() {
+    let d = parse(
+        r#"
+extern "C" { fn ffi(); }
+mod m { extern "C" { fn ffi_in_mod(); } fn in_mod() {} }
+struct S;
+impl S {
+    fn method(&self) { fn nested_in_method() {} let _c = || { fn in_closure() {} }; }
+    const C: u8 = { fn in_assoc_const() {} 1 };
+}
+trait T { fn required(); fn provided() { fn nested_in_provided() {} } }
+fn free() { fn nested_in_free() {} }
+"#,
+    );
+    for (n, k) in [
+        ("ffi", Function),
+        ("ffi_in_mod", Function),
+        ("in_mod", Function),
+        ("method", Method),
+        ("nested_in_method", Function),
+        ("in_closure", Function),
+        ("in_assoc_const", Function),
+        ("required", Method),
+        ("provided", Method),
+        ("nested_in_provided", Function),
+        ("free", Function),
+        ("nested_in_free", Function),
+    ] {
+        assert_eq!(kind_of(&d, n), k, "{n}");
+    }
+}

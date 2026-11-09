@@ -667,6 +667,22 @@ closure, and the corpus oracle); every mutation of the rule is caught by at
 least one test; the benchmark gate is unchanged (ingest within noise, DB size
 identical).
 
+**ADR-025 addendum: classification in recovered trees (M7.3b.5b stabilization).**
+`mind-code@3` decided "method or function" by looking through the `declaration_list` of an
+impl or trait and nothing else, while the traversal derives `parent_syntax_path` by passing the
+context through *every* node that is not an entity. In a tree that parsed cleanly the two agree.
+In a recovered tree they did not: tree-sitter's error recovery can insert a wrapper into an impl
+body (for example a `foreign_mod_item` with a MISSING `extern`), and an item inside it was a
+`function` whose parent path said `impl:...` (found by the corrupted-source test; reduced to a
+96-byte fixture; 8 further cases in 14,400 corrupted variants of the project's files).
+Decision: the walk goes up through every non-entity node and stops at the first impl, trait or
+other entity, which is the traversal's own rule. Clean trees: identical (6,108 of 6,110 derivations
+of this repository and a sample of the cargo registry byte-identical; the other two are the edited
+files themselves; 25 recovered ones included). Recovered trees: `kind` can differ, nothing else.
+**The extractor version is NOT moved** (it would re-derive every file for a corner that exists
+only in malformed input); a stored `@3` derivation of such a file keeps its old `kind` until the
+file changes. Revisit if that ever matters.
+
 ## ADR-026: Agent-driven ingest behind a restrictive allowlist (2026-11-07)
 
 **Decision.** The MCP server gains `repo_outline` (read-only) and `repo_ingest`

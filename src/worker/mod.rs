@@ -8,10 +8,11 @@
 //! parent nothing but an error.
 //!
 //! Not wired into any tool: the in-process ingest is unchanged until this slice has passed its
-//! gate. Directory extraction only; the context exchange (`has_code_derivation`), Git, grants and
-//! the broker are later slices.
+//! gate. Directory extraction only; the context exchange ([`context`]) carries the little database
+//! knowledge the worker needs. Git, grants and the broker are later slices.
 
 pub mod client;
+pub mod context;
 #[cfg(all(unix, feature = "spawn-gate"))]
 pub mod gate;
 pub mod run;
@@ -24,7 +25,8 @@ use crate::ingest::code::ParsePolicy;
 /// Channel and root descriptors in the worker.
 pub const CHANNEL_FD: i32 = 3;
 pub const ROOT_FD: i32 = 4;
-pub const PROTOCOL: u32 = 1;
+/// Version 2 adds the context exchange (see [`context`]); there is no version-1 fallback.
+pub const PROTOCOL: u32 = 2;
 /// The request is one JSON line of at most this size.
 pub const MAX_REQUEST: usize = 64 * 1024;
 /// The hello is one JSON line of at most this size.
@@ -33,6 +35,7 @@ pub const MAX_HELLO: usize = 16 * 1024;
 /// What the parent asks for. The worker never chooses its own authority: the root is the
 /// descriptor it was given, and `root` only names it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub v: u32,
     pub op: Uuid,

@@ -17,9 +17,37 @@ use mindspace::ingest::deadline::Deadline;
 use mindspace::ingest::extract::{persist, Extracted, StoreContext};
 use mindspace::mcp::McpConfig;
 use mindspace::storage::Store;
-use mindspace::worker::client::{extract_directory as isolated, WorkerConfig, WorkerError};
+use mindspace::worker::client::{extract_directory as isolated_with, WorkerConfig, WorkerError};
+use mindspace::worker::context::ContextSource;
 use mindspace::{initialize, open_existing, SqliteStore};
 use std::collections::BTreeMap;
+
+/// A parent that knows no derivation and accepts any space (the context-exchange tests use a real
+/// store, see `tests/context_exchange.rs`).
+struct Blank;
+
+impl ContextSource for Blank {
+    fn space_exists(&self, _: mindspace::core::Uuid) -> mindspace::core::Result<bool> {
+        Ok(true)
+    }
+    fn derivation_known(
+        &self,
+        _: mindspace::core::CodeLanguage,
+        _: &str,
+        _: &mindspace::core::CodeParserIdentity,
+    ) -> mindspace::core::Result<bool> {
+        Ok(false)
+    }
+}
+
+fn isolated(
+    cfg: &WorkerConfig,
+    anchor: &Anchor,
+    spaces: &[mindspace::core::Uuid],
+    cancel: &AtomicBool,
+) -> Result<(Extracted, mindspace::worker::client::WorkerStats), WorkerError> {
+    isolated_with(cfg, anchor, spaces, &Blank, cancel)
+}
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -629,6 +657,10 @@ mod fake_workers {
     //! worker's confinement is turned off for them (and only for them).
     use super::*;
 
+    /// The worker's side of the handshake with an empty manifest: read the request, answer for
+    /// its operation, read the context. What the stand-in does next is the test.
+    pub(super) const HANDSHAKE: &str = r#"IFS= read -r REQ <&3; OP=$(printf '%s' "$REQ" | sed 's/.*"op":"\([^"]*\)".*/\1/'); printf '{"v":2,"op":"%s","entries":[]}\n' "$OP" >&3; IFS= read -r CTX <&3;"#;
+
     fn script(dir: &Path, body: &str) -> WorkerConfig {
         let path = dir.join("fake.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -672,7 +704,9 @@ mod fake_workers {
         assert!(matches!(r, Err(WorkerError::Died { .. })), "{r:?}");
         let (r, _) = run(&script(
             t.path(),
-            "echo hello >&3; head -c 200 /dev/zero | tr '\\0' 'A' >&3; sleep 1",
+            &format!(
+                "echo hello >&3; {HANDSHAKE} head -c 200 /dev/zero | tr '\\0' 'A' >&3; sleep 1"
+            ),
         ));
         match r {
             Err(WorkerError::Stream(m)) => assert!(m.contains("frame length"), "{m}"),
@@ -681,7 +715,7 @@ mod fake_workers {
         // a frame of another operation (a replayed stream)
         let frame = r#"{"v":1,"op":"00000000-0000-7000-8000-000000000000","seq":0,"records":[{"type":"begin","kind":"files"}]}"#;
         let body = format!(
-            "echo hello >&3; printf '\\{:03o}\\000\\000\\000' >&3; printf '%s' '{}' >&3; sleep 1",
+            "echo hello >&3; {HANDSHAKE} printf '\\{:03o}\\000\\000\\000' >&3; printf '%s' '{}' >&3; sleep 1",
             frame.len(),
             frame
         );

@@ -19,6 +19,9 @@ use crate::ingest::confined::Anchor;
 use crate::ingest::extract::Extracted;
 use crate::ingest::stream::{consume, Kind, ProducerLimits, StreamLimits};
 
+use super::context::{
+    answer, check_result, validate_spaces, ContextSource, Manifest, MAX_MANIFEST_LINE,
+};
 use super::{Hello, Request, CHANNEL_FD, MAX_HELLO, PROTOCOL, ROOT_FD};
 
 #[derive(Debug, Clone)]
@@ -78,6 +81,9 @@ pub enum WorkerError {
     /// The hard wall-clock limit or the idle limit expired; the worker's group was killed.
     Timeout(&'static str),
     Cancelled,
+    /// The context exchange was refused: a request the parent will not make (unknown space) or a
+    /// manifest that is malformed, over budget or for another operation. Nothing was persisted.
+    Context(String),
     /// The stream was malformed, truncated, over budget or inconsistent; nothing was kept.
     Stream(String),
     /// The worker ended without delivering a complete stream, or failed after it.
@@ -95,6 +101,7 @@ impl std::fmt::Display for WorkerError {
             Self::Sandbox(m) => write!(f, "the extraction worker is not confined: {m}"),
             Self::Timeout(w) => write!(f, "the extraction worker timed out ({w})"),
             Self::Cancelled => write!(f, "the extraction was cancelled"),
+            Self::Context(m) => write!(f, "the context exchange was refused: {m}"),
             Self::Stream(m) => write!(f, "the extraction worker's result was refused: {m}"),
             Self::Died { status, stderr } => {
                 write!(f, "the extraction worker ended ({status}): {stderr}")
@@ -116,6 +123,10 @@ pub struct WorkerStats {
     pub frames: u64,
     pub bytes: u64,
     pub records: u64,
+    /// Distinct source blobs the worker listed, and how many `(blob, identity)` hits the parent
+    /// returned.
+    pub manifest_entries: u64,
+    pub known_sent: u64,
     /// Peak resident set of the worker (kB) as reported by `wait4`.
     pub worker_peak_rss_kb: i64,
     pub exit: String,
@@ -311,9 +322,19 @@ pub fn extract_directory(
     cfg: &WorkerConfig,
     anchor: &Anchor,
     spaces: &[Uuid],
+    ctx: &dyn ContextSource,
     cancel: &AtomicBool,
 ) -> Result<(Extracted, WorkerStats), WorkerError> {
     let begun = Instant::now();
+    // the parent decides what may be asked: spaces are checked here, before anything is started
+    validate_spaces(spaces).map_err(WorkerError::Context)?;
+    for id in spaces {
+        match ctx.space_exists(*id) {
+            Ok(true) => {}
+            Ok(false) => return Err(WorkerError::Context(format!("space {id} does not exist"))),
+            Err(e) => return Err(WorkerError::Context(format!("checking space {id}: {e}"))),
+        }
+    }
     let (parent_end, child_end) =
         UnixStream::pair().map_err(|e| WorkerError::Spawn(format!("socketpair: {e}")))?;
     let root = anchor
@@ -334,7 +355,7 @@ pub fn extract_directory(
     let stderr = child.stderr.take();
 
     let outcome = run_session(
-        cfg, anchor, spaces, cancel, parent_end, begun, pid, &mut stats,
+        cfg, anchor, spaces, ctx, cancel, parent_end, begun, pid, &mut stats,
     );
 
     // Did the worker end by itself? (Asked before we end it; a stream that stops short usually
@@ -414,6 +435,7 @@ fn run_session(
     cfg: &WorkerConfig,
     anchor: &Anchor,
     spaces: &[Uuid],
+    ctx: &dyn ContextSource,
     cancel: &AtomicBool,
     parent_end: UnixStream,
     begun: Instant,
@@ -491,8 +513,47 @@ fn run_session(
         .write_all(&bytes)
         .map_err(|e| WorkerError::Io(format!("sending the request: {e}")))?;
 
-    // 3. the stream, validated record by record; nothing is returned unless it is complete
-    match consume(
+    // 3. the context exchange: the worker lists the blobs it would parse, the parent answers with
+    //    the derivations it already has (nothing else about its database)
+    let mut line = Vec::new();
+    match (&mut reader)
+        .take(MAX_MANIFEST_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)
+    {
+        Ok(0) => {
+            return Err(by_cause(WorkerError::Died {
+                status: "closed the channel before the manifest".into(),
+                stderr: String::new(),
+            }))
+        }
+        Ok(_) if line.last() == Some(&b'\n') => {}
+        Ok(_) if line.len() > MAX_MANIFEST_LINE => {
+            return Err(WorkerError::Context("the manifest is too long".into()))
+        }
+        Ok(_) => {
+            return Err(by_cause(WorkerError::Died {
+                status: "the manifest is truncated".into(),
+                stderr: String::new(),
+            }))
+        }
+        Err(e) => return Err(by_cause(WorkerError::Io(e.to_string()))),
+    }
+    let manifest: Manifest = serde_json::from_slice(&line)
+        .map_err(|e| WorkerError::Context(format!("unreadable manifest: {e}")))?;
+    manifest.validate(op).map_err(WorkerError::Context)?;
+    let policy = cfg.producer.parse_policy;
+    let context = answer(ctx, op, &policy, &manifest)
+        .map_err(|e| WorkerError::Context(format!("answering the manifest: {e}")))?;
+    stats.manifest_entries = manifest.entries.len() as u64;
+    stats.known_sent = context.known.len() as u64;
+    let mut bytes = serde_json::to_vec(&context).map_err(|e| WorkerError::Io(e.to_string()))?;
+    bytes.push(b'\n');
+    (&writer)
+        .write_all(&bytes)
+        .map_err(|e| by_cause(WorkerError::Io(format!("sending the context: {e}"))))?;
+
+    // 4. the stream, validated record by record; nothing is returned unless it is complete
+    let extracted = match consume(
         &mut reader,
         op,
         Kind::Files,
@@ -504,10 +565,15 @@ fn run_session(
             stats.frames = st.frames;
             stats.bytes = st.bytes;
             stats.records = st.records;
-            Ok(extracted)
+            extracted
         }
-        Err(e) => Err(by_cause(WorkerError::Stream(e.to_string()))),
+        Err(e) => return Err(by_cause(WorkerError::Stream(e.to_string()))),
+    };
+    // 5. the result against what was asked, still before anything is persisted
+    if let Extracted::Files(files) = &extracted {
+        check_result(files, spaces, &policy).map_err(WorkerError::Stream)?;
     }
+    Ok(extracted)
 }
 
 fn verify_hello(h: &Hello, pid: u32, via_proc: bool) -> Result<(), WorkerError> {

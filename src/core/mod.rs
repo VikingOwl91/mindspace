@@ -927,7 +927,7 @@ pub struct ObservedFile {
 
 // Syntax-derived facts deliberately do not enter the Evidence/Assertion/
 // Memory spine. Positions are half-open bytes plus one-based line/columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeLanguage {
     Rust,
@@ -1021,7 +1021,7 @@ pub struct CodeRange {
     pub end_line: u32,
     pub end_column: u32,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CodeParserIdentity {
     pub extractor: String,
     pub extractor_version: String,

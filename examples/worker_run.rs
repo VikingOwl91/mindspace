@@ -8,6 +8,23 @@ use mindspace::ingest::confined::Anchor;
 use mindspace::mcp::McpConfig;
 use mindspace::worker::client::{extract_directory, WorkerConfig};
 
+/// No database: any space is accepted and no derivation is known (every source is parsed).
+struct NoDb;
+
+impl mindspace::worker::context::ContextSource for NoDb {
+    fn space_exists(&self, _: mindspace::core::Uuid) -> mindspace::core::Result<bool> {
+        Ok(true)
+    }
+    fn derivation_known(
+        &self,
+        _: mindspace::core::CodeLanguage,
+        _: &str,
+        _: &mindspace::core::CodeParserIdentity,
+    ) -> mindspace::core::Result<bool> {
+        Ok(false)
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let dir = std::fs::canonicalize(&a[1]).unwrap();
@@ -78,7 +95,7 @@ fn main() {
     }
     let ids = vec![];
     let t = Instant::now();
-    let r = extract_directory(&cfg, &anchor, &ids, &cancel);
+    let r = extract_directory(&cfg, &anchor, &ids, &NoDb, &cancel);
     let wall_ms = t.elapsed().as_secs_f64() * 1000.0;
     let gone = {
         let p = pid.load(std::sync::atomic::Ordering::SeqCst);

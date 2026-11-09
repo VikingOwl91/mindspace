@@ -138,7 +138,13 @@ pub fn run(store: &dyn Store, config: &McpConfig, root_arg: &str) -> Result<()> 
         });
     }
     let cancel = AtomicBool::new(false);
-    let result = super::client::extract_directory(&cfg, &anchor, &[space], &cancel);
+    let result = super::client::extract_directory(
+        &cfg,
+        &anchor,
+        &[space],
+        &crate::ingest::extract::StoreContext(store),
+        &cancel,
+    );
     let worker_pid = pid.load(std::sync::atomic::Ordering::SeqCst);
     match result {
         Ok((extracted, stats)) => {

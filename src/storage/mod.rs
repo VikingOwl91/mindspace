@@ -61,6 +61,11 @@ pub trait Store {
     /// structure derived from its source files. Either everything commits (as one recording
     /// revision) or nothing does. `report.code` carries the code counters.
     ///
+    ///
+    /// Error contract: `Error::CommitOutcomeUnknown` is the ONLY error after which the data may
+    /// have been committed (the COMMIT itself failed in a way that does not say). Every other
+    /// error means nothing was committed and no recording revision was consumed.
+    ///
     /// `before_commit` runs after every write succeeded and immediately before the COMMIT, still
     /// inside the transaction. If it fails the transaction is rolled back and its error is returned:
     /// nothing is committed. (This is the hook for a commit-time authorization decision.)

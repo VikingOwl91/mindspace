@@ -37,7 +37,8 @@ use crate::ingest::deadline::Deadline;
 use crate::ingest::extract::{persist_files_gated, Extracted, StoreContext};
 use crate::storage::Store;
 use crate::worker::client::{
-    commit_done, commit_request, extract_via_broker, WorkerConfig, WorkerError,
+    commit_begin, commit_done, commit_request, extract_via_broker, CommitAnswer, WorkerConfig,
+    WorkerError,
 };
 
 use super::repo_tools::{summarize, McpConfig, MAX_UNSCOPED_INGEST_FILES};
@@ -86,11 +87,27 @@ fn failure(kind: &str, message: impl Into<String>) -> ToolFailure {
 }
 
 fn failure_with(kind: &str, message: impl Into<String>, persisted: Value) -> ToolFailure {
+    failure_commit(kind, message, "NOT_STARTED", persisted)
+}
+
+/// `commit_state`: NOT_STARTED (failed before any write), ROLLED_BACK (nothing committed, certain)
+/// or UNKNOWN (see the persistence section).
+fn failure_commit(
+    kind: &str,
+    message: impl Into<String>,
+    commit_state: &str,
+    persisted: Value,
+) -> ToolFailure {
     let message = message.into();
-    let structured = json!({
+    let mut structured = json!({
         "error": { "kind": kind, "message": message },
-        "persisted": persisted
+        "persisted": persisted,
+        "commit_state": commit_state
     });
+    if commit_state != "NOT_STARTED" {
+        // one transaction: everything or nothing
+        structured["atomic"] = json!(true);
+    }
     ToolFailure {
         message: structured.to_string(),
         structured: Some(structured),
@@ -161,6 +178,22 @@ fn gate_pause(var: &str) {
     }
 }
 
+/// Test builds only: with `<var>=<prefix>` creates `<prefix>.committed` and returns.
+#[cfg(feature = "spawn-gate")]
+fn gate_mark(var: &str) {
+    if let Some(prefix) = std::env::var_os(var) {
+        let mut p = prefix;
+        p.push(".committed");
+        // the instant itself (ns since the epoch, same clock as the test's), not the file's mtime:
+        // file times use a coarse clock that can lag the real time by milliseconds
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let _ = std::fs::write(std::path::PathBuf::from(p), ns.to_string());
+    }
+}
+
 /// Own cgroup as the kernel reports it (`/proc/self` is the one entry the sandbox allows).
 fn own_cgroup() -> Option<String> {
     std::fs::read_to_string("/proc/self/cgroup")
@@ -214,7 +247,14 @@ pub fn run(
     for n in &names {
         let id = store
             .get_space(n)
-            .map_err(|e| failure("unknown_space", e.to_string()))?
+            .map_err(|e| match e {
+                crate::core::Error::ConnectionDiscarded => failure(
+                    "store_discarded",
+                    "the database handle of this server was discarded after an uncertain commit \
+                     outcome; restart the server",
+                ),
+                other => failure("unknown_space", other.to_string()),
+            })?
             .id;
         if ids.contains(&id) {
             return Err(failure("invalid_argument", "a space is named twice"));
@@ -290,6 +330,12 @@ pub fn run(
     // commit-time authorization decision from the broker taken inside it, immediately before the
     // COMMIT. A denial rolls the transaction back. While the commit runs the broker holds the
     // grant store's shared lock, so a revocation that starts now is ordered after the commit.
+    //
+    // The outcome is one of three, never inferred from whether a message arrived:
+    //   COMMITTED   the storage layer returned Ok: SQLite's COMMIT succeeded.
+    //   ROLLED_BACK any other error: nothing was committed (statement error, denied lease, a
+    //               COMMIT that SQLite defines as not committed).
+    //   UNKNOWN     `CommitOutcomeUnknown`: the COMMIT failed in a way that does not say.
     let Extracted::Files(files) = extracted else {
         return Err(failure(
             "result_refused",
@@ -297,63 +343,145 @@ pub fn run(
         ));
     };
     let leased = Cell::new(false);
-    let denial: RefCell<Option<String>> = RefCell::new(None);
+    let lost = Cell::new(false);
+    let denial: RefCell<Option<(&'static str, String)>> = RefCell::new(None);
     let t_persist = Instant::now();
+    #[cfg(feature = "spawn-gate")]
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        // one-shot per server: the first persistence is faulted, later ones are not
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        if !ARMED.swap(true, SeqCst) {
+            if std::env::var_os("MINDSPACE_STORE_GATE_FAIL_COMMIT").is_some() {
+                crate::storage::sqlite::gate::FAIL_COMMIT.store(true, SeqCst);
+            }
+            if std::env::var_os("MINDSPACE_STORE_GATE_LOSE_ACK").is_some() {
+                crate::storage::sqlite::gate::LOSE_ACK.store(true, SeqCst);
+            }
+            if std::env::var_os("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT").is_some() {
+                crate::storage::sqlite::gate::PAUSE_IN_COMMIT.store(true, SeqCst);
+            }
+        }
+    }
     let result = persist_files_gated(store, files, &Deadline::none(), &|| {
         #[cfg(feature = "spawn-gate")]
         gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE");
+        let refuse = |kind: &'static str, why: String| {
+            *denial.borrow_mut() = Some((kind, why.clone()));
+            Err(crate::core::Error::Storage(format!(
+                "the commit was not authorized: {why}"
+            )))
+        };
         match commit_request(&link, rep.op) {
-            Ok(()) => {
+            CommitAnswer::Granted => {
                 leased.set(true);
                 let granted_at = Instant::now();
                 #[cfg(feature = "spawn-gate")]
                 gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER");
-                // The broker lets revocations proceed after COMMIT_HOLD_MAX. A commit must end
+                // The broker may have died during the lease (its lock dies with it, and a
+                // revocation could then complete). A live link has nothing to read.
+                if !link_idle(&link) {
+                    return refuse(
+                        "broker_unavailable",
+                        "the broker is not available (it went away during the commit lease)"
+                            .to_string(),
+                    );
+                }
+                // The broker lets revocations proceed after COMMIT_HOLD_MAX. A commit must start
                 // inside the lease: use a shorter budget here (the broker's clock started
                 // earlier than this one) and abandon the commit otherwise.
                 if granted_at.elapsed() >= LEASE_BUDGET {
-                    *denial.borrow_mut() =
-                        Some("the commit lease expired before the commit".to_string());
-                    return Err(crate::core::Error::Storage(
+                    return refuse(
+                        "commit_not_authorized",
                         "the commit lease expired before the commit".to_string(),
-                    ));
+                    );
+                }
+                // From here the broker keeps the lease for as long as the COMMIT runs (up to its
+                // in-flight ceiling, after which it removes this process). A broker that is gone
+                // refuses nothing and needs nothing: the commit is not started.
+                if let Err(why) = commit_begin(&link) {
+                    return refuse("broker_unavailable", why);
                 }
                 Ok(())
             }
-            Err(reason) => {
-                *denial.borrow_mut() = Some(reason.clone());
-                Err(crate::core::Error::Storage(format!(
-                    "the commit was not authorized: {reason}"
-                )))
+            CommitAnswer::Denied(reason) => refuse("revoked", reason),
+            CommitAnswer::Lost(reason) => {
+                // The broker may still answer later and may then hold a lease: the link is out
+                // of step and is not used again; a best-effort release follows below.
+                lost.set(true);
+                leased.set(true);
+                let kind = if reason.contains("broker is not available") {
+                    "broker_unavailable"
+                } else {
+                    "commit_not_authorized"
+                };
+                refuse(kind, reason)
             }
         }
     });
-    if leased.get() {
-        commit_done(&link); // success or not: the lease ends with the commit attempt
+    if result.is_ok() {
+        #[cfg(feature = "spawn-gate")]
+        {
+            gate_mark("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED");
+            gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED");
+        }
+    }
+    // The lease ends with the commit attempt, AFTER the COMMIT returned (never before it).
+    #[allow(unused_mut)]
+    let mut send_done = leased.get();
+    #[cfg(feature = "spawn-gate")]
+    if std::env::var_os("MINDSPACE_ISOLATED_GATE_DROP_COMMIT_DONE").is_some() {
+        send_done = false; // a lost completion message: the broker's ceiling ends the lease
+    }
+    if send_done {
+        commit_done(&link);
     }
     drop(link);
-    let persist_ms = t_persist.elapsed().as_millis() as u64;
-    if let Some(reason) = denial.into_inner() {
-        // rolled back before the COMMIT: nothing was written, which is certain
-        let kind = if reason.contains("broker is not available") {
-            "broker_unavailable"
-        } else if reason.contains("lease expired") {
-            "commit_not_authorized"
-        } else {
-            "revoked"
-        };
-        return Err(failure(kind, format!("the commit was refused: {reason}")));
+    if lost.get() {
+        iso.poisoned.store(true, Ordering::SeqCst);
     }
-    let report = result.map_err(|e| {
-        let mut f = failure_with("persist_failed", e.to_string(), json!("unknown"));
-        // the single transaction either committed everything or nothing; only a failure of the
-        // COMMIT itself leaves the outcome unknown
-        if let Some(s) = f.structured.as_mut() {
-            s["atomic"] = json!(true);
-            f.message = s.to_string();
+    let persist_ms = t_persist.elapsed().as_millis() as u64;
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => {
+            if let Some((kind, why)) = denial.into_inner() {
+                return Err(failure_commit(
+                    kind,
+                    format!("the commit was refused: {why}"),
+                    "ROLLED_BACK",
+                    json!(false),
+                ));
+            }
+            return Err(match e {
+                crate::core::Error::CommitOutcomeUnknown { detail } => failure_commit(
+                    "commit_outcome_unknown",
+                    format!(
+                        "the outcome of the database commit is unknown ({detail}); do not assume \
+                         either result. The database handle of this server was discarded: restart \
+                         the server, then ingest the same directory again (it reuses what was \
+                         committed)"
+                    ),
+                    "UNKNOWN",
+                    json!("unknown"),
+                ),
+                // the handle was discarded by an earlier uncertain outcome: it refuses to start a
+                // write, so nothing was written (but the worker ran for nothing)
+                crate::core::Error::ConnectionDiscarded => failure_commit(
+                    "store_discarded",
+                    "the database handle of this server was discarded after an uncertain commit \
+                     outcome; restart the server",
+                    "NOT_STARTED",
+                    json!(false),
+                ),
+                other => failure_commit(
+                    "persist_failed",
+                    other.to_string(),
+                    "ROLLED_BACK",
+                    json!(false),
+                ),
+            });
         }
-        f
-    })?;
+    };
     let outcome = crate::core::IngestOutcome::Files(report);
     let authority = match rep.authority {
         crate::worker::broker::AuthoritySource::Static => "static_root",
@@ -391,6 +519,7 @@ pub fn run(
             "note": "there is no aggregate per-operation memory limit; only the wall clock, the stream limits and the structural parse policy bound the operation",
         },
         "persist_ms": persist_ms,
+        "commit_state": "COMMITTED",
         "commit_authorization": "granted by the broker immediately before the COMMIT",
         "elapsed_ms": t0.elapsed().as_millis() as u64,
         "sandbox": config.sandbox().label(),

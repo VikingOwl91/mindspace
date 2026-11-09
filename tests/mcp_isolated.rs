@@ -85,7 +85,7 @@ impl World {
         [
             "sources",
             "code_derivations",
-            "observations",
+            "ingest_sessions",
             "code_entities",
         ]
         .iter()
@@ -1068,9 +1068,9 @@ fn revocation_during_persistence_waits_for_the_commit_and_is_ordered_after_it() 
 }
 
 #[test]
-fn a_stalled_frontend_cannot_hold_a_revocation_longer_than_the_lease_ceiling() {
+fn a_frontend_that_never_begins_its_commit_is_removed_at_the_grant_ceiling() {
     let w = World::new();
-    let (project, dynamic) = grant_world(&w, &[("x.rs", "pub fn stalled_symbol() {}\n")]);
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
     let pause = Pause::new(&w, "stalled");
     let mut m = mcp!(
         w,
@@ -1079,32 +1079,32 @@ fn a_stalled_frontend_cannot_hold_a_revocation_longer_than_the_lease_ceiling() {
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
     );
     w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
-    let before = w.rows();
-    let id = m.send_call(
+    let before = w.dump();
+    let frontend = m.child.id();
+    m.send_call(
         TOOL,
         json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
     );
-    pause.wait_reached();
+    pause.wait_reached(); // leased, nothing begun: the frontend stalls here
     let gid = w.grant_id(&dynamic);
-    let t = Instant::now();
-    // the frontend stays stalled: the revocation is delayed by the lease ceiling, not blocked
-    w.ok(&["grant", "revoke", &gid]);
-    let waited = t.elapsed();
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(stays_blocked(&mut revoke, Duration::from_millis(1000)));
+    // the policy: the broker removes the frontend, THEN the lock is released
+    let waited = exits_within(&mut revoke, Duration::from_secs(10)).expect("the lease never ended");
+    assert!(revoke.wait().unwrap().success());
     assert!(
-        waited >= Duration::from_millis(2500) && waited < Duration::from_secs(8),
-        "revoke waited {waited:?} (ceiling 3 s)"
+        !alive(frontend),
+        "the stalled frontend must be gone when the revocation completes"
     );
     pause.go();
-    // the late frontend finds its lease expired and does NOT commit
-    let r = m.read_result(id);
-    assert_eq!(err_kind(&r), "commit_not_authorized", "{r}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(w.integrity(), "ok");
     assert_eq!(
-        w.rows(),
+        w.dump(),
         before,
-        "a commit after a completed revocation never happens"
+        "a removed frontend cannot commit afterwards"
     );
-    eprintln!("stalled frontend: revoke waited {waited:?}, commit abandoned");
-    m.finish();
+    eprintln!("stalled before COMMIT: frontend removed, revocation completed after the grant ceiling ({waited:?} after the stall began)");
 }
 
 #[test]
@@ -1185,6 +1185,818 @@ fn the_unscoped_file_limit_of_repo_ingest_applies_and_a_refusal_is_early_and_cle
     eprintln!(
         "2001 files refused after {took:?}; exactly 2000 files ingested in {:?}",
         t2.elapsed()
+    );
+    m.finish();
+}
+
+// ------------------------------------------------------------------ commit-boundary fault injection
+//
+// Commit states (never inferred from whether a message arrived):
+//   COMMITTED    the storage layer returned Ok.
+//   ROLLED_BACK  any other error: nothing was committed (and no recording revision consumed).
+//   UNKNOWN      `CommitOutcomeUnknown`: the COMMIT failed in a way that does not say.
+// Ordering on the success path: SQLite COMMIT returns -> frontend sends `CommitDone` -> broker
+// releases the grant store's shared lock. Process death anywhere releases the lock (the kernel
+// drops flock with the descriptor; the broker also releases on hang-up and after 3 s).
+
+impl World {
+    fn dump(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let c = rusqlite::Connection::open_with_flags(
+            &self.db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let tables: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        let mut out = std::collections::BTreeMap::new();
+        for t in tables {
+            let cols: Vec<String> = c
+                .prepare(&format!("PRAGMA table_info(\"{t}\")"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .flatten()
+                .collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let expr = cols
+                .iter()
+                .map(|n| format!("quote(\"{n}\")"))
+                .collect::<Vec<_>>()
+                .join("||'|'||");
+            let mut rows: Vec<String> = c
+                .prepare(&format!("SELECT {expr} FROM \"{t}\""))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect();
+            rows.sort();
+            out.insert(t, rows);
+        }
+        out
+    }
+    fn count(&self, table: &str) -> i64 {
+        rusqlite::Connection::open_with_flags(&self.db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+    fn integrity(&self) -> String {
+        rusqlite::Connection::open(&self.db)
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap()
+    }
+    /// The tables a repeated ingestion must not grow (derived structure is keyed by content).
+    fn structure(&self) -> Vec<i64> {
+        [
+            "sources",
+            "code_inputs",
+            "code_derivations",
+            "code_entities",
+            "code_contexts",
+        ]
+        .iter()
+        .map(|t| self.count(t))
+        .collect()
+    }
+    fn revoke_bg(&self, gid: &str) -> std::process::Child {
+        self.mind(&["grant", "revoke", gid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+}
+
+impl Pause {
+    /// The instant the frontend recorded right after its COMMIT returned (ns since the epoch).
+    fn committed_ns(&self) -> u128 {
+        std::fs::read_to_string(self.file(".committed"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+    fn reset(&self) {
+        for e in [".reached", ".go", ".committed"] {
+            let _ = std::fs::remove_file(self.file(e));
+        }
+    }
+}
+
+/// Waits for a child, up to `limit`; returns how long it took, or None if it is still running.
+fn exits_within(child: &mut std::process::Child, limit: Duration) -> Option<Duration> {
+    let t = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return Some(t.elapsed());
+        }
+        if t.elapsed() >= limit {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// True if the child has NOT exited after `window` (it is blocked, e.g. on the grant lock).
+fn stays_blocked(child: &mut std::process::Child, window: Duration) -> bool {
+    exits_within(child, window).is_none()
+}
+
+fn kill(pid: i32) {
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+fn fault_state(r: &Value) -> (String, Value) {
+    (
+        r["structuredContent"]["commit_state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        r["structuredContent"]["persisted"].clone(),
+    )
+}
+
+const SYMBOL_FILES: &[(&str, &str)] = &[
+    ("x.rs", "pub fn fault_symbol() {}\nstruct S;\n"),
+    ("d.md", "# D\n\nbody\n"),
+];
+
+// 1 ------------------------------------------------------------------------------------------
+
+#[test]
+fn frontend_crash_before_commit_leaves_no_trace_and_no_lock_and_a_retry_is_clean() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "p1");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached(); // the write transaction is open and uncommitted
+    let (wd, br) = (m.watchdog as u32, m.broker as u32);
+    kill(m.child.id() as i32);
+    let _ = m.child.wait();
+    assert!(gone(wd) && gone(br));
+    // SQLite recovers the log: the uncommitted transaction left nothing, not even a revision
+    assert_eq!(w.integrity(), "ok");
+    assert_eq!(w.dump(), before);
+    // the broker had not taken the lock yet: a revocation is not delayed at all
+    let gid = w.grant_id(&dynamic);
+    let t = Instant::now();
+    w.ok(&["grant", "revoke", &gid]);
+    assert!(t.elapsed() < Duration::from_secs(2));
+    // a retry from a new server equals one clean ingestion
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let mut m2 = mcp!(w, &[&project], OPT_IN, &[]);
+    let r = m2.ingest(&dynamic);
+    assert_eq!(r["isError"], false, "{r}");
+    let reference = World::new();
+    let rdir = reference.dir("dynamic", SYMBOL_FILES);
+    let rp = reference.dir("project", &[("a.md", "# A\n")]);
+    let mut mr = mcp!(reference, &[&rp, &rdir], &[], &[]);
+    assert_eq!(
+        mr.call(
+            "repo_ingest",
+            json!({"path": rdir.to_str().unwrap(), "spaces": ["p"]})
+        )["isError"],
+        false
+    );
+    assert_eq!(w.structure(), reference.structure());
+    m2.finish();
+    mr.finish();
+}
+
+// 2 ------------------------------------------------------------------------------------------
+
+#[test]
+fn frontend_crash_right_after_commit_keeps_the_data_frees_the_lock_and_a_retry_adds_no_structure() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "p2");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before_rows = w.rows();
+    m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached(); // COMMIT returned; CommitDone not sent; the broker still holds the lock
+    assert!(
+        w.rows() > before_rows,
+        "committed and visible to another connection"
+    );
+    let committed = w.dump();
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(
+        stays_blocked(&mut revoke, Duration::from_millis(300)),
+        "the lease is still held"
+    );
+    kill(m.child.id() as i32);
+    let _ = m.child.wait();
+    // the hang-up releases the lock: the revocation completes, long before the 3 s ceiling
+    let waited = exits_within(&mut revoke, Duration::from_secs(2))
+        .expect("the lock leaked after the frontend died");
+    assert!(revoke.wait().unwrap().success());
+    assert_eq!(w.integrity(), "ok");
+    assert_eq!(w.dump(), committed, "the crash changed nothing");
+    // retry (the client never got an answer): no duplicate structure, one more observation
+    let structure = w.structure();
+    let observations = w.count("ingest_sessions");
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let mut m2 = mcp!(w, &[&project], OPT_IN, &[]);
+    let r = m2.ingest(&dynamic);
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(
+        r["structuredContent"]["context_exchange"]["known_derivations_reused"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        w.structure(),
+        structure,
+        "a retry after an uncertain outcome adds no derived structure"
+    );
+    assert_eq!(
+        w.count("ingest_sessions"),
+        observations + 1,
+        "documented: exactly-once needs operation ids"
+    );
+    eprintln!("frontend crash after COMMIT: lock released {waited:?} after the crash");
+    m2.finish();
+}
+
+// 3 ------------------------------------------------------------------------------------------
+
+#[test]
+fn broker_crash_before_the_commit_is_granted_rolls_back() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "p3");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached();
+    kill(m.broker);
+    assert!(gone(m.broker as u32));
+    pause.go();
+    let r = m.read_result(id);
+    assert_eq!(err_kind(&r.clone()).as_str(), "broker_unavailable", "{r}");
+    assert_eq!(fault_state(&r).0, "ROLLED_BACK");
+    assert_eq!(w.dump(), before, "no unauthorized commit");
+    assert!(alive(m.child.id()));
+    m.finish();
+}
+
+// 4 ------------------------------------------------------------------------------------------
+
+#[test]
+fn broker_crash_while_holding_the_grant_lock_frees_it_and_the_frontend_does_not_commit() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "p4");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached(); // lease granted, lock held, nothing committed
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(stays_blocked(&mut revoke, Duration::from_millis(300)));
+    kill(m.broker); // the lock dies with the process
+    let waited = exits_within(&mut revoke, Duration::from_secs(2))
+        .expect("the lock leaked after the broker died");
+    assert!(revoke.wait().unwrap().success());
+    // the revocation has completed; only now does the frontend resume: it must NOT commit
+    pause.go();
+    let r = m.read_result(id);
+    assert_eq!(err_kind(&r.clone()).as_str(), "broker_unavailable", "{r}");
+    assert_eq!(fault_state(&r).0, "ROLLED_BACK");
+    assert_eq!(w.dump(), before, "no commit after the revocation completed");
+    eprintln!("broker crash during the lease: revocation completed {waited:?} after the kill");
+    m.finish();
+}
+
+// 5 ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_lost_completion_message_costs_the_frontend_at_the_in_flight_ceiling_and_the_data_is_committed()
+{
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[
+            ("MINDSPACE_ISOLATED_GATE_DROP_COMMIT_DONE", "1".into()),
+            ("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS", "2500".into()),
+        ]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let frontend = m.child.id();
+    let r = m.ingest(&dynamic);
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["commit_state"], "COMMITTED");
+    assert!(w.count("code_derivations") > 0);
+    let committed = w.dump();
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    let waited = exits_within(&mut revoke, Duration::from_secs(10)).expect("the lease never ended");
+    assert!(revoke.wait().unwrap().success());
+    assert!(
+        waited >= Duration::from_millis(2000),
+        "the lease must hold to the ceiling: {waited:?}"
+    );
+    // the broker cannot tell a lost message from a stalled COMMIT: it removed the frontend first
+    assert!(!alive(frontend));
+    assert_eq!(w.dump(), committed);
+    eprintln!(
+        "lost CommitDone: revoke waited {waited:?}, the frontend was removed, data stays committed"
+    );
+}
+
+// 6 ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_commit_decision_that_arrives_too_late_rolls_back_and_the_link_is_not_reused() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_BROKER_GATE_COMMIT_REPLY_DELAY_MS", "4000".into())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    let t = Instant::now();
+    let r = m.ingest(&dynamic);
+    let took = t.elapsed();
+    assert_eq!(err_kind(&r), "commit_not_authorized", "{r}");
+    assert_eq!(fault_state(&r).0, "ROLLED_BACK");
+    assert!(
+        took >= Duration::from_millis(2800) && took < Duration::from_secs(8),
+        "{took:?}"
+    );
+    assert_eq!(
+        w.dump(),
+        before,
+        "a lost answer is a refusal, never a commit"
+    );
+    // the broker may still answer later: the link is out of step and is not used again
+    let r = m.ingest(&dynamic);
+    assert_eq!(err_kind(&r), "broker_unavailable", "{r}");
+    // the lease the broker granted late ends at once (the frontend's best-effort release)
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(
+        exits_within(&mut revoke, Duration::from_secs(8)).is_some(),
+        "the late lease leaked"
+    );
+    m.finish();
+}
+
+// 7 ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_frontend_stalled_after_the_commit_is_removed_and_the_committed_data_stays() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "p7");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[
+            ("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED", pause.var()),
+            ("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS", "2500".into()),
+        ]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let frontend = m.child.id();
+    m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached(); // COMMITTED; the frontend sits on its completion message
+    let committed = w.dump();
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    let waited = exits_within(&mut revoke, Duration::from_secs(10))
+        .expect("the ceiling did not end the lease");
+    assert!(revoke.wait().unwrap().success());
+    assert!(waited >= Duration::from_millis(2000), "{waited:?}");
+    assert!(!alive(frontend), "removed before the lock was released");
+    assert_eq!(w.integrity(), "ok");
+    assert_eq!(w.dump(), committed, "the data is committed and stays");
+}
+
+// 8 ------------------------------------------------------------------------------------------
+
+#[test]
+fn revocation_racing_the_commit_boundary_is_always_ordered_one_way_or_the_other() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "p8");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[
+            ("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var()),
+            ("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED", pause.var()),
+        ]
+    );
+    let (mut committed, mut denied) = (0, 0);
+    for i in 0..14 {
+        w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+        pause.reset();
+        let before = w.dump();
+        let id = m.send_call(
+            TOOL,
+            json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+        );
+        pause.wait_reached();
+        let gid = w.grant_id(&dynamic);
+        // the two orders alternate: revocation first / release first. No sleeps between them.
+        let mut revoke;
+        if i % 2 == 0 {
+            revoke = w.revoke_bg(&gid);
+            pause.go();
+        } else {
+            pause.go();
+            revoke = w.revoke_bg(&gid);
+        }
+        let r = m.read_result(id);
+        assert!(exits_within(&mut revoke, Duration::from_secs(8)).is_some());
+        let revoke_done = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        assert!(revoke.wait().unwrap().success());
+        if r["isError"] == false {
+            committed += 1;
+            // a revocation can complete only after the commit it raced with: the lock orders it
+            assert!(
+                pause.committed_ns() <= revoke_done,
+                "iteration {i}: the revocation completed BEFORE the commit"
+            );
+            assert!(w.dump() != before);
+        } else {
+            denied += 1;
+            assert_eq!(err_kind(&r), "revoked", "iteration {i}: {r}");
+            assert_eq!(
+                w.dump(),
+                before,
+                "iteration {i}: a denied commit left a trace"
+            );
+            assert!(!pause.file(".committed").exists());
+        }
+    }
+    eprintln!("racing revocation, 14 iterations: {committed} committed (revoke ordered after), {denied} denied (rolled back)");
+    m.finish();
+}
+
+// 9 ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_failed_sqlite_commit_is_rolled_back_and_costs_no_revision() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_STORE_GATE_FAIL_COMMIT", "1".into())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    let revisions = w.count("m6_revisions");
+    // a real SQLite COMMIT failure (the commit hook vetoes): SQLite turns it into a rollback
+    let r = m.ingest(&dynamic);
+    assert_eq!(err_kind(&r), "persist_failed", "{r}");
+    assert_eq!(fault_state(&r).0, "ROLLED_BACK");
+    assert_eq!(w.dump(), before);
+    assert_eq!(
+        w.count("m6_revisions"),
+        revisions,
+        "a rolled-back ingestion consumed a revision"
+    );
+    assert_eq!(w.integrity(), "ok");
+    // the lease ended with the attempt: a revocation is not delayed
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(
+        exits_within(&mut revoke, Duration::from_secs(2)).is_some(),
+        "the lock leaked"
+    );
+    // the fault was one-shot: a retry succeeds and costs exactly one revision
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let r = m.ingest(&dynamic);
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(w.count("m6_revisions"), revisions + 1);
+    m.finish();
+}
+
+#[test]
+fn an_unknown_commit_outcome_is_never_reported_as_success_and_a_retry_is_consistent() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_STORE_GATE_LOSE_ACK", "1".into())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before_rows = w.rows();
+    // the COMMIT really succeeds, but the storage layer reports that it does not know
+    let r = m.ingest(&dynamic);
+    assert_eq!(r["isError"], true, "no false success: {r}");
+    assert_eq!(err_kind_unknown(&r), "commit_outcome_unknown", "{r}");
+    assert_eq!(fault_state(&r), ("UNKNOWN".to_string(), json!("unknown")));
+    assert!(
+        w.rows() > before_rows,
+        "the data is in fact committed: the tool must not claim otherwise"
+    );
+    assert_eq!(w.integrity(), "ok");
+    let structure = w.structure();
+    // the handle was discarded (as for a real unknown outcome): this server says so explicitly
+    let r = m.ingest(&dynamic);
+    assert_eq!(err_kind(&r), "store_discarded", "{r}");
+    m.finish();
+    // the documented remedy: restart, then ingest the same directory again. It reuses everything.
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let mut m2 = mcp!(w, &[&project], OPT_IN, &[]);
+    let r = m2.ingest(&dynamic);
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(
+        r["structuredContent"]["context_exchange"]["known_derivations_reused"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        w.structure(),
+        structure,
+        "no inconsistent or duplicate derivations after the retry"
+    );
+    assert_eq!(w.integrity(), "ok");
+    m2.finish();
+}
+
+fn err_kind_unknown(r: &Value) -> String {
+    r["structuredContent"]["error"]["kind"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+// ------------------------------------------------------------------ COMMIT held beyond the lease
+//
+// Invariant I: a `mind grant revoke` that returns success never completes while an
+// already-authorized COMMIT is still in flight (the committing process alive, the COMMIT not
+// finished). The COMMIT must have finished, or the process that could finish it must be dead.
+
+/// Who holds a flock on the grant store, from the kernel's own table: `(pid, "READ"|"WRITE")`.
+fn store_lock_holders(w: &World) -> Vec<(u32, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let ino = std::fs::metadata(w.state.join("mindspace/grants.jsonl"))
+        .unwrap()
+        .ino();
+    std::fs::read_to_string("/proc/locks")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("FLOCK"))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            // "1: FLOCK ADVISORY READ 4242 08:01:123456 0 EOF"
+            let inode: u64 = f.get(5)?.rsplit(':').next()?.parse().ok()?;
+            (inode == ino).then(|| (f[4].parse().unwrap_or(0), f[3].to_string()))
+        })
+        .collect()
+}
+
+#[test]
+fn a_commit_held_inside_sqlite_beyond_the_ceiling_is_aborted_by_removing_the_frontend_before_the_revocation_completes(
+) {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "inflight");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[
+            ("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", pause.var()),
+            ("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS", "2500".into()),
+        ]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    let frontend = m.child.id();
+    m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached(); // the COMMIT is running inside SQLite and is held there
+    let holders = store_lock_holders(&w);
+    assert!(
+        holders.contains(&(m.broker as u32, "READ".to_string())),
+        "{holders:?}"
+    );
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    // inside the in-flight ceiling the revocation WAITS (the old behaviour released at 3 s)
+    assert!(
+        stays_blocked(&mut revoke, Duration::from_millis(1500)),
+        "overtaken while the COMMIT was in flight"
+    );
+    assert!(alive(frontend), "removed before the in-flight ceiling");
+    // beyond the ceiling the frontend is removed FIRST, then the lock is released
+    let waited = exits_within(&mut revoke, Duration::from_secs(10)).expect("the lease never ended");
+    assert!(revoke.wait().unwrap().success());
+    assert!(
+        !alive(frontend),
+        "VIOLATION: the revocation completed while the committing process was alive"
+    );
+    assert_eq!(w.integrity(), "ok");
+    assert_eq!(w.dump(), before, "the aborted COMMIT left nothing");
+    // letting the held COMMIT go changes nothing: the process that could finish it is dead
+    pause.go();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        w.dump(),
+        before,
+        "a COMMIT finished after the revocation completed"
+    );
+    eprintln!("COMMIT in flight beyond the ceiling: revocation completed {waited:?} after it began blocking, frontend removed first, database unchanged");
+}
+
+#[test]
+fn a_commit_in_flight_within_the_ceiling_finishes_before_the_revocation_completes() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "inflight_ok");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[
+            ("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", pause.var()),
+            ("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED", pause.var()),
+        ]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before_rows = w.rows();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached();
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    // well past the old 3 s ceiling: still waiting, because the COMMIT is still running
+    assert!(stays_blocked(&mut revoke, Duration::from_millis(3500)));
+    assert_eq!(w.rows(), before_rows);
+    pause.go();
+    let r = m.read_result(id);
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["commit_state"], "COMMITTED");
+    assert!(exits_within(&mut revoke, Duration::from_secs(5)).is_some());
+    let revoke_done = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    assert!(revoke.wait().unwrap().success());
+    assert!(
+        pause.committed_ns() <= revoke_done,
+        "the revocation completed before the COMMIT finished"
+    );
+    assert!(w.rows() > before_rows);
+    m.finish();
+}
+
+#[test]
+fn a_frontend_that_dies_during_the_commit_aborts_it_and_frees_the_lock() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "inflight_crash");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.dump();
+    m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached();
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(stays_blocked(&mut revoke, Duration::from_millis(300)));
+    kill(m.child.id() as i32);
+    let _ = m.child.wait();
+    let waited = exits_within(&mut revoke, Duration::from_secs(2))
+        .expect("the hang-up did not release the lock");
+    assert!(revoke.wait().unwrap().success());
+    assert_eq!(w.integrity(), "ok");
+    assert_eq!(w.dump(), before, "the COMMIT died with the process");
+    eprintln!("frontend death during COMMIT: revocation completed {waited:?} after the kill; database unchanged");
+}
+
+#[test]
+fn a_broker_that_dies_during_the_commit_loses_the_lease_which_is_the_documented_weaker_guarantee() {
+    // PINNED LIMIT, not a goal: the lock dies with the broker, so a revocation can complete while
+    // a COMMIT that had already begun is still running, and that COMMIT is not aborted. What is
+    // guaranteed: a commit that had NOT begun is refused (the begin message fails), and success is
+    // reported only because SQLite said so, never because the broker did.
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, SYMBOL_FILES);
+    let pause = Pause::new(&w, "inflight_broker");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[
+            ("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", pause.var()),
+            ("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED", pause.var()),
+        ]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before_rows = w.rows();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached();
+    kill(m.broker);
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w.revoke_bg(&gid);
+    assert!(
+        exits_within(&mut revoke, Duration::from_secs(3)).is_some(),
+        "the lock must die with the broker"
+    );
+    assert!(revoke.wait().unwrap().success());
+    // causal order, no clocks: the COMMIT is released only NOW, after the revocation completed
+    assert!(!pause.file(".go").exists());
+    assert_eq!(
+        w.rows(),
+        before_rows,
+        "the COMMIT had not finished when the revocation completed"
+    );
+    pause.go();
+    let r = m.read_result(id);
+    assert_eq!(r["isError"], false, "SQLite said committed: {r}");
+    assert!(
+        w.rows() > before_rows,
+        "and that COMMIT then finished: it was not aborted"
     );
     m.finish();
 }

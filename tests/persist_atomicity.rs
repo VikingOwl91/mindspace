@@ -241,3 +241,53 @@ fn a_document_only_ingestion_still_commits_without_code() {
     assert!(db.count("sources") > 0);
     assert_eq!(db.count("code_derivations"), 0);
 }
+
+fn alpha_hits(db: &Db) -> usize {
+    mindspace::retrieval::search_code(
+        &db.store(),
+        mindspace::core::CodeSearchQuery {
+            text: "alpha".into(),
+            kinds: vec![],
+            repository: None,
+            path_prefix: None,
+            space_ids: None,
+            limit: 100,
+            all_versions: false,
+        },
+    )
+    .unwrap()
+    .len()
+}
+
+#[test]
+fn ingesting_the_same_directory_again_adds_no_structure_and_no_duplicate_search_hits() {
+    // A retry after an uncertain commit outcome is a re-ingestion. It used to add one identical
+    // `code_contexts` row per file each time (a NULL commit id defeats INSERT OR IGNORE), and
+    // `code_search` then returned every hit once per ingestion.
+    let (_d, root, cfg) = sample();
+    let db = db();
+    persist(&db.store(), extracted(&db, &root, &cfg), &Deadline::none()).unwrap();
+    let structure = [
+        "code_inputs",
+        "code_derivations",
+        "code_entities",
+        "code_contexts",
+        "sources",
+    ]
+    .map(|t| db.count(t));
+    let hits = alpha_hits(&db);
+    assert!(hits > 0);
+    for _ in 0..3 {
+        persist(&db.store(), extracted(&db, &root, &cfg), &Deadline::none()).unwrap();
+    }
+    let again = [
+        "code_inputs",
+        "code_derivations",
+        "code_entities",
+        "code_contexts",
+        "sources",
+    ]
+    .map(|t| db.count(t));
+    assert_eq!(structure, again, "re-ingestion grew the derived structure");
+    assert_eq!(hits, alpha_hits(&db), "re-ingestion duplicated search hits");
+}

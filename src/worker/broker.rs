@@ -293,6 +293,12 @@ fn run_process(
                 pids_max: Some(256),
             };
         }
+        if let Some(ms) = std::env::var("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            cfg.commit_inflight_ceiling = Duration::from_millis(ms);
+        }
         if let Some(ms) = std::env::var("MINDSPACE_BROKER_GATE_WALL_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -300,10 +306,33 @@ fn run_process(
             cfg.wall_timeout = Duration::from_millis(ms);
         }
     }
-    let broker = match Broker::new(Box::new(authority), cfg) {
+    let mut broker = match Broker::new(Box::new(authority), cfg) {
         Ok(b) => b,
         Err(e) => return fail(format!("cannot start (no cgroup delegation?): {e}"), 71),
     };
+    // The peer of a socketpair is named by whoever created it: stage 1, which became the
+    // frontend. Take a pidfd now, while that process certainly exists.
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: SO_PEERCRED on our own socket.
+        let ok = unsafe {
+            libc::getsockopt(
+                link.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut _,
+                &mut len,
+            )
+        } == 0;
+        if ok && cred.pid > 0 {
+            // SAFETY: pidfd_open on that pid; the descriptor is owned from here on.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, cred.pid, 0) } as i32;
+            if fd >= 0 {
+                broker.set_frontend(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
     broker.serve(link);
     0
 }
@@ -511,6 +540,10 @@ pub enum ToBroker {
     CommitRequest {
         op: Uuid,
     },
+    /// The frontend is about to run COMMIT (sent right before it). From here the broker keeps the
+    /// lease until `CommitDone` or the frontend's death, up to the in-flight ceiling; at the
+    /// ceiling it removes the frontend (SIGKILL) before it releases the lease.
+    CommitBegin,
     /// The frontend's commit finished (or was abandoned): the lease may be released.
     CommitDone,
 }
@@ -1070,6 +1103,11 @@ pub struct BrokerConfig {
     /// Refuse a worker whose `/proc` entry does not show seccomp, no-new-privs, no tracer and no
     /// capabilities. Only tests that stand in a fake worker turn this off.
     pub verify_confinement: bool,
+    /// A frontend that was granted a commit lease must send `CommitBegin` (or `CommitDone`)
+    /// within this time, else it is removed.
+    pub commit_grant_ceiling: Duration,
+    /// Once `CommitBegin` was sent, the COMMIT may take this long; then the frontend is removed.
+    pub commit_inflight_ceiling: Duration,
     /// How often the authority behind a running operation is verified again. Only revocable
     /// authority (a grant) is rechecked; a static root cannot be revoked.
     pub recheck_interval: Duration,
@@ -1092,6 +1130,8 @@ impl BrokerConfig {
                 pids_max: None,
             },
             verify_confinement: true,
+            commit_grant_ceiling: COMMIT_HOLD_MAX,
+            commit_inflight_ceiling: Duration::from_secs(30),
             recheck_interval: Duration::from_millis(100),
             max_concurrent: 1,
         }
@@ -1101,6 +1141,9 @@ impl BrokerConfig {
 pub struct Broker {
     authority: Box<dyn RootAuthority>,
     cfg: BrokerConfig,
+    /// The frontend process, as a pidfd taken when the connection was made (so a recycled pid can
+    /// never be signalled). `None` in library use, where the "frontend" is the caller's own process.
+    frontend: Option<OwnedFd>,
     scope: Option<ScopeHandle>,
     active: AtomicUsize,
     seen: Mutex<(HashSet<Uuid>, VecDeque<Uuid>)>,
@@ -1187,10 +1230,50 @@ impl Broker {
         Ok(Self {
             authority,
             cfg,
+            frontend: None,
             scope,
             active: AtomicUsize::new(0),
             seen: Mutex::new((HashSet::new(), VecDeque::new())),
         })
+    }
+
+    /// Product use: the process on the other end of the channel, which the broker may remove when
+    /// it holds a commit lease for longer than the ceilings allow.
+    pub fn set_frontend(&mut self, pidfd: OwnedFd) {
+        self.frontend = Some(pidfd);
+    }
+
+    /// Removes the frontend and waits until it is gone. The lease is released only AFTER this: a
+    /// process that can no longer run cannot complete a COMMIT. Without a known frontend nothing
+    /// can be removed and the caller falls back to releasing at the ceiling (documented).
+    /// A process that cannot die yet (blocked in the kernel) is waited for: its COMMIT is then
+    /// genuinely in flight and the revocation must wait with it.
+    fn remove_frontend(&self) -> bool {
+        let Some(fd) = &self.frontend else {
+            return false;
+        };
+        // SAFETY: pidfd_send_signal on a pidfd this process owns; no siginfo.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+        let mut p = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: poll on a descriptor this process owns; readable once the process exited.
+            let r = unsafe { libc::poll(&mut p, 1, -1) };
+            if r > 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return true;
+            }
+        }
     }
 
     fn remember(&self, op: Uuid) -> bool {
@@ -1252,6 +1335,9 @@ impl Broker {
                 Ok(ToBroker::CommitRequest { op }) => {
                     self.commit_lease(&sock, &mut reader, op, awaiting.take());
                 }
+                // A completion message that arrives after its lease ended (the ceiling, or a
+                // frontend that gave up waiting for the grant) is harmless: ignore it.
+                Ok(ToBroker::CommitDone | ToBroker::CommitBegin) => {}
                 Ok(ToBroker::Done | ToBroker::Cancel) if terminal_pending => {
                     terminal_pending = false;
                 }
@@ -1438,10 +1524,44 @@ impl Broker {
         match self.authority.hold(&auth, COMMIT_HOLD_MAX) {
             Err(reason) => reply(&FromBroker::CommitDenied { op, reason }),
             Ok(hold) => {
+                // Test builds only (feature `spawn-gate`): answer late, to exercise a frontend
+                // that gives up waiting while the lease is already held.
+                #[cfg(feature = "spawn-gate")]
+                if let Some(ms) = std::env::var("MINDSPACE_BROKER_GATE_COMMIT_REPLY_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
                 reply(&FromBroker::CommitGranted { op });
-                // the lease lasts until `CommitDone`, a hang-up or the ceiling
-                let _ = sock.set_read_timeout(Some(COMMIT_HOLD_MAX));
-                let _ = read_line_limited(reader);
+                // The lease lasts until the frontend says `CommitDone`, or hangs up (it died, so
+                // nothing can commit any more). Ceilings, not guesses: a frontend that does not
+                // begin its COMMIT within the grant ceiling, or does not finish it within the
+                // in-flight ceiling, is removed BEFORE the lock is released; SQLite offers no way
+                // to cancel a COMMIT that is running, and a process that is gone cannot finish one.
+                let mut next = self.cfg.commit_grant_ceiling;
+                loop {
+                    let _ = sock.set_read_timeout(Some(next));
+                    match read_line_limited(reader) {
+                        Ok(None) => break, // hang-up: the frontend is gone
+                        Ok(Some(line)) => match serde_json::from_str::<ToBroker>(&line) {
+                            Ok(ToBroker::CommitDone) => break,
+                            Ok(ToBroker::CommitBegin) => {
+                                next = self.cfg.commit_inflight_ceiling;
+                                continue;
+                            }
+                            _ => {
+                                self.remove_frontend();
+                                break;
+                            }
+                        },
+                        Err(_) => {
+                            // the ceiling passed (or the channel is broken)
+                            self.remove_frontend();
+                            break;
+                        }
+                    }
+                }
                 let _ = sock.set_read_timeout(None);
                 drop(hold);
             }

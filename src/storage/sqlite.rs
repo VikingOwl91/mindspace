@@ -127,22 +127,38 @@ impl WriteTransaction<'_> {
             .tx
             .take()
             .expect("write transaction is present until commit");
-        let result = tx.commit().map_err(dberr);
+        let result = tx.commit();
         self.revision_state
             .active_revision
             .store(0, Ordering::SeqCst);
-        if result.is_err() {
+        if let Err(e) = result {
             if !self.conn.is_autocommit() {
                 let _ = self.conn.execute_batch("ROLLBACK");
             }
-            self.revision_state.poisoned.store(true, Ordering::SeqCst);
-            return result;
+            let error = commit_failure(e);
+            // A COMMIT SQLite defines as "not committed" (busy, locked, constraint) that left the
+            // connection outside a transaction again leaves a clean handle: keep using it. An
+            // unknown outcome, or a handle still inside a transaction, is discarded.
+            if matches!(error, Error::CommitOutcomeUnknown { .. }) || !self.conn.is_autocommit() {
+                self.revision_state.poisoned.store(true, Ordering::SeqCst);
+            }
+            return Err(error);
         }
         if !self.conn.is_autocommit() {
             self.revision_state.poisoned.store(true, Ordering::SeqCst);
-            return Err(Error::Storage(
-                "SQLite commit returned with an active transaction".to_string(),
-            ));
+            return Err(Error::CommitOutcomeUnknown {
+                detail: "SQLite commit returned with an active transaction".to_string(),
+            });
+        }
+        // Test builds only: the COMMIT really succeeded, but the caller must not know it, and the
+        // handle is discarded exactly as for a real unknown outcome.
+        #[cfg(feature = "spawn-gate")]
+        if gate::LOSE_ACK.swap(false, Ordering::SeqCst) {
+            self.revision_state.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::CommitOutcomeUnknown {
+                detail: "test hook: the commit succeeded but its acknowledgement was lost"
+                    .to_string(),
+            });
         }
         Ok(())
     }
@@ -159,6 +175,44 @@ impl Drop for WriteTransaction<'_> {
             }
         }
     }
+}
+
+/// Classifies a failed COMMIT. Busy, locked and constraint failures (a deferred constraint, or a
+/// commit hook that vetoed) are, by SQLite's contract, a transaction that was NOT committed:
+/// the ordinary error. Anything else (I/O, a full disk, corruption...) can fail after the commit
+/// record reached the log, so what became durable is unknown: [`Error::CommitOutcomeUnknown`].
+fn commit_failure(e: rusqlite::Error) -> Error {
+    let definitive = matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(code, _) if matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked
+                | rusqlite::ErrorCode::ConstraintViolation
+        )
+    );
+    if definitive {
+        dberr(e)
+    } else {
+        Error::CommitOutcomeUnknown {
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// Test builds only (feature `spawn-gate`): one-shot faults at the COMMIT boundary, armed by the
+/// MCP tool's test hooks. Absent from a plain build.
+#[cfg(feature = "spawn-gate")]
+pub mod gate {
+    use std::sync::atomic::AtomicBool;
+    /// The next COMMIT is vetoed by the commit hook: a real SQLite commit failure (rolled back).
+    pub static FAIL_COMMIT: AtomicBool = AtomicBool::new(false);
+    /// The next COMMIT really succeeds, but the caller is told the outcome is unknown.
+    pub static LOSE_ACK: AtomicBool = AtomicBool::new(false);
+    /// The next COMMIT is held INSIDE SQLite (in its commit hook, with the write transaction open
+    /// and the COMMIT running) until `<prefix>.go` exists; `<prefix>.reached` announces it. The
+    /// prefix is read from `MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT`.
+    pub static PAUSE_IN_COMMIT: AtomicBool = AtomicBool::new(false);
 }
 
 /// Facts about a database file that `mind doctor` needs, read without touching
@@ -605,6 +659,25 @@ fn register_revision_context(conn: &Connection, state: &Arc<RevisionState>) -> R
     let commit_state = Arc::clone(state);
     conn.commit_hook(Some(move || {
         commit_state.active_revision.store(0, Ordering::SeqCst);
+        #[cfg(feature = "spawn-gate")]
+        if gate::FAIL_COMMIT.swap(false, Ordering::SeqCst) {
+            return true; // veto: SQLite turns this COMMIT into a ROLLBACK
+        }
+        #[cfg(feature = "spawn-gate")]
+        if gate::PAUSE_IN_COMMIT.swap(false, Ordering::SeqCst) {
+            if let Some(prefix) = std::env::var_os("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT") {
+                let with = |ext: &str| {
+                    let mut p = prefix.clone();
+                    p.push(ext);
+                    std::path::PathBuf::from(p)
+                };
+                let _ = std::fs::write(with(".reached"), b"");
+                let end = std::time::Instant::now() + Duration::from_secs(60);
+                while !with(".go").exists() && std::time::Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
         false
     }))
     .map_err(dberr)?;
@@ -3239,11 +3312,24 @@ fn record_code_observation_tx(
             tx.execute("INSERT INTO code_inputs(id,content_hash,repository_id,blob_oid,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![input_id,input.content_hash,input.repository_id.map(|x|x.to_string()),input.blob_oid,Ts::now().0]).map_err(dberr)?;
         }
         for context in input.contexts {
-            tx.execute(
-                "INSERT OR IGNORE INTO code_contexts(input_id,path,commit_oid) VALUES(?1,?2,?3)",
-                rusqlite::params![input_id, context.path, context.commit_oid],
-            )
-            .map_err(dberr)?;
+            // A directory context has no commit id. A NULL in the key makes every row distinct,
+            // so INSERT OR IGNORE would add the same context again on each re-ingestion (and
+            // `code_search` would repeat every hit): check explicitly.
+            if context.commit_oid.is_none() {
+                tx.execute(
+                    "INSERT INTO code_contexts(input_id,path,commit_oid) SELECT ?1,?2,NULL \
+                     WHERE NOT EXISTS (SELECT 1 FROM code_contexts \
+                     WHERE input_id=?1 AND path=?2 AND commit_oid IS NULL)",
+                    rusqlite::params![input_id, context.path],
+                )
+                .map_err(dberr)?;
+            } else {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_contexts(input_id,path,commit_oid) VALUES(?1,?2,?3)",
+                    rusqlite::params![input_id, context.path, context.commit_oid],
+                )
+                .map_err(dberr)?;
+            }
         }
         let d = &input.derivation;
         let derivation_id:Option<String>=tx.query_row("SELECT id FROM code_derivations WHERE input_id=?1 AND extractor=?2 AND extractor_version=?3 AND grammar=?4 AND grammar_version=?5",rusqlite::params![input_id,d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?;
@@ -5266,5 +5352,54 @@ mod effective_derivation_tests {
             .query_row("SELECT COUNT(*) FROM code_derivations d WHERE d.input_id='i1' AND d.created_at=(SELECT MAX(d2.created_at) FROM code_derivations d2 WHERE d2.input_id=d.input_id)", [], |r| r.get(0))
             .unwrap();
         assert_eq!(old, 2);
+    }
+}
+
+#[cfg(test)]
+mod commit_failure_tests {
+    use super::*;
+
+    fn failure(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    #[test]
+    fn only_failures_that_sqlite_defines_as_not_committed_are_rolled_back() {
+        // not committed by SQLite's contract: the ordinary errors
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_CONSTRAINT,
+        ] {
+            assert!(
+                !matches!(
+                    commit_failure(failure(code)),
+                    Error::CommitOutcomeUnknown { .. }
+                ),
+                "code {code} is a definitive rollback"
+            );
+        }
+        // the log may already hold the commit record: unknown
+        for code in [
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_CORRUPT,
+            rusqlite::ffi::SQLITE_NOTADB,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_INTERRUPT,
+        ] {
+            assert!(
+                matches!(
+                    commit_failure(failure(code)),
+                    Error::CommitOutcomeUnknown { .. }
+                ),
+                "code {code} must be reported as an unknown outcome"
+            );
+        }
+        // a non-SQLite error is not a definitive rollback either
+        assert!(matches!(
+            commit_failure(rusqlite::Error::InvalidQuery),
+            Error::CommitOutcomeUnknown { .. }
+        ));
     }
 }

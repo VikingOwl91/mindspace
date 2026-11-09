@@ -855,30 +855,49 @@ pub fn extract_via_broker(
     }
 }
 
+/// The broker's answer to a commit request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitAnswer {
+    /// A lease is held: commit (or abandon), then call [`commit_done`].
+    Granted,
+    /// The broker said no: do NOT commit. The link is still in step.
+    Denied(String),
+    /// No usable answer (timeout, end of file, garbage): the broker may still answer or may hold a
+    /// lease. Do NOT commit, and do not use this link again.
+    Lost(String),
+}
+
 /// Asks the broker for the commit-time decision of the operation `op` that just ended `done`.
-/// `Ok(())`: the frontend holds a lease and must commit (or abandon) and then call
-/// [`commit_done`]. `Err(reason)`: it must NOT commit.
-pub fn commit_request(link: &UnixStream, op: Uuid) -> Result<(), String> {
-    let mut b = serde_json::to_vec(&ToBroker::CommitRequest { op }).map_err(|e| e.to_string())?;
+pub fn commit_request(link: &UnixStream, op: Uuid) -> CommitAnswer {
+    let lost = |m: String| CommitAnswer::Lost(m);
+    let Ok(mut b) = serde_json::to_vec(&ToBroker::CommitRequest { op }) else {
+        return lost("cannot encode the commit request".into());
+    };
     b.push(b'\n');
-    (&*link)
-        .write_all(&b)
-        .map_err(|e| format!("the broker is not available: {e}"))?;
-    link.set_read_timeout(Some(COMMIT_HOLD_MAX))
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = (&*link).write_all(&b) {
+        return lost(format!("the broker is not available: {e}"));
+    }
+    if link.set_read_timeout(Some(COMMIT_HOLD_MAX)).is_err() {
+        return lost("cannot wait for the broker".into());
+    }
+    let Ok(clone) = link.try_clone() else {
+        return lost("cannot read from the broker".into());
+    };
+    let mut reader = BufReader::new(clone);
     let mut line = Vec::new();
-    let mut reader = BufReader::new(link.try_clone().map_err(|e| e.to_string())?);
-    let n = (&mut reader)
+    match (&mut reader)
         .take(MAX_LINE as u64 + 1)
         .read_until(b'\n', &mut line)
-        .map_err(|e| format!("no commit decision from the broker: {e}"))?;
-    if n == 0 || line.last() != Some(&b'\n') {
-        return Err("the broker is not available (it exited before deciding)".into());
+    {
+        Ok(0) => return lost("the broker is not available (it exited before deciding)".into()),
+        Ok(_) if line.last() == Some(&b'\n') => {}
+        Ok(_) => return lost("a truncated answer from the broker".into()),
+        Err(e) => return lost(format!("no commit decision from the broker in time: {e}")),
     }
     match serde_json::from_slice::<FromBroker>(&line) {
-        Ok(FromBroker::CommitGranted { op: o }) if o == op => Ok(()),
-        Ok(FromBroker::CommitDenied { op: o, reason }) if o == op => Err(reason),
-        other => Err(format!(
+        Ok(FromBroker::CommitGranted { op: o }) if o == op => CommitAnswer::Granted,
+        Ok(FromBroker::CommitDenied { op: o, reason }) if o == op => CommitAnswer::Denied(reason),
+        other => lost(format!(
             "unexpected answer to the commit request: {other:?}"
         )),
     }
@@ -890,4 +909,14 @@ pub fn commit_done(link: &UnixStream) {
         b.push(b'\n');
         let _ = (&*link).write_all(&b);
     }
+}
+
+/// Tells the broker that the COMMIT starts now (send it right before). An error means the broker
+/// is gone: the commit must not be started.
+pub fn commit_begin(link: &UnixStream) -> Result<(), String> {
+    let mut b = serde_json::to_vec(&ToBroker::CommitBegin).map_err(|e| e.to_string())?;
+    b.push(b'\n');
+    (&*link)
+        .write_all(&b)
+        .map_err(|e| format!("the broker is not available (it went away before the commit): {e}"))
 }

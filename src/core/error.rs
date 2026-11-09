@@ -137,6 +137,12 @@ pub enum Error {
     #[error("SQLite connection was discarded after an uncertain transaction outcome")]
     ConnectionDiscarded,
 
+    /// The COMMIT failed in a way that does not say whether it took effect (an I/O error, a full
+    /// disk...). Every OTHER error from a write method means nothing was committed; this one
+    /// means "unknown": the data may or may not be there, and the connection is discarded.
+    #[error("the outcome of the database commit is unknown: {detail}")]
+    CommitOutcomeUnknown { detail: String },
+
     #[error("invalid path '{path}': {reason}")]
     InvalidPath { path: String, reason: String },
 

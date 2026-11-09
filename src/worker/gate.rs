@@ -182,3 +182,154 @@ pub fn run(store: &dyn Store, config: &McpConfig, root_arg: &str) -> Result<()> 
     println!("{}", serde_json::Value::Object(out));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// M7.3b.3a broker gate (same status as above: test scaffolding behind the `spawn-gate` feature).
+// Runs inside the real sandboxed `mind mcp --broker` frontend and talks to the real broker over
+// the one inherited descriptor. Commands on stdin, one JSON result per line on stdout:
+//   extract <root>      extraction through the broker, persisted by this process on success
+//   probe <path>        what this (confined) frontend can read directly
+//   broker              the broker as this frontend sees it (pid, signal, ptrace, /proc/mem)
+//   raw <json>          one raw line to the broker (replay / injection tests)
+//   self                this process
+// ---------------------------------------------------------------------------------------------
+
+pub fn run_broker_gate(store: &dyn Store, config: &McpConfig) -> Result<()> {
+    use serde_json::json;
+    use std::io::BufRead;
+    // as startup left it, before anything in the gate touches the descriptor
+    let fd_cloexec = std::env::var(crate::sandbox::ENV_BROKER_FD)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        // SAFETY: F_GETFD only reads the flags.
+        .map(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0);
+    let Some(link) = super::broker::take_frontend_link() else {
+        println!("{}", json!({"fatal": "no broker channel"}));
+        return Ok(());
+    };
+    // SO_PEERCRED on a socketpair names whoever created it (stage 1 = this very pid), not the
+    // forked broker, so the broker is found as this process's only child.
+    let peer_pid: i32 =
+        std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", std::process::id()))
+            .ok()
+            .and_then(|t| t.split_whitespace().next().and_then(|p| p.parse().ok()))
+            .unwrap_or(0);
+    let space = store.get_space("p")?.id;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let (cmd, arg) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+        let out = match cmd {
+            "self" => json!({
+                "pid": std::process::id(),
+                "sandbox": config.sandbox().label(),
+                "seccomp_mode": status("Seccomp:"),
+                "broker_pid": peer_pid,
+                "broker_fd_cloexec": fd_cloexec,
+            }),
+            "probe" => json!({
+                "read_dir": probe(std::fs::read_dir(arg).map(|_| ())),
+                "read_file": probe(std::fs::read(std::path::Path::new(arg).join("a.md"))),
+            }),
+            "broker" => {
+                // SAFETY: a null-signal probe and a ptrace attach attempt on the broker's pid.
+                let sig = unsafe { libc::kill(peer_pid, 0) };
+                let sig_errno = if sig == 0 {
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                };
+                let pt = unsafe { libc::ptrace(libc::PTRACE_ATTACH, peer_pid, 0, 0) };
+                let pt_errno = if pt == 0 {
+                    unsafe { libc::ptrace(libc::PTRACE_DETACH, peer_pid, 0, 0) };
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                };
+                json!({
+                    "broker_pid": peer_pid,
+                    "kill0_errno": sig_errno,
+                    "ptrace_errno": pt_errno,
+                    "read_mem": probe(std::fs::read(format!("/proc/{peer_pid}/mem")).map(|_| ())),
+                    "read_environ": probe(std::fs::read(format!("/proc/{peer_pid}/environ")).map(|_| ())),
+                })
+            }
+            "raw" => {
+                use std::io::Write;
+                let _ = (&link).write_all(format!("{arg}\n").as_bytes());
+                match super::broker::recv_with_fd(&link) {
+                    Ok((bytes, fd)) => {
+                        let text = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                        let mut fin = String::new();
+                        if fd.is_some() {
+                            // an operation started: end it and collect the report
+                            let _ = (&link).write_all(b"{\"type\":\"cancel\"}\n");
+                            let mut r = std::io::BufReader::new(&link);
+                            let _ = r.read_line(&mut fin);
+                        }
+                        json!({"answer": text, "had_fd": fd.is_some(), "finished": fin.trim_end()})
+                    }
+                    Err(e) => json!({"error": e.to_string()}),
+                }
+            }
+            "extract" => {
+                let mut cfg = super::client::WorkerConfig::new("/nonexistent");
+                if let Some(ms) = std::env::var("GATE_WALL_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    cfg.wall_timeout = Duration::from_millis(ms);
+                }
+                if std::env::var_os("GATE_NO_EVIDENCE").is_some() {
+                    cfg.require_sandbox_evidence = false;
+                }
+                let pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                cfg.observe_pid = Some(pid.clone());
+                let cancel = AtomicBool::new(false);
+                let res = super::client::extract_via_broker(
+                    &cfg,
+                    &link,
+                    std::path::Path::new(arg),
+                    &[space],
+                    &crate::ingest::extract::StoreContext(store),
+                    &cancel,
+                );
+                let worker_pid = pid.load(std::sync::atomic::Ordering::SeqCst);
+                match res {
+                    Ok((extracted, stats, rep)) => {
+                        // bytes that must never appear in a worker's result (db, grant store...)
+                        let text = serde_json::to_string(&extracted).unwrap_or_default();
+                        let leaked: Vec<String> = std::env::var("GATE_FORBID")
+                            .unwrap_or_default()
+                            .split('|')
+                            .filter(|m| !m.is_empty() && text.contains(m))
+                            .map(str::to_string)
+                            .collect();
+                        let persisted = persist(store, extracted, &Deadline::none());
+                        json!({
+                            "ok": true,
+                            "leaked": leaked,
+                            "worker_pid": worker_pid,
+                            "observed": rep.observed,
+                            "exit": rep.exit,
+                            "exited_by_itself": rep.exited_by_itself,
+                            "descendants_killed": rep.descendants_killed,
+                            "peak_rss_kb": rep.peak_rss_kb,
+                            "cgroup_peak_bytes": rep.cgroup_peak_bytes,
+                            "records": stats.records,
+                            "persisted": persisted.is_ok(),
+                            "persist_error": persisted.err().map(|e| e.to_string()),
+                        })
+                    }
+                    Err(e) => {
+                        json!({"ok": false, "worker_pid": worker_pid, "error": e.to_string()})
+                    }
+                }
+            }
+            "quit" => break,
+            other => json!({"error": format!("unknown command {other}")}),
+        };
+        println!("{out}");
+    }
+    Ok(())
+}

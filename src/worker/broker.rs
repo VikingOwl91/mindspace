@@ -138,6 +138,121 @@ impl RootAuthority for GrantRoots {
     }
 }
 
+/// Static roots always; grants too when a store is configured. A grant store that cannot be
+/// verified contributes NO root (fewer roots, never more), the static roots stay usable.
+pub struct CombinedAuthority {
+    pub static_roots: StaticRoots,
+    pub grants: Option<GrantRoots>,
+}
+
+impl RootAuthority for CombinedAuthority {
+    fn roots(&self) -> Result<Vec<AuthorizedRoot>, String> {
+        let mut v = self.static_roots.roots()?;
+        if let Some(g) = &self.grants {
+            if let Ok(more) = g.roots() {
+                v.extend(more);
+            }
+        }
+        Ok(v)
+    }
+}
+
+// ------------------------------------------------------------------ the broker process (stage 1)
+
+/// Body of the broker process forked by `sandbox::enter_with_broker`: outside the frontend's
+/// Landlock domain, under the inherited socket-deny filter, with exactly one descriptor (the
+/// channel to the frontend). It serves that one connection and exits when the frontend closes it
+/// (which includes the frontend dying), after ending every operation it had running.
+pub fn process_main(
+    link: UnixStream,
+    exe: PathBuf,
+    static_roots: Vec<PathBuf>,
+    grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+) -> ! {
+    // SAFETY: plain prctl/open/dup2 calls on this process. Not dumpable: the frontend is this
+    // process's parent and must not be able to ptrace it or read its memory.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        // the broker must not keep the client's stdin/stdout pipes open (stderr stays: diagnostics)
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null >= 0 {
+            libc::dup2(null, 0);
+            libc::dup2(null, 1);
+            if null > 2 {
+                libc::close(null);
+            }
+        }
+    }
+    crate::sandbox::close_all_except(&[link.as_raw_fd()]);
+    let code = run_process(link, exe, static_roots, grants);
+    // SAFETY: leave without running the parent's atexit handlers or flushing its buffers.
+    unsafe { libc::_exit(code) }
+}
+
+fn run_process(
+    link: UnixStream,
+    exe: PathBuf,
+    static_roots: Vec<PathBuf>,
+    grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+) -> i32 {
+    let fail = |m: String, c: i32| {
+        eprintln!("mind broker: {m}");
+        c
+    };
+    let static_roots = match StaticRoots::new(&static_roots) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("static roots: {e}"), 70),
+    };
+    let authority = CombinedAuthority {
+        static_roots,
+        grants: grants.map(|(dir, policy)| GrantRoots {
+            store: crate::grants::Store::in_dir(dir),
+            policy,
+        }),
+    };
+    #[allow(unused_mut)]
+    let mut cfg = BrokerConfig::new(exe);
+    // Test builds only (feature `spawn-gate`, enabled for `cargo test`, absent from a plain
+    // build): stand-in workers and short limits for the failure tests.
+    #[cfg(feature = "spawn-gate")]
+    {
+        if let Ok(script) = std::env::var("MINDSPACE_BROKER_GATE_WORKER") {
+            cfg.exe = PathBuf::from("/bin/sh");
+            cfg.args = vec![script.into()];
+            cfg.verify_confinement = false;
+        }
+        if let Some(ms) = std::env::var("MINDSPACE_BROKER_GATE_WALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            cfg.wall_timeout = Duration::from_millis(ms);
+        }
+    }
+    let broker = match Broker::new(Box::new(authority), cfg) {
+        Ok(b) => b,
+        Err(e) => return fail(format!("cannot start (no cgroup delegation?): {e}"), 71),
+    };
+    broker.serve(link);
+    0
+}
+
+/// Stage 2 (the frontend): the channel to the broker, once. `None` when the server was not
+/// started with a broker, when the descriptor is not a unix stream socket, or on a second call.
+pub fn take_frontend_link() -> Option<UnixStream> {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if TAKEN.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let fd = crate::sandbox::broker_fd_from_env()?;
+    // SAFETY: the descriptor was validated as a socket and is owned by this process from here on;
+    // close-on-exec keeps it out of the Git children the frontend starts.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        Some(UnixStream::from_raw_fd(fd))
+    }
+}
+
 // ------------------------------------------------------------------ protocol
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +508,12 @@ impl CgroupScope {
                 candidates.push(p.to_path_buf());
             }
         }
+        // Test builds only (feature `spawn-gate`): point the broker at a parent it cannot write
+        // to, to observe the real kernel refusal and the fail-closed start.
+        #[cfg(feature = "spawn-gate")]
+        if let Ok(p) = std::env::var("MINDSPACE_BROKER_GATE_CGROUP_PARENT") {
+            candidates = vec![PathBuf::from(p)];
+        }
         // Strictly one at a time: the process lives in at most one `supervisor`. A candidate
         // without controllers is torn down (the process goes home) before the next is tried;
         // if none has controllers the first one that works is created again and kept.
@@ -417,9 +538,19 @@ impl CgroupScope {
     }
 
     /// Removes the empty trees of brokers that no longer exist (killed before they could clean
-    /// up). Only directories named `mindspace-<pid>[-n]` whose pid is gone, and only empty ones.
+    /// up): processes still in them are killed (`cgroup.kill`) and the tree is removed. Only
+    /// directories named `mindspace-<pid>[-n]` whose pid is gone are touched.
     fn sweep(parent: &Path) {
         fn remove_tree(dir: &Path) {
+            // a dead broker may have left workers (or their escaped descendants) behind
+            let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+            let end = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < end
+                && std::fs::read_to_string(dir.join("cgroup.events"))
+                    .is_ok_and(|e| !e.lines().any(|l| l.trim() == "populated 0"))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
                     if e.path().is_dir() {

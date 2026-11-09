@@ -285,6 +285,10 @@ pub enum Command {
         /// access: restart it after `mind grant approve`
         #[arg(long)]
         grants: bool,
+        /// Start the worker broker (stage 1 forks it outside the sandbox; M7.3b.3a). Hidden:
+        /// no MCP tool uses it yet.
+        #[arg(long, hide = true)]
+        broker: bool,
     },
 }
 
@@ -904,12 +908,14 @@ License: {}",
             ingest_timeout,
             insecure_no_sandbox,
             grants,
+            broker,
         } => mcp_command(
             cli,
             allow_roots,
             *ingest_timeout,
             *insecure_no_sandbox,
             *grants,
+            *broker,
         )?,
     }
     Ok(())
@@ -924,10 +930,20 @@ fn mcp_command(
     ingest_timeout: std::time::Duration,
     insecure: bool,
     use_grants: bool,
+    broker: bool,
 ) -> Result<()> {
     use crate::mcp::{McpConfig, SandboxState};
+    // Stage 2 keeps exactly one inherited descriptor: the validated broker channel (if any).
     #[cfg(target_os = "linux")]
-    crate::sandbox::close_inherited_fds();
+    {
+        let keep = crate::sandbox::broker_fd_from_env();
+        crate::sandbox::close_inherited_fds_except(keep);
+        if let Some(fd) = keep {
+            // never into the Git children this process starts, whether or not anything uses it
+            // SAFETY: close-on-exec on a descriptor this process owns.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
     // One clear primary error for a database that was never initialized, before
     // any sandbox work that would otherwise report an unrelated reason first.
     let db = db_path(cli)?;
@@ -1003,7 +1019,21 @@ fn mcp_command(
         #[cfg(not(target_os = "linux"))]
         SandboxState::Unavailable("--insecure-no-sandbox is only supported on Linux".to_string())
     } else {
-        let (state, seccomp) = sandbox_state(cli, &config, &grant_args, &grant_ids);
+        #[cfg(unix)]
+        let broker_req = broker.then(|| crate::sandbox::BrokerRequest {
+            grants: store_dir.clone().map(|dir| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|h| h.is_absolute());
+                let policy =
+                    crate::grants::PathPolicy::standard(&dir, db.parent(), home.as_deref());
+                (dir, policy)
+            }),
+        });
+        #[cfg(not(unix))]
+        let broker_req = None;
+        let (state, seccomp) =
+            sandbox_state(cli, &config, &grant_args, &grant_ids, broker_req.as_ref());
         seccomp_report = seccomp;
         state
     };
@@ -1014,6 +1044,10 @@ fn mcp_command(
     let store = open(cli)?;
     // Test harness only (feature `spawn-gate`, enabled for `cargo test` builds, absent from a plain build):
     // run the worker from this sandboxed frontend.
+    #[cfg(all(unix, feature = "spawn-gate"))]
+    if std::env::var_os("MINDSPACE_BROKER_GATE").is_some() {
+        return crate::worker::gate::run_broker_gate(&store, &config);
+    }
     #[cfg(all(unix, feature = "spawn-gate"))]
     if let Ok(root) = std::env::var("MINDSPACE_SPAWN_GATE") {
         return crate::worker::gate::run(&store, &config, &root);
@@ -1086,8 +1120,9 @@ fn sandbox_state(
     config: &crate::mcp::McpConfig,
     extra_args: &[std::ffi::OsString],
     grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
+    broker: Option<&crate::sandbox::BrokerRequest>,
 ) -> (crate::mcp::SandboxState, serde_json::Value) {
-    let (state, seccomp, scope) = sandbox_state_inner(cli, config, extra_args, grant_ids);
+    let (state, seccomp, scope) = sandbox_state_inner(cli, config, extra_args, grant_ids, broker);
     // `seccomp` is the socket-deny report; the Landlock signal scope travels next to it.
     let mut report = seccomp.to_json();
     report["signal_scope"] = serde_json::json!(scope.label());
@@ -1100,6 +1135,7 @@ fn sandbox_state_inner(
     config: &crate::mcp::McpConfig,
     extra_args: &[std::ffi::OsString],
     grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
+    broker: Option<&crate::sandbox::BrokerRequest>,
 ) -> (
     crate::mcp::SandboxState,
     crate::sandbox::seccomp::Status,
@@ -1203,7 +1239,7 @@ fn sandbox_state_inner(
             std::process::exit(78);
         }
     }
-    match sandbox::enter_with_args(&plan, extra_args) {
+    match sandbox::enter_with_broker(&plan, extra_args, broker) {
         Outcome::NotNeeded => (SandboxState::NotNeeded, na, no_scope),
         Outcome::Unavailable(reason) => (SandboxState::Unavailable(reason), na, no_scope),
     }
@@ -1215,6 +1251,7 @@ fn sandbox_state(
     _config: &crate::mcp::McpConfig,
     _extra_args: &[std::ffi::OsString],
     _grant_ids: &std::collections::BTreeMap<PathBuf, (u64, u64)>,
+    _broker: Option<&crate::sandbox::BrokerRequest>,
 ) -> (crate::mcp::SandboxState, serde_json::Value) {
     (
         crate::mcp::SandboxState::Unavailable(

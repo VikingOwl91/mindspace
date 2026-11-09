@@ -131,6 +131,94 @@ pub fn landlock_abi() -> u32 {
 const SIGNAL_SCOPE_ABI: u32 = 6;
 
 pub(crate) const ENV_SIGNAL_CANARY: &str = "MINDSPACE_SANDBOX_SIGNAL_CANARY";
+/// Stage 1 to stage 2: the number of the one inherited descriptor, the frontend's end of the
+/// broker channel (M7.3b.3a). Only meaningful together with [`ENV_STAGE2`].
+pub(crate) const ENV_BROKER_FD: &str = "MINDSPACE_SANDBOX_BROKER_FD";
+
+/// What stage 1 needs to start the broker beyond the [`Plan`]: where the grant store is (if
+/// grants are in use). The static roots are the plan's roots.
+#[derive(Debug, Clone)]
+pub struct BrokerRequest {
+    pub grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+}
+
+/// The broker descriptor stage 2 was started with, if it is what it must be: an `AF_UNIX`
+/// `SOCK_STREAM` socket. `None` outside a stage 2 start or for anything else (the number is then
+/// treated like every other inherited descriptor: closed, and refused by `verify_stage2`).
+pub fn broker_fd_from_env() -> Option<i32> {
+    std::env::var_os(ENV_STAGE2)?;
+    let fd: i32 = std::env::var(ENV_BROKER_FD).ok()?.parse().ok()?;
+    if fd <= 2 {
+        return None;
+    }
+    // SAFETY: fstat/getsockopt on a number we only inspect.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return None;
+        }
+        let (mut dom, mut ty) = (0i32, 0i32);
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut dom as *mut _ as *mut _,
+            &mut len,
+        ) != 0
+        {
+            return None;
+        }
+        len = std::mem::size_of::<i32>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut _,
+            &mut len,
+        ) != 0
+        {
+            return None;
+        }
+        (dom == libc::AF_UNIX && ty == libc::SOCK_STREAM).then_some(fd)
+    }
+}
+
+/// Forks the broker. Called in stage 1 AFTER the socket-deny filter (the broker inherits it) and
+/// BEFORE `restrict_self`, so the broker is outside the frontend's Landlock domain. Returns the
+/// frontend's end of the channel, already without close-on-exec so that it survives the exec
+/// into stage 2. The broker never returns from here.
+fn spawn_broker(
+    plan: &Plan,
+    req: &BrokerRequest,
+) -> Result<std::os::unix::net::UnixStream, String> {
+    use std::os::fd::AsRawFd;
+    let (front, back) =
+        std::os::unix::net::UnixStream::pair().map_err(|e| format!("broker channel: {e}"))?;
+    // SAFETY: fork in a single-threaded process (the seccomp installation verified one thread).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!(
+            "cannot fork the broker: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if pid == 0 {
+        drop(front);
+        crate::worker::broker::process_main(
+            back,
+            plan.exe.clone(),
+            plan.roots.iter().map(|(p, _)| p.clone()).collect(),
+            req.grants.clone(),
+        );
+    }
+    drop(back);
+    // SAFETY: clearing close-on-exec on our own descriptor.
+    if unsafe { libc::fcntl(front.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
+        return Err("cannot pass the broker channel to stage 2".into());
+    }
+    Ok(front)
+}
 
 /// A process OUTSIDE the sandbox-to-be, reparented to init (double fork), that
 /// sleeps for a while. After the restriction, signalling it must fail with
@@ -474,7 +562,15 @@ pub fn open_fds_above_stderr() -> Vec<i32> {
 /// descriptors that are already open, so an inherited descriptor to a file or
 /// directory outside the roots would stay usable inside the sandbox.
 pub fn close_inherited_fds() {
+    close_inherited_fds_except(None)
+}
+
+/// As [`close_inherited_fds`], keeping `keep` (stage 2: the validated broker channel).
+pub fn close_inherited_fds_except(keep: Option<i32>) {
     for fd in open_fds_above_stderr() {
+        if Some(fd) == keep {
+            continue;
+        }
         // SAFETY: closing a descriptor number we just listed. This runs first
         // thing in `mind mcp`, before anything of ours has been opened, so
         // these are inherited descriptors; a failed close is harmless.
@@ -694,6 +790,16 @@ pub fn enter(plan: &Plan) -> Outcome {
 /// process's arguments (roots that stage 1 resolved, for example granted ones,
 /// which stage 2 could no longer read from disk once confined).
 pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
+    enter_with_broker(plan, extra_args, None)
+}
+
+/// As [`enter_with_args`]; with `broker` a broker process is forked outside the Landlock domain
+/// and the frontend's end of its channel is the one descriptor stage 2 inherits.
+pub fn enter_with_broker(
+    plan: &Plan,
+    extra_args: &[OsString],
+    broker: Option<&BrokerRequest>,
+) -> Outcome {
     if plan.roots.is_empty() {
         return Outcome::NotNeeded;
     }
@@ -735,6 +841,13 @@ pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
         Err(e) => return Outcome::Unavailable(e),
     };
 
+    // The broker must exist before this process confines itself: a child of a confined process
+    // can never be less confined. Failure is a start failure (the repository tools stay off).
+    let broker_link = match broker.map(|b| spawn_broker(plan, b)) {
+        Some(Ok(l)) => Some(l),
+        Some(Err(e)) => return Outcome::Unavailable(format!("broker: {e}")),
+        None => None,
+    };
     // From here on the process is confined (or the call failed before that).
     let status = match ruleset.restrict_self() {
         Ok(s) => s,
@@ -767,6 +880,10 @@ pub fn enter_with_args(plan: &Plan, extra_args: &[OsString]) -> Outcome {
         .env(ENV_STAGE2, "1")
         .env(ENV_CANARY, &canary_dir)
         .env("TMPDIR", &tmp);
+    if let Some(l) = &broker_link {
+        use std::os::fd::AsRawFd;
+        cmd.env(ENV_BROKER_FD, l.as_raw_fd().to_string());
+    }
     let err = cmd.exec();
     die(&format!("cannot restart under the sandbox: {err}"));
 }
@@ -988,7 +1105,13 @@ pub fn verify_stage2(private_tmp: &Path) -> Result<Option<Report>, String> {
             "the environment says the process is sandboxed, but the observed behavior says otherwise: {failures:?}"
         ));
     }
-    let stray = open_fds_above_stderr();
+    // The broker channel is the one descriptor stage 2 may hold, and only if it is a unix stream
+    // socket; the number comes from stage 1's environment and is checked, not trusted.
+    let allowed = broker_fd_from_env();
+    let stray: Vec<i32> = open_fds_above_stderr()
+        .into_iter()
+        .filter(|fd| Some(*fd) != allowed)
+        .collect();
     if !stray.is_empty() {
         return Err(format!(
             "unexpected open file descriptors in the sandboxed process: {stray:?}"

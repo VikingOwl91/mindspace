@@ -57,6 +57,19 @@ pub trait Store {
         &self,
         observation: CodeObservation,
     ) -> Result<CodeObservationReport>;
+    /// Atomically records one directory ingestion: the observation and, if there is any, the
+    /// structure derived from its source files. Either everything commits (as one recording
+    /// revision) or nothing does. `report.code` carries the code counters.
+    ///
+    /// `before_commit` runs after every write succeeded and immediately before the COMMIT, still
+    /// inside the transaction. If it fails the transaction is rolled back and its error is returned:
+    /// nothing is committed. (This is the hook for a commit-time authorization decision.)
+    fn record_files_ingest(
+        &self,
+        observation: IngestObservation,
+        code: Option<CodeObservation>,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<ObservationReport>;
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>>;
     /// Symbol search over the code-structure layer: definitions whose name,
     /// qualified name, signature, or path match every query term, ranked by

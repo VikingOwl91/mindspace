@@ -72,7 +72,21 @@ pub struct AuthorizedRoot {
 /// at once). Never fed by the frontend.
 pub trait RootAuthority: Send + Sync {
     fn roots(&self) -> Result<Vec<AuthorizedRoot>, String>;
+
+    /// The commit-time decision. Takes whatever excludes a concurrent revocation FIRST (for a
+    /// grant: the shared lock of the grant store, which `mind grant revoke` needs exclusively),
+    /// THEN verifies that `auth` is still valid and will stay valid for `horizon`. Dropping the
+    /// returned [`Hold`] releases the exclusion. Err: not authorized (fail closed).
+    fn hold(&self, auth: &AuthorizedRoot, horizon: Duration) -> Result<Hold, String>;
 }
+
+/// See [`RootAuthority::hold`].
+#[derive(Debug)]
+pub struct Hold(#[allow(dead_code)] Option<crate::grants::StoreHold>);
+
+/// How long a commit lease can last: after this the broker lets revocations proceed whether or not
+/// the frontend has finished. Also the horizon a grant must stay valid for to be granted a lease.
+pub const COMMIT_HOLD_MAX: Duration = Duration::from_secs(3);
 
 /// Roots fixed at construction; their device/inode are pinned then.
 pub struct StaticRoots(Vec<AuthorizedRoot>);
@@ -102,6 +116,15 @@ impl RootAuthority for StaticRoots {
     fn roots(&self) -> Result<Vec<AuthorizedRoot>, String> {
         Ok(self.0.clone())
     }
+
+    fn hold(&self, auth: &AuthorizedRoot, _horizon: Duration) -> Result<Hold, String> {
+        // a static root cannot be revoked: nothing to exclude, only the root must still be ours
+        self.0
+            .iter()
+            .any(|r| r.path == auth.path && r.dev == auth.dev && r.ino == auth.ino)
+            .then_some(Hold(None))
+            .ok_or_else(|| "the static root is not configured".to_string())
+    }
 }
 
 /// Active grants of the store, re-validated now (path policy, device/inode as approved).
@@ -110,9 +133,10 @@ pub struct GrantRoots {
     pub policy: crate::grants::PathPolicy,
 }
 
-impl RootAuthority for GrantRoots {
-    fn roots(&self) -> Result<Vec<AuthorizedRoot>, String> {
-        let now = time::OffsetDateTime::now_utc();
+impl GrantRoots {
+    /// The grants valid at `now` (the commit lease asks for `now + horizon`, so a grant that
+    /// would expire inside the lease is not leased).
+    fn roots_at(&self, now: time::OffsetDateTime) -> Result<Vec<AuthorizedRoot>, String> {
         let res = crate::grants::resolve_for_start(&self.store, &self.policy, now);
         if let Some(e) = res.store_error {
             return Err(format!("the grant store cannot be verified: {e}"));
@@ -138,6 +162,27 @@ impl RootAuthority for GrantRoots {
     }
 }
 
+impl RootAuthority for GrantRoots {
+    fn roots(&self) -> Result<Vec<AuthorizedRoot>, String> {
+        self.roots_at(time::OffsetDateTime::now_utc())
+    }
+
+    fn hold(&self, auth: &AuthorizedRoot, horizon: Duration) -> Result<Hold, String> {
+        // order matters: the lock first, the check second. A revocation that completed before the
+        // lock is seen by the check; one that starts after it waits for the lock.
+        let guard = self.store.hold_shared().map_err(|e| e.to_string())?;
+        let until = time::OffsetDateTime::now_utc() + horizon;
+        let valid = self.roots_at(until)?.iter().any(|r| {
+            r.source == auth.source && r.path == auth.path && r.dev == auth.dev && r.ino == auth.ino
+        });
+        if valid {
+            Ok(Hold(guard))
+        } else {
+            Err("the grant was revoked, expired or can no longer be verified".to_string())
+        }
+    }
+}
+
 /// Static roots always; grants too when a store is configured. A grant store that cannot be
 /// verified contributes NO root (fewer roots, never more), the static roots stay usable.
 pub struct CombinedAuthority {
@@ -154,6 +199,16 @@ impl RootAuthority for CombinedAuthority {
             }
         }
         Ok(v)
+    }
+
+    fn hold(&self, auth: &AuthorizedRoot, horizon: Duration) -> Result<Hold, String> {
+        match &auth.source {
+            AuthoritySource::Static => self.static_roots.hold(auth, horizon),
+            AuthoritySource::Grant(_) => match &self.grants {
+                Some(g) => g.hold(auth, horizon),
+                None => Err("no grant store is configured".to_string()),
+            },
+        }
     }
 }
 
@@ -451,6 +506,13 @@ pub enum ToBroker {
     /// The frontend validated the stream; let the worker finish and report.
     Done,
     Cancel,
+    /// Right before the COMMIT of the result of the operation that just ended `done`: may the
+    /// frontend commit? The answer is a lease (see [`RootAuthority::hold`]).
+    CommitRequest {
+        op: Uuid,
+    },
+    /// The frontend's commit finished (or was abandoned): the lease may be released.
+    CommitDone,
 }
 
 /// What the broker saw of the worker from outside.
@@ -505,6 +567,16 @@ pub enum FromBroker {
         observed: Observed,
     },
     Refused {
+        reason: String,
+    },
+    /// The frontend may commit now; revocations wait until `CommitDone`, a hang-up or
+    /// [`COMMIT_HOLD_MAX`].
+    CommitGranted {
+        op: Uuid,
+    },
+    /// The frontend must not commit.
+    CommitDenied {
+        op: Uuid,
         reason: String,
     },
     Finished {
@@ -1034,6 +1106,12 @@ pub struct Broker {
     seen: Mutex<(HashSet<Uuid>, VecDeque<Uuid>)>,
 }
 
+/// What `operation` leaves for the serve loop.
+struct OpEnd {
+    terminal_pending: bool,
+    commit: Option<(Uuid, AuthorizedRoot)>,
+}
+
 /// Released when an operation ends, whatever the way.
 struct Permit<'a>(&'a AtomicUsize);
 impl Drop for Permit<'_> {
@@ -1142,6 +1220,8 @@ impl Broker {
         // own terminal message (`Cancel`, because its result is an error). Exactly that one
         // message is expected and ignored; any other stray message stays a protocol violation.
         let mut terminal_pending = false;
+        // the operation that ended `done` and whose result the frontend may ask to commit
+        let mut awaiting: Option<(Uuid, AuthorizedRoot)> = None;
         loop {
             let line = match read_line_limited(&mut reader) {
                 Ok(Some(l)) => l,
@@ -1160,10 +1240,17 @@ impl Broker {
                     spaces,
                 }) => {
                     terminal_pending = false;
+                    awaiting = None;
                     match self.operation(&sock, &mut reader, v, op, kind, root, spaces) {
-                        Ok(pending) => terminal_pending = pending,
+                        Ok(end) => {
+                            terminal_pending = end.terminal_pending;
+                            awaiting = end.commit;
+                        }
                         Err(why) => self.refuse(&sock, &why),
                     }
+                }
+                Ok(ToBroker::CommitRequest { op }) => {
+                    self.commit_lease(&sock, &mut reader, op, awaiting.take());
                 }
                 Ok(ToBroker::Done | ToBroker::Cancel) if terminal_pending => {
                     terminal_pending = false;
@@ -1200,7 +1287,7 @@ impl Broker {
         _kind: OpKind,
         root: String,
         spaces: Vec<Uuid>,
-    ) -> Result<bool, String> {
+    ) -> Result<OpEnd, String> {
         if v != BROKER_PROTOCOL {
             return Err(format!("broker protocol {v}"));
         }
@@ -1320,8 +1407,45 @@ impl Broker {
         let mut b = serde_json::to_vec(&fin).map_err(|e| e.to_string())?;
         b.push(b'\n');
         let _ = (&*sock).write_all(&b);
-        // true: the broker ended it, so the frontend's terminal message is still on its way
-        Ok(!consumed)
+        // terminal_pending: the broker ended it, so the frontend's terminal message is still on
+        // its way. commit: only an operation that ended `done` may ask for a commit lease.
+        Ok(OpEnd {
+            terminal_pending: !consumed,
+            commit: (ended_by == EndedBy::Done).then_some((op, auth)),
+        })
+    }
+
+    /// The commit-time decision (see [`RootAuthority::hold`]). Single use per finished operation.
+    fn commit_lease(
+        &self,
+        sock: &UnixStream,
+        reader: &mut BufReader<UnixStream>,
+        op: Uuid,
+        awaiting: Option<(Uuid, AuthorizedRoot)>,
+    ) {
+        let reply = |m: &FromBroker| {
+            let mut b = serde_json::to_vec(m).unwrap_or_default();
+            b.push(b'\n');
+            let _ = (&*sock).write_all(&b);
+        };
+        let Some((_, auth)) = awaiting.filter(|(a, _)| *a == op) else {
+            reply(&FromBroker::CommitDenied {
+                op,
+                reason: "no finished operation awaits a commit".into(),
+            });
+            return;
+        };
+        match self.authority.hold(&auth, COMMIT_HOLD_MAX) {
+            Err(reason) => reply(&FromBroker::CommitDenied { op, reason }),
+            Ok(hold) => {
+                reply(&FromBroker::CommitGranted { op });
+                // the lease lasts until `CommitDone`, a hang-up or the ceiling
+                let _ = sock.set_read_timeout(Some(COMMIT_HOLD_MAX));
+                let _ = read_line_limited(reader);
+                let _ = sock.set_read_timeout(None);
+                drop(hold);
+            }
+        }
     }
 
     fn spawn(

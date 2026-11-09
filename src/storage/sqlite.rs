@@ -1954,49 +1954,28 @@ impl Store for SqliteStore {
     ) -> Result<CodeObservationReport> {
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let mut report = CodeObservationReport::default();
-        for input in observation.inputs {
-            report.supported_inputs += 1;
-            let existing:Option<String>=match (&input.repository_id,&input.blob_oid) { (Some(repo),Some(blob))=>tx.query_row("SELECT id FROM code_inputs WHERE repository_id=?1 AND blob_oid=?2",rusqlite::params![repo.to_string(),blob],|r|r.get(0)).optional().map_err(dberr)?, _=>tx.query_row("SELECT id FROM code_inputs WHERE repository_id IS NULL AND content_hash=?1",rusqlite::params![input.content_hash],|r|r.get(0)).optional().map_err(dberr)? };
-            let is_new = existing.is_none();
-            let input_id = existing.unwrap_or_else(|| Uuid::now_v7().to_string());
-            if is_new {
-                tx.execute("INSERT INTO code_inputs(id,content_hash,repository_id,blob_oid,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![input_id,input.content_hash,input.repository_id.map(|x|x.to_string()),input.blob_oid,Ts::now().0]).map_err(dberr)?;
-            }
-            for context in input.contexts {
-                tx.execute("INSERT OR IGNORE INTO code_contexts(input_id,path,commit_oid) VALUES(?1,?2,?3)",rusqlite::params![input_id,context.path,context.commit_oid]).map_err(dberr)?;
-            }
-            let d = &input.derivation;
-            let derivation_id:Option<String>=tx.query_row("SELECT id FROM code_derivations WHERE input_id=?1 AND extractor=?2 AND extractor_version=?3 AND grammar=?4 AND grammar_version=?5",rusqlite::params![input_id,d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?;
-            // A policy skip (status `failed`, identity with a `+skip(` suffix) is counted
-            // whether the row is new or already there.
-            let skip_reason = crate::ingest::code::skip_reason_of(&d.identity);
-            if let Some(reason) = &skip_reason {
-                report.skipped += 1;
-                *report.skip_reasons.entry(reason.clone()).or_default() += 1;
-            }
-            if derivation_id.is_some() {
-                report.reused += 1;
-                continue;
-            }
-            let did = Uuid::now_v7();
-            tx.execute("INSERT INTO code_derivations(id,input_id,language,extractor,extractor_version,grammar,grammar_version,status,error_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",rusqlite::params![did.to_string(),input_id,input.language.as_str(),d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version,d.status.as_str(),d.error_count,Ts::now().0]).map_err(dberr)?;
-            if skip_reason.is_none() {
-                report.parsed += 1;
-                report.entities += d.entities.len() as u64;
-                report.parse_errors +=
-                    u64::from(d.status != crate::core::CodeParseStatus::Complete);
-            }
-            for e in &d.entities {
-                tx.execute("INSERT INTO code_entities(id,derivation_id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),e.kind.as_str(),e.name,e.qualified_name,e.syntax_path,e.parent_syntax_path,e.range.start_byte as i64,e.range.end_byte as i64,e.range.start_line,e.range.start_column,e.range.end_line,e.range.end_column,e.signature,e.visibility,e.is_async]).map_err(dberr)?;
-            }
-            for i in &d.imports {
-                tx.execute("INSERT INTO code_imports(id,derivation_id,raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),i.raw,i.target,i.alias,i.range.start_byte as i64,i.range.end_byte as i64,i.range.start_line,i.range.start_column,i.range.end_line,i.range.end_column]).map_err(dberr)?;
-            }
-            for relationship in &d.relationships {
-                tx.execute("INSERT INTO code_relationship_observations(id,derivation_id,kind,source_syntax_path,raw_target,start_byte,end_byte) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),relationship.kind.as_str(),relationship.source_syntax_path,relationship.raw_target,relationship.range.start_byte as i64,relationship.range.end_byte as i64]).map_err(dberr)?;
-            }
+        let report = record_code_observation_tx(&tx, observation)?;
+        tx.commit()?;
+        Ok(report)
+    }
+
+    fn record_files_ingest(
+        &self,
+        observation: IngestObservation,
+        code: Option<CodeObservation>,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<ObservationReport> {
+        // ONE transaction, ONE recording revision for the whole logical ingestion: the observation
+        // and its derivations commit together, or (on any error, or a crash before the commit)
+        // neither does. The two `record_*` methods above remain for callers that want one part.
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
+        let mut report = record_observation_tx(&tx, observation)?;
+        if let Some(code) = code {
+            report.code = record_code_observation_tx(&tx, code)?;
         }
+        // an error here drops `tx`, which rolls back: nothing of this ingestion is committed
+        before_commit()?;
         tx.commit()?;
         Ok(report)
     }
@@ -3226,6 +3205,78 @@ enum Plan {
 /// What the engine believes about one logical source inside an ingest
 /// root: its expected location and the hash of its latest version.
 type KnownSource = (String, Option<String>);
+
+/// The code-structure write of [`Store::record_code_observation`], inside a transaction the
+/// caller owns (and commits).
+fn record_code_observation_tx(
+    tx: &Connection,
+    observation: CodeObservation,
+) -> Result<CodeObservationReport> {
+    let mut report = CodeObservationReport::default();
+    for input in observation.inputs {
+        report.supported_inputs += 1;
+        let existing: Option<String> = match (&input.repository_id, &input.blob_oid) {
+            (Some(repo), Some(blob)) => tx
+                .query_row(
+                    "SELECT id FROM code_inputs WHERE repository_id=?1 AND blob_oid=?2",
+                    rusqlite::params![repo.to_string(), blob],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(dberr)?,
+            _ => tx
+                .query_row(
+                    "SELECT id FROM code_inputs WHERE repository_id IS NULL AND content_hash=?1",
+                    rusqlite::params![input.content_hash],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(dberr)?,
+        };
+        let is_new = existing.is_none();
+        let input_id = existing.unwrap_or_else(|| Uuid::now_v7().to_string());
+        if is_new {
+            tx.execute("INSERT INTO code_inputs(id,content_hash,repository_id,blob_oid,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![input_id,input.content_hash,input.repository_id.map(|x|x.to_string()),input.blob_oid,Ts::now().0]).map_err(dberr)?;
+        }
+        for context in input.contexts {
+            tx.execute(
+                "INSERT OR IGNORE INTO code_contexts(input_id,path,commit_oid) VALUES(?1,?2,?3)",
+                rusqlite::params![input_id, context.path, context.commit_oid],
+            )
+            .map_err(dberr)?;
+        }
+        let d = &input.derivation;
+        let derivation_id:Option<String>=tx.query_row("SELECT id FROM code_derivations WHERE input_id=?1 AND extractor=?2 AND extractor_version=?3 AND grammar=?4 AND grammar_version=?5",rusqlite::params![input_id,d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?;
+        // A policy skip (status `failed`, identity with a `+skip(` suffix) is counted
+        // whether the row is new or already there.
+        let skip_reason = crate::ingest::code::skip_reason_of(&d.identity);
+        if let Some(reason) = &skip_reason {
+            report.skipped += 1;
+            *report.skip_reasons.entry(reason.clone()).or_default() += 1;
+        }
+        if derivation_id.is_some() {
+            report.reused += 1;
+            continue;
+        }
+        let did = Uuid::now_v7();
+        tx.execute("INSERT INTO code_derivations(id,input_id,language,extractor,extractor_version,grammar,grammar_version,status,error_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",rusqlite::params![did.to_string(),input_id,input.language.as_str(),d.identity.extractor,d.identity.extractor_version,d.identity.grammar,d.identity.grammar_version,d.status.as_str(),d.error_count,Ts::now().0]).map_err(dberr)?;
+        if skip_reason.is_none() {
+            report.parsed += 1;
+            report.entities += d.entities.len() as u64;
+            report.parse_errors += u64::from(d.status != crate::core::CodeParseStatus::Complete);
+        }
+        for e in &d.entities {
+            tx.execute("INSERT INTO code_entities(id,derivation_id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),e.kind.as_str(),e.name,e.qualified_name,e.syntax_path,e.parent_syntax_path,e.range.start_byte as i64,e.range.end_byte as i64,e.range.start_line,e.range.start_column,e.range.end_line,e.range.end_column,e.signature,e.visibility,e.is_async]).map_err(dberr)?;
+        }
+        for i in &d.imports {
+            tx.execute("INSERT INTO code_imports(id,derivation_id,raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),i.raw,i.target,i.alias,i.range.start_byte as i64,i.range.end_byte as i64,i.range.start_line,i.range.start_column,i.range.end_line,i.range.end_column]).map_err(dberr)?;
+        }
+        for relationship in &d.relationships {
+            tx.execute("INSERT INTO code_relationship_observations(id,derivation_id,kind,source_syntax_path,raw_target,start_byte,end_byte) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),relationship.kind.as_str(),relationship.source_syntax_path,relationship.raw_target,relationship.range.start_byte as i64,relationship.range.end_byte as i64]).map_err(dberr)?;
+        }
+    }
+    Ok(report)
+}
 
 fn record_observation_tx(
     conn: &Connection,

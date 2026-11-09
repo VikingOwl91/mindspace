@@ -917,3 +917,274 @@ fn measure_isolated_vs_in_process_and_revocation_latency() {
     );
     m.finish();
 }
+
+// ------------------------------------------------------------------ commit-time authorization
+//
+// Linearization point of a revocation against a persistence (docs/m7.3b-mcp-isolated-ingest.md):
+// the broker takes the grant store's shared lock and THEN rechecks the grant, immediately before
+// the frontend's COMMIT. Revocations that finished earlier deny the commit; revocations that start
+// later wait for the lock and are ordered after the commit. The pause hooks (test builds only)
+// stop the frontend at exact points; the tests wait on files, not on sleeps.
+
+struct Pause {
+    prefix: PathBuf,
+}
+
+impl Pause {
+    fn new(w: &World, name: &str) -> Self {
+        // the database directory is the one place the confined frontend can write
+        Self {
+            prefix: w.db.parent().unwrap().join(name),
+        }
+    }
+    fn var(&self) -> String {
+        self.prefix.display().to_string()
+    }
+    fn file(&self, ext: &str) -> PathBuf {
+        let mut p = self.prefix.clone().into_os_string();
+        p.push(ext);
+        PathBuf::from(p)
+    }
+    fn wait_reached(&self) {
+        let end = Instant::now() + Duration::from_secs(60);
+        while !self.file(".reached").exists() {
+            assert!(
+                Instant::now() < end,
+                "the frontend never reached the boundary"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn go(&self) {
+        std::fs::write(self.file(".go"), b"").unwrap();
+    }
+}
+
+fn grant_world(w: &World, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+    let project = w.dir("project", &[("a.md", "# A\n")]);
+    let dynamic = w.dir("dynamic", files);
+    (project, dynamic)
+}
+
+#[test]
+fn revocation_after_worker_completion_but_before_persistence_denies_the_commit() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(
+        &w,
+        &[("x.rs", "pub fn late_symbol() {}\n"), ("d.md", "# D\n")],
+    );
+    let pause = Pause::new(&w, "before");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.rows();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    // the worker finished, the stream was validated, the write transaction is open but
+    // uncommitted, and the frontend is stopped right before it asks the broker
+    pause.wait_reached();
+    assert_eq!(w.rows(), before, "nothing is visible before the commit");
+    let gid = w.grant_id(&dynamic);
+    w.ok(&[
+        "grant",
+        "revoke",
+        &gid,
+        "--reason",
+        "between validation and commit",
+    ]);
+    pause.go();
+    let r = m.read_result(id);
+    assert_eq!(err_kind(&r), "revoked", "{r}");
+    assert!(r["structuredContent"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("commit"));
+    assert_eq!(w.rows(), before, "the denied commit left no trace");
+    let hit = m.call("code_search", json!({"query": "late_symbol"}));
+    assert_eq!(
+        hit["structuredContent"]["hits"].as_array().unwrap().len(),
+        0,
+        "{hit}"
+    );
+    m.finish();
+}
+
+#[test]
+fn revocation_during_persistence_waits_for_the_commit_and_is_ordered_after_it() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, &[("x.rs", "pub fn during_symbol() {}\n")]);
+    let pause = Pause::new(&w, "after");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.rows();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    // the lease is granted: the broker holds the store's shared lock, the commit has not happened
+    pause.wait_reached();
+    assert_eq!(w.rows(), before);
+    let gid = w.grant_id(&dynamic);
+    let mut revoke = w
+        .mind(&["grant", "revoke", &gid, "--reason", "during the commit"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        revoke.try_wait().unwrap().is_none(),
+        "`mind grant revoke` must wait while a commit is leased"
+    );
+    pause.go();
+    let r = m.read_result(id);
+    assert_eq!(r["isError"], false, "the leased commit went through: {r}");
+    assert!(w.rows() > before, "committed");
+    // only now can the revocation complete: it is ordered AFTER the commit
+    let t = Instant::now();
+    assert!(revoke.wait().unwrap().success());
+    assert!(t.elapsed() < Duration::from_secs(5));
+    // after the commit: the data stays (revoking never deletes), new operations are refused
+    let hit = m.call("code_search", json!({"query": "during_symbol"}));
+    assert_eq!(
+        hit["structuredContent"]["hits"].as_array().unwrap().len(),
+        1,
+        "{hit}"
+    );
+    let r = m.ingest(&dynamic);
+    assert_eq!(err_kind(&r), "root_not_authorized", "{r}");
+    m.finish();
+}
+
+#[test]
+fn a_stalled_frontend_cannot_hold_a_revocation_longer_than_the_lease_ceiling() {
+    let w = World::new();
+    let (project, dynamic) = grant_world(&w, &[("x.rs", "pub fn stalled_symbol() {}\n")]);
+    let pause = Pause::new(&w, "stalled");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
+    );
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    let before = w.rows();
+    let id = m.send_call(
+        TOOL,
+        json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    pause.wait_reached();
+    let gid = w.grant_id(&dynamic);
+    let t = Instant::now();
+    // the frontend stays stalled: the revocation is delayed by the lease ceiling, not blocked
+    w.ok(&["grant", "revoke", &gid]);
+    let waited = t.elapsed();
+    assert!(
+        waited >= Duration::from_millis(2500) && waited < Duration::from_secs(8),
+        "revoke waited {waited:?} (ceiling 3 s)"
+    );
+    pause.go();
+    // the late frontend finds its lease expired and does NOT commit
+    let r = m.read_result(id);
+    assert_eq!(err_kind(&r), "commit_not_authorized", "{r}");
+    assert_eq!(
+        w.rows(),
+        before,
+        "a commit after a completed revocation never happens"
+    );
+    eprintln!("stalled frontend: revoke waited {waited:?}, commit abandoned");
+    m.finish();
+}
+
+#[test]
+fn a_database_failure_at_the_commit_boundary_leaves_nothing_even_through_mcp() {
+    let w = World::new();
+    let project = w.dir(
+        "project",
+        &[("a.md", "# A\n\nalpha\n"), ("l.rs", "pub fn fi() {}\n")],
+    );
+    let mut m = mcp!(w, &[&project], OPT_IN, &[]);
+    // a real SQLite fault in the SECOND part of the old two-step write
+    rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fi BEFORE INSERT ON code_derivations BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+    let before = w.rows();
+    let r = m.ingest(&project);
+    assert_eq!(r["isError"], true, "{r}");
+    assert_eq!(
+        r["structuredContent"]["error"]["kind"], "persist_failed",
+        "{r}"
+    );
+    assert_eq!(r["structuredContent"]["atomic"], true, "{r}");
+    assert_eq!(
+        w.rows(),
+        before,
+        "the observation was rolled back with the derivations"
+    );
+    rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .execute_batch("DROP TRIGGER fi")
+        .unwrap();
+    // the same call now succeeds (a retry heals; there was nothing half-written to repair)
+    let r = m.ingest(&project);
+    assert_eq!(r["isError"], false, "{r}");
+    m.finish();
+}
+
+// ------------------------------------------------------------------ resource policy parity
+
+#[test]
+fn the_unscoped_file_limit_of_repo_ingest_applies_and_a_refusal_is_early_and_clean() {
+    let w = World::new();
+    let project = w.dir("project", &[]);
+    for i in 0..2001 {
+        std::fs::write(project.join(format!("n{i}.md")), format!("# N{i}\n")).unwrap();
+    }
+    let mut m = mcp!(w, &[&project], OPT_IN, &[]);
+    let before = w.rows();
+    let t = Instant::now();
+    let r = m.ingest(&project);
+    let took = t.elapsed();
+    assert_eq!(err_kind(&r), "too_many_files", "{r}");
+    assert!(r["structuredContent"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("2000"));
+    assert_eq!(w.rows(), before, "nothing persisted");
+    assert!(children_of(m.broker).is_empty(), "the worker was ended");
+    // the in-process tool applies the same limit to the same tree
+    let r2 = m.call(
+        "repo_ingest",
+        json!({"path": project.to_str().unwrap(), "spaces": ["p"]}),
+    );
+    assert_eq!(r2["isError"], true);
+    assert!(
+        r2["content"][0]["text"].as_str().unwrap().contains("2000"),
+        "{r2}"
+    );
+    // exactly the limit passes
+    std::fs::remove_file(project.join("n2000.md")).unwrap();
+    let t2 = Instant::now();
+    let r = m.ingest(&project);
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["resource_policy"]["max_files"], 2000);
+    eprintln!(
+        "2001 files refused after {took:?}; exactly 2000 files ingested in {:?}",
+        t2.elapsed()
+    );
+    m.finish();
+}

@@ -457,6 +457,10 @@ pub struct Store {
     dir: PathBuf,
 }
 
+/// See [`Store::hold_shared`]. The lock is released when this is dropped.
+#[derive(Debug)]
+pub struct StoreHold(#[allow(dead_code)] File);
+
 fn io_err(path: &Path, what: &str, e: std::io::Error) -> Error {
     Error::Grant(format!("{what} {}: {e}", path.display()))
 }
@@ -608,6 +612,26 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    /// A shared lock on the store file, held until the guard is dropped. While it is held no event
+    /// can be appended (`append` takes the exclusive lock): a `mind grant revoke` that starts now
+    /// waits and so is ordered AFTER whatever the holder does next. `None`: no store file exists,
+    /// so there is nothing to revoke. Same safety checks as `load`.
+    pub fn hold_shared(&self) -> Result<Option<StoreHold>> {
+        let path = self.file();
+        let Some(dirfd) = self.open_dir(false)? else {
+            return Ok(None);
+        };
+        let file = match openat_nofollow(&dirfd, STORE_FILE, libc::O_RDONLY, 0) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(&path, "cannot open the grant store", e)),
+        };
+        self.check_open_file(&file)?;
+        file.lock_shared()
+            .map_err(|e| io_err(&path, "cannot lock", e))?;
+        Ok(Some(StoreHold(file)))
     }
 
     /// Reads and verifies the store under a shared lock. A missing file is an

@@ -21,7 +21,7 @@ use crate::ingest::stream::{consume, Kind, ProducerLimits, StreamLimits};
 
 use super::broker::{
     recv_with_fd, AuthoritySource, EndedBy, FromBroker, Observed, OpKind, ToBroker,
-    BROKER_PROTOCOL, MAX_LINE,
+    BROKER_PROTOCOL, COMMIT_HOLD_MAX, MAX_LINE,
 };
 use super::context::{
     answer, check_result, validate_spaces, ContextSource, Manifest, MAX_MANIFEST_LINE,
@@ -658,6 +658,8 @@ fn verify_hello(h: &Hello, pid: u32, via_proc: bool) -> Result<(), WorkerError> 
 /// What the broker reported when the operation ended.
 #[derive(Debug, Clone)]
 pub struct BrokerReport {
+    /// The operation id: the key for the commit lease.
+    pub op: Uuid,
     pub observed: Observed,
     /// Where the broker took the authority from (derived by the broker, never by the caller).
     pub authority: AuthoritySource,
@@ -827,6 +829,7 @@ pub fn extract_via_broker(
         return Err(WorkerError::Timeout("broker wall clock"));
     }
     let report = BrokerReport {
+        op,
         observed,
         authority,
         ended_by,
@@ -849,5 +852,42 @@ pub fn extract_via_broker(
             stderr: String::new(),
         }),
         Err(e) => Err(e),
+    }
+}
+
+/// Asks the broker for the commit-time decision of the operation `op` that just ended `done`.
+/// `Ok(())`: the frontend holds a lease and must commit (or abandon) and then call
+/// [`commit_done`]. `Err(reason)`: it must NOT commit.
+pub fn commit_request(link: &UnixStream, op: Uuid) -> Result<(), String> {
+    let mut b = serde_json::to_vec(&ToBroker::CommitRequest { op }).map_err(|e| e.to_string())?;
+    b.push(b'\n');
+    (&*link)
+        .write_all(&b)
+        .map_err(|e| format!("the broker is not available: {e}"))?;
+    link.set_read_timeout(Some(COMMIT_HOLD_MAX))
+        .map_err(|e| e.to_string())?;
+    let mut line = Vec::new();
+    let mut reader = BufReader::new(link.try_clone().map_err(|e| e.to_string())?);
+    let n = (&mut reader)
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|e| format!("no commit decision from the broker: {e}"))?;
+    if n == 0 || line.last() != Some(&b'\n') {
+        return Err("the broker is not available (it exited before deciding)".into());
+    }
+    match serde_json::from_slice::<FromBroker>(&line) {
+        Ok(FromBroker::CommitGranted { op: o }) if o == op => Ok(()),
+        Ok(FromBroker::CommitDenied { op: o, reason }) if o == op => Err(reason),
+        other => Err(format!(
+            "unexpected answer to the commit request: {other:?}"
+        )),
+    }
+}
+
+/// Releases the lease taken by a successful [`commit_request`] (also when the commit failed).
+pub fn commit_done(link: &UnixStream) {
+    if let Ok(mut b) = serde_json::to_vec(&ToBroker::CommitDone) {
+        b.push(b'\n');
+        let _ = (&*link).write_all(&b);
     }
 }

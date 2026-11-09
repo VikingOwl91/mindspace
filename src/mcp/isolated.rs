@@ -22,6 +22,7 @@
 //!   stream and structural-parse limits. There is NO aggregate per-operation memory limit; the
 //!   unit's own `MemoryMax=` (if any) covers the tree because it lives inside the unit.
 
+use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -33,14 +34,19 @@ use serde_json::{json, Map, Value};
 
 use crate::core::Uuid;
 use crate::ingest::deadline::Deadline;
-use crate::ingest::extract::{persist, StoreContext};
+use crate::ingest::extract::{persist_files_gated, Extracted, StoreContext};
 use crate::storage::Store;
-use crate::worker::client::{extract_via_broker, WorkerConfig, WorkerError};
+use crate::worker::client::{
+    commit_done, commit_request, extract_via_broker, WorkerConfig, WorkerError,
+};
 
-use super::repo_tools::{summarize, McpConfig};
+use super::repo_tools::{summarize, McpConfig, MAX_UNSCOPED_INGEST_FILES};
 use super::tools::ToolFailure;
 
 pub const TOOL: &str = "repo_ingest_isolated";
+
+/// How long this side may use a commit lease: shorter than the broker's ceiling.
+const LEASE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// The frontend's end of the broker channel. One operation at a time (the lock); a link that may
 /// be out of step is never used again.
@@ -118,12 +124,41 @@ fn error_of(e: WorkerError) -> (ToolFailure, bool) {
         Timeout(_) => "timeout",
         Cancelled => "cancelled",
         Context(_) => "context_refused",
+        Stream(m) if m.contains("files exceed the limit") => "too_many_files",
         Stream(_) => "result_refused",
         Sandbox(_) => "confinement_not_verified",
         Died { .. } => "worker_failed",
         Spawn(_) | Io(_) => "broker_io",
     };
+    let text = if kind == "too_many_files" {
+        format!(
+            "refusing an ingest of more than {MAX_UNSCOPED_INGEST_FILES} ingestable files: this tool \
+             takes a whole directory and cannot narrow it; ingest a smaller directory ({text})"
+        )
+    } else {
+        text
+    };
     (failure(kind, text), poison)
+}
+
+/// Test builds only (feature `spawn-gate`): makes a boundary deterministic. With `<var>=<prefix>`
+/// the frontend creates `<prefix>.reached`, then waits (at most 15 s) for `<prefix>.go`.
+#[cfg(feature = "spawn-gate")]
+fn gate_pause(var: &str) {
+    let Some(prefix) = std::env::var_os(var) else {
+        return;
+    };
+    let prefix = std::path::PathBuf::from(prefix);
+    let with = |ext: &str| {
+        let mut p = prefix.clone().into_os_string();
+        p.push(ext);
+        std::path::PathBuf::from(p)
+    };
+    let _ = std::fs::write(with(".reached"), b"");
+    let end = Instant::now() + std::time::Duration::from_secs(15);
+    while !with(".go").exists() && Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Own cgroup as the kernel reports it (`/proc/self` is the one entry the sandbox allows).
@@ -209,6 +244,10 @@ pub fn run(
     #[allow(unused_mut)]
     let mut cfg = WorkerConfig::new("/nonexistent"); // the broker starts the worker; this path is unused
     cfg.wall_timeout = config.ingest_timeout();
+    // This tool is always unscoped (there is no `paths`), so it gets the limit `repo_ingest` has
+    // for unscoped trees. The producer streams files one by one: the 2001st is refused as it
+    // arrives and the worker is ended, without a pre-scan.
+    cfg.stream.extraction.max_files = MAX_UNSCOPED_INGEST_FILES as usize;
     // Test builds only (feature `spawn-gate`): the stand-in workers of the failure tests cannot
     // say hello as a real worker does.
     #[cfg(feature = "spawn-gate")]
@@ -234,8 +273,6 @@ pub fn run(
             return Err(f);
         }
     };
-    drop(link);
-
     // The worker must have run inside this server's own cgroup (and so inside its unit): a
     // placement elsewhere would silently escape the unit's lifecycle and limits.
     let contained = match (own_cgroup(), rep.observed.cgroup.as_deref()) {
@@ -249,11 +286,75 @@ pub fn run(
         ));
     }
 
-    // Only now, with the broker's `done` and a validated result, anything is written.
-    // `persist` is the existing two-step writer: a failure may leave the first step committed, so
-    // "persisted" is honestly unknown here.
-    let outcome = persist(store, extracted, &Deadline::none())
-        .map_err(|e| failure_with("persist_failed", e.to_string(), json!("unknown")))?;
+    // Persistence: ONE transaction for the whole ingestion (observation and derivations), and a
+    // commit-time authorization decision from the broker taken inside it, immediately before the
+    // COMMIT. A denial rolls the transaction back. While the commit runs the broker holds the
+    // grant store's shared lock, so a revocation that starts now is ordered after the commit.
+    let Extracted::Files(files) = extracted else {
+        return Err(failure(
+            "result_refused",
+            "the result is not a directory ingestion",
+        ));
+    };
+    let leased = Cell::new(false);
+    let denial: RefCell<Option<String>> = RefCell::new(None);
+    let t_persist = Instant::now();
+    let result = persist_files_gated(store, files, &Deadline::none(), &|| {
+        #[cfg(feature = "spawn-gate")]
+        gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE");
+        match commit_request(&link, rep.op) {
+            Ok(()) => {
+                leased.set(true);
+                let granted_at = Instant::now();
+                #[cfg(feature = "spawn-gate")]
+                gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER");
+                // The broker lets revocations proceed after COMMIT_HOLD_MAX. A commit must end
+                // inside the lease: use a shorter budget here (the broker's clock started
+                // earlier than this one) and abandon the commit otherwise.
+                if granted_at.elapsed() >= LEASE_BUDGET {
+                    *denial.borrow_mut() =
+                        Some("the commit lease expired before the commit".to_string());
+                    return Err(crate::core::Error::Storage(
+                        "the commit lease expired before the commit".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Err(reason) => {
+                *denial.borrow_mut() = Some(reason.clone());
+                Err(crate::core::Error::Storage(format!(
+                    "the commit was not authorized: {reason}"
+                )))
+            }
+        }
+    });
+    if leased.get() {
+        commit_done(&link); // success or not: the lease ends with the commit attempt
+    }
+    drop(link);
+    let persist_ms = t_persist.elapsed().as_millis() as u64;
+    if let Some(reason) = denial.into_inner() {
+        // rolled back before the COMMIT: nothing was written, which is certain
+        let kind = if reason.contains("broker is not available") {
+            "broker_unavailable"
+        } else if reason.contains("lease expired") {
+            "commit_not_authorized"
+        } else {
+            "revoked"
+        };
+        return Err(failure(kind, format!("the commit was refused: {reason}")));
+    }
+    let report = result.map_err(|e| {
+        let mut f = failure_with("persist_failed", e.to_string(), json!("unknown"));
+        // the single transaction either committed everything or nothing; only a failure of the
+        // COMMIT itself leaves the outcome unknown
+        if let Some(s) = f.structured.as_mut() {
+            s["atomic"] = json!(true);
+            f.message = s.to_string();
+        }
+        f
+    })?;
+    let outcome = crate::core::IngestOutcome::Files(report);
     let authority = match rep.authority {
         crate::worker::broker::AuthoritySource::Static => "static_root",
         crate::worker::broker::AuthoritySource::Grant(_) => "grant",
@@ -284,8 +385,13 @@ pub fn run(
             "placement": "inside the server's own cgroup (the unit's lifecycle and limits apply)",
             "wall_clock_limit_ms": config.ingest_timeout().as_millis() as u64,
             "per_operation_memory_limit": null,
+            "max_files": MAX_UNSCOPED_INGEST_FILES,
+            "max_stream_bytes": 512 * 1024 * 1024,
+            "max_blob_bytes": 32 * 1024 * 1024,
             "note": "there is no aggregate per-operation memory limit; only the wall clock, the stream limits and the structural parse policy bound the operation",
         },
+        "persist_ms": persist_ms,
+        "commit_authorization": "granted by the broker immediately before the COMMIT",
         "elapsed_ms": t0.elapsed().as_millis() as u64,
         "sandbox": config.sandbox().label(),
         "seccomp": config.seccomp(),

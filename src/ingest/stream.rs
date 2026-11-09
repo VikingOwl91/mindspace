@@ -1669,7 +1669,10 @@ impl<'a> Assembler<'a> {
     }
 
     fn count_check(&self) -> Result<()> {
-        let n = self.derivations.len() + self.files.len();
+        // The record being opened is the owner and is not in the lists until it closes: count it,
+        // or the limit would admit one file more than it says (the in-process validation counts
+        // exactly).
+        let n = self.derivations.len() + self.files.len() + usize::from(self.owner.is_some());
         if n > self.limits.extraction.max_files {
             return bad(format!("{n} files exceed the limit"));
         }

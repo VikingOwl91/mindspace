@@ -121,15 +121,26 @@ pub fn persist_files(
     extracted: ExtractedFiles,
     deadline: &Deadline,
 ) -> Result<crate::core::ObservationReport> {
+    persist_files_gated(store, extracted, deadline, &|| Ok(()))
+}
+
+/// As [`persist_files`], with a decision taken right before the COMMIT: if `before_commit` fails
+/// the whole ingestion is rolled back and its error returned.
+pub fn persist_files_gated(
+    store: &dyn Store,
+    extracted: ExtractedFiles,
+    deadline: &Deadline,
+    before_commit: &dyn Fn() -> Result<()>,
+) -> Result<crate::core::ObservationReport> {
     // The last point where the limit can stop the ingest cleanly.
     deadline.check("preparing to write")?;
-    let mut report = store.record_observation(extracted.observation)?;
-    if !extracted.code_inputs.is_empty() {
-        report.code = store.record_code_observation(CodeObservation {
-            inputs: extracted.code_inputs,
-        })?;
-    }
-    Ok(report)
+    // One transaction for the whole logical ingestion (observation + derivations): see
+    // `Store::record_files_ingest`. (The Git path below is still separate writes.)
+    let has_code = !extracted.code_inputs.is_empty();
+    let code = has_code.then_some(CodeObservation {
+        inputs: extracted.code_inputs,
+    });
+    store.record_files_ingest(extracted.observation, code, before_commit)
 }
 
 pub fn persist_git(

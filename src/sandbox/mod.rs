@@ -134,11 +134,20 @@ pub(crate) const ENV_SIGNAL_CANARY: &str = "MINDSPACE_SANDBOX_SIGNAL_CANARY";
 /// Stage 1 to stage 2: the number of the one inherited descriptor, the frontend's end of the
 /// broker channel (M7.3b.3a). Only meaningful together with [`ENV_STAGE2`].
 pub(crate) const ENV_BROKER_FD: &str = "MINDSPACE_SANDBOX_BROKER_FD";
+/// Stage 1 to stage 2: `1` when stage 1 approved a git executable under the trust policy and gave it
+/// to the broker. Stage 1 clears any value it inherited before it decides; stage 2 offers the Git
+/// tool only when it is set. (Stage 2's environment is the one stage 1 passes on; no MCP request
+/// can set it.)
+pub(crate) const ENV_GIT_APPROVED: &str = "MINDSPACE_SANDBOX_GIT_APPROVED";
 
 /// What stage 1 needs to start the broker beyond the [`Plan`]: where the grant store is (if
 /// grants are in use). The static roots are the plan's roots.
 #[derive(Debug, Clone)]
 pub struct BrokerRequest {
+    /// The git executable the isolated Git worker may run, already resolved under the trust policy
+    /// (`GitExecutable::resolve_trusted`) by stage 1, or `None`: then the broker refuses every Git
+    /// operation. It is never read from anything a request can influence.
+    pub git: Option<crate::ingest::confined_git::GitExecutable>,
     /// The roots named explicitly on the command line (`--allow-root`): the broker's static,
     /// non-revocable authority. Grants that happened to be active at start are NOT in here: they
     /// stay revocable and are read from the store by the broker like any later grant.
@@ -229,6 +238,7 @@ fn spawn_broker(
                     plan.exe.clone(),
                     req.static_roots.clone(),
                     req.grants.clone(),
+                    req.git.clone(),
                 );
             }
             libc::_exit(if wd < 0 { 70 } else { 0 });
@@ -1032,6 +1042,19 @@ pub fn enter_extraction_worker_with_exec(
     keep: &[i32],
     exec: &[PathBuf],
 ) -> Result<WorkerSandbox, String> {
+    enter_extraction_worker_with_exec_files(root, keep, exec, &[])
+}
+
+/// As [`enter_extraction_worker_with_exec`], and the execute right is also given to the inodes of
+/// `exec_files`: descriptors the caller opened and VERIFIED (see
+/// `ingest::confined_git::verify_pin`). The rule is created from the descriptor itself, so the
+/// inode that was checked is the inode that is allowed; no path is opened a second time.
+pub fn enter_extraction_worker_with_exec_files(
+    root: &std::os::fd::OwnedFd,
+    keep: &[i32],
+    exec: &[PathBuf],
+    exec_files: &[std::fs::File],
+) -> Result<WorkerSandbox, String> {
     use std::os::fd::AsRawFd;
     // SAFETY: plain prctl calls on this process.
     unsafe {
@@ -1040,6 +1063,10 @@ pub fn enter_extraction_worker_with_exec(
             return Err("cannot set no_new_privs".into());
         }
     }
+    // the verified descriptors must survive the clean-up below until the rules are installed
+    let mut keep: Vec<i32> = keep.to_vec();
+    keep.extend(exec_files.iter().map(|f| f.as_raw_fd()));
+    let keep = &keep[..];
     close_all_except(keep);
     let root_raw = root.as_raw_fd();
     let seccomp = match seccomp::apply_allowing(keep)? {
@@ -1062,12 +1089,17 @@ pub fn enter_extraction_worker_with_exec(
             rights: Rights::FileExec,
         });
     }
-    let rs = build_ruleset(&rules, &Default::default())?
+    let mut rs = build_ruleset(&rules, &Default::default())?
         .add_rule(PathBeneath::new(
             root,
             AccessFs::ReadFile | AccessFs::ReadDir,
         ))
         .map_err(|e| format!("rule for the root descriptor: {e}"))?;
+    for f in exec_files {
+        rs = rs
+            .add_rule(PathBeneath::new(f, AccessFs::Execute | AccessFs::ReadFile))
+            .map_err(|e| format!("execute rule for a verified descriptor: {e}"))?;
+    }
     let status = rs
         .restrict_self()
         .map_err(|e| format!("restricting the process failed: {e}"))?;

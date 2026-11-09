@@ -1,5 +1,6 @@
 #[cfg(unix)]
 pub mod isolated;
+pub mod isolated_git;
 mod protocol;
 mod repo_tools;
 mod tools;

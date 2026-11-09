@@ -256,6 +256,12 @@ pub enum Command {
         git_exe: PathBuf,
         #[arg(long)]
         repository_id: String,
+        /// `dev:ino:size:uid:mode:sha256` of the binary, from the broker's trust policy.
+        #[arg(long)]
+        git_pin: Option<String>,
+        /// The same for the ELF interpreter.
+        #[arg(long)]
+        interp_pin: Option<String>,
         /// TEST HARNESS (feature `spawn-gate`): a named misbehaviour of the worker.
         #[cfg(feature = "spawn-gate")]
         #[arg(long)]
@@ -314,6 +320,16 @@ pub enum Command {
         /// without it the tool does not exist.
         #[arg(long = "isolated-ingest", hide = true)]
         isolated_ingest: bool,
+        /// EXPERIMENTAL (M7.3b.5e): offer `repo_ingest_git_isolated`. Requires `--git-exe`; implies
+        /// the broker. Hidden; without it (or when the executable fails the trust policy) the
+        /// tool does not exist.
+        #[arg(long = "isolated-git-ingest", hide = true)]
+        isolated_git_ingest: bool,
+        /// The git executable the isolated Git worker may run: an absolute path that passes the
+        /// trust policy (root-owned chain, not group/other writable, an ELF binary). Chosen by the
+        /// administrator at start-up; never searched on PATH and never taken from a request.
+        #[arg(long = "git-exe", hide = true, value_name = "PATH")]
+        git_exe: Option<PathBuf>,
     },
 }
 
@@ -939,14 +955,18 @@ License: {}",
             grants,
             broker,
             isolated_ingest,
+            isolated_git_ingest,
+            git_exe,
         } => mcp_command(
             cli,
             allow_roots,
             *ingest_timeout,
             *insecure_no_sandbox,
             *grants,
-            *broker || *isolated_ingest,
+            *broker || *isolated_ingest || *isolated_git_ingest,
             *isolated_ingest,
+            *isolated_git_ingest,
+            git_exe.as_deref(),
         )?,
     }
     Ok(())
@@ -955,6 +975,7 @@ License: {}",
 /// `mind mcp`: sets up the kernel sandbox (self re-exec, ADR-029) when roots are
 /// configured, then serves. Never starts the repository tools without either a
 /// verified sandbox or the explicit opt-out.
+#[allow(clippy::too_many_arguments)]
 fn mcp_command(
     cli: &Cli,
     allow_roots: &[String],
@@ -963,8 +984,52 @@ fn mcp_command(
     use_grants: bool,
     broker: bool,
     isolated_ingest: bool,
+    isolated_git_ingest: bool,
+    git_exe: Option<&std::path::Path>,
 ) -> Result<()> {
     use crate::mcp::{McpConfig, SandboxState};
+    // Stage 1 decides, once, whether the Git tool may exist: an explicit flag, an explicit
+    // administrator path and the executable trust policy. The decision travels to stage 2 as an
+    // environment marker that stage 1 always clears first (stage 2 only offers the tool when the
+    // marker is set AND the broker channel and sandbox verify). Failing any step: one line, no tool.
+    #[cfg(unix)]
+    let git_exec = if std::env::var_os(crate::sandbox::ENV_STAGE2).is_none() {
+        // SAFETY: single-threaded start-up, before any thread exists in this process.
+        unsafe { std::env::remove_var(crate::sandbox::ENV_GIT_APPROVED) };
+        if isolated_git_ingest {
+            match git_exe {
+                None => {
+                    eprintln!(
+                        "mind: --isolated-git-ingest needs --git-exe <absolute path>; \
+                         repo_ingest_git_isolated is NOT offered"
+                    );
+                    None
+                }
+                Some(p) => match crate::ingest::confined_git::GitExecutable::resolve_trusted(
+                    p,
+                    &crate::ingest::confined_git::TrustPolicy::default(),
+                ) {
+                    Ok(g) => {
+                        // SAFETY: as above.
+                        unsafe { std::env::set_var(crate::sandbox::ENV_GIT_APPROVED, "1") };
+                        Some(g)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "mind: --git-exe {} fails the executable trust policy ({e}); \
+                             repo_ingest_git_isolated is NOT offered",
+                            p.display()
+                        );
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Stage 2 keeps exactly one inherited descriptor: the validated broker channel (if any).
     #[cfg(target_os = "linux")]
     {
@@ -1057,6 +1122,7 @@ fn mcp_command(
             static_roots: McpConfig::from_specs(allow_roots)
                 .map(|c| c.roots().iter().map(|r| r.path.clone()).collect())
                 .unwrap_or_default(),
+            git: git_exec.clone(),
             grants: store_dir.clone().map(|dir| {
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
@@ -1080,15 +1146,40 @@ fn mcp_command(
     // The experimental tool exists only if it was asked for AND the kernel sandbox is verified AND
     // the broker channel arrived (stage 2 only). Anything else: no tool, and one line saying why.
     #[cfg(unix)]
-    let config = if isolated_ingest {
+    let config = if isolated_ingest || isolated_git_ingest {
         let enforced = matches!(config.sandbox(), SandboxState::Enforced(_));
+        let git_approved = isolated_git_ingest
+            && std::env::var_os(crate::sandbox::ENV_GIT_APPROVED).is_some_and(|v| v == "1");
         match (enforced, crate::worker::broker::take_frontend_link()) {
-            (true, Some(link)) => config.with_isolated_ingest(link),
+            (true, Some(link)) => {
+                let shared = std::sync::Arc::new(crate::mcp::isolated::IsolatedIngest::new(link));
+                let mut config = config;
+                if isolated_ingest {
+                    config = config.with_isolated_ingest_shared(shared.clone());
+                }
+                if git_approved {
+                    config = config.with_isolated_git_shared(shared);
+                } else if isolated_git_ingest {
+                    eprintln!(
+                        "mind: --isolated-git-ingest: no approved git executable; \
+                         repo_ingest_git_isolated is NOT offered"
+                    );
+                }
+                config
+            }
             _ => {
-                eprintln!(
-                    "mind: --isolated-ingest: no verified sandbox and broker channel; \
-                     repo_ingest_isolated is NOT offered"
-                );
+                if isolated_ingest {
+                    eprintln!(
+                        "mind: --isolated-ingest: no verified sandbox and broker channel; \
+                         repo_ingest_isolated is NOT offered"
+                    );
+                }
+                if isolated_git_ingest {
+                    eprintln!(
+                        "mind: --isolated-git-ingest: no verified sandbox and broker channel; \
+                         repo_ingest_git_isolated is NOT offered"
+                    );
+                }
                 config
             }
         }
@@ -1096,7 +1187,7 @@ fn mcp_command(
         config
     };
     #[cfg(not(unix))]
-    let _ = isolated_ingest;
+    let _ = (isolated_ingest, isolated_git_ingest, git_exe);
     let store = open(cli)?;
     // Test harness only (feature `spawn-gate`, enabled for `cargo test` builds, absent from a plain build):
     // run the worker from this sandboxed frontend.
@@ -1330,6 +1421,8 @@ pub fn run(cli: &Cli) -> Result<i32> {
     if let Command::GitExtractionWorker {
         git_exe,
         repository_id,
+        git_pin,
+        interp_pin,
         #[cfg(feature = "spawn-gate")]
         gate,
     } = &cli.command
@@ -1342,7 +1435,26 @@ pub fn run(cli: &Cli) -> Result<i32> {
         let gate = gate.as_deref();
         #[cfg(not(feature = "spawn-gate"))]
         let gate = None;
-        return Ok(crate::worker::run::main_git(git_exe, id, gate));
+        use crate::ingest::confined_git::FilePin;
+        let pins = match (git_pin, interp_pin) {
+            (None, None) => None,
+            (Some(g), i) => {
+                let parsed = FilePin::parse(g)
+                    .and_then(|g| i.as_deref().map(FilePin::parse).transpose().map(|i| (g, i)));
+                match parsed {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("mind git-extraction-worker: {e}");
+                        return Ok(78);
+                    }
+                }
+            }
+            (None, Some(_)) => {
+                eprintln!("mind git-extraction-worker: an interpreter pin without a binary pin");
+                return Ok(78);
+            }
+        };
+        return Ok(crate::worker::run::main_git(git_exe, id, pins, gate));
     }
     #[cfg(all(unix, feature = "spawn-gate"))]
     if let Command::GitProbe { scenario, git } = &cli.command {

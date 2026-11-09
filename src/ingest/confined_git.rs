@@ -35,7 +35,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use super::deadline::Deadline;
 use super::git::{parse_commit, parse_tree, ConfinedExec, GitPin, GitReader};
-use super::gitverify::{HeadClosure, RawObject, VerifyLimits};
+use super::gitverify::{hex_encode, HeadClosure, RawObject, VerifyLimits};
 use crate::core::{
     Error, GitBlobData, GitCommitData, GitObjectKind, GitTagData, GitTreeData, Result, Uuid,
 };
@@ -51,6 +51,10 @@ fn refuse(msg: impl Into<String>) -> Error {
 pub struct GitExecutable {
     exe: PathBuf,
     interpreter: Option<PathBuf>,
+    /// Set by [`GitExecutable::resolve_trusted`] only: what the files were when the trust policy
+    /// was applied. The worker re-checks it on the descriptors it opens (see [`FilePin`]).
+    exe_pin: Option<FilePin>,
+    interpreter_pin: Option<FilePin>,
 }
 
 impl GitExecutable {
@@ -88,7 +92,12 @@ impl GitExecutable {
                 })
             })
             .transpose()?;
-        Ok(Self { exe, interpreter })
+        Ok(Self {
+            exe,
+            interpreter,
+            exe_pin: None,
+            interpreter_pin: None,
+        })
     }
 
     pub fn exe(&self) -> &Path {
@@ -104,6 +113,297 @@ impl GitExecutable {
         let mut v = vec![self.exe.clone()];
         v.extend(self.interpreter.clone());
         v
+    }
+}
+
+/// Who may own the files and directories the git executable is reached through. The default is
+/// root alone: nobody but root can then change what the path leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustPolicy {
+    pub owners: Vec<u32>,
+}
+
+impl Default for TrustPolicy {
+    fn default() -> Self {
+        Self { owners: vec![0] }
+    }
+}
+
+/// What a trusted file was when the policy was applied, compared again by the worker on the
+/// descriptor it opens before it confines itself. A replaced file (another inode), a file modified
+/// in place (another size or digest) and a changed owner or mode are all refused.
+///
+/// This pins the file between the policy check and the worker's start. It does NOT pin what
+/// executes later: the worker's Landlock rule is bound to the verified inode, so a path swapped
+/// afterwards cannot run (fail closed), but a file modified in place afterwards would. Writing it
+/// requires the owner or root; the trust policy exists so that is nobody the server defends against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePin {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub uid: u32,
+    pub mode: u32,
+    pub sha256: String,
+}
+
+impl FilePin {
+    /// `dev:ino:size:uid:mode:sha256`, the form passed on the worker's command line.
+    pub fn to_arg(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            self.dev, self.ino, self.size, self.uid, self.mode, self.sha256
+        )
+    }
+
+    pub fn parse(arg: &str) -> Result<Self> {
+        let bad = || refuse("a malformed executable pin");
+        let p: Vec<&str> = arg.split(':').collect();
+        let [dev, ino, size, uid, mode, sha] = p.as_slice() else {
+            return Err(bad());
+        };
+        if sha.len() != 64
+            || !sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(bad());
+        }
+        Ok(Self {
+            dev: dev.parse().map_err(|_| bad())?,
+            ino: ino.parse().map_err(|_| bad())?,
+            size: size.parse().map_err(|_| bad())?,
+            uid: uid.parse().map_err(|_| bad())?,
+            mode: mode.parse().map_err(|_| bad())?,
+            sha256: sha.to_string(),
+        })
+    }
+
+    fn of(file: &File, what: &Path) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        let io = |e: std::io::Error| Error::GitUnavailable {
+            detail: format!("{}: {e}", what.display()),
+        };
+        let meta = file.metadata().map_err(io)?;
+        if !meta.is_file() {
+            return Err(refuse(format!("{} is not a regular file", what.display())));
+        }
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        let mut f = file;
+        loop {
+            let n = f.read(&mut buf).map_err(io)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > MAX_EXECUTABLE_BYTES {
+                return Err(refuse(format!("{} is implausibly large", what.display())));
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            uid: meta.uid(),
+            mode: meta.mode(),
+            sha256: hex_encode(&h.finalize()),
+        })
+    }
+}
+
+/// Larger than any real git binary or dynamic loader.
+const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Opens `path` without following a link, reads the pin of the OPENED file and compares it with
+/// `expected`. Returns the file, so that the caller can bind the sandbox's execute right to exactly
+/// this inode (no second open of the path).
+pub fn verify_pin(path: &Path, expected: &FilePin) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| Error::GitUnavailable {
+            detail: format!("{}: {e}", path.display()),
+        })?;
+    let now = FilePin::of(&file, path)?;
+    if &now != expected {
+        return Err(refuse(format!(
+            "{} is not the file that was approved (it was replaced or modified since the server started, or its owner or mode changed)",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn trusted_owner(policy: &TrustPolicy, uid: u32) -> bool {
+    policy.owners.contains(&uid)
+}
+
+/// Resolves `path` component by component the way the kernel would, and requires that EVERYTHING
+/// it passes through is trusted: every directory and the final file owned by an accepted uid and
+/// not writable by group or others (a sticky bit does not excuse that), every symbolic link owned
+/// by an accepted uid. Returns the resulting path, free of links. This is the attacker model:
+/// whoever is not an accepted owner cannot change what the path leads to, because they can
+/// neither write a directory entry nor a file on the way.
+fn trusted_resolve(path: &Path, policy: &TrustPolicy) -> Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt;
+    if !path.is_absolute() {
+        return Err(refuse("the git executable must be an absolute path"));
+    }
+    let components = |p: &Path| -> VecDeque<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_os_string()),
+                std::path::Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect()
+    };
+    let untrusted = |what: &str, p: &Path| {
+        refuse(format!(
+            "{what} {} is not trusted: it must be owned by an accepted owner (default: root) and not writable by group or others",
+            p.display()
+        ))
+    };
+    let check_dir = |md: &std::fs::Metadata, p: &Path| -> Result<()> {
+        if !trusted_owner(policy, md.uid()) || md.mode() & 0o022 != 0 {
+            return Err(untrusted("the directory", p));
+        }
+        Ok(())
+    };
+    let io = |p: &Path, e: std::io::Error| Error::GitUnavailable {
+        detail: format!("git executable {}: {e}", p.display()),
+    };
+    let mut resolved = PathBuf::from("/");
+    check_dir(
+        &std::fs::symlink_metadata("/").map_err(|e| io(&resolved, e))?,
+        &resolved,
+    )?;
+    let mut todo = components(path);
+    let mut links = 0;
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(&name);
+        let md = std::fs::symlink_metadata(&next).map_err(|e| io(&next, e))?;
+        if md.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                return Err(refuse(
+                    "too many symbolic links on the path of the git executable",
+                ));
+            }
+            if !trusted_owner(policy, md.uid()) {
+                return Err(untrusted("the symbolic link", &next));
+            }
+            let target = std::fs::read_link(&next).map_err(|e| io(&next, e))?;
+            if target.is_absolute() {
+                resolved = PathBuf::from("/");
+            }
+            for c in components(&target).into_iter().rev() {
+                todo.push_front(c);
+            }
+        } else if md.is_dir() {
+            check_dir(&md, &next)?;
+            resolved = next;
+        } else if todo.is_empty() {
+            if !trusted_owner(policy, md.uid()) || md.mode() & 0o022 != 0 {
+                return Err(untrusted("the file", &next));
+            }
+            resolved = next;
+        } else {
+            return Err(refuse(format!("{} is not a directory", next.display())));
+        }
+    }
+    Ok(resolved)
+}
+
+impl GitExecutable {
+    /// The production resolver: [`GitExecutable::resolve`] plus the trust policy and the pins.
+    ///
+    /// Required, else an error (and the Git tool is not offered): the path is absolute; the whole
+    /// path to the binary, links included, is trusted ([`TrustPolicy`]); the same for the
+    /// `PT_INTERP` path of the binary; the binary is a 64-bit ELF; the pins of both files are
+    /// taken from descriptors that were opened without following a link.
+    pub fn resolve_trusted(path: &Path, policy: &TrustPolicy) -> Result<Self> {
+        let exe_path = trusted_resolve(path, policy)?;
+        let mut g = Self::resolve(&exe_path)?;
+        if g.exe != exe_path {
+            return Err(refuse(
+                "the git executable changed while it was being resolved",
+            ));
+        }
+        let interp_trusted = match elf_interpreter(&exe_path)? {
+            Some(raw) => {
+                let resolved = trusted_resolve(&raw, policy)?;
+                if g.interpreter.as_deref() != Some(resolved.as_path()) {
+                    return Err(refuse(
+                        "the ELF interpreter changed while it was being resolved",
+                    ));
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+        let pin = |p: &Path| -> Result<FilePin> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(p)
+                .map_err(|e| Error::GitUnavailable {
+                    detail: format!("{}: {e}", p.display()),
+                })?;
+            let pin = FilePin::of(&f, p)?;
+            // the descriptor, not the path, decides: owner and mode of what was actually opened
+            if !trusted_owner(policy, pin.uid) || pin.mode & 0o022 != 0 {
+                return Err(refuse(format!("{} is not trusted", p.display())));
+            }
+            Ok(pin)
+        };
+        g.exe_pin = Some(pin(&exe_path)?);
+        g.interpreter_pin = interp_trusted.as_deref().map(pin).transpose()?;
+        Ok(g)
+    }
+
+    /// The pins taken by [`GitExecutable::resolve_trusted`] (binary, interpreter), if any.
+    pub fn pins(&self) -> Option<(&FilePin, Option<&FilePin>)> {
+        self.exe_pin
+            .as_ref()
+            .map(|p| (p, self.interpreter_pin.as_ref()))
+    }
+
+    /// Re-checks the pins on freshly opened descriptors and returns those descriptors (binary,
+    /// interpreter) for the sandbox. An executable without pins is refused here: a caller that
+    /// wants the trusted form must have it.
+    pub fn verify_pins(&self) -> Result<Vec<File>> {
+        let Some((exe_pin, interp_pin)) = self.pins() else {
+            return Err(refuse("the git executable carries no pin"));
+        };
+        let mut files = vec![verify_pin(&self.exe, exe_pin)?];
+        match (&self.interpreter, interp_pin) {
+            (Some(path), Some(pin)) => files.push(verify_pin(path, pin)?),
+            (None, None) => {}
+            _ => return Err(refuse("the interpreter pin does not match the executable")),
+        }
+        Ok(files)
+    }
+
+    /// The same executable with the given pins attached (the worker rebuilds the form the broker
+    /// had from its command line).
+    pub fn with_pins(mut self, exe: FilePin, interpreter: Option<FilePin>) -> Self {
+        self.exe_pin = Some(exe);
+        self.interpreter_pin = interpreter;
+        self
     }
 }
 

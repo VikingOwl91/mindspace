@@ -80,7 +80,7 @@ absolute path. The git reader is changed to the inherited-descriptor pin style (
 common dir if it is inside the root) beneath the root descriptor, keeps those descriptors, and each git child inherits only them
 (plus stdio) and uses `GIT_DIR=/proc/self/fd/N`. The channel and control descriptors are close-on-exec for git children.
 Every git child therefore: is in the worker's Landlock domain (cannot widen it), cannot write, cannot open sockets, cannot become
-privileged, dies with the cgroup, and can execute nothing but git. The deadline kills it as before.
+privileged, dies with the cgroup, and can execute nothing but git by path (qualification: Landlock does not restrict exec of a memfd the confined code fills itself; see m7.3b5e-mcp-git-tool.md section 3). The deadline kills it as before.
 
 ### 4.3 Identity (the marker) and what v1 refuses
 * **v1 requires an existing `mindspace-repository-id` marker.** The worker reads it (read-only works); the **broker reads it too**

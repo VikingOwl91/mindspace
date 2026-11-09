@@ -1110,3 +1110,110 @@ fn a_git_operation_id_cannot_be_reused_and_the_identity_in_ready_is_the_brokers(
     assert!(fd.is_some());
     (&r.link).write_all(b"{\"type\":\"cancel\"}\n").unwrap();
 }
+
+// ================================================================== the trusted executable
+
+use mindspace::ingest::confined_git::TrustPolicy;
+use std::os::unix::fs::PermissionsExt;
+
+/// A copy of git in a private directory below `target`, resolved with the PRODUCTION resolver
+/// (pins included), the test user accepted as an owner so the fixture can be trusted at all.
+fn trusted_copy() -> (tempfile::TempDir, PathBuf, GitExecutable) {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/trust-tests");
+    std::fs::create_dir_all(&base).unwrap();
+    let d = tempfile::Builder::new().tempdir_in(&base).unwrap();
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let exe = std::fs::canonicalize(d.path()).unwrap().join("git");
+    std::fs::copy(GIT, &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // SAFETY: getuid cannot fail.
+    let me = unsafe { libc::getuid() };
+    let g = GitExecutable::resolve_trusted(
+        &exe,
+        &TrustPolicy {
+            owners: vec![0, me],
+        },
+    )
+    .unwrap();
+    (d, exe, g)
+}
+
+fn trusted_cfg(g: GitExecutable) -> BrokerConfig {
+    let mut c = BrokerConfig::new(mind());
+    c.git = Some(g);
+    c
+}
+
+#[test]
+fn the_worker_gets_the_pins_and_a_binary_that_changed_before_it_started_never_runs() {
+    need!();
+    let (_d, exe, g) = trusted_copy();
+    let repo = new_repo();
+    let db = db();
+    // unchanged: the worker verifies the pins and runs this very copy
+    let r = rig(fixed(&repo.path), trusted_cfg(g.clone()));
+    let (res, _, rep) = ingest(&r, &repo.path, &db).unwrap();
+    persist(&r, &db, res, &rep);
+    let before = db.counts();
+
+    // the pins really are on the worker's command line
+    let mut hang = trusted_cfg(g.clone());
+    hang.git_gate = Some("hang".into());
+    let r2 = rig(fixed(&repo.path), hang);
+    let db2 = Arc::new(self::db());
+    let (pid, cancel, h) = start_hanging(&r2, &repo, db2.clone(), wcfg());
+    let (worker, _child) = wait_for_git_child(&pid);
+    let cmdline = std::fs::read(format!("/proc/{worker}/cmdline")).unwrap();
+    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    assert!(
+        cmdline.contains("--git-pin ") && cmdline.contains("--repository-id "),
+        "{cmdline}"
+    );
+    if g.interpreter().is_some() {
+        assert!(cmdline.contains("--interp-pin "), "{cmdline}");
+    }
+    cancel.store(true, Ordering::SeqCst);
+    let _ = h.join();
+
+    // modified in place (same inode, one byte more): the worker refuses before it reads anything
+    let original = std::fs::read(&exe).unwrap();
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&exe)
+            .unwrap()
+            .write_all(b"\0")
+            .unwrap();
+    }
+    let pid = Arc::new(AtomicU32::new(0));
+    let mut c = wcfg();
+    c.observe_pid = Some(pid.clone());
+    let r3 = rig(fixed(&repo.path), trusted_cfg(g.clone()));
+    let e = ingest_with(&r3, &c, &repo.path, &db, &AtomicBool::new(false))
+        .expect_err("a modified git binary was run");
+    // refused before the worker confined itself or read anything
+    assert!(
+        matches!(&e, WorkerError::Refused(m) if m.contains("before it was confined")),
+        "{e}"
+    );
+    assert!(gone(pid.load(Ordering::SeqCst)));
+    assert_eq!(before, db.counts());
+
+    // restored byte for byte (same inode): the pins match again and it works
+    std::fs::write(&exe, &original).unwrap();
+    let r4 = rig(fixed(&repo.path), trusted_cfg(g.clone()));
+    ingest(&r4, &repo.path, &db).unwrap();
+
+    // replaced by an identical copy (another inode): refused, identity is pinned
+    let twin = exe.with_file_name("git.twin");
+    std::fs::write(&twin, &original).unwrap();
+    std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&twin, &exe).unwrap();
+    let r5 = rig(fixed(&repo.path), trusted_cfg(g));
+    assert!(
+        ingest(&r5, &repo.path, &db).is_err(),
+        "a replaced git binary was run"
+    );
+    assert_eq!(before, db.counts());
+}

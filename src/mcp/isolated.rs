@@ -53,8 +53,8 @@ const LEASE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500)
 /// be out of step is never used again.
 #[derive(Debug)]
 pub struct IsolatedIngest {
-    link: Mutex<UnixStream>,
-    poisoned: AtomicBool,
+    pub(super) link: Mutex<UnixStream>,
+    pub(super) poisoned: AtomicBool,
 }
 
 impl IsolatedIngest {
@@ -116,7 +116,7 @@ fn failure_commit(
 
 /// An idle, healthy link has nothing to read. Readable means the peer closed it (end of file) or
 /// something unexpected is queued; both mean it must not be used.
-fn link_idle(link: &UnixStream) -> bool {
+pub(super) fn link_idle(link: &UnixStream) -> bool {
     let mut p = libc::pollfd {
         fd: link.as_raw_fd(),
         events: libc::POLLIN | libc::POLLRDHUP,

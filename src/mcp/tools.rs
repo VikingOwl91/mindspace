@@ -41,6 +41,10 @@ pub fn definitions_for(config: &McpConfig) -> Vec<Value> {
     if config.isolated().is_some() {
         all.push(super::isolated::definition());
     }
+    #[cfg(unix)]
+    if config.isolated_git().is_some() {
+        all.push(super::isolated_git::definition());
+    }
     #[cfg(not(unix))]
     let _ = config;
     all
@@ -311,6 +315,10 @@ fn call_tool(
     if name == super::isolated::TOOL {
         return super::isolated::run(store, config, obj);
     }
+    #[cfg(unix)]
+    if name == super::isolated_git::TOOL {
+        return super::isolated_git::run(store, config, obj);
+    }
     let result: Result<Value> = (|| match name {
         "memory_create" => {
             let spaces = resolve_spaces(store, string_array(obj, "spaces")?)?;
@@ -512,6 +520,8 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
         "repo_request_access" => (&["path", "access", "reason"], &["path"]),
         #[cfg(unix)]
         super::isolated::TOOL => (&["path", "spaces"], &["path", "spaces"]),
+        #[cfg(unix)]
+        super::isolated_git::TOOL => (&["path", "spaces"], &["path", "spaces"]),
         "memory_history" => (&["subject"], &["subject"]),
         "memory_conflicts" | "space_list" => (&[], &[]),
         "memory_add_spaces" => (&["id", "spaces"], &["id", "spaces"]),

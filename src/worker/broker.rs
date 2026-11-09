@@ -222,6 +222,7 @@ fn process_main(
     exe: PathBuf,
     static_roots: Vec<PathBuf>,
     grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+    git: Option<crate::ingest::confined_git::GitExecutable>,
     scope: &CgroupScope,
     watchdog: i32,
 ) -> ! {
@@ -247,7 +248,7 @@ fn process_main(
         }
     }
     crate::sandbox::close_all_except(&[link.as_raw_fd()]);
-    let code = run_process(link, exe, static_roots, grants);
+    let code = run_process(link, exe, static_roots, grants, git);
     // SAFETY: leave without running the parent's atexit handlers or flushing its buffers.
     unsafe { libc::_exit(code) }
 }
@@ -257,6 +258,7 @@ fn run_process(
     exe: PathBuf,
     static_roots: Vec<PathBuf>,
     grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+    git: Option<crate::ingest::confined_git::GitExecutable>,
 ) -> i32 {
     let fail = |m: String, c: i32| {
         eprintln!("mind broker: {m}");
@@ -275,6 +277,7 @@ fn run_process(
     };
     #[allow(unused_mut)]
     let mut cfg = BrokerConfig::new(exe);
+    cfg.git = git;
     // Test builds only (feature `spawn-gate`, enabled for `cargo test`, absent from a plain
     // build): stand-in workers and short limits for the failure tests.
     #[cfg(feature = "spawn-gate")]
@@ -374,6 +377,7 @@ pub fn watchdog_main(
     exe: PathBuf,
     static_roots: Vec<PathBuf>,
     grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+    git: Option<crate::ingest::confined_git::GitExecutable>,
 ) -> ! {
     let fail = |m: String, c: i32| -> ! {
         eprintln!("mind broker: {m}");
@@ -410,7 +414,7 @@ pub fn watchdog_main(
         fail("cannot fork the broker".into(), 70);
     }
     if broker == 0 {
-        process_main(back, exe, static_roots, grants, &scope, unsafe {
+        process_main(back, exe, static_roots, grants, git, &scope, unsafe {
             libc::getppid()
         });
     }
@@ -1444,6 +1448,14 @@ impl Broker {
                     OsString::from("--git-exe"),
                     git.exe().as_os_str().to_os_string(),
                 ];
+                if let Some((exe_pin, interp_pin)) = git.pins() {
+                    a.push(OsString::from("--git-pin"));
+                    a.push(OsString::from(exe_pin.to_arg()));
+                    if let Some(p) = interp_pin {
+                        a.push(OsString::from("--interp-pin"));
+                        a.push(OsString::from(p.to_arg()));
+                    }
+                }
                 a.push(OsString::from("--repository-id"));
                 // TEST HARNESS (feature `spawn-gate`): the worker is told another identity than
                 // the one in the marker, as if the marker had changed after the broker read it
@@ -1652,6 +1664,11 @@ impl Broker {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // TEST HARNESS (feature `spawn-gate`): let a test see why a worker ended
+        #[cfg(feature = "spawn-gate")]
+        if std::env::var_os("MINDSPACE_BROKER_GATE_WORKER_STDERR").is_some() {
+            cmd.stderr(Stdio::inherit());
+        }
         let (chan, rootfd, ctl) = (channel.as_raw_fd(), root.as_raw_fd(), control.as_raw_fd());
         let procs = cgroup_procs.map(|f| f.as_raw_fd());
         let (rlimit_as, rlimit_cpu) = (self.cfg.rlimit_as_mib, self.cfg.rlimit_cpu_secs);

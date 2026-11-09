@@ -246,6 +246,10 @@ impl crate::ingest::extract::ExtractionContext for AlwaysKnown {
 pub fn main_git(
     git_path: &std::path::Path,
     expected: crate::core::Uuid,
+    pins: Option<(
+        crate::ingest::confined_git::FilePin,
+        Option<crate::ingest::confined_git::FilePin>,
+    )>,
     gate: Option<&str>,
 ) -> i32 {
     #[cfg(not(feature = "spawn-gate"))]
@@ -278,11 +282,33 @@ pub fn main_git(
         Ok(g) => g,
         Err(e) => return fail(&format!("git executable: {e}"), 78),
     };
-    let sandbox =
-        match crate::sandbox::enter_extraction_worker_with_exec(&root, &keep, &git.exec_grants()) {
-            Ok(s) => s,
-            Err(e) => return fail(&format!("sandbox: {e}"), 78),
-        };
+    // With pins (the production form) the files are opened and compared with what the broker's
+    // trust policy saw; the sandbox's execute rule is then created from THOSE descriptors. A
+    // replaced, modified or re-owned file ends the worker here, before it reads anything.
+    let entered = match pins {
+        Some((exe_pin, interp_pin)) => {
+            let git = git.clone().with_pins(exe_pin, interp_pin);
+            match git.verify_pins() {
+                Ok(files) => {
+                    let r = crate::sandbox::enter_extraction_worker_with_exec_files(
+                        &root,
+                        &keep,
+                        &[],
+                        &files,
+                    );
+                    // the rules hold the inodes now; the descriptors are no longer needed
+                    drop(files);
+                    r
+                }
+                Err(e) => return fail(&format!("git executable: {e}"), 78),
+            }
+        }
+        None => crate::sandbox::enter_extraction_worker_with_exec(&root, &keep, &git.exec_grants()),
+    };
+    let sandbox = match entered {
+        Ok(s) => s,
+        Err(e) => return fail(&format!("sandbox: {e}"), 78),
+    };
     if let Some(mut ctl) = control {
         if ctl.write_all(b"READY\n").is_err() {
             return fail("cannot report to the broker", 2);

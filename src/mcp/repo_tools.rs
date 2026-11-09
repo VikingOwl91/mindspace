@@ -105,6 +105,11 @@ pub struct McpConfig {
     /// with `--isolated-ingest` and the sandbox and the broker channel were verified.
     #[cfg(unix)]
     isolated: Option<std::sync::Arc<super::isolated::IsolatedIngest>>,
+    /// The experimental isolated Git tool (M7.3b.5e): present only when the server was started with
+    /// `--isolated-git-ingest` and an approved `--git-exe`, and the sandbox and the broker channel
+    /// were verified. Shares the broker channel with `isolated` when both are offered.
+    #[cfg(unix)]
+    isolated_git: Option<std::sync::Arc<super::isolated::IsolatedIngest>>,
 }
 
 impl Default for McpConfig {
@@ -119,6 +124,8 @@ impl Default for McpConfig {
             request_log: None,
             #[cfg(unix)]
             isolated: None,
+            #[cfg(unix)]
+            isolated_git: None,
         }
     }
 }
@@ -234,6 +241,8 @@ impl McpConfig {
             request_log: None,
             #[cfg(unix)]
             isolated: None,
+            #[cfg(unix)]
+            isolated_git: None,
         })
     }
 
@@ -245,6 +254,31 @@ impl McpConfig {
             link,
         )));
         self
+    }
+
+    /// Offers `repo_ingest_isolated` over a channel that other isolated tools may share.
+    #[cfg(unix)]
+    pub fn with_isolated_ingest_shared(
+        mut self,
+        shared: std::sync::Arc<super::isolated::IsolatedIngest>,
+    ) -> Self {
+        self.isolated = Some(shared);
+        self
+    }
+
+    /// Offers `repo_ingest_git_isolated`. Without this call the tool does not exist for this server.
+    #[cfg(unix)]
+    pub fn with_isolated_git_shared(
+        mut self,
+        shared: std::sync::Arc<super::isolated::IsolatedIngest>,
+    ) -> Self {
+        self.isolated_git = Some(shared);
+        self
+    }
+
+    #[cfg(unix)]
+    pub fn isolated_git(&self) -> Option<&super::isolated::IsolatedIngest> {
+        self.isolated_git.as_deref()
     }
 
     #[cfg(unix)]

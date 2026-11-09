@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::Uuid;
 use crate::ingest::confined::Anchor;
-use crate::ingest::extract::Extracted;
+use crate::ingest::extract::{Extracted, ExtractedGit};
 use crate::ingest::stream::{consume, Kind, ProducerLimits, StreamLimits};
 
 use super::broker::{
@@ -24,7 +24,8 @@ use super::broker::{
     BROKER_PROTOCOL, COMMIT_HOLD_MAX, MAX_LINE,
 };
 use super::context::{
-    answer, check_result, validate_spaces, ContextSource, Manifest, MAX_MANIFEST_LINE,
+    answer, answer_git, check_result, check_result_git, validate_spaces, ContextSource,
+    GitManifest, Manifest, MAX_MANIFEST_LINE,
 };
 use super::{Hello, Request, CHANNEL_FD, MAX_HELLO, PROTOCOL, ROOT_FD};
 
@@ -146,6 +147,8 @@ pub struct WorkerStats {
     /// Peak resident set of the worker (kB) as reported by `wait4`.
     pub worker_peak_rss_kb: i64,
     pub exit: String,
+    /// Git operations: what the receiver verified, and how strongly.
+    pub verification: Option<crate::ingest::gitverify::VerificationSummary>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -382,6 +385,7 @@ pub fn extract_directory(
         begun,
         pid,
         &mut stats,
+        None,
     );
 
     // Did the worker end by itself? (Asked before we end it; a stream that stops short usually
@@ -469,6 +473,7 @@ fn run_session(
     begun: Instant,
     pid: u32,
     stats: &mut WorkerStats,
+    git: Option<Uuid>,
 ) -> Result<Extracted, WorkerError> {
     let cause = Rc::new(Cell::new(None));
     let writer = parent_end
@@ -552,6 +557,83 @@ fn run_session(
     (&writer)
         .write_all(&bytes)
         .map_err(|e| WorkerError::Io(format!("sending the request: {e}")))?;
+
+    // Git: the manifest is bound to the repository identity the BROKER read from the authorized
+    // root (never the worker's), the operation and the head it names; the stream is verified in
+    // full before it is returned; and the result is checked against the context that was sent.
+    if let Some(repository_id) = git {
+        let mut line = Vec::new();
+        match (&mut reader)
+            .take(MAX_MANIFEST_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => {
+                return Err(by_cause(WorkerError::Died {
+                    status: "closed the channel before the manifest".into(),
+                    stderr: String::new(),
+                }))
+            }
+            Ok(_) if line.last() == Some(&b'\n') => {}
+            Ok(_) if line.len() > MAX_MANIFEST_LINE => {
+                return Err(WorkerError::Context("the manifest is too long".into()))
+            }
+            Ok(_) => {
+                return Err(by_cause(WorkerError::Died {
+                    status: "the manifest is truncated".into(),
+                    stderr: String::new(),
+                }))
+            }
+            Err(e) => return Err(by_cause(WorkerError::Io(e.to_string()))),
+        }
+        let manifest: GitManifest = serde_json::from_slice(&line)
+            .map_err(|e| WorkerError::Context(format!("unreadable manifest: {e}")))?;
+        manifest
+            .validate(op, repository_id)
+            .map_err(WorkerError::Context)?;
+        let policy = cfg.producer.parse_policy;
+        let context = answer_git(ctx, op, &policy, &manifest)
+            .map_err(|e| WorkerError::Context(format!("answering the manifest: {e}")))?;
+        stats.manifest_entries = manifest.entries.len() as u64;
+        stats.known_sent = context.known.len() as u64;
+        let mut bytes = serde_json::to_vec(&context).map_err(|e| WorkerError::Io(e.to_string()))?;
+        bytes.push(b'\n');
+        (&writer)
+            .write_all(&bytes)
+            .map_err(|e| by_cause(WorkerError::Io(format!("sending the context: {e}"))))?;
+        let extracted = match consume(
+            &mut reader,
+            op,
+            Kind::GitVerified,
+            None,
+            &cfg.stream,
+            Some(cancel),
+        ) {
+            Ok((extracted, st)) => {
+                stats.frames = st.frames;
+                stats.bytes = st.bytes;
+                stats.records = st.records;
+                stats.verification = st.verification;
+                extracted
+            }
+            Err(e) => return Err(by_cause(WorkerError::Stream(e.to_string()))),
+        };
+        let Extracted::Git(g) = &extracted else {
+            return Err(WorkerError::Stream(
+                "the result is not a Git observation".into(),
+            ));
+        };
+        // root substitution: the label the worker put on the result is the root it was given
+        if std::path::Path::new(&g.observation.repository_path) != root
+            || std::path::Path::new(&g.observation.session.root) != root
+        {
+            return Err(WorkerError::Stream(
+                "the result names another root than the one the broker authorized".into(),
+            ));
+        }
+        check_result_git(g, op, repository_id, spaces, &policy, &context)
+            .map_err(WorkerError::Stream)?;
+        return Ok(extracted);
+    }
 
     // 3. the context exchange: the worker lists the blobs it would parse, the parent answers with
     //    the derivations it already has (nothing else about its database)
@@ -683,6 +765,53 @@ pub fn extract_via_broker(
     ctx: &dyn ContextSource,
     cancel: &AtomicBool,
 ) -> Result<(Extracted, WorkerStats, BrokerReport), WorkerError> {
+    broker_operation(
+        OpKind::DirectoryExtract,
+        cfg,
+        link,
+        root,
+        spaces,
+        ctx,
+        cancel,
+    )
+}
+
+/// Runs one Git extraction (HEAD, as a verified transport) through the broker. The same contract
+/// as [`extract_via_broker`], and in addition: the broker (not the worker) read the repository
+/// identity from the authorized root and reports it in `Ready`; the manifest, the context and the
+/// result are bound to it, to the operation and to the head the worker named; the stream is
+/// verified object by object ([`crate::ingest::gitverify`]) before it is returned; and a reuse
+/// placeholder is accepted only if this operation announced it. There is no in-process fallback:
+/// a broker without Git configured, an unsupported repository, a missing identity or a failed
+/// isolation is an error. The caller persists after `Ok`, with
+/// [`persist_git_with_lease`].
+pub fn extract_git_via_broker(
+    cfg: &WorkerConfig,
+    link: &UnixStream,
+    root: &std::path::Path,
+    spaces: &[Uuid],
+    ctx: &dyn ContextSource,
+    cancel: &AtomicBool,
+) -> Result<(ExtractedGit, WorkerStats, BrokerReport), WorkerError> {
+    let (extracted, stats, report) =
+        broker_operation(OpKind::GitExtract, cfg, link, root, spaces, ctx, cancel)?;
+    match extracted {
+        Extracted::Git(g) => Ok((g, stats, report)),
+        Extracted::Files(_) => Err(WorkerError::Stream(
+            "the result is not a Git observation".into(),
+        )),
+    }
+}
+
+fn broker_operation(
+    kind: OpKind,
+    cfg: &WorkerConfig,
+    link: &UnixStream,
+    root: &std::path::Path,
+    spaces: &[Uuid],
+    ctx: &dyn ContextSource,
+    cancel: &AtomicBool,
+) -> Result<(Extracted, WorkerStats, BrokerReport), WorkerError> {
     let begun = Instant::now();
     validate_spaces(spaces).map_err(WorkerError::Context)?;
     for id in spaces {
@@ -705,7 +834,7 @@ pub fn extract_via_broker(
     send(&ToBroker::Begin {
         v: BROKER_PROTOCOL,
         op,
-        kind: OpKind::DirectoryExtract,
+        kind,
         root: root.display().to_string(),
         spaces: spaces.to_vec(),
     })?;
@@ -723,7 +852,7 @@ pub fn extract_via_broker(
     let text = String::from_utf8_lossy(&bytes);
     let ready: FromBroker = serde_json::from_str(text.trim_end())
         .map_err(|e| WorkerError::Io(format!("unreadable answer from the broker: {e}")))?;
-    let (observed, got_spaces, got_root, authority) = match ready {
+    let (observed, got_spaces, got_root, authority, repository_id) = match ready {
         FromBroker::Refused { reason } => return Err(WorkerError::Refused(reason)),
         FromBroker::Ready {
             v,
@@ -732,7 +861,8 @@ pub fn extract_via_broker(
             root: r,
             observed,
             authority,
-        } if v == BROKER_PROTOCOL && o == op => (observed, s, r, authority),
+            repository_id,
+        } if v == BROKER_PROTOCOL && o == op => (observed, s, r, authority, repository_id),
         other => {
             return Err(WorkerError::Io(format!(
                 "the broker answered with something else than Ready for this operation: {other:?}"
@@ -748,6 +878,15 @@ pub fn extract_via_broker(
             "the broker bound the operation to another root or spaces".into(),
         ));
     }
+    // the identity binding exists exactly for Git operations
+    let git = match (kind, repository_id) {
+        (OpKind::GitExtract, Some(id)) => Some(id),
+        (OpKind::DirectoryExtract, None) => None,
+        _ => return Err(WorkerError::Io(
+            "the broker's answer does not match the kind of the operation (repository identity)"
+                .into(),
+        )),
+    };
     let channel = UnixStream::from(fd);
     let pid = observed.pid;
     let mut stats = WorkerStats {
@@ -769,6 +908,7 @@ pub fn extract_via_broker(
         begun,
         pid,
         &mut stats,
+        git,
     );
     // tell the broker how it ended; it ends the worker and everything below it either way
     let _ = send(&if outcome.is_ok() {
@@ -919,4 +1059,108 @@ pub fn commit_begin(link: &UnixStream) -> Result<(), String> {
     (&*link)
         .write_all(&b)
         .map_err(|e| format!("the broker is not available (it went away before the commit): {e}"))
+}
+
+// ------------------------------------------------------------------------------ Git persistence
+
+/// How long this side may use a commit lease: shorter than the broker's ceiling, because the
+/// broker's clock started earlier.
+const LEASE_BUDGET: Duration = Duration::from_millis(2500);
+
+/// True when nothing is queued on the broker link: a readable link (or a hang-up) means the broker
+/// answered something unexpected or is gone, and the lease must not be relied on.
+fn link_idle(link: &UnixStream) -> bool {
+    let mut p = libc::pollfd {
+        fd: link.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: poll on a descriptor this process owns, zero timeout.
+    unsafe { libc::poll(&mut p, 1, 0) == 0 }
+}
+
+/// Why [`persist_git_with_lease`] did not persist.
+#[derive(Debug)]
+pub enum PersistFailure {
+    /// The commit was not authorized (revoked, expired, no lease, broker unavailable): the
+    /// transaction was rolled back, NOTHING was written, no recording revision was consumed.
+    /// `kind` names the cause (`revoked`, `broker_unavailable`, `commit_not_authorized`).
+    Denied { kind: &'static str, reason: String },
+    /// The storage layer failed. `CommitOutcomeUnknown` is the only case in which data may have
+    /// been committed; every other error is a rollback.
+    Store(crate::core::Error),
+}
+
+/// Persists a verified Git result in ONE transaction (one recording revision), asking the broker
+/// for a commit-time authorization immediately before the COMMIT. While the commit runs the broker
+/// holds the grant store's shared lock, so a revocation that starts now is ordered after the
+/// commit. The outcome is COMMITTED (`Ok`), ROLLED_BACK (`Denied`, or any `Store` error except the
+/// one below) or UNKNOWN (`Store(CommitOutcomeUnknown)`): never inferred from whether a message
+/// arrived. A denied lease rolls the transaction back.
+pub fn persist_git_with_lease(
+    store: &dyn crate::storage::Store,
+    link: &UnixStream,
+    op: Uuid,
+    extracted: ExtractedGit,
+    deadline: &crate::ingest::deadline::Deadline,
+) -> Result<crate::core::GitObservationReport, PersistFailure> {
+    use std::cell::RefCell;
+    let leased = Cell::new(false);
+    let lost = Cell::new(false);
+    let denial: RefCell<Option<(&'static str, String)>> = RefCell::new(None);
+    let result = crate::ingest::extract::persist_git_gated(store, extracted, deadline, &|| {
+        let refuse = |kind: &'static str, why: String| {
+            *denial.borrow_mut() = Some((kind, why.clone()));
+            Err(crate::core::Error::Storage(format!(
+                "the commit was not authorized: {why}"
+            )))
+        };
+        match commit_request(link, op) {
+            CommitAnswer::Granted => {
+                leased.set(true);
+                let granted_at = Instant::now();
+                // the broker may have died during the lease (its lock dies with it)
+                if !link_idle(link) {
+                    return refuse(
+                        "broker_unavailable",
+                        "the broker is not available (it went away during the commit lease)"
+                            .to_string(),
+                    );
+                }
+                if granted_at.elapsed() >= LEASE_BUDGET {
+                    return refuse(
+                        "commit_not_authorized",
+                        "the commit lease expired before the commit".to_string(),
+                    );
+                }
+                if let Err(why) = commit_begin(link) {
+                    return refuse("broker_unavailable", why);
+                }
+                Ok(())
+            }
+            CommitAnswer::Denied(reason) => refuse("revoked", reason),
+            CommitAnswer::Lost(reason) => {
+                lost.set(true);
+                leased.set(true);
+                let kind = if reason.contains("broker is not available") {
+                    "broker_unavailable"
+                } else {
+                    "commit_not_authorized"
+                };
+                refuse(kind, reason)
+            }
+        }
+    });
+    // the lease ends with the commit attempt, AFTER the COMMIT returned (never before it); a link
+    // that is out of step is not used again
+    if leased.get() && !lost.get() {
+        commit_done(link);
+    }
+    match result {
+        Ok(report) => Ok(report),
+        Err(e) => match denial.into_inner() {
+            Some((kind, reason)) => Err(PersistFailure::Denied { kind, reason }),
+            None => Err(PersistFailure::Store(e)),
+        },
+    }
 }

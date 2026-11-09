@@ -925,6 +925,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
     Ok(ExtractedGit {
         observation,
         code_inputs,
+        reused: Default::default(),
     })
 }
 

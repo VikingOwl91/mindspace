@@ -319,6 +319,62 @@ pub fn run_broker_gate(store: &dyn Store, config: &McpConfig) -> Result<()> {
                     }
                 }
             }
+            "git-extract" => {
+                // HEAD of a Git repository through the broker, persisted with the commit lease
+                let mut cfg = super::client::WorkerConfig::new("/nonexistent");
+                if let Some(ms) = std::env::var("GATE_WALL_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    cfg.wall_timeout = Duration::from_millis(ms);
+                }
+                if std::env::var_os("GATE_NO_EVIDENCE").is_some() {
+                    cfg.require_sandbox_evidence = false;
+                }
+                let pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                cfg.observe_pid = Some(pid.clone());
+                let cancel = AtomicBool::new(false);
+                let res = super::client::extract_git_via_broker(
+                    &cfg,
+                    &link,
+                    std::path::Path::new(arg),
+                    &[space],
+                    &crate::ingest::extract::StoreContext(store),
+                    &cancel,
+                );
+                let worker_pid = pid.load(std::sync::atomic::Ordering::SeqCst);
+                match res {
+                    Ok((g, stats, rep)) => {
+                        let persisted = super::client::persist_git_with_lease(
+                            store,
+                            &link,
+                            rep.op,
+                            g,
+                            &Deadline::none(),
+                        );
+                        json!({
+                            "ok": true,
+                            "worker_pid": worker_pid,
+                            "observed": rep.observed,
+                            "exit": rep.exit,
+                            "exited_by_itself": rep.exited_by_itself,
+                            "descendants_killed": rep.descendants_killed,
+                            "records": stats.records,
+                            "verification": stats.verification.map(|v| json!({
+                                "content_verified_objects": v.content_verified_objects,
+                                "content_verified_blobs": v.content_verified_blobs,
+                                "unverified_blobs": v.unverified_blobs,
+                                "external_references": v.external_references,
+                            })),
+                            "persisted": persisted.is_ok(),
+                            "persist_error": persisted.err().map(|e| format!("{e:?}")),
+                        })
+                    }
+                    Err(e) => {
+                        json!({"ok": false, "worker_pid": worker_pid, "error": e.to_string()})
+                    }
+                }
+            }
             "quit" => break,
             other => json!({"error": format!("unknown command {other}")}),
         };

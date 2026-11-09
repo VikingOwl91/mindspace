@@ -62,6 +62,17 @@ pub fn main(scenario: &str, git: &Path) -> i32 {
             return 4;
         }
     };
+    // TEST HARNESS: stay confined and wait until the test has done something to the filesystem
+    // (for example replaced the git binary), then carry on
+    if let Some(go) = std::env::var_os("PROBE_HOLD_FILE") {
+        println!("{}", json!({"hold": true}));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !Path::new(&go).exists() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let ms = std::env::var("PROBE_DEADLINE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

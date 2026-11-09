@@ -246,6 +246,21 @@ pub enum Command {
     #[cfg(unix)]
     #[command(hide = true, name = "extraction-worker")]
     ExtractionWorker,
+    /// EXPERIMENT (M7.3b.5d): the Git mode of the confined extraction worker. Started by the
+    /// broker only, with the verified git executable and the repository identity the broker
+    /// bound. Not for users.
+    #[cfg(unix)]
+    #[command(hide = true, name = "git-extraction-worker")]
+    GitExtractionWorker {
+        #[arg(long)]
+        git_exe: PathBuf,
+        #[arg(long)]
+        repository_id: String,
+        /// TEST HARNESS (feature `spawn-gate`): a named misbehaviour of the worker.
+        #[cfg(feature = "spawn-gate")]
+        #[arg(long)]
+        gate: Option<String>,
+    },
     /// TEST HARNESS (feature `spawn-gate`, never in a shipped build): confines itself like the
     /// extraction worker with execute rights for git, then drives the confined Git reader.
     #[cfg(all(unix, feature = "spawn-gate"))]
@@ -913,6 +928,8 @@ License: {}",
         // handled at the top of `run`, before anything else happens
         #[cfg(unix)]
         Command::ExtractionWorker => unreachable!("the worker is started by `run`"),
+        #[cfg(unix)]
+        Command::GitExtractionWorker { .. } => unreachable!("the worker is started by `run`"),
         #[cfg(all(unix, feature = "spawn-gate"))]
         Command::GitProbe { .. } => unreachable!("the probe is started by `run`"),
         Command::Mcp {
@@ -1308,6 +1325,24 @@ pub fn run(cli: &Cli) -> Result<i32> {
     #[cfg(unix)]
     if let Command::ExtractionWorker = &cli.command {
         return Ok(crate::worker::run::main());
+    }
+    #[cfg(unix)]
+    if let Command::GitExtractionWorker {
+        git_exe,
+        repository_id,
+        #[cfg(feature = "spawn-gate")]
+        gate,
+    } = &cli.command
+    {
+        let Ok(id) = crate::core::Uuid::parse_str(repository_id) else {
+            eprintln!("mind git-extraction-worker: --repository-id is not a UUID");
+            return Ok(2);
+        };
+        #[cfg(feature = "spawn-gate")]
+        let gate = gate.as_deref();
+        #[cfg(not(feature = "spawn-gate"))]
+        let gate = None;
+        return Ok(crate::worker::run::main_git(git_exe, id, gate));
     }
     #[cfg(all(unix, feature = "spawn-gate"))]
     if let Command::GitProbe { scenario, git } = &cli.command {

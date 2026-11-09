@@ -1278,6 +1278,261 @@ pub fn emit_verified(
     Ok(())
 }
 
+/// The blobs at HEAD that a worker would interpret, with every path they are at: regular files
+/// (not symlinks, not gitlinks) the selection matches, that are memory material or source code.
+fn ingestable_blobs(
+    files: &[super::gitverify::TreeFile],
+    selection: &super::outline::PathSelection,
+) -> BTreeMap<String, Vec<String>> {
+    use super::{code, is_ingestable};
+    let mut by_blob: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for f in files {
+        if f.kind != GitObjectKind::Blob || f.mode == "120000" || !selection.matches(&f.path) {
+            continue;
+        }
+        let p = Path::new(&f.path);
+        if !is_ingestable(p) && code::language_for(p).is_none() {
+            continue;
+        }
+        by_blob
+            .entry(f.oid.clone())
+            .or_default()
+            .push(f.path.clone());
+    }
+    by_blob
+}
+
+/// The distinct `(language, blob id)` the context exchange asks about: the source blobs at HEAD.
+/// This is the Git manifest; nothing else about the repository is sent to the parent.
+pub fn head_code_candidates(
+    files: &[super::gitverify::TreeFile],
+    selection: &super::outline::PathSelection,
+) -> BTreeSet<(crate::core::CodeLanguage, String)> {
+    let mut out = BTreeSet::new();
+    for (blob, paths) in ingestable_blobs(files, selection) {
+        for p in &paths {
+            if let Some(language) = super::code::language_for(Path::new(p)) {
+                out.insert((language, blob.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Streams a verified HEAD: the producer side of [`Kind::GitVerified`], used by the Git worker.
+///
+/// `closure` is what the worker read ([`super::confined_git::ConfinedGitReader::head_closure`])
+/// and `files` the paths of its tree. The records are the raw objects, the blob rows, the remotes,
+/// and, for every blob the selection interprets, its exact bytes (as text), its memory
+/// derivations and its code input. A code input whose blob the parent announced as known (`ctx`)
+/// is sent as an explicit placeholder (`reused`): its content still travels, so the receiver
+/// verifies the blob id against the bytes in the same stream.
+///
+/// A blob that is not valid UTF-8 is not interpreted (its bytes cannot be carried as text, so
+/// they could not be verified); its row stays an unverified `(oid, size)`.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_verified_head(
+    ctx: &dyn ExtractionContext,
+    reader: &super::confined_git::ConfinedGitReader,
+    closure: &super::gitverify::HeadClosure,
+    files: &[super::gitverify::TreeFile],
+    repository_id: Uuid,
+    repo_path: &Path,
+    space_ids: &[Uuid],
+    selection: &super::outline::PathSelection,
+    deadline: &Deadline,
+    limits: &ProducerLimits,
+    sink: &mut dyn RecordSink,
+) -> Result<()> {
+    use super::{code, media_type_of, parse_material, ParsedMaterial};
+    let by_blob = ingestable_blobs(files, selection);
+    let size_of: HashMap<&str, u64> = closure
+        .blobs
+        .iter()
+        .map(|(o, s)| (o.as_str(), *s))
+        .collect();
+    // a blob over the limit fails the operation before any content is read
+    for (oid, paths) in &by_blob {
+        let size = size_of.get(oid.as_str()).copied().unwrap_or(0);
+        if size > limits.max_blob_bytes {
+            return Err(Error::BlobTooLarge {
+                path: paths.first().cloned().unwrap_or_else(|| oid.clone()),
+                size,
+                limit: limits.max_blob_bytes,
+            });
+        }
+    }
+    sink.emit(&Record::Begin {
+        kind: Kind::GitVerified,
+    })?;
+    sink.emit(&Record::GitHeader {
+        session: SessionDraft {
+            root: repo_path.display().to_string(),
+            scope: IngestScope::GitRepository,
+            observed_at: crate::core::Ts::now(),
+        },
+        repository_id,
+        repository_path: repo_path.display().to_string(),
+        spaces: space_ids.to_vec(),
+    })?;
+    sink.emit(&Record::Head {
+        symbolic: closure.symbolic.clone(),
+        commit_oid: closure.commit_oid.clone(),
+    })?;
+    for obj in &closure.objects {
+        sink.emit(&Record::RawObject {
+            kind: obj.kind,
+            oid: obj.oid.clone(),
+            size: obj.bytes.len() as u64,
+            hex: super::gitverify::hex_encode(&obj.bytes),
+        })?;
+    }
+    for (oid, size) in &closure.blobs {
+        sink.emit(&Record::Blob {
+            item: GitBlobData {
+                oid: oid.clone(),
+                size_bytes: *size,
+                content: None,
+            },
+        })?;
+    }
+    for (name, raw) in reader.remotes()? {
+        let parsed = super::remote::parse(&raw);
+        sink.emit(&Record::Remote {
+            item: GitRemoteDraft {
+                name,
+                url: parsed.url,
+                slug_key: parsed.slug.as_ref().map(|s| s.key()),
+                slug: parsed.slug.as_ref().map(|s| s.short()),
+            },
+        })?;
+    }
+
+    // ---- bodies: blob batches
+    let mut pending: Vec<Vec<String>> = Vec::new();
+    let (mut batch, mut batch_bytes): (Vec<String>, u64) = (Vec::new(), 0);
+    for oid in by_blob.keys() {
+        let size = size_of.get(oid.as_str()).copied().unwrap_or(0);
+        if !batch.is_empty()
+            && (batch_bytes + size > BLOB_BATCH_BYTES || batch.len() >= BLOB_BATCH_COUNT)
+        {
+            pending.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes += size;
+        batch.push(oid.clone());
+    }
+    if !batch.is_empty() {
+        pending.push(batch);
+    }
+    for batch in pending {
+        deadline.check("reading file contents")?;
+        for (blob_oid, bytes) in reader.blob_bytes(&batch)? {
+            if bytes.len() as u64 > limits.max_blob_bytes {
+                return Err(Error::BlobTooLarge {
+                    path: by_blob
+                        .get(&blob_oid)
+                        .and_then(|u| u.first().cloned())
+                        .unwrap_or_else(|| blob_oid.clone()),
+                    size: bytes.len() as u64,
+                    limit: limits.max_blob_bytes,
+                });
+            }
+            let Ok(content) = String::from_utf8(bytes) else {
+                continue; // not text: stays an unverified (oid, size) row
+            };
+            let Some(uses) = by_blob.get(&blob_oid) else {
+                continue;
+            };
+            sink.emit(&Record::BlobContent {
+                oid: blob_oid.clone(),
+                len: content.len() as u64,
+            })?;
+            emit_chunks(sink, &content)?;
+            let content_hash = sha256_hex(content.as_bytes());
+            let mut code_input: Option<(CodeInputDraft, bool)> = None;
+            for path in uses {
+                deadline.check("deriving memories")?;
+                let media_type = media_type_of(Path::new(path)).unwrap_or("text/rust");
+                let stem = Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("untitled")
+                    .to_string();
+                let mut parsed = if media_type == "text/rust" {
+                    ParsedMaterial {
+                        title: stem.clone(),
+                        evidences: vec![],
+                        assertions: vec![],
+                        memories: vec![],
+                    }
+                } else {
+                    parse_material(&stem, &content, media_type, space_ids)
+                };
+                for a in &mut parsed.assertions {
+                    a.extraction = format!("git:{}", a.extraction);
+                }
+                emit_derivation(
+                    sink,
+                    GitDerivedFile {
+                        source_kind: crate::core::SourceKind::GitBlob,
+                        path: path.clone(),
+                        blob_oid: blob_oid.clone(),
+                        commit_oid: closure.commit_oid.clone(),
+                        content_hash: content_hash.clone(),
+                        content: String::new(),
+                        title: parsed.title,
+                        media_type: media_type.to_string(),
+                        evidences: parsed.evidences,
+                        assertions: parsed.assertions,
+                        memories: parsed.memories,
+                    },
+                    true,
+                )?;
+                let Some(language) = code::language_for(Path::new(path)) else {
+                    continue;
+                };
+                deadline.check("parsing source files")?;
+                if code_input.is_none() {
+                    let (derivation, reused) = super::structural_decision(
+                        ctx,
+                        language,
+                        &content,
+                        &content_hash,
+                        Some(repository_id),
+                        Some(&blob_oid),
+                        &limits.parse_policy,
+                        false,
+                    )?;
+                    code_input = Some((
+                        CodeInputDraft {
+                            language,
+                            content_hash: content_hash.clone(),
+                            content: String::new(),
+                            repository_id: Some(repository_id),
+                            blob_oid: Some(blob_oid.clone()),
+                            contexts: vec![],
+                            derivation,
+                        },
+                        reused,
+                    ));
+                }
+                let Some((entry, _)) = code_input.as_mut() else {
+                    continue;
+                };
+                entry.contexts.push(CodeContextDraft {
+                    path: path.clone(),
+                    commit_oid: Some(closure.commit_oid.clone()),
+                });
+            }
+            if let Some((input, reused)) = code_input {
+                emit_code_input(sink, input, true, reused)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sends an existing result as a stream (tests, hostile-input construction, and
 /// the transport benchmark). Content is sent with each user, not shared.
 pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result<()> {
@@ -2440,6 +2695,7 @@ impl<'a> Assembler<'a> {
                         current_commits: self.current_commits,
                     },
                     code_inputs: self.code_inputs,
+                    reused: Default::default(),
                 })
             }
             Kind::GitVerified => unreachable!("handled above"),
@@ -2594,6 +2850,7 @@ impl<'a> Assembler<'a> {
                 remotes: self.remotes,
             },
             code_inputs: self.code_inputs,
+            reused: self.reused,
         });
         Ok((extracted, summary))
     }

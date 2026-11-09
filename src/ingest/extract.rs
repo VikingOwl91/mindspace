@@ -90,6 +90,12 @@ pub struct ExtractedFiles {
 pub struct ExtractedGit {
     pub observation: GitObservation,
     pub code_inputs: Vec<CodeInputDraft>,
+    /// Indexes into `code_inputs` that a verified record stream declared as reused derivations
+    /// (placeholders for derivations the requester announced as known). Empty for in-process
+    /// extraction. Provenance only: persistence ignores it, `worker::context::check_result_git`
+    /// checks it against the context this operation sent.
+    #[serde(default)]
+    pub reused: std::collections::BTreeSet<usize>,
 }
 
 // The size difference is a few hundred bytes of struct headers; the content lives on the heap,

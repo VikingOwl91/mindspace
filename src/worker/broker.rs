@@ -279,6 +279,10 @@ fn run_process(
     // build): stand-in workers and short limits for the failure tests.
     #[cfg(feature = "spawn-gate")]
     {
+        if let Ok(git) = std::env::var("MINDSPACE_BROKER_GATE_GIT") {
+            cfg.git = crate::ingest::confined_git::GitExecutable::resolve(Path::new(&git)).ok();
+            cfg.git_gate = std::env::var("MINDSPACE_BROKER_GATE_GIT_MODE").ok();
+        }
         if let Ok(script) = std::env::var("MINDSPACE_BROKER_GATE_WORKER") {
             cfg.exe = PathBuf::from("/bin/sh");
             cfg.args = vec![script.into()];
@@ -518,6 +522,10 @@ pub fn take_frontend_link() -> Option<UnixStream> {
 #[serde(rename_all = "snake_case")]
 pub enum OpKind {
     DirectoryExtract,
+    /// HEAD of one Git repository, as a verified transport (`Kind::GitVerified`). The broker, not
+    /// the request, selects the worker mode from this (it is the worker's argv): a worker cannot
+    /// choose its own sandbox.
+    GitExtract,
 }
 
 /// Frontend to broker. The vocabulary is closed: there is no grant id, access mode, ttl, limit,
@@ -598,6 +606,10 @@ pub enum FromBroker {
         root: String,
         authority: AuthoritySource,
         observed: Observed,
+        /// Git operations only: the repository identity the BROKER read from the authorized root
+        /// (never the worker's). The frontend refuses a stream that names another repository.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_id: Option<Uuid>,
     },
     Refused {
         reason: String,
@@ -1089,6 +1101,13 @@ pub struct BrokerConfig {
     /// The worker binary and its arguments (`mind extraction-worker`).
     pub exe: PathBuf,
     pub args: Vec<OsString>,
+    /// Git extraction (`OpKind::GitExtract`): the verified git binary and its ELF interpreter, the
+    /// only two files the Git worker may execute. `None`: Git operations are refused (there is no
+    /// in-process fallback, ever).
+    pub git: Option<crate::ingest::confined_git::GitExecutable>,
+    /// TEST HARNESS (feature `spawn-gate`): a named misbehaviour passed to the Git worker.
+    #[cfg(feature = "spawn-gate")]
+    pub git_gate: Option<String>,
     /// Hard bound for one operation, start-up included. Set by the broker, not the frontend.
     pub wall_timeout: Duration,
     /// Spawn until `READY`.
@@ -1120,6 +1139,9 @@ impl BrokerConfig {
         Self {
             exe: exe.into(),
             args: vec![OsString::from("extraction-worker")],
+            git: None,
+            #[cfg(feature = "spawn-gate")]
+            git_gate: None,
             wall_timeout: Duration::from_secs(300),
             startup_timeout: Duration::from_secs(10),
             exit_grace: Duration::from_secs(5),
@@ -1370,7 +1392,7 @@ impl Broker {
         reader: &mut BufReader<UnixStream>,
         v: u32,
         op: Uuid,
-        _kind: OpKind,
+        kind: OpKind,
         root: String,
         spaces: Vec<Uuid>,
     ) -> Result<OpEnd, String> {
@@ -1402,6 +1424,46 @@ impl Broker {
         if real != auth.path {
             return Err("the root is not at its authorized path".into());
         }
+        // 4b. Git: the broker itself checks that the layout is one a worker can confine and reads the
+        //     repository identity from the pinned root (no process started, no content parsed).
+        //     Both are decided BEFORE a worker exists; the worker's own claims are checked against
+        //     this value by the frontend.
+        let (worker_args, repository_id) = match kind {
+            OpKind::DirectoryExtract => (self.cfg.args.clone(), None),
+            OpKind::GitExtract => {
+                let Some(git) = &self.cfg.git else {
+                    return Err("git extraction is not configured on this broker".into());
+                };
+                let id = crate::ingest::confined_git::inspect_root({
+                    use std::os::fd::AsFd;
+                    pinned.as_fd()
+                })
+                .map_err(|e| format!("repository refused: {e}"))?;
+                let mut a: Vec<OsString> = vec![
+                    OsString::from("git-extraction-worker"),
+                    OsString::from("--git-exe"),
+                    git.exe().as_os_str().to_os_string(),
+                ];
+                a.push(OsString::from("--repository-id"));
+                // TEST HARNESS (feature `spawn-gate`): the worker is told another identity than
+                // the one in the marker, as if the marker had changed after the broker read it
+                #[cfg(feature = "spawn-gate")]
+                let told = if self.cfg.git_gate.as_deref() == Some("broker-wrong-identity") {
+                    Uuid::now_v7()
+                } else {
+                    id
+                };
+                #[cfg(not(feature = "spawn-gate"))]
+                let told = id;
+                a.push(OsString::from(told.to_string()));
+                #[cfg(feature = "spawn-gate")]
+                if let Some(g) = &self.cfg.git_gate {
+                    a.push(OsString::from("--gate"));
+                    a.push(OsString::from(g));
+                }
+                (a, Some(id))
+            }
+        };
         let root_fd = reopen_dir(&pinned).map_err(|e| format!("root descriptor: {e}"))?;
         // 5. cgroup
         let cg = match (&self.cfg.cleanup, &self.scope) {
@@ -1426,7 +1488,13 @@ impl Broker {
             ),
             None => None,
         };
-        let child = self.spawn(&child_end, &root_fd, &ctl_child, procs_fd.as_ref())?;
+        let child = self.spawn(
+            &worker_args,
+            &child_end,
+            &root_fd,
+            &ctl_child,
+            procs_fd.as_ref(),
+        )?;
         drop(child_end);
         drop(ctl_child);
         drop(root_fd);
@@ -1466,6 +1534,7 @@ impl Broker {
             root,
             authority: auth.source.clone(),
             observed,
+            repository_id,
         };
         let mut b = serde_json::to_vec(&ready).map_err(|e| e.to_string())?;
         b.push(b'\n');
@@ -1570,13 +1639,14 @@ impl Broker {
 
     fn spawn(
         &self,
+        args: &[OsString],
         channel: &UnixStream,
         root: &OwnedFd,
         control: &UnixStream,
         cgroup_procs: Option<&std::fs::File>,
     ) -> Result<std::process::Child, String> {
         let mut cmd = Command::new(&self.cfg.exe);
-        cmd.args(&self.cfg.args)
+        cmd.args(args)
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::null())

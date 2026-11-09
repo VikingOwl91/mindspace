@@ -185,6 +185,18 @@ pub trait ContextSource {
         content_hash: &str,
         identity: &CodeParserIdentity,
     ) -> Result<bool>;
+    /// Whether this blob of this repository already has a derivation under `identity`. The
+    /// default is "unknown": a source that does not implement it is never believed to know
+    /// anything (the worker then parses again).
+    fn git_derivation_known(
+        &self,
+        _language: CodeLanguage,
+        _repository_id: Uuid,
+        _blob_oid: &str,
+        _identity: &CodeParserIdentity,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 impl ContextSource for StoreContext<'_> {
@@ -199,6 +211,16 @@ impl ContextSource for StoreContext<'_> {
     ) -> Result<bool> {
         use crate::ingest::extract::ExtractionContext;
         self.has_code_derivation(language, content_hash, None, None, identity)
+    }
+    fn git_derivation_known(
+        &self,
+        language: CodeLanguage,
+        repository_id: Uuid,
+        blob_oid: &str,
+        identity: &CodeParserIdentity,
+    ) -> Result<bool> {
+        use crate::ingest::extract::ExtractionContext;
+        self.has_code_derivation(language, "", Some(repository_id), Some(blob_oid), identity)
     }
 }
 
@@ -391,5 +413,316 @@ impl crate::ingest::extract::ExtractionContext for KnownSet {
         Ok(self
             .0
             .contains(&(content_hash.to_string(), identity.clone())))
+    }
+}
+
+// ------------------------------------------------------------------------------------- Git
+//
+// The Git form of the exchange (M7.3b.5d). Same shape, other keys:
+//
+//   worker -> parent   GitManifest  v, op, repository_id, head, entries[{language, blob_oid}]
+//   parent -> worker   GitContext   v, op, repository_id, head, identities[..], known[[blob_oid, idx]..]
+//
+// What it is bound to, and by whom:
+//
+// * the OPERATION (`op`): a manifest or context of another operation is refused on both sides;
+// * the REPOSITORY (`repository_id`): the parent's value is the one the BROKER read from the
+//   authorized root before it started the worker; a manifest naming another repository is
+//   refused, so a worker cannot learn or claim anything about another repository's derivations;
+// * the HEAD the worker is about to send (`head`): the stream must carry exactly this head;
+// * the EXTRACTOR version: through the identities (`mind-code@N` is part of every identity, and
+//   a derivation of another version is never announced as known).
+//
+// A reuse placeholder in the stream is valid only for a `(blob_oid, identity)` pair this very
+// context announced ([`check_result_git`]). Existence of an object id in the local store proves
+// nothing about a placeholder.
+
+/// One source blob the worker would have to parse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct GitManifestEntry {
+    pub language: CodeLanguage,
+    /// 40 lowercase hex digits (SHA-1).
+    pub blob_oid: String,
+}
+
+/// Worker to parent: the distinct source blobs at HEAD.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitManifest {
+    pub v: u32,
+    pub op: Uuid,
+    pub repository_id: Uuid,
+    pub head: String,
+    pub entries: Vec<GitManifestEntry>,
+}
+
+/// Parent to worker: which of those blobs already have which derivation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitContext {
+    pub v: u32,
+    pub op: Uuid,
+    pub repository_id: Uuid,
+    pub head: String,
+    pub identities: Vec<CodeParserIdentity>,
+    /// `[blob_oid, index into identities]`, each pair at most once.
+    pub known: Vec<(String, u8)>,
+}
+
+impl GitManifest {
+    /// Strict check on the parent's side. `repository_id` is the identity the broker bound.
+    pub fn validate(&self, op: Uuid, repository_id: Uuid) -> std::result::Result<(), String> {
+        if self.v != PROTOCOL {
+            return bad(format!("manifest protocol {}", self.v));
+        }
+        if self.op != op {
+            return bad("the manifest belongs to another operation");
+        }
+        if self.repository_id != repository_id {
+            return bad("the manifest names another repository than the one the broker bound");
+        }
+        if !crate::ingest::gitverify::is_sha1_oid(&self.head) {
+            return bad("the manifest head is not a SHA-1 object id");
+        }
+        if self.entries.len() > MAX_MANIFEST_ENTRIES {
+            return bad(format!(
+                "{} manifest entries (at most {MAX_MANIFEST_ENTRIES})",
+                self.entries.len()
+            ));
+        }
+        let mut seen = HashSet::with_capacity(self.entries.len());
+        for e in &self.entries {
+            if !crate::ingest::gitverify::is_sha1_oid(&e.blob_oid) {
+                return bad("a manifest blob id is not a SHA-1 object id");
+            }
+            if !seen.insert((e.language, e.blob_oid.as_str())) {
+                return bad("a manifest entry is repeated");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GitContext {
+    /// Strict check on the worker's side. `policy` is the one of its own request; `repository_id`
+    /// and `head` are what the worker itself determined (and sent in its manifest).
+    pub fn validate(
+        &self,
+        op: Uuid,
+        repository_id: Uuid,
+        head: &str,
+        policy: &ParsePolicy,
+    ) -> std::result::Result<(), String> {
+        if self.v != PROTOCOL {
+            return bad(format!("context protocol {}", self.v));
+        }
+        if self.op != op {
+            return bad("the context belongs to another operation");
+        }
+        if self.repository_id != repository_id || self.head != head {
+            return bad("the context is bound to another repository or head");
+        }
+        if self.identities.len() > MAX_IDENTITIES {
+            return bad("too many identities");
+        }
+        let allowed = identities_for(policy);
+        let mut seen = Vec::new();
+        for i in &self.identities {
+            if !allowed.contains(i) {
+                return bad("the context names an identity this operation cannot ask about");
+            }
+            if seen.contains(&i) {
+                return bad("an identity is listed twice");
+            }
+            seen.push(i);
+        }
+        if self.known.len() > MAX_KNOWN {
+            return bad(format!(
+                "{} known derivations (at most {MAX_KNOWN})",
+                self.known.len()
+            ));
+        }
+        let mut pairs = HashSet::with_capacity(self.known.len());
+        for (h, i) in &self.known {
+            if !crate::ingest::gitverify::is_sha1_oid(h) {
+                return bad("a known blob id is not a SHA-1 object id");
+            }
+            if usize::from(*i) >= self.identities.len() {
+                return bad("a known derivation names a missing identity");
+            }
+            if !pairs.insert((h.as_str(), *i)) {
+                return bad("a known derivation is repeated");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builds the parent's answer to a validated manifest: the hits, nothing else.
+pub fn answer_git(
+    src: &dyn ContextSource,
+    op: Uuid,
+    policy: &ParsePolicy,
+    manifest: &GitManifest,
+) -> Result<GitContext> {
+    let identities = identities_for(policy);
+    let mut known = Vec::new();
+    for e in &manifest.entries {
+        if src.git_derivation_known(
+            e.language,
+            manifest.repository_id,
+            &e.blob_oid,
+            &identities[0],
+        )? {
+            known.push((e.blob_oid.clone(), 0u8));
+            continue;
+        }
+        for (i, id) in identities.iter().enumerate().skip(1) {
+            if src.git_derivation_known(e.language, manifest.repository_id, &e.blob_oid, id)? {
+                known.push((e.blob_oid.clone(), i as u8));
+            }
+        }
+    }
+    Ok(GitContext {
+        v: PROTOCOL,
+        op,
+        repository_id: manifest.repository_id,
+        head: manifest.head.clone(),
+        identities,
+        known,
+    })
+}
+
+/// Checks the worker's verified Git result against what the parent asked for and told it, before
+/// anything is persisted. The object verification itself already happened in the stream
+/// assembler; this adds the BINDINGS: repository identity (the broker's, not the worker's),
+/// spaces, the head the manifest named, the identities, and the provenance of every reuse
+/// placeholder.
+///
+/// A code input may be declared `reused` only for a `(blob id, identity)` pair that appears in
+/// `sent`, the context this very operation transmitted for this repository. A claim for anything
+/// else (an unsent blob, another identity, a pair known only to another operation or another
+/// extractor version) is refused, and so is a freshly produced derivation that contradicts what
+/// was announced as known. Emptiness is never evidence of reuse, and neither is the existence of
+/// the id in the parent's store.
+pub fn check_result_git(
+    g: &crate::ingest::extract::ExtractedGit,
+    op: Uuid,
+    repository_id: Uuid,
+    spaces: &[Uuid],
+    policy: &ParsePolicy,
+    sent: &GitContext,
+) -> std::result::Result<(), String> {
+    if sent.op != op {
+        return bad("the context belongs to another operation");
+    }
+    if sent.repository_id != repository_id {
+        return bad("the context belongs to another repository");
+    }
+    let o = &g.observation;
+    if o.repository_id != repository_id {
+        return bad("the result names another repository than the one the broker bound");
+    }
+    if o.spaces != spaces {
+        return bad("the result names other spaces than the request");
+    }
+    let only_head = std::slice::from_ref(&sent.head);
+    if o.view_commits != only_head || o.current_commits.as_deref() != Some(only_head) {
+        return bad("the result is for another head than the manifest named");
+    }
+    let allowed = identities_for(policy);
+    let current = &allowed[0];
+    let known: HashSet<(&str, &CodeParserIdentity)> = sent
+        .known
+        .iter()
+        .filter_map(|(h, i)| {
+            sent.identities
+                .get(usize::from(*i))
+                .map(|id| (h.as_str(), id))
+        })
+        .collect();
+    if g.reused.iter().any(|i| *i >= g.code_inputs.len()) {
+        return bad("a reuse declaration points at no code input");
+    }
+    let mut decided: std::collections::HashMap<&str, (&CodeParserIdentity, bool)> =
+        std::collections::HashMap::new();
+    for (n, input) in g.code_inputs.iter().enumerate() {
+        let id = &input.derivation.identity;
+        if !allowed.contains(id) {
+            return bad("a derivation carries an identity this operation cannot produce");
+        }
+        if input.repository_id != Some(repository_id) {
+            return bad("a code input of another repository");
+        }
+        let Some(blob) = input.blob_oid.as_deref() else {
+            return bad("a code input without a blob id");
+        };
+        let reused = g.reused.contains(&n);
+        if reused {
+            if !known.contains(&(blob, id)) {
+                return bad("a reused derivation the parent did not announce for this operation");
+            }
+            let d = &input.derivation;
+            if !(d.entities.is_empty() && d.imports.is_empty() && d.relationships.is_empty()) {
+                return bad("a reused derivation carries structure");
+            }
+        } else if known.contains(&(blob, id)) || known.contains(&(blob, current)) {
+            return bad("a fresh derivation for a blob announced as known");
+        }
+        if let Some(prev) = decided.insert(blob, (id, reused)) {
+            if prev != (id, reused) {
+                return bad("conflicting derivations for the same blob");
+            }
+        }
+        if let Some(reason) = code::skip_reason_of(id) {
+            let oversized = input.content.len() as u64 > policy.max_source_bytes;
+            let source_reason =
+                reason.starts_with(&format!("{}:source_bytes", code::POLICY_REVISION));
+            if source_reason != oversized {
+                return bad("a skip derivation does not fit the size of its source");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Worker-side first pass: nothing to collect (the manifest comes from the HEAD tree); kept for
+/// symmetry with the directory form. Second pass: the parent's answer, and nothing else, is what
+/// is "known", keyed by blob id.
+pub struct GitKnownSet(HashSet<(String, CodeParserIdentity)>);
+
+impl GitKnownSet {
+    /// From a context that passed [`GitContext::validate`].
+    pub fn new(context: GitContext) -> Self {
+        let ids = context.identities;
+        Self(
+            context
+                .known
+                .into_iter()
+                .map(|(h, i)| (h, ids[usize::from(i)].clone()))
+                .collect(),
+        )
+    }
+}
+
+impl crate::ingest::extract::ExtractionContext for GitKnownSet {
+    fn space_id(&self, name: &str) -> Result<Uuid> {
+        Err(Error::InvalidExtraction(format!(
+            "the worker cannot resolve the space `{name}`"
+        )))
+    }
+    fn git_refs_current(&self, _: Uuid) -> Result<Vec<crate::core::GitRefObservation>> {
+        Ok(Vec::new())
+    }
+    fn has_code_derivation(
+        &self,
+        _: CodeLanguage,
+        _: &str,
+        _: Option<Uuid>,
+        blob_oid: Option<&str>,
+        identity: &CodeParserIdentity,
+    ) -> Result<bool> {
+        Ok(blob_oid.is_some_and(|b| self.0.contains(&(b.to_string(), identity.clone()))))
     }
 }

@@ -240,32 +240,16 @@ pub struct HeadSnapshot {
     pub files: Vec<(String, String, String, String)>,
 }
 
-/// A Git reader for a sandboxed worker. See the module documentation.
-pub struct ConfinedGitReader {
-    inner: GitReader,
-    /// For the identity marker: read through `openat`, never created.
-    git_dir: File,
-    #[cfg_attr(not(feature = "spawn-gate"), allow(dead_code))]
-    exec: ConfinedExec,
-}
-
-impl ConfinedGitReader {
-    /// Opens `<root>/.git` beneath the verified root descriptor and refuses everything v1 cannot
-    /// confine (module documentation). `root` is not consumed: it is duplicated.
-    pub fn open(root: BorrowedFd<'_>, git: &GitExecutable, deadline: Deadline) -> Result<Self> {
-        let root_file: File = root
-            .try_clone_to_owned()
-            .map_err(|e| Error::Io {
-                path: "<root descriptor>".into(),
-                source: e,
-            })?
-            .into();
-        let root_fd = root_file.as_raw_fd();
-        match kind_of(root_fd, ".") {
-            Ok(Some(k)) if k == libc::S_IFDIR => {}
-            _ => return Err(refuse("the root descriptor is not a directory")),
-        }
-        match kind_of(root_fd, ".git").map_err(|e| Error::Io {
+/// The layout checks of [`ConfinedGitReader::open`], without starting any process: `<root>/.git`
+/// must be a real directory of a plain (non-linked, non-bare) repository without alternates or
+/// grafts. Returns the opened git directory. The broker runs this too, before it starts a worker,
+/// so an unsupported layout never reaches one.
+fn check_layout(root_fd: RawFd) -> Result<File> {
+    match kind_of(root_fd, ".") {
+        Ok(Some(k)) if k == libc::S_IFDIR => {}
+        _ => return Err(refuse("the root descriptor is not a directory")),
+    }
+    match kind_of(root_fd, ".git").map_err(|e| Error::Io {
             path: ".git".into(),
             source: e,
         })? {
@@ -287,57 +271,128 @@ impl ConfinedGitReader {
             Some(k) if k == libc::S_IFDIR => {}
             Some(_) => return Err(refuse("`.git` is neither a directory nor a file")),
         }
-        let git_dir = open_beneath(root_fd, ".git", libc::O_RDONLY | libc::O_DIRECTORY)
-            .map_err(|e| refuse(format!("cannot open `.git`: {e}")))?;
-        let gfd = git_dir.as_raw_fd();
-        // layouts v1 cannot confine
-        if exists_beneath(gfd, &["commondir"])? {
-            return Err(refuse(
-                "unsupported repository: the git directory belongs to a linked worktree (`commondir`)",
-            ));
-        }
-        if exists_beneath(gfd, &["worktrees"])? {
-            return Err(refuse(
+    let git_dir = open_beneath(root_fd, ".git", libc::O_RDONLY | libc::O_DIRECTORY)
+        .map_err(|e| refuse(format!("cannot open `.git`: {e}")))?;
+    let gfd = git_dir.as_raw_fd();
+    // layouts v1 cannot confine
+    if exists_beneath(gfd, &["commondir"])? {
+        return Err(refuse(
+            "unsupported repository: the git directory belongs to a linked worktree (`commondir`)",
+        ));
+    }
+    if exists_beneath(gfd, &["worktrees"])? {
+        return Err(refuse(
                 "unsupported repository: it has linked worktrees (`.git/worktrees`); they are not supported",
             ));
-        }
-        for alt in ["alternates", "http-alternates"] {
-            if exists_beneath(gfd, &["objects", "info", alt])? {
-                return Err(refuse(format!(
+    }
+    for alt in ["alternates", "http-alternates"] {
+        if exists_beneath(gfd, &["objects", "info", alt])? {
+            return Err(refuse(format!(
                     "unsupported repository: object alternates (`objects/info/{alt}`) are not supported"
+                )));
+        }
+    }
+    if exists_beneath(gfd, &["info", "grafts"])? {
+        return Err(refuse(
+            "unsupported repository: `info/grafts` rewrites history and cannot be switched off",
+        ));
+    }
+    // top-level entries git follows; a link among them is refused (a link cannot leave the
+    // authorized root, the kernel stops that, but it can point somewhere else inside it)
+    for name in [
+        "HEAD",
+        "config",
+        "objects",
+        "refs",
+        "packed-refs",
+        "info",
+        "shallow",
+    ] {
+        if let Some(k) = kind_of(gfd, name).map_err(|e| Error::Io {
+            path: name.into(),
+            source: e,
+        })? {
+            if k == libc::S_IFLNK {
+                return Err(refuse(format!(
+                    "the git directory contains a symbolic link (`{name}`); not supported"
                 )));
             }
         }
-        if exists_beneath(gfd, &["info", "grafts"])? {
-            return Err(refuse(
-                "unsupported repository: `info/grafts` rewrites history and cannot be switched off",
-            ));
+    }
+    if kind_of(gfd, "HEAD").ok().flatten() != Some(libc::S_IFREG) {
+        return Err(refuse("not a git repository: `.git/HEAD` is missing"));
+    }
+    Ok(git_dir)
+}
+
+/// The identity marker of the repository whose git directory is `git_dir_fd`: read-only,
+/// `O_NOFOLLOW`, at most 256 bytes, never created. A missing marker is `identity_missing`; a marker
+/// that is not a UUID is refused.
+fn read_marker_at(git_dir_fd: RawFd) -> Result<Uuid> {
+    const NAME: &str = "mindspace-repository-id";
+    let at = |reason: String| Error::RepositoryIdentity {
+        path: format!(".git/{NAME}"),
+        reason,
+    };
+    let mut f = match open_beneath(git_dir_fd, NAME, libc::O_RDONLY) {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            return Err(at(
+                "identity_missing: this repository has no identity marker; ingest it once with `mind ingest`"
+                    .into(),
+            ))
         }
-        // top-level entries git follows; a link among them is refused (a link cannot leave the
-        // authorized root, the kernel stops that, but it can point somewhere else inside it)
-        for name in [
-            "HEAD",
-            "config",
-            "objects",
-            "refs",
-            "packed-refs",
-            "info",
-            "shallow",
-        ] {
-            if let Some(k) = kind_of(gfd, name).map_err(|e| Error::Io {
-                path: name.into(),
+        Err(e) => return Err(at(format!("cannot read marker: {e}"))),
+    };
+    let mut text = String::new();
+    (&mut f)
+        .take(256)
+        .read_to_string(&mut text)
+        .map_err(|e| at(format!("cannot read marker: {e}")))?;
+    Uuid::parse_str(text.trim()).map_err(|_| at("marker exists but is not a UUID".into()))
+}
+
+/// What the BROKER learns about an authorized root before it starts a worker, without starting
+/// any process and without parsing repository content: the layout is one this milestone can
+/// confine ([`ConfinedGitReader::open`] applies the same checks) and the repository has an
+/// identity marker. The broker binds that identity to the operation; the worker cannot choose
+/// another. (The marker is repository content: a hostile repository can ship any UUID in it. That
+/// limitation is documented and unchanged.)
+pub fn inspect_root(root: BorrowedFd<'_>) -> Result<Uuid> {
+    let root_file: File = root
+        .try_clone_to_owned()
+        .map_err(|e| Error::Io {
+            path: "<root descriptor>".into(),
+            source: e,
+        })?
+        .into();
+    let git_dir = check_layout(root_file.as_raw_fd())?;
+    read_marker_at(git_dir.as_raw_fd())
+}
+
+/// A Git reader for a sandboxed worker. See the module documentation.
+pub struct ConfinedGitReader {
+    inner: GitReader,
+    /// For the identity marker: read through `openat`, never created.
+    git_dir: File,
+    #[cfg_attr(not(feature = "spawn-gate"), allow(dead_code))]
+    exec: ConfinedExec,
+}
+
+impl ConfinedGitReader {
+    /// Opens `<root>/.git` beneath the verified root descriptor and refuses everything v1 cannot
+    /// confine (module documentation). `root` is not consumed: it is duplicated.
+    pub fn open(root: BorrowedFd<'_>, git: &GitExecutable, deadline: Deadline) -> Result<Self> {
+        let root_file: File = root
+            .try_clone_to_owned()
+            .map_err(|e| Error::Io {
+                path: "<root descriptor>".into(),
                 source: e,
-            })? {
-                if k == libc::S_IFLNK {
-                    return Err(refuse(format!(
-                        "the git directory contains a symbolic link (`{name}`); not supported"
-                    )));
-                }
-            }
-        }
-        if kind_of(gfd, "HEAD").ok().flatten() != Some(libc::S_IFREG) {
-            return Err(refuse("not a git repository: `.git/HEAD` is missing"));
-        }
+            })?
+            .into();
+        let root_fd = root_file.as_raw_fd();
+        let git_dir = check_layout(root_fd)?;
+        let gfd = git_dir.as_raw_fd();
         let exec = ConfinedExec {
             exe: git.exe().to_path_buf(),
             git_dir_fd: gfd,
@@ -373,27 +428,7 @@ impl ConfinedGitReader {
     /// The Mindspace identity of the repository: the marker that already exists. A repository
     /// without one is an error that says so; the reader never creates one.
     pub fn repository_id(&self) -> Result<Uuid> {
-        const NAME: &str = "mindspace-repository-id";
-        let at = |reason: String| Error::RepositoryIdentity {
-            path: format!(".git/{NAME}"),
-            reason,
-        };
-        let mut f = match open_beneath(self.git_dir.as_raw_fd(), NAME, libc::O_RDONLY) {
-            Ok(f) => f,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                return Err(at(
-                    "identity_missing: this repository has no identity marker; ingest it once with `mind ingest`"
-                        .into(),
-                ))
-            }
-            Err(e) => return Err(at(format!("cannot read marker: {e}"))),
-        };
-        let mut text = String::new();
-        (&mut f)
-            .take(256)
-            .read_to_string(&mut text)
-            .map_err(|e| at(format!("cannot read marker: {e}")))?;
-        Uuid::parse_str(text.trim()).map_err(|_| at("marker exists but is not a UUID".into()))
+        read_marker_at(self.git_dir.as_raw_fd())
     }
 
     /// The commit HEAD resolves to and the entries of its tree. An unborn HEAD is an error.
@@ -509,6 +544,23 @@ impl ConfinedGitReader {
     ) -> Result<(Vec<GitCommitData>, Vec<GitTreeData>, Vec<GitTagData>)> {
         require_sha1_oids(oids)?;
         self.inner.objects(oids)
+    }
+
+    /// The configured remotes `(name, raw url)`; the url is sanitized by the caller.
+    pub fn remotes(&self) -> Result<Vec<(String, String)>> {
+        self.inner.remotes()
+    }
+
+    /// Blob contents as the exact bytes git stores (no text conversion), by oid. One git call.
+    pub fn blob_bytes(&self, oids: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+        require_sha1_oids(oids)?;
+        Ok(self
+            .inner
+            .raw_objects(oids)?
+            .into_iter()
+            .filter(|(_, kind, _)| *kind == GitObjectKind::Blob)
+            .map(|(oid, _, bytes)| (oid, bytes))
+            .collect())
     }
 
     /// Blob contents by oid.

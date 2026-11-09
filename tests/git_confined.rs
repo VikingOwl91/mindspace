@@ -168,10 +168,20 @@ fn snapshot(dir: &Path) -> BTreeMap<String, String> {
 
 /// Starts `mind git-probe` with `root` as descriptor 4 (unless `place_root` is false).
 fn probe_cmd(scenario: &str, root: &Path, env: &[(&str, &str)], place_root: bool) -> Command {
+    probe_cmd_with(scenario, GIT, root, env, place_root)
+}
+
+fn probe_cmd_with(
+    scenario: &str,
+    git: &str,
+    root: &Path,
+    env: &[(&str, &str)],
+    place_root: bool,
+) -> Command {
     let rootfile = std::fs::File::open(root).unwrap();
     let rootfd = rootfile.as_raw_fd();
     let mut c = Command::new(env!("CARGO_BIN_EXE_mind"));
-    c.args(["git-probe", scenario, GIT]).env_clear();
+    c.args(["git-probe", scenario, git]).env_clear();
     for (k, v) in env {
         c.env(k, v);
     }
@@ -1060,4 +1070,103 @@ fn performance_observation() {
             files.len(), in_process, confined, in_sandbox
         );
     }
+}
+
+// ------------------------------------------------------------------------------- pinning
+
+/// What is pinned about the git executable, and when. The worker resolves the path BEFORE it
+/// confines itself and its Landlock rule is bound to that file's INODE; every later `exec` goes
+/// through the path again. These tests change the filesystem AFTER the confinement is in force.
+fn held_probe(
+    fx: &Fixture,
+    exe: &Path,
+) -> (
+    std::process::Child,
+    std::io::BufReader<std::process::ChildStdout>,
+    PathBuf,
+) {
+    let go = fx.outside.join("go");
+    let mut cmd = probe_cmd_with(
+        "head",
+        exe.to_str().unwrap(),
+        &fx.root,
+        &[("PROBE_HOLD_FILE", go.to_str().unwrap())],
+        true,
+    );
+    cmd.stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+    assert!(
+        line.contains("hold"),
+        "the probe did not reach the hold point: {line:?}"
+    );
+    (child, out, go)
+}
+
+fn finish_probe(
+    mut child: std::process::Child,
+    mut out: std::io::BufReader<std::process::ChildStdout>,
+    go: &Path,
+) -> Value {
+    std::fs::write(go, b"").unwrap();
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
+    child.wait().unwrap();
+    serde_json::from_str(rest.lines().last().unwrap_or("{}")).unwrap_or_else(|_| panic!("{rest:?}"))
+}
+
+#[test]
+fn a_binary_replaced_after_the_confinement_is_not_executed() {
+    if !kernel_ok() {
+        return;
+    }
+    let fx = fixture();
+    let exe = fx.outside.join("git");
+    std::fs::copy(GIT, &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // control: unchanged, the copy works
+    let (child, out, go) = held_probe(&fx, &exe);
+    let v = finish_probe(child, out, &go);
+    assert_eq!(
+        v["commit"],
+        git(&fx.root, &["rev-parse", "HEAD"]).as_str(),
+        "{v}"
+    );
+    std::fs::remove_file(&go).unwrap();
+    // the swap: a different executable takes the path's place while the worker is confined
+    let (child, out, go) = held_probe(&fx, &exe);
+    let other = fx.outside.join("other");
+    std::fs::copy("/usr/bin/true", &other).unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&other, &exe).unwrap();
+    let v = finish_probe(child, out, &go);
+    // fail closed: the new file has no execute right in the worker's domain
+    let e = v["open_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the swapped binary ran: {v}"));
+    assert!(e.contains("cannot run git"), "{e}");
+}
+
+/// A LIMIT, pinned as such: the rule is bound to the inode, not to its contents. A file that is
+/// modified IN PLACE (same inode) keeps its execute right in the worker's domain. Only a binary
+/// that the attacker could write to is exposed, which is why the resolver refuses group/other
+/// writable files; the directories above it are not checked. When a content hash or an ownership
+/// check is added, this test is the one to flip.
+#[test]
+fn a_binary_modified_in_place_after_the_confinement_still_runs_a_documented_limit() {
+    if !kernel_ok() {
+        return;
+    }
+    let fx = fixture();
+    let exe = fx.outside.join("git");
+    std::fs::copy(GIT, &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (child, out, go) = held_probe(&fx, &exe);
+    std::fs::write(&exe, std::fs::read("/usr/bin/true").unwrap()).unwrap(); // same inode
+    let v = finish_probe(child, out, &go);
+    // `true` was executed: it printed nothing, so the object format came back empty
+    let e = v["open_error"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(e.contains("object format"), "{e}");
 }

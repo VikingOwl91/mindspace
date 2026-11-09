@@ -245,7 +245,7 @@ fn handle_message(
             }
             Some(json_rpc_result(
                 id,
-                json!({ "tools": tools::definitions() }),
+                json!({ "tools": tools::definitions_for(config) }),
             ))
         }
         "tools/call" => {
@@ -274,7 +274,7 @@ fn handle_message(
                     "tools/call requires a string name",
                 ));
             };
-            if !tools::contains(name) {
+            if !tools::contains_for(config, name) {
                 return Some(json_rpc_error(id, -32602, format!("unknown tool: {name}")));
             }
             let arguments = match params.get("arguments") {

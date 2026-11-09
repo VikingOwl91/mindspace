@@ -467,6 +467,21 @@ pub struct Observed {
     pub cleanup: Cleanup,
 }
 
+/// How an operation ended, as the broker saw it. Only `Done` permits persisting the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndedBy {
+    /// The frontend validated the stream and said `Done`, and the authority was still valid at
+    /// the broker's final recheck (the point after which a revocation no longer matters).
+    Done,
+    /// `Cancel`, a hang-up or a protocol violation from the frontend.
+    Cancelled,
+    /// The broker's wall-clock limit.
+    Timeout,
+    /// The grant behind the operation was revoked or expired, or could not be verified.
+    Revoked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cleanup {
@@ -495,6 +510,7 @@ pub enum FromBroker {
     Finished {
         op: Uuid,
         exit: String,
+        ended_by: EndedBy,
         /// The leader ended on its own before the broker ended it.
         exited_by_itself: bool,
         /// Processes still in the operation's cgroup when it was killed (descendants).
@@ -704,6 +720,12 @@ impl CgroupScope {
             if p.starts_with("/sys/fs/cgroup") && p != Path::new("/sys/fs/cgroup") {
                 candidates.push(p.to_path_buf());
             }
+        }
+        // Without a configured limit there is exactly one acceptable placement: inside the
+        // cgroup this process started in (so the unit's lifecycle and limits cover the tree). If
+        // that fails the start fails; a sibling placement would silently leave the unit.
+        if !need_controllers {
+            candidates.truncate(1);
         }
         // Test builds only (feature `spawn-gate`): point the broker at a parent it cannot write
         // to, to observe the real kernel refusal and the fail-closed start.
@@ -976,6 +998,9 @@ pub struct BrokerConfig {
     /// Refuse a worker whose `/proc` entry does not show seccomp, no-new-privs, no tracer and no
     /// capabilities. Only tests that stand in a fake worker turn this off.
     pub verify_confinement: bool,
+    /// How often the authority behind a running operation is verified again. Only revocable
+    /// authority (a grant) is rechecked; a static root cannot be revoked.
+    pub recheck_interval: Duration,
     /// Operations at once across all connections; more are refused (`busy`), not queued.
     pub max_concurrent: usize,
 }
@@ -995,6 +1020,7 @@ impl BrokerConfig {
                 pids_max: None,
             },
             verify_confinement: true,
+            recheck_interval: Duration::from_millis(100),
             max_concurrent: 1,
         }
     }
@@ -1112,6 +1138,10 @@ impl Broker {
             return;
         };
         let mut reader = BufReader::new(read_half);
+        // After an operation the BROKER ended (revocation, timeout) the frontend still sends its
+        // own terminal message (`Cancel`, because its result is an error). Exactly that one
+        // message is expected and ignored; any other stray message stays a protocol violation.
+        let mut terminal_pending = false;
         loop {
             let line = match read_line_limited(&mut reader) {
                 Ok(Some(l)) => l,
@@ -1129,10 +1159,14 @@ impl Broker {
                     root,
                     spaces,
                 }) => {
-                    if let Err(why) = self.operation(&sock, &mut reader, v, op, kind, root, spaces)
-                    {
-                        self.refuse(&sock, &why);
+                    terminal_pending = false;
+                    match self.operation(&sock, &mut reader, v, op, kind, root, spaces) {
+                        Ok(pending) => terminal_pending = pending,
+                        Err(why) => self.refuse(&sock, &why),
                     }
+                }
+                Ok(ToBroker::Done | ToBroker::Cancel) if terminal_pending => {
+                    terminal_pending = false;
                 }
                 // Done/Cancel outside an operation, or anything unparsable: a protocol violation
                 Ok(_) => {
@@ -1166,7 +1200,7 @@ impl Broker {
         _kind: OpKind,
         root: String,
         spaces: Vec<Uuid>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if v != BROKER_PROTOCOL {
             return Err(format!("broker protocol {v}"));
         }
@@ -1257,7 +1291,7 @@ impl Broker {
             op,
             spaces,
             root,
-            authority: auth.source,
+            authority: auth.source.clone(),
             observed,
         };
         let mut b = serde_json::to_vec(&ready).map_err(|e| e.to_string())?;
@@ -1268,7 +1302,7 @@ impl Broker {
         }
         drop(front_end);
         // 9. supervise
-        let by_itself = self.supervise(sock, reader, &mut run);
+        let (ended_by, by_itself, consumed) = self.supervise(sock, reader, &mut run, &auth);
         // the timeout belongs to supervision only; the connection serves the next operation
         let _ = sock.set_read_timeout(None);
         let peak = run.cg.as_ref().and_then(|c| c.peak());
@@ -1276,6 +1310,7 @@ impl Broker {
         let fin = FromBroker::Finished {
             op,
             exit: describe(run.status),
+            ended_by,
             exited_by_itself: by_itself && run.leader_exited_alone(),
             descendants_killed: killed,
             peak_rss_kb: run.rusage.ru_maxrss,
@@ -1285,7 +1320,8 @@ impl Broker {
         let mut b = serde_json::to_vec(&fin).map_err(|e| e.to_string())?;
         b.push(b'\n');
         let _ = (&*sock).write_all(&b);
-        Ok(())
+        // true: the broker ended it, so the frontend's terminal message is still on its way
+        Ok(!consumed)
     }
 
     fn spawn(
@@ -1435,19 +1471,48 @@ impl Broker {
         Ok(o)
     }
 
-    /// Returns whether the leader ended by itself after `Done`. Ends (and returns false) on
-    /// `Cancel`, a frontend hang-up, a protocol violation or the wall-clock limit.
+    /// Whether the authority an operation started with still holds. A static root is not
+    /// revocable and is not rechecked against the grant store (the two stay distinct). A grant
+    /// must still be listed with the same id, path and device/inode; if the store cannot be
+    /// verified the answer is no (fail closed).
+    fn still_authorized(&self, auth: &AuthorizedRoot) -> bool {
+        match &auth.source {
+            AuthoritySource::Static => true,
+            AuthoritySource::Grant(_) => self.authority.roots().is_ok_and(|rs| {
+                rs.iter().any(|r| {
+                    r.source == auth.source
+                        && r.path == auth.path
+                        && r.dev == auth.dev
+                        && r.ino == auth.ino
+                })
+            }),
+        }
+    }
+
+    /// Runs until the operation ends and says how. A revocable grant is rechecked every
+    /// `recheck_interval`, whatever the worker is doing (parsing, or waiting inside the context
+    /// exchange), and once more when the frontend says `Done`: that last check is the
+    /// linearization point after which the result may be persisted.
     fn supervise(
         &self,
         sock: &UnixStream,
         reader: &mut BufReader<UnixStream>,
         run: &mut Running,
-    ) -> bool {
+        auth: &AuthorizedRoot,
+    ) -> (EndedBy, bool, bool) {
         let deadline = Instant::now() + self.cfg.wall_timeout;
+        let mut next_check = Instant::now() + self.cfg.recheck_interval;
         let _ = sock.set_read_timeout(Some(Duration::from_millis(10)));
         loop {
-            if Instant::now() >= deadline {
-                return false;
+            let now = Instant::now();
+            if now >= deadline {
+                return (EndedBy::Timeout, false, false);
+            }
+            if now >= next_check {
+                next_check = now + self.cfg.recheck_interval;
+                if !self.still_authorized(auth) {
+                    return (EndedBy::Revoked, false, false);
+                }
             }
             // the worker may end on its own (crash, or done) while the frontend is still reading
             let mut line = Vec::new();
@@ -1456,16 +1521,23 @@ impl Broker {
                 .take(MAX_LINE as u64 + 1)
                 .read_until(b'\n', &mut line)
             {
-                Ok(0) => return false, // frontend hung up
+                Ok(0) => return (EndedBy::Cancelled, false, true), // frontend hung up
                 Ok(_) if line.last() == Some(&b'\n') => {
                     line.pop();
                     return match serde_json::from_slice::<ToBroker>(&line) {
-                        Ok(ToBroker::Done) => run.wait_leader(self.cfg.exit_grace),
+                        Ok(ToBroker::Done) => {
+                            let by_itself = run.wait_leader(self.cfg.exit_grace);
+                            if self.still_authorized(auth) {
+                                (EndedBy::Done, by_itself, true)
+                            } else {
+                                (EndedBy::Revoked, false, true)
+                            }
+                        }
                         // Cancel, a second Begin, junk: all end the operation
-                        _ => false,
+                        _ => (EndedBy::Cancelled, false, true),
                     };
                 }
-                Ok(_) => return false, // too long / truncated
+                Ok(_) => return (EndedBy::Cancelled, false, true), // too long / truncated
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -1473,7 +1545,7 @@ impl Broker {
                             | std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::Interrupted
                     ) => {}
-                Err(_) => return false,
+                Err(_) => return (EndedBy::Cancelled, false, true),
             }
         }
     }

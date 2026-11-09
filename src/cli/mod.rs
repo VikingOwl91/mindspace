@@ -289,6 +289,11 @@ pub enum Command {
         /// no MCP tool uses it yet.
         #[arg(long, hide = true)]
         broker: bool,
+        /// EXPERIMENTAL (M7.3b.4): offer `repo_ingest_isolated`, which ingests a directory through
+        /// a worker started by a broker outside this server's sandbox. Implies the broker. Hidden;
+        /// without it the tool does not exist.
+        #[arg(long = "isolated-ingest", hide = true)]
+        isolated_ingest: bool,
     },
 }
 
@@ -909,13 +914,15 @@ License: {}",
             insecure_no_sandbox,
             grants,
             broker,
+            isolated_ingest,
         } => mcp_command(
             cli,
             allow_roots,
             *ingest_timeout,
             *insecure_no_sandbox,
             *grants,
-            *broker,
+            *broker || *isolated_ingest,
+            *isolated_ingest,
         )?,
     }
     Ok(())
@@ -931,6 +938,7 @@ fn mcp_command(
     insecure: bool,
     use_grants: bool,
     broker: bool,
+    isolated_ingest: bool,
 ) -> Result<()> {
     use crate::mcp::{McpConfig, SandboxState};
     // Stage 2 keeps exactly one inherited descriptor: the validated broker channel (if any).
@@ -1021,6 +1029,10 @@ fn mcp_command(
     } else {
         #[cfg(unix)]
         let broker_req = broker.then(|| crate::sandbox::BrokerRequest {
+            // explicit roots only: a grant that was active at start must stay revocable
+            static_roots: McpConfig::from_specs(allow_roots)
+                .map(|c| c.roots().iter().map(|r| r.path.clone()).collect())
+                .unwrap_or_default(),
             grants: store_dir.clone().map(|dir| {
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
@@ -1041,6 +1053,26 @@ fn mcp_command(
         eprintln!("mind: the repository tools are OFF: {reason}");
     }
     let config = config.with_sandbox(state).with_seccomp(seccomp_report);
+    // The experimental tool exists only if it was asked for AND the kernel sandbox is verified AND
+    // the broker channel arrived (stage 2 only). Anything else: no tool, and one line saying why.
+    #[cfg(unix)]
+    let config = if isolated_ingest {
+        let enforced = matches!(config.sandbox(), SandboxState::Enforced(_));
+        match (enforced, crate::worker::broker::take_frontend_link()) {
+            (true, Some(link)) => config.with_isolated_ingest(link),
+            _ => {
+                eprintln!(
+                    "mind: --isolated-ingest: no verified sandbox and broker channel; \
+                     repo_ingest_isolated is NOT offered"
+                );
+                config
+            }
+        }
+    } else {
+        config
+    };
+    #[cfg(not(unix))]
+    let _ = isolated_ingest;
     let store = open(cli)?;
     // Test harness only (feature `spawn-gate`, enabled for `cargo test` builds, absent from a plain build):
     // run the worker from this sandboxed frontend.

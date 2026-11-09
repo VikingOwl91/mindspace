@@ -9,6 +9,49 @@ use crate::storage::Store;
 
 use super::repo_tools::{self, McpConfig};
 
+/// A failed tool call: the text shown to the model and, optionally, the same failure as
+/// structured content. Existing tools only ever produce the text.
+#[derive(Debug)]
+pub struct ToolFailure {
+    pub message: String,
+    pub structured: Option<Value>,
+}
+
+impl From<String> for ToolFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            structured: None,
+        }
+    }
+}
+
+impl From<&str> for ToolFailure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+/// The tools this server offers: the fixed set, plus the experimental isolated-ingest tool when,
+/// and only when, the server was started with it and verified the broker channel. Without the
+/// opt-in the list is exactly [`definitions`].
+pub fn definitions_for(config: &McpConfig) -> Vec<Value> {
+    let mut all = definitions();
+    #[cfg(unix)]
+    if config.isolated().is_some() {
+        all.push(super::isolated::definition());
+    }
+    #[cfg(not(unix))]
+    let _ = config;
+    all
+}
+
+pub fn contains_for(config: &McpConfig, name: &str) -> bool {
+    definitions_for(config)
+        .iter()
+        .any(|definition| definition["name"].as_str() == Some(name))
+}
+
 pub fn definitions() -> Vec<Value> {
     vec![
         tool(
@@ -213,12 +256,6 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
-pub fn contains(name: &str) -> bool {
-    definitions()
-        .iter()
-        .any(|definition| definition["name"].as_str() == Some(name))
-}
-
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({
         "name": name,
@@ -248,10 +285,16 @@ pub fn call_result(
                 "isError": false
             })
         }
-        Err(error) => json!({
-            "content": [{ "type": "text", "text": error }],
-            "isError": true
-        }),
+        Err(failure) => {
+            let mut result = json!({
+                "content": [{ "type": "text", "text": failure.message }],
+                "isError": true
+            });
+            if let Some(structured) = failure.structured {
+                result["structuredContent"] = structured;
+            }
+            result
+        }
     }
 }
 
@@ -261,9 +304,13 @@ fn call_tool(
     semantic: &mut SemanticCache,
     name: &str,
     args: &Value,
-) -> std::result::Result<Value, String> {
+) -> std::result::Result<Value, ToolFailure> {
     validate_arguments(name, args)?;
     let obj = args.as_object().ok_or("arguments must be an object")?;
+    #[cfg(unix)]
+    if name == super::isolated::TOOL {
+        return super::isolated::run(store, config, obj);
+    }
     let result: Result<Value> = (|| match name {
         "memory_create" => {
             let spaces = resolve_spaces(store, string_array(obj, "spaces")?)?;
@@ -419,7 +466,7 @@ fn call_tool(
         }
         _ => Err(Error::Storage(format!("unknown tool: {name}"))),
     })();
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| ToolFailure::from(error.to_string()))
 }
 
 fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), String> {
@@ -463,6 +510,8 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             &["path", "spaces"],
         ),
         "repo_request_access" => (&["path", "access", "reason"], &["path"]),
+        #[cfg(unix)]
+        super::isolated::TOOL => (&["path", "spaces"], &["path", "spaces"]),
         "memory_history" => (&["subject"], &["subject"]),
         "memory_conflicts" | "space_list" => (&[], &[]),
         "memory_add_spaces" => (&["id", "spaces"], &["id", "spaces"]),
@@ -652,6 +701,27 @@ fn resolve_spaces(store: &dyn Store, names: Vec<&str>) -> Result<Vec<Uuid>> {
 mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
+
+    #[test]
+    fn without_the_opt_in_the_tool_list_is_exactly_the_fixed_list() {
+        let config = McpConfig::default();
+        assert_eq!(definitions_for(&config), definitions());
+        assert!(!contains_for(&config, "repo_ingest_isolated"));
+        assert!(contains_for(&config, "repo_ingest"));
+        // and a call is refused at the tool layer too, not only in the protocol layer
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut semantic = SemanticCache::default();
+        let args = json!({"path": "/x", "spaces": ["p"]});
+        let result = call_result(
+            &store,
+            &config,
+            &mut semantic,
+            "repo_ingest_isolated",
+            &args,
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["error"]["kind"], "not_enabled");
+    }
 
     #[test]
     fn registers_all_tools_with_object_schemas() {

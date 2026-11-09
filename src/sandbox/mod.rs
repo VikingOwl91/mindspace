@@ -139,6 +139,10 @@ pub(crate) const ENV_BROKER_FD: &str = "MINDSPACE_SANDBOX_BROKER_FD";
 /// grants are in use). The static roots are the plan's roots.
 #[derive(Debug, Clone)]
 pub struct BrokerRequest {
+    /// The roots named explicitly on the command line (`--allow-root`): the broker's static,
+    /// non-revocable authority. Grants that happened to be active at start are NOT in here: they
+    /// stay revocable and are read from the store by the broker like any later grant.
+    pub static_roots: Vec<PathBuf>,
     pub grants: Option<(PathBuf, crate::grants::PathPolicy)>,
 }
 
@@ -223,7 +227,7 @@ fn spawn_broker(
                     frontend,
                     pidfd,
                     plan.exe.clone(),
-                    plan.roots.iter().map(|(p, _)| p.clone()).collect(),
+                    req.static_roots.clone(),
                     req.grants.clone(),
                 );
             }

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod isolated;
 mod protocol;
 mod repo_tools;
 mod tools;

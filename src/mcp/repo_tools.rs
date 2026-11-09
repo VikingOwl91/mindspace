@@ -101,6 +101,10 @@ pub struct McpConfig {
     /// Where `repo_request_access` records requests (a log next to the
     /// database); `None` disables the tool. A request is never a permission.
     request_log: Option<PathBuf>,
+    /// The experimental isolated-ingest tool (M7.3b.4): present only when the server was started
+    /// with `--isolated-ingest` and the sandbox and the broker channel were verified.
+    #[cfg(unix)]
+    isolated: Option<std::sync::Arc<super::isolated::IsolatedIngest>>,
 }
 
 impl Default for McpConfig {
@@ -113,6 +117,8 @@ impl Default for McpConfig {
             ),
             seccomp: json!({"state": "not_evaluated"}),
             request_log: None,
+            #[cfg(unix)]
+            isolated: None,
         }
     }
 }
@@ -226,7 +232,29 @@ impl McpConfig {
             ),
             seccomp: json!({"state": "not_evaluated"}),
             request_log: None,
+            #[cfg(unix)]
+            isolated: None,
         })
+    }
+
+    /// Offers `repo_ingest_isolated`, served through this broker channel. Without this call the
+    /// tool does not exist for this server.
+    #[cfg(unix)]
+    pub fn with_isolated_ingest(mut self, link: std::os::unix::net::UnixStream) -> Self {
+        self.isolated = Some(std::sync::Arc::new(super::isolated::IsolatedIngest::new(
+            link,
+        )));
+        self
+    }
+
+    #[cfg(unix)]
+    pub fn isolated(&self) -> Option<&super::isolated::IsolatedIngest> {
+        self.isolated.as_deref()
+    }
+
+    #[cfg(not(unix))]
+    pub fn isolated(&self) -> Option<&()> {
+        None
     }
 
     pub fn with_request_log(mut self, file: PathBuf) -> Self {
@@ -596,7 +624,7 @@ pub fn ingest(
     }))
 }
 
-fn summarize(outcome: &IngestOutcome) -> Value {
+pub(super) fn summarize(outcome: &IngestOutcome) -> Value {
     fn capped(v: Value) -> Value {
         let items = v.as_array().cloned().unwrap_or_default();
         json!({ "total": items.len(), "sample": items.into_iter().take(SAMPLE).collect::<Vec<_>>() })

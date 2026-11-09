@@ -20,7 +20,8 @@ use crate::ingest::extract::Extracted;
 use crate::ingest::stream::{consume, Kind, ProducerLimits, StreamLimits};
 
 use super::broker::{
-    recv_with_fd, FromBroker, Observed, OpKind, ToBroker, BROKER_PROTOCOL, MAX_LINE,
+    recv_with_fd, AuthoritySource, EndedBy, FromBroker, Observed, OpKind, ToBroker,
+    BROKER_PROTOCOL, MAX_LINE,
 };
 use super::context::{
     answer, check_result, validate_spaces, ContextSource, Manifest, MAX_MANIFEST_LINE,
@@ -87,6 +88,10 @@ pub enum WorkerError {
     /// The hard wall-clock limit or the idle limit expired; the worker's group was killed.
     Timeout(&'static str),
     Cancelled,
+    /// The grant behind the operation was revoked (or expired, or could not be verified) while it
+    /// ran or before its result could be accepted; the worker was ended and nothing may be
+    /// persisted.
+    Revoked,
     /// The context exchange was refused: a request the parent will not make (unknown space) or a
     /// manifest that is malformed, over budget or for another operation. Nothing was persisted.
     Context(String),
@@ -108,6 +113,10 @@ impl std::fmt::Display for WorkerError {
             Self::Sandbox(m) => write!(f, "the extraction worker is not confined: {m}"),
             Self::Timeout(w) => write!(f, "the extraction worker timed out ({w})"),
             Self::Cancelled => write!(f, "the extraction was cancelled"),
+            Self::Revoked => write!(
+                f,
+                "the grant for this directory was revoked while the extraction ran; nothing was persisted"
+            ),
             Self::Context(m) => write!(f, "the context exchange was refused: {m}"),
             Self::Stream(m) => write!(f, "the extraction worker's result was refused: {m}"),
             Self::Died { status, stderr } => {
@@ -650,6 +659,9 @@ fn verify_hello(h: &Hello, pid: u32, via_proc: bool) -> Result<(), WorkerError> 
 #[derive(Debug, Clone)]
 pub struct BrokerReport {
     pub observed: Observed,
+    /// Where the broker took the authority from (derived by the broker, never by the caller).
+    pub authority: AuthoritySource,
+    pub ended_by: EndedBy,
     pub exit: String,
     pub exited_by_itself: bool,
     pub descendants_killed: u32,
@@ -709,7 +721,7 @@ pub fn extract_via_broker(
     let text = String::from_utf8_lossy(&bytes);
     let ready: FromBroker = serde_json::from_str(text.trim_end())
         .map_err(|e| WorkerError::Io(format!("unreadable answer from the broker: {e}")))?;
-    let (observed, got_spaces, got_root) = match ready {
+    let (observed, got_spaces, got_root, authority) = match ready {
         FromBroker::Refused { reason } => return Err(WorkerError::Refused(reason)),
         FromBroker::Ready {
             v,
@@ -717,8 +729,8 @@ pub fn extract_via_broker(
             spaces: s,
             root: r,
             observed,
-            ..
-        } if v == BROKER_PROTOCOL && o == op => (observed, s, r),
+            authority,
+        } if v == BROKER_PROTOCOL && o == op => (observed, s, r, authority),
         other => {
             return Err(WorkerError::Io(format!(
                 "the broker answered with something else than Ready for this operation: {other:?}"
@@ -769,9 +781,11 @@ pub fn extract_via_broker(
             .map_err(|e| WorkerError::Io(e.to_string()))?,
     );
     let mut line = Vec::new();
-    let fin = (&mut reader)
+    let read = (&mut reader)
         .take(MAX_LINE as u64 + 1)
-        .read_until(b'\n', &mut line)
+        .read_until(b'\n', &mut line);
+    let broker_gone = matches!(read, Ok(0));
+    let fin = read
         .ok()
         .filter(|n| *n > 0 && line.last() == Some(&b'\n'))
         .and_then(|_| serde_json::from_slice::<FromBroker>(&line).ok());
@@ -779,6 +793,7 @@ pub fn extract_via_broker(
     let Some(FromBroker::Finished {
         op: fop,
         exit,
+        ended_by,
         exited_by_itself,
         descendants_killed,
         peak_rss_kb,
@@ -786,6 +801,12 @@ pub fn extract_via_broker(
         ..
     }) = fin
     else {
+        if broker_gone {
+            // the broker (or its watchdog) ended during the operation: explicit, not a worker death
+            return Err(WorkerError::Refused(
+                "the broker is not available (it exited during the operation)".into(),
+            ));
+        }
         return Err(outcome.err().unwrap_or(WorkerError::Io(
             "the broker did not report how the worker ended".into(),
         )));
@@ -797,8 +818,18 @@ pub fn extract_via_broker(
     }
     stats.exit = exit.clone();
     stats.worker_peak_rss_kb = peak_rss_kb;
+    // The broker's word comes first: a revoked operation is never accepted, whatever the stream
+    // looked like, and a broker timeout is a timeout, not a dead worker.
+    if ended_by == EndedBy::Revoked {
+        return Err(WorkerError::Revoked);
+    }
+    if ended_by == EndedBy::Timeout {
+        return Err(WorkerError::Timeout("broker wall clock"));
+    }
     let report = BrokerReport {
         observed,
+        authority,
+        ended_by,
         exit: exit.clone(),
         exited_by_itself,
         descendants_killed,
@@ -806,7 +837,7 @@ pub fn extract_via_broker(
         cgroup_peak_bytes,
     };
     match outcome {
-        Ok(extracted) if exited_by_itself && exit == "exit code 0" => {
+        Ok(extracted) if ended_by == EndedBy::Done && exited_by_itself && exit == "exit code 0" => {
             Ok((extracted, stats, report))
         }
         Ok(_) => Err(WorkerError::Died {

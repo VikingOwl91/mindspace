@@ -130,6 +130,11 @@ fn bad<T>(why: impl Into<String>) -> Result<T> {
 pub enum Kind {
     Files,
     Git,
+    /// A Git operation whose objects are VERIFIED by the receiver (M7.3b.5c): HEAD only. The
+    /// worker sends the HEAD identity and the RAW commit and tree objects instead of parsed
+    /// records; the receiver recomputes the ids, parses them itself and checks how they relate
+    /// (see [`super::gitverify`]). No refs, history, tags or views travel.
+    GitVerified,
 }
 
 /// Where the content of a derivation or code input comes from.
@@ -166,6 +171,9 @@ pub struct Counts {
     pub blobs: u64,
     pub derivations: u64,
     pub code_inputs: u64,
+    /// Raw commit and tree objects of a verified Git transport.
+    #[serde(default)]
+    pub raw_objects: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +198,20 @@ pub enum Record {
         repository_id: Uuid,
         repository_path: String,
         spaces: Vec<Uuid>,
+    },
+    /// `GitVerified` only: what HEAD is. `symbolic` is the branch HEAD points at (`None` when
+    /// detached). The commit is a claim about repository state; its content is verified.
+    Head {
+        symbolic: Option<String>,
+        commit_oid: String,
+    },
+    /// `GitVerified` only: the raw bytes (lowercase hex) of one commit or tree object. `oid` and
+    /// `size` are claims; the receiver recomputes the id from the type, the length and the bytes.
+    RawObject {
+        kind: GitObjectKind,
+        oid: String,
+        size: u64,
+        hex: String,
     },
     Ref {
         item: GitRefObservation,
@@ -269,6 +291,8 @@ impl Record {
             Record::FilesHeader { .. } => "files_header",
             Record::File { .. } => "file",
             Record::GitHeader { .. } => "git_header",
+            Record::Head { .. } => "head",
+            Record::RawObject { .. } => "raw_object",
             Record::Ref { .. } => "ref",
             Record::Commit { .. } => "commit",
             Record::Tree { .. } => "tree",
@@ -502,6 +526,7 @@ impl<W: Write> FrameWriter<'_, W> {
             "blob" => c.blobs += 1,
             "derivation" => c.derivations += 1,
             "code_input" => c.code_inputs += 1,
+            "raw_object" => c.raw_objects += 1,
             _ => {}
         }
     }
@@ -791,6 +816,8 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     sink: &mut dyn RecordSink,
 ) -> Result<()> {
     use super::{code, is_ingestable, media_type_of, parse_material, ParsedMaterial};
+    // before the identity marker is created or anything is emitted (see `require_sha1`)
+    reader.require_sha1()?;
     let repository_id = reader.repository_id()?;
     let space_ids = super::resolve_spaces_with(ctx, space_names)?;
     let refs = reader.refs()?;
@@ -1186,6 +1213,71 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     Ok(())
 }
 
+/// Sends a verified HEAD transport: the header, the HEAD claim, the raw commit and trees, the
+/// blob rows, and the derivations and code inputs of `extracted` that belong to HEAD (everything
+/// else of `extracted` — refs, history, tags, views — is not sent; the receiver derives what it
+/// stores from the verified objects). `extracted` supplies the session, the repository identity,
+/// the spaces, the remotes and the parsed code; the objects come from `closure`.
+pub fn emit_verified(
+    sink: &mut dyn RecordSink,
+    extracted: ExtractedGit,
+    closure: &super::gitverify::HeadClosure,
+    reused: &std::collections::BTreeSet<usize>,
+) -> Result<()> {
+    let o = extracted.observation;
+    sink.emit(&Record::Begin {
+        kind: Kind::GitVerified,
+    })?;
+    sink.emit(&Record::GitHeader {
+        session: o.session,
+        repository_id: o.repository_id,
+        repository_path: o.repository_path,
+        spaces: o.spaces,
+    })?;
+    sink.emit(&Record::Head {
+        symbolic: closure.symbolic.clone(),
+        commit_oid: closure.commit_oid.clone(),
+    })?;
+    for obj in &closure.objects {
+        sink.emit(&Record::RawObject {
+            kind: obj.kind,
+            oid: obj.oid.clone(),
+            size: obj.bytes.len() as u64,
+            hex: super::gitverify::hex_encode(&obj.bytes),
+        })?;
+    }
+    for (oid, size) in &closure.blobs {
+        sink.emit(&Record::Blob {
+            item: GitBlobData {
+                oid: oid.clone(),
+                size_bytes: *size,
+                content: None,
+            },
+        })?;
+    }
+    for item in o.remotes {
+        sink.emit(&Record::Remote { item })?;
+    }
+    for d in o.derivations {
+        if d.commit_oid == closure.commit_oid {
+            emit_derivation(sink, d, false)?;
+        }
+    }
+    // `reused`: indexes of code inputs sent as placeholders of a derivation the requester already
+    // has. A placeholder carries no parts, but its CONTENT still travels, so the receiver verifies
+    // the blob id against the bytes in the same stream.
+    for (i, mut c) in extracted.code_inputs.into_iter().enumerate() {
+        let placeholder = reused.contains(&i);
+        if placeholder {
+            c.derivation.entities.clear();
+            c.derivation.imports.clear();
+            c.derivation.relationships.clear();
+        }
+        emit_code_input(sink, c, false, placeholder)?;
+    }
+    Ok(())
+}
+
 /// Sends an existing result as a stream (tests, hostile-input construction, and
 /// the transport benchmark). Content is sent with each user, not shared.
 pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result<()> {
@@ -1286,6 +1378,8 @@ pub struct StreamLimits {
     pub max_frames: u64,
     pub max_record: usize,
     pub extraction: ExtractionLimits,
+    /// Bounds of a verified Git transport (`Kind::GitVerified`).
+    pub verify: super::gitverify::VerifyLimits,
 }
 
 impl Default for StreamLimits {
@@ -1296,6 +1390,7 @@ impl Default for StreamLimits {
             max_frames: MAX_FRAMES,
             max_record: MAX_RECORD,
             extraction: ExtractionLimits::default(),
+            verify: super::gitverify::VerifyLimits::default(),
         }
     }
 }
@@ -1305,6 +1400,8 @@ pub struct ReadStats {
     pub frames: u64,
     pub bytes: u64,
     pub records: u64,
+    /// Set for `Kind::GitVerified`: what was verified, and how strongly.
+    pub verification: Option<super::gitverify::VerificationSummary>,
 }
 
 #[derive(Deserialize)]
@@ -1412,7 +1509,8 @@ pub fn consume<R: Read>(
             asm.accept(record)?;
         }
     }
-    let extracted = asm.finish()?;
+    let (extracted, verification) = asm.finish()?;
+    stats.verification = verification;
     Ok((extracted, stats))
 }
 
@@ -1514,6 +1612,7 @@ enum Phase {
     Start,
     Begun,
     Header,
+    Head,
     Refs,
     Objects,
     Blobs,
@@ -1587,6 +1686,12 @@ struct Assembler<'a> {
     current_tags: Option<Vec<(String, String)>>,
     derivations: Vec<GitDerivedFile>,
     code_inputs: Vec<CodeInputDraft>,
+    /// `GitVerified`: the HEAD claim, and the raw objects received (verified in `finish`).
+    head: Option<(Option<String>, String)>,
+    raw_objects: Vec<super::gitverify::RawObject>,
+    raw_bytes: u64,
+    raw_commits: usize,
+    raw_trees: usize,
     /// Indexes into `code_inputs` the producer declared as reused derivations.
     reused: std::collections::BTreeSet<usize>,
     /// The open code input was declared reused: it must stay empty.
@@ -1626,6 +1731,11 @@ impl<'a> Assembler<'a> {
             current_tags: None,
             derivations: Vec::new(),
             code_inputs: Vec::new(),
+            head: None,
+            raw_objects: Vec::new(),
+            raw_bytes: 0,
+            raw_commits: 0,
+            raw_trees: 0,
             reused: std::collections::BTreeSet::new(),
             reused_open: false,
             keys: HashSet::new(),
@@ -1651,8 +1761,27 @@ impl<'a> Assembler<'a> {
     }
 
     fn git(&self, what: &str) -> Result<()> {
-        if self.expect != Kind::Git {
+        if !matches!(self.expect, Kind::Git | Kind::GitVerified) {
             return bad(format!("`{what}` in a files operation"));
+        }
+        Ok(())
+    }
+
+    /// A record of the parsed-object protocol: refused in a verified transport, where the receiver
+    /// builds commits and trees from raw objects and the scope is HEAD alone.
+    fn git_unverified(&self, what: &str) -> Result<()> {
+        self.git(what)?;
+        if self.expect == Kind::GitVerified {
+            return bad(format!(
+                "`{what}` in a verified Git transport (HEAD and raw objects only)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn verified_only(&self, what: &str) -> Result<()> {
+        if self.expect != Kind::GitVerified {
+            return bad(format!("`{what}` outside a verified Git transport"));
         }
         Ok(())
     }
@@ -1795,7 +1924,9 @@ impl<'a> Assembler<'a> {
                 repository_path,
                 spaces,
             } => {
-                if self.expect != Kind::Git || self.phase != Phase::Begun {
+                if !matches!(self.expect, Kind::Git | Kind::GitVerified)
+                    || self.phase != Phase::Begun
+                {
                     return bad("`git_header` out of place");
                 }
                 self.session = Some(session);
@@ -1838,8 +1969,84 @@ impl<'a> Assembler<'a> {
                 self.owner = Some(Owner::File(file));
                 self.count_check()?;
             }
+            Record::Head {
+                symbolic,
+                commit_oid,
+            } => {
+                self.verified_only("head")?;
+                self.at(Phase::Head, name)?;
+                if self.head.is_some() {
+                    return bad("a second `head` record");
+                }
+                if !super::gitverify::is_sha1_oid(&commit_oid) {
+                    return bad(format!("malformed head id `{}`", short(&commit_oid)));
+                }
+                if let Some(r) = &symbolic {
+                    if !r.starts_with("refs/")
+                        || r.len() > self.limits.extraction.max_path_bytes
+                        || r.chars().any(|c| c.is_control() || c.is_whitespace())
+                    {
+                        return bad(format!("malformed symbolic head `{}`", short(r)));
+                    }
+                }
+                self.head = Some((symbolic, commit_oid));
+            }
+            Record::RawObject {
+                kind,
+                oid,
+                size,
+                hex,
+            } => {
+                self.verified_only("raw_object")?;
+                self.at(Phase::Objects, name)?;
+                if self.head.is_none() {
+                    return bad("a `raw_object` before the `head` record");
+                }
+                let v = &self.limits.verify;
+                self.seen.raw_objects += 1;
+                let (mut commits, mut trees) = (0usize, 0usize);
+                match kind {
+                    GitObjectKind::Commit => commits = 1,
+                    GitObjectKind::Tree => trees = 1,
+                    other => {
+                        return bad(format!("a {} object in a HEAD transport", other.as_str()))
+                    }
+                }
+                self.raw_commits += commits;
+                self.raw_trees += trees;
+                if self.raw_commits > v.max_commits {
+                    return bad(format!("more than {} commit object(s)", v.max_commits));
+                }
+                if self.raw_trees > v.max_trees {
+                    return bad(format!("more than {} tree objects", v.max_trees));
+                }
+                // the declared size is checked BEFORE anything is decoded or allocated
+                if size > v.max_raw_object_bytes as u64 {
+                    return bad(format!(
+                        "an object of {size} bytes exceeds the limit of {}",
+                        v.max_raw_object_bytes
+                    ));
+                }
+                if hex.len() as u64 != size.saturating_mul(2) {
+                    return bad("a `raw_object` whose declared size is not its content length");
+                }
+                self.raw_bytes = self.raw_bytes.saturating_add(size);
+                if self.raw_bytes > v.max_total_object_bytes {
+                    return bad(format!(
+                        "more than {} bytes of objects",
+                        v.max_total_object_bytes
+                    ));
+                }
+                self.oid(&oid, "object")?;
+                self.unique("object", &oid)?;
+                let Some(bytes) = super::gitverify::hex_decode(&hex) else {
+                    return bad("a `raw_object` that is not hexadecimal");
+                };
+                self.raw_objects
+                    .push(super::gitverify::RawObject { kind, oid, bytes });
+            }
             Record::Ref { item } => {
-                self.git("ref")?;
+                self.git_unverified("ref")?;
                 self.at(Phase::Refs, name)?;
                 self.unique("ref", &item.name)?;
                 self.oid(&item.target_oid, "ref target")?;
@@ -1847,7 +2054,7 @@ impl<'a> Assembler<'a> {
                 self.refs.push(item);
             }
             Record::Commit { item } => {
-                self.git("commit")?;
+                self.git_unverified("commit")?;
                 self.at(Phase::Objects, name)?;
                 self.oid(&item.oid, "commit")?;
                 self.unique("object", &item.oid)?;
@@ -1855,7 +2062,7 @@ impl<'a> Assembler<'a> {
                 self.commits.push(item);
             }
             Record::Tree { item } => {
-                self.git("tree")?;
+                self.git_unverified("tree")?;
                 self.at(Phase::Objects, name)?;
                 self.oid(&item.oid, "tree")?;
                 self.unique("object", &item.oid)?;
@@ -1863,7 +2070,7 @@ impl<'a> Assembler<'a> {
                 self.trees.push(item);
             }
             Record::Tag { item } => {
-                self.git("tag")?;
+                self.git_unverified("tag")?;
                 self.at(Phase::Objects, name)?;
                 self.oid(&item.oid, "tag")?;
                 self.unique("object", &item.oid)?;
@@ -1878,12 +2085,20 @@ impl<'a> Assembler<'a> {
                     return bad("a `blob` record must not carry content");
                 }
                 self.unique("blob", &item.oid)?;
+                if self.expect == Kind::GitVerified
+                    && self.blobs.len() >= self.limits.verify.max_blobs
+                {
+                    return bad(format!(
+                        "more than {} blob records",
+                        self.limits.verify.max_blobs
+                    ));
+                }
                 self.blob_index.insert(item.oid.clone(), self.blobs.len());
                 self.seen.blobs += 1;
                 self.blobs.push(item);
             }
             Record::RefEvent { item } => {
-                self.git("ref_event")?;
+                self.git_unverified("ref_event")?;
                 self.at(Phase::RefEvents, name)?;
                 self.unique("ref event", &item.name)?;
                 self.ref_events.push(item);
@@ -1895,7 +2110,7 @@ impl<'a> Assembler<'a> {
                 self.remotes.push(item);
             }
             Record::ViewCommits { oids } => {
-                self.git("view_commits")?;
+                self.git_unverified("view_commits")?;
                 self.at(Phase::Views, name)?;
                 for o in &oids {
                     self.oid(o, "view commit")?;
@@ -1903,7 +2118,7 @@ impl<'a> Assembler<'a> {
                 self.view_commits.extend(oids);
             }
             Record::CurrentCommits { oids } => {
-                self.git("current_commits")?;
+                self.git_unverified("current_commits")?;
                 self.at(Phase::CurrentCommits, name)?;
                 for o in &oids {
                     self.oid(o, "current commit")?;
@@ -1913,7 +2128,7 @@ impl<'a> Assembler<'a> {
                     .extend(oids);
             }
             Record::CurrentTags { pairs } => {
-                self.git("current_tags")?;
+                self.git_unverified("current_tags")?;
                 self.at(Phase::CurrentTags, name)?;
                 for (path, blob) in &pairs {
                     self.path(path)?;
@@ -1965,8 +2180,10 @@ impl<'a> Assembler<'a> {
                 self.at(Phase::Body, name)?;
                 self.close_owner()?;
                 if reused {
-                    if self.expect != Kind::Files {
-                        return bad("a reused derivation outside a directory operation");
+                    if self.expect == Kind::Git {
+                        return bad(
+                            "a reused derivation outside a directory or verified operation",
+                        );
                     }
                     let d = &input.derivation;
                     let skip = super::code::skip_reason_of(&d.identity).is_some();
@@ -1995,7 +2212,7 @@ impl<'a> Assembler<'a> {
                     }
                 }
                 let id = match self.expect {
-                    Kind::Git => {
+                    Kind::Git | Kind::GitVerified => {
                         let Some(oid) = &input.blob_oid else {
                             return bad("a git `code_input` without a blob id");
                         };
@@ -2177,7 +2394,7 @@ impl<'a> Assembler<'a> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Extracted> {
+    fn finish(mut self) -> Result<(Extracted, Option<super::gitverify::VerificationSummary>)> {
         if !self.ended {
             return bad("the stream ended before the closing record");
         }
@@ -2185,6 +2402,10 @@ impl<'a> Assembler<'a> {
             .session
             .take()
             .ok_or_else(|| Error::InvalidExtraction("record stream: no header".into()))?;
+        if self.expect == Kind::GitVerified {
+            let (extracted, summary) = self.finish_verified(session)?;
+            return Ok((extracted, Some(summary)));
+        }
         Ok(match self.expect {
             Kind::Files => Extracted::Files(ExtractedFiles {
                 observation: IngestObservation {
@@ -2221,6 +2442,159 @@ impl<'a> Assembler<'a> {
                     code_inputs: self.code_inputs,
                 })
             }
+            Kind::GitVerified => unreachable!("handled above"),
         })
+        .map(|e| (e, None))
+    }
+
+    /// The verification of a HEAD transport. Everything the persisted observation contains is
+    /// derived here from content-verified bytes or checked against them; the worker's claims
+    /// (the HEAD it names, blob sizes, which paths carry derivations) are cross-checked, never
+    /// copied.
+    fn finish_verified(
+        mut self,
+        session: SessionDraft,
+    ) -> Result<(Extracted, super::gitverify::VerificationSummary)> {
+        use super::gitverify::{verify_blob, verify_head};
+        let Some((symbolic, head_oid)) = self.head.take() else {
+            return bad("a verified transport without a `head` record");
+        };
+        let v = verify_head(&head_oid, &self.raw_objects, &self.limits.verify)?;
+        let head_commit = v.commit.oid.clone();
+
+        // blob ids named by the verified trees, and the paths each one is at
+        let mut tree_blobs: HashMap<&str, &str> = HashMap::new(); // oid -> any path
+        let mut at_path: HashMap<&str, (&str, GitObjectKind)> = HashMap::new(); // path -> (oid, kind)
+        for f in &v.files {
+            at_path.insert(&f.path, (&f.oid, f.kind));
+            if f.kind == GitObjectKind::Blob {
+                tree_blobs.insert(&f.oid, &f.path);
+            }
+        }
+        // the blob rows must be exactly the blobs the verified trees name: an extra row is an
+        // object nobody references, a missing one a blob without a size
+        for b in &self.blobs {
+            if !tree_blobs.contains_key(b.oid.as_str()) {
+                return bad(format!(
+                    "the blob `{}` is not named by any verified tree",
+                    short(&b.oid)
+                ));
+            }
+        }
+        if self.blobs.len() != tree_blobs.len() {
+            return bad(format!(
+                "{} blob record(s) for {} blob(s) named by the verified trees",
+                self.blobs.len(),
+                tree_blobs.len()
+            ));
+        }
+
+        // content: every blob whose bytes travelled must hash to its id, and its size must agree
+        let mut verified_blobs: BTreeSet<String> = BTreeSet::new();
+        let sizes: HashMap<&str, u64> = self
+            .blobs
+            .iter()
+            .map(|b| (b.oid.as_str(), b.size_bytes))
+            .collect();
+        let mut check_content = |oid: &str, text: &str| -> Result<()> {
+            if !tree_blobs.contains_key(oid) {
+                return bad(format!(
+                    "content for the blob `{}`, which no verified tree names",
+                    short(oid)
+                ));
+            }
+            verify_blob(oid, text.as_bytes())?;
+            if sizes.get(oid).copied() != Some(text.len() as u64) {
+                return bad(format!(
+                    "the size recorded for the blob `{}` is not the size of its content",
+                    short(oid)
+                ));
+            }
+            verified_blobs.insert(oid.to_string());
+            Ok(())
+        };
+        for b in &self.blobs {
+            if let Some(text) = &b.content {
+                check_content(&b.oid, text)?;
+            }
+        }
+        for d in &self.derivations {
+            check_content(&d.blob_oid, &d.content)?;
+            // the path -> blob binding: the VERIFIED tree decides what is at a path
+            if d.commit_oid != head_commit {
+                return bad(format!(
+                    "a derivation at `{}`, which is not the verified head commit",
+                    short(&d.commit_oid)
+                ));
+            }
+            match at_path.get(d.path.as_str()) {
+                Some((oid, GitObjectKind::Blob)) if *oid == d.blob_oid => {}
+                _ => {
+                    return bad(format!(
+                        "the derivation of `{}` names a blob the verified tree does not have there",
+                        short(&d.path)
+                    ))
+                }
+            }
+        }
+        for c in &self.code_inputs {
+            let Some(oid) = &c.blob_oid else {
+                return bad("a code input without a blob id");
+            };
+            check_content(oid, &c.content)?;
+            if c.contexts.is_empty() {
+                return bad("a code input without a context");
+            }
+            for ctx in &c.contexts {
+                if ctx.commit_oid.as_deref() != Some(head_commit.as_str()) {
+                    return bad("a code context at a commit other than the verified head");
+                }
+                match at_path.get(ctx.path.as_str()) {
+                    Some((o, GitObjectKind::Blob)) if *o == oid.as_str() => {}
+                    _ => {
+                        return bad(format!(
+                        "the code input at `{}` names a blob the verified tree does not have there",
+                        short(&ctx.path)
+                    ))
+                    }
+                }
+            }
+        }
+
+        let mut summary = v.summary;
+        summary.content_verified_blobs = verified_blobs.len() as u64;
+        summary.unverified_blobs = (tree_blobs.len() - verified_blobs.len()) as u64;
+
+        self.derivations
+            .sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
+        let refs = vec![GitRefObservation {
+            name: "HEAD".into(),
+            target_oid: head_commit.clone(),
+            target_kind: GitObjectKind::Commit,
+            symbolic_target: symbolic,
+        }];
+        let extracted = Extracted::Git(ExtractedGit {
+            observation: GitObservation {
+                session,
+                repository_id: self.repository_id.unwrap_or_default(),
+                repository_path: self.repository_path,
+                refs,
+                commits: vec![v.commit],
+                trees: v.trees,
+                blobs: self.blobs,
+                tags: Vec::new(),
+                derivations: self.derivations,
+                ref_events: Vec::new(),
+                // HEAD is the only view: memories derived at other commits are retired, exactly
+                // as for the in-process HEAD scope; tag releases are left untouched
+                current_commits: Some(vec![head_commit.clone()]),
+                current_tags: None,
+                view_commits: vec![head_commit],
+                spaces: self.spaces,
+                remotes: self.remotes,
+            },
+            code_inputs: self.code_inputs,
+        });
+        Ok((extracted, summary))
     }
 }

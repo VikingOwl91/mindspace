@@ -53,6 +53,14 @@ pub enum Error {
     #[error("git command failed: {command}: {stderr}")]
     GitCommand { command: String, stderr: String },
 
+    /// The repository's object format is not SHA-1. Object ids, the tree parser and the stored
+    /// model are 40-digit SHA-1 throughout; a SHA-256 repository would be misread, not rejected.
+    #[error(
+        "unsupported repository: object format `{format}` is not supported \
+         (only SHA-1 repositories can be ingested)"
+    )]
+    UnsupportedObjectFormat { format: String },
+
     /// An ingest hit its time limit before it wrote anything (or between
     /// independent ingest roots). The message says what was and was not kept.
     #[error("{message}")]

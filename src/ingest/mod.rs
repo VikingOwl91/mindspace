@@ -5,6 +5,7 @@ pub mod confined_git;
 pub mod deadline;
 pub mod extract;
 pub mod git;
+pub mod gitverify;
 pub mod markdown;
 pub mod outline;
 pub mod release;
@@ -634,6 +635,8 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
     scope: GitScope,
     deadline: &Deadline,
 ) -> Result<ExtractedGit> {
+    // before the identity marker is created or anything is read (see `require_sha1`)
+    reader.require_sha1()?;
     let repository_id = reader.repository_id()?;
     let space_ids = resolve_spaces_with(ctx, space_names)?;
 

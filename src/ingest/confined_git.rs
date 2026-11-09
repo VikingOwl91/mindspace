@@ -31,8 +31,11 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
+use std::collections::{BTreeSet, HashSet};
+
 use super::deadline::Deadline;
-use super::git::{ConfinedExec, GitPin, GitReader};
+use super::git::{parse_commit, parse_tree, ConfinedExec, GitPin, GitReader};
+use super::gitverify::{HeadClosure, RawObject, VerifyLimits};
 use crate::core::{
     Error, GitBlobData, GitCommitData, GitObjectKind, GitTagData, GitTreeData, Result, Uuid,
 };
@@ -363,12 +366,7 @@ impl ConfinedGitReader {
         // (`parse_tree` reads 20-byte entries): a SHA-256 repository would be misread, not
         // rejected, so it is refused here, by what git itself reports. (Milestone 5c decides
         // whether SHA-256 is supported; see docs/m7.3b5c-verified-git-transport-plan.md.)
-        let format = reader.inner.object_format()?;
-        if format != "sha1" {
-            return Err(refuse(format!(
-                "unsupported repository: object format `{format}`; only SHA-1 repositories are supported"
-            )));
-        }
+        reader.inner.require_sha1()?;
         Ok(reader)
     }
 
@@ -404,6 +402,98 @@ impl ConfinedGitReader {
         require_sha1_oids(std::slice::from_ref(&commit))?;
         let files = self.inner.commit_files(&commit)?;
         Ok(HeadSnapshot { commit, files })
+    }
+
+    /// HEAD's commit and every tree below its root tree as RAW objects, and the `(oid, size)` of
+    /// every blob those trees name: what a worker sends for a verified transport
+    /// ([`crate::ingest::stream::Kind::GitVerified`]). The limits are enforced while the closure
+    /// is collected, so an oversized repository stops early; a subtree shared by several paths
+    /// is read once. Parents are NOT read.
+    pub fn head_closure(&self, limits: &VerifyLimits) -> Result<HeadClosure> {
+        let commit_oid = self.inner.head_commit()?;
+        require_sha1_oids(std::slice::from_ref(&commit_oid))?;
+        let symbolic = self.inner.head_symbolic()?;
+        let too_big =
+            |what: &str| refuse(format!("the repository is too large to transport: {what}"));
+        let mut objects: Vec<RawObject> = Vec::new();
+        let mut total: u64 = 0;
+        let mut take = |raw: Vec<(String, GitObjectKind, Vec<u8>)>,
+                        objects: &mut Vec<RawObject>|
+         -> Result<()> {
+            for (oid, kind, bytes) in raw {
+                if bytes.len() > limits.max_raw_object_bytes {
+                    return Err(too_big(&format!("object {oid} is {} bytes", bytes.len())));
+                }
+                total = total.saturating_add(bytes.len() as u64);
+                if total > limits.max_total_object_bytes {
+                    return Err(too_big("the objects exceed the byte limit"));
+                }
+                objects.push(RawObject { kind, oid, bytes });
+            }
+            Ok(())
+        };
+        take(
+            self.inner.raw_objects(std::slice::from_ref(&commit_oid))?,
+            &mut objects,
+        )?;
+        let commit = parse_commit(&commit_oid, &objects[0].bytes)?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut level = vec![commit.tree_oid.clone()];
+        seen.insert(commit.tree_oid.clone());
+        let mut blobs: BTreeSet<String> = BTreeSet::new();
+        let mut entries = 0usize;
+        let mut depth = 0usize;
+        while !level.is_empty() {
+            depth += 1;
+            if depth > limits.max_depth + 1 {
+                return Err(too_big("directories are nested too deeply"));
+            }
+            let mut next: Vec<String> = Vec::new();
+            for chunk in level.chunks(256) {
+                if seen.len() > limits.max_trees {
+                    return Err(too_big("too many trees"));
+                }
+                let before = objects.len();
+                take(self.inner.raw_objects(chunk)?, &mut objects)?;
+                for o in &objects[before..] {
+                    let t = parse_tree(&o.oid, &o.bytes)?;
+                    entries = entries.saturating_add(t.entries.len());
+                    if entries > limits.max_tree_entries {
+                        return Err(too_big("too many tree entries"));
+                    }
+                    for e in t.entries {
+                        match e.target_kind {
+                            GitObjectKind::Tree => {
+                                if seen.insert(e.target_oid.clone()) {
+                                    next.push(e.target_oid);
+                                }
+                            }
+                            GitObjectKind::Blob => {
+                                blobs.insert(e.target_oid);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            level = next;
+        }
+        if blobs.len() > limits.max_blobs {
+            return Err(too_big("too many blobs"));
+        }
+        let wanted: Vec<String> = blobs.into_iter().collect();
+        let blobs = self
+            .inner
+            .batch_check(&wanted)?
+            .into_iter()
+            .map(|(oid, _, size)| (oid, size))
+            .collect();
+        Ok(HeadClosure {
+            symbolic,
+            commit_oid,
+            objects,
+            blobs,
+        })
     }
 
     /// Types and sizes of the given objects (missing ones are left out).

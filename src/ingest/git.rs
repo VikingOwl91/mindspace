@@ -386,6 +386,28 @@ impl GitReader {
         Ok((commits, trees, tags))
     }
 
+    /// Raw objects (kind and bytes) by oid, as git stores them. One git call.
+    pub(super) fn raw_objects(
+        &self,
+        oids: &[String],
+    ) -> Result<Vec<(String, GitObjectKind, Vec<u8>)>> {
+        self.batch_raw(oids)
+    }
+
+    /// The branch HEAD points at (`refs/heads/main`), `None` when HEAD is detached. One git call.
+    pub(super) fn head_symbolic(&self) -> Result<Option<String>> {
+        let out = run_codes(
+            &self.path,
+            &self.deadline,
+            self.pin.as_ref(),
+            &["symbolic-ref", "-q", "HEAD"],
+            None,
+            &[0, 1],
+        )?;
+        let name = String::from_utf8_lossy(&out).trim().to_string();
+        Ok((!name.is_empty()).then_some(name))
+    }
+
     /// Blob contents by oid. One git call.
     pub fn blob_contents(&self, oids: &[String]) -> Result<Vec<GitBlobData>> {
         let checked = self.batch_check(oids)?;
@@ -432,6 +454,18 @@ impl GitReader {
             result.push((mode, kind, oid, path.to_string()));
         }
         Ok(result)
+    }
+
+    /// Refuses a repository whose object format is not SHA-1 ([`Error::UnsupportedObjectFormat`]).
+    /// Called before anything is read or written, in particular before the identity marker is
+    /// created: the tree parser reads 20-byte entries and would misread SHA-256 silently.
+    pub(super) fn require_sha1(&self) -> Result<()> {
+        match self.object_format()?.as_str() {
+            "sha1" => Ok(()),
+            other => Err(Error::UnsupportedObjectFormat {
+                format: other.to_string(),
+            }),
+        }
     }
 
     /// The object format git reports for the repository (`sha1` or `sha256`). One git call.

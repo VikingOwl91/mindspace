@@ -2,7 +2,9 @@
 //! `mind extraction-worker` (`sandbox::enter_extraction_worker`, descriptors 3 and 4 as the parent
 //! places them) and then tries the things a hostile worker would try, printing what the kernel
 //! answered. usage: worker_probe <read|list|write>:<path> | socket:<inet|inet6|unix|netlink> |
-//! fd:<n> | parent-environ:<pid> ... Prints one `RESULT <arg> <outcome>` line per argument.
+//! fd:<n> | parent-environ:<pid> | exec:<program> | sh:<command> ... `exec` tries to START a program
+//! (`<program> -c true`) and reports what the kernel answered; `sh` runs `/bin/sh -c <command>` and
+//! reports its exit code. Prints one `RESULT <arg> <outcome>` line per argument.
 use std::os::fd::{FromRawFd, OwnedFd};
 
 fn outcome<T>(r: std::io::Result<T>) -> String {
@@ -38,6 +40,25 @@ fn main() {
             "write" => outcome(std::fs::write(rest, b"x")),
             "create" => outcome(std::fs::File::create(rest)),
             "parent-environ" => outcome(std::fs::read(format!("/proc/{rest}/environ"))),
+            "exec" => match std::process::Command::new(rest)
+                .args(["-c", "true"])
+                .stdin(std::process::Stdio::null())
+                .status()
+            {
+                Ok(st) if st.success() => "ALLOWED".into(),
+                Ok(st) => format!("started, exit {:?}", st.code()),
+                Err(e) => outcome::<()>(Err(e)),
+            },
+            "sh" => match std::process::Command::new("/bin/sh")
+                .args(["-c", rest])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(st) => format!("exit {:?}", st.code()),
+                Err(e) => outcome::<()>(Err(e)),
+            },
             "proc-list" => outcome(std::fs::read_dir("/proc").map(|_| ())),
             "socket" => {
                 let domain = match rest {

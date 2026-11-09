@@ -455,6 +455,57 @@ fn the_confined_process_cannot_leave_its_root_or_reach_data_the_network_or_inher
     assert!(!root_was_written(&b.join("root")));
 }
 
+/// M7.3b.5b stabilization: the directory worker has no business executing anything. Its system
+/// directories were granted "read" in the Landlock sense, which includes EXECUTE; the worker never
+/// executes a program after its own `exec`, so the right was unnecessary authority.
+#[test]
+fn the_directory_worker_cannot_execute_a_program() {
+    let base = tempfile::tempdir().unwrap();
+    let b = base.path();
+    write(b, "root/a.md", "# A\n");
+    // the control: the same programs DO start outside the sandbox, so a refusal means the kernel
+    for prog in ["/bin/sh", "/usr/bin/env", "/usr/bin/git"] {
+        if Path::new(prog).exists() {
+            let st = Command::new(prog).args(["-c", "true"]).output();
+            assert!(
+                st.is_ok(),
+                "{prog} does not start even outside the sandbox: {st:?}"
+            );
+        }
+    }
+    let progs: Vec<&str> = [
+        "/bin/sh",
+        "/usr/bin/sh",
+        "/usr/bin/env",
+        "/usr/bin/git",
+        "/usr/bin/true",
+    ]
+    .into_iter()
+    .filter(|p| Path::new(p).exists())
+    .collect();
+    assert!(!progs.is_empty());
+    let mut args: Vec<String> = progs.iter().map(|p| format!("exec:{p}")).collect();
+    // the worker's own binary, reached through the system libraries' directory layout
+    args.push(format!("exec:{}", env!("CARGO_BIN_EXE_mind")));
+    args.push(format!("read:{}", b.join("root/a.md").display()));
+    let (lines, err) = probe(&b.join("root"), None, &args);
+    assert!(
+        lines.iter().any(|l| l.starts_with("SANDBOX ")),
+        "{lines:?} {err}"
+    );
+    assert_eq!(
+        result(&lines, &format!("read:{}", b.join("root/a.md").display())),
+        "ALLOWED"
+    );
+    for a in &args[..args.len() - 1] {
+        assert_eq!(
+            result(&lines, a),
+            "EACCES",
+            "{a} was not refused: {lines:?}"
+        );
+    }
+}
+
 fn root_was_written(root: &Path) -> bool {
     root.join("new.md").exists() || std::fs::read_to_string(root.join("a.md")).unwrap() != "# A\n"
 }

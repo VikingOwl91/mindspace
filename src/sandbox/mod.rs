@@ -329,6 +329,9 @@ pub enum Rights {
     All,
     /// Read, list and execute.
     Read,
+    /// Read and list, NO execute. A worker never starts a program after its own `exec`, so its
+    /// system directories carry no execute right (see [`worker_rules`]).
+    ReadList,
     /// One file: read.
     FileRead,
     /// One file: read and write (`/dev/null`).
@@ -788,6 +791,7 @@ fn build_ruleset(
         let rights: BitFlags<AccessFs> = match rule.rights {
             Rights::All => all,
             Rights::Read => read,
+            Rights::ReadList => AccessFs::ReadFile | AccessFs::ReadDir,
             Rights::FileRead => AccessFs::ReadFile.into(),
             Rights::FileReadWrite => AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
             Rights::FileExec => AccessFs::Execute | AccessFs::ReadFile,
@@ -944,12 +948,18 @@ pub struct WorkerSandbox {
 /// The rules of a worker: system libraries and the few files the runtime reads, its own `/proc`
 /// entry, `/dev/null`. No data directory, no database, no models, no Git, no `/etc`. The data
 /// root is added separately, as a descriptor.
+///
+/// **No execute right anywhere.** The libraries are read and listed, never executed: the kernel
+/// maps the libraries the worker needs without it, and the worker starts no program after its own
+/// `exec`. (`Rights::Read` would include execute: with it a confined worker could start
+/// `/bin/sh` or any other program beneath `/usr`. A started program stays inside the worker's
+/// domain, so this was surplus authority rather than an escape, but nothing needs it.)
 fn worker_rules() -> Vec<Rule> {
     let mut r = Vec::new();
     for p in ["/usr", "/lib", "/lib64"] {
         r.push(Rule {
             path: PathBuf::from(p),
-            rights: Rights::Read,
+            rights: Rights::ReadList,
         });
     }
     for p in ["/etc/ld.so.cache", "/dev/urandom"] {
@@ -965,7 +975,7 @@ fn worker_rules() -> Vec<Rule> {
     if let Some(own) = own_proc_dir() {
         r.push(Rule {
             path: own,
-            rights: Rights::Read,
+            rights: Rights::ReadList,
         });
     }
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
@@ -973,7 +983,7 @@ fn worker_rules() -> Vec<Rule> {
             if let Ok(c) = std::fs::canonicalize(d) {
                 r.push(Rule {
                     path: c,
-                    rights: Rights::Read,
+                    rights: Rights::ReadList,
                 });
             }
         }
@@ -1099,6 +1109,19 @@ fn worker_self_test(root_fd: i32) -> Result<Vec<(String, String)>, String> {
     };
     check("socket(AF_INET)", sock(libc::AF_INET), true);
     check("socket(AF_UNIX)", sock(libc::AF_UNIX), true);
+    // no program can be started: the system directories carry no execute right
+    if std::path::Path::new("/bin/sh").exists() {
+        check(
+            "execute /bin/sh",
+            classify(
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", "true"])
+                    .stdin(std::process::Stdio::null())
+                    .status(),
+            ),
+            true,
+        );
+    }
     check(
         "list the root",
         classify(std::fs::read_dir(&via_root).map(|_| ())),

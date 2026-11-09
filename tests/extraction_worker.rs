@@ -289,13 +289,50 @@ fn slow_source() -> String {
     format!("const X: [u8; 1] = [{}];\n", vec!["1"; 950_000].join(","))
 }
 
+/// The `worker_probe` example, built for the profile this test binary was built with.
+///
+/// `cargo test --test extraction_worker` (and `--release`) does not build examples; only a plain
+/// `cargo test` does. The test used to assume the example was there, which failed with `NotFound`
+/// in a targeted or release run, and ran a STALE example after the probe source changed. So the
+/// harness builds it itself, once per test process: incremental, so a fresh example costs a no-op
+/// `cargo build`, and always with this binary's profile and target directory.
 fn probe_binary() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    exe.parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/worker_probe")
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let exe = std::env::current_exe().unwrap();
+            // <target dir>/<profile dir>/deps/<this test binary>
+            let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
+            let target_dir = profile_dir.parent().unwrap();
+            let mut cmd = Command::new(env!("CARGO"));
+            cmd.args(["build", "--locked", "--quiet", "--example", "worker_probe"])
+                .arg("--manifest-path")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .arg("--target-dir")
+                .arg(target_dir);
+            match profile_dir.file_name().and_then(|n| n.to_str()) {
+                Some("debug") => {}
+                Some("release") => {
+                    cmd.arg("--release");
+                }
+                Some(custom) => {
+                    cmd.args(["--profile", custom]);
+                }
+                None => panic!("cannot tell the build profile from {profile_dir:?}"),
+            }
+            let out = cmd
+                .output()
+                .expect("cannot run cargo to build worker_probe");
+            assert!(
+                out.status.success(),
+                "building the worker_probe example failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let path = profile_dir.join("examples/worker_probe");
+            assert!(path.exists(), "{path:?} was not produced");
+            path
+        })
+        .clone()
 }
 
 /// Runs `worker_probe` with the root at descriptor 4 and a channel at 3, plus `leak` (a secret

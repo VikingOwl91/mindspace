@@ -296,7 +296,13 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
         for t in ["scope_spaces", "scopes", "repository_remotes", "git_views"] {
             conn.execute_batch(&format!("DROP TABLE {t};")).unwrap();
         }
-        conn.execute("DELETE FROM schema_migrations WHERE version = 9", [])
+        // the document tables of migration 10 go with it: the database predates both
+        for t in ["doc_nodes", "doc_extractions", "doc_blobs"] {
+            conn.execute_batch(&format!("DROP TABLE {t};")).unwrap();
+        }
+        conn.execute_batch("DROP INDEX uq_logical_documents_location;")
+            .unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version IN (9, 10)", [])
             .unwrap();
         (
             conn.query_row("SELECT COUNT(*) FROM m6_revisions", [], |r| r.get(0))
@@ -306,7 +312,7 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
         )
     };
 
-    // Opening applies only migration 9.
+    // Opening applies migrations 9 and 10 only (the M6 baseline is not repeated).
     let (_, err, ok) = m.run(&["space", "list"]);
     assert!(ok, "{err}");
     let conn = Connection::open(m.db()).unwrap();
@@ -315,7 +321,7 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     for t in ["scopes", "scope_spaces", "repository_remotes", "git_views"] {
         let n: i64 = conn
             .query_row(

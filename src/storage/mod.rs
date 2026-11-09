@@ -3,12 +3,13 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation,
+    Anchor, AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation,
     CodeObservationReport, CodeParserIdentity, CodeResolutionReport, CodeSearchQuery,
-    ConflictGroup, EmbeddingIndexStatus, GitObservation, GitObservationReport, GitRefObservation,
+    ConflictGroup, DocumentExtractionDraft, DocumentExtractionInfo, DocumentExtractionReport,
+    EmbeddingIndexStatus, GitObservation, GitObservationReport, GitRefObservation,
     IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory, MemoryDetail, MemorySummary,
     ObservationReport, Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink,
-    TemporalDimension, TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
+    StoredCitation, TemporalDimension, TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
 
 /// The relationship resolutions that belong to one Git ingestion: run for each commit after the
@@ -51,6 +52,28 @@ pub trait Store {
     /// changed logical sources, exactly as specified in
     /// docs/memory-model.md section 6.
     fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport>;
+    // -- documents (M8 S1) --------------------------------------------------
+
+    /// Atomically records one document extraction: the document (a logical source of kind
+    /// `document`, one per location), its revision (the canonical text), the extraction keyed by the
+    /// original-bytes hash and the extractor identity, its structure nodes and, only if the draft
+    /// asks for it, the original bytes. All or nothing, in one recording revision; an identical
+    /// repeat changes nothing and consumes no revision. It never touches memories, assertions,
+    /// evidence or the file lifecycle.
+    fn record_document_extraction(
+        &self,
+        draft: DocumentExtractionDraft,
+    ) -> Result<DocumentExtractionReport>;
+    /// The stored side of a citation: `None` when no extraction with the anchor's identity exists
+    /// (wrong revision, other extractor, unknown document). An anchor that names more than the stored
+    /// extraction supports is an error, never a downgrade.
+    fn resolve_document_anchor(&self, anchor: &Anchor) -> Result<Option<StoredCitation>>;
+    /// Every extraction of one document, oldest first.
+    fn list_document_extractions(&self, logical_id: Uuid) -> Result<Vec<DocumentExtractionInfo>>;
+    /// Erases retained original bytes. The extractions, their text and their anchors stay; their
+    /// citations simply stop reporting `bytes_resolved`. `false`: nothing was retained.
+    fn erase_document_bytes(&self, source_bytes_hash: &str) -> Result<bool>;
+
     /// The logical identity and lifecycle journal of one source.
     fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>>;
 

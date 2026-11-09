@@ -11,16 +11,17 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use uuid::Uuid;
 
 use crate::core::{
-    cosine_similarity, decode_f32_le, encode_f32_le, sha256_hex, Assertion, AssertionDraft,
+    cosine_similarity, decode_f32_le, encode_f32_le, sha256_hex, Anchor, Assertion, AssertionDraft,
     AssertionEmbedding, AssertionKind, CodeDerivation, CodeEntity, CodeImport, CodeObservation,
-    CodeObservationReport, ConflictGroup, EmbeddingIndexStatus, Error, Evidence, EvidenceDraft,
-    EvidenceKind, FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
+    CodeObservationReport, ConflictGroup, DocumentExtractionDraft, DocumentExtractionInfo,
+    DocumentExtractionReport, EmbeddingIndexStatus, Error, Evidence, EvidenceDraft, EvidenceKind,
+    FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
     GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
     IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft, ManualMemoryReport, Memory,
     MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
     ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
-    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, TemporalCoverage,
-    TemporalCoverageStatus, TemporalDimension, TemporalHistoryCapabilities, Ts,
+    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, StoredCitation,
+    TemporalCoverage, TemporalCoverageStatus, TemporalDimension, TemporalHistoryCapabilities, Ts,
     UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
@@ -47,10 +48,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         include_str!("../../migrations/0009_scopes_and_views.sql"),
     ),
+    (10, include_str!("../../migrations/0010_documents.sql")),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -59,6 +61,8 @@ const M6_VERSION: i64 = 8;
 const FILE_PRODUCER_FAMILY: &str = "file:legacy";
 const GIT_PRODUCER_FAMILY: &str = "git:legacy";
 const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
+
+mod documents;
 
 pub struct SqliteStore {
     conn: Mutex<Option<Connection>>,
@@ -1912,6 +1916,21 @@ impl Store for SqliteStore {
         let report = record_observation_tx(&tx, observation)?;
         tx.commit()?;
         Ok(report)
+    }
+    fn record_document_extraction(
+        &self,
+        draft: DocumentExtractionDraft,
+    ) -> Result<DocumentExtractionReport> {
+        documents::record(self, draft)
+    }
+    fn resolve_document_anchor(&self, anchor: &Anchor) -> Result<Option<StoredCitation>> {
+        documents::resolve(self, anchor)
+    }
+    fn list_document_extractions(&self, logical_id: Uuid) -> Result<Vec<DocumentExtractionInfo>> {
+        documents::list(self, logical_id)
+    }
+    fn erase_document_bytes(&self, source_bytes_hash: &str) -> Result<bool> {
+        documents::erase(self, source_bytes_hash)
     }
     fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>> {
         let conn = self.connection()?;
@@ -3826,8 +3845,8 @@ fn absent_logical_at(conn: &Connection, location: &str) -> Result<Option<Uuid>> 
 
 fn logical_at(conn: &Connection, location: &str, state: &str) -> Result<Option<Uuid>> {
     let sql = format!(
-        "SELECT id FROM logical_sources WHERE current_location = ?1 AND state = '{state}' \
-         ORDER BY created_at DESC, id DESC LIMIT 1"
+        "SELECT id FROM logical_sources WHERE kind = 'file' AND current_location = ?1 \
+         AND state = '{state}' ORDER BY created_at DESC, id DESC LIMIT 1"
     );
     let id: Option<String> = conn
         .query_row(&sql, rusqlite::params![location], |r| r.get(0))

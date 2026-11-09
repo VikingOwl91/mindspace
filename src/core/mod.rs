@@ -1,5 +1,11 @@
+pub mod document;
 pub mod error;
 
+pub use document::{
+    is_sha256_hex, params_hash, source_precision_claim, Anchor, AnchorPrecision, BBox,
+    CitationStatus, DocNodeDraft, DocumentExtractionDraft, DocumentExtractionInfo,
+    DocumentExtractionReport, LiveObservation, NodeKind, Resolution, RetainedBytes, StoredCitation,
+};
 pub use error::{Error, Result};
 
 use std::collections::BTreeMap;
@@ -265,6 +271,8 @@ pub enum SourceKind {
     /// A release derived from a tag ref (ADR-024); not a blob.
     GitTag,
     Manual,
+    /// A document (M8): its versions hold canonical extracted text. Outside the file lifecycle.
+    Document,
 }
 
 impl SourceKind {
@@ -274,6 +282,7 @@ impl SourceKind {
             SourceKind::GitBlob => "git_blob",
             SourceKind::GitTag => "git_tag",
             SourceKind::Manual => "manual",
+            SourceKind::Document => "document",
         }
     }
 
@@ -283,6 +292,7 @@ impl SourceKind {
             "git_blob" => Some(SourceKind::GitBlob),
             "git_tag" => Some(SourceKind::GitTag),
             "manual" => Some(SourceKind::Manual),
+            "document" => Some(SourceKind::Document),
             _ => None,
         }
     }
@@ -473,6 +483,8 @@ pub enum LogicalKind {
     File,
     GitPath,
     Manual,
+    /// A document (M8): outside the file lifecycle.
+    Document,
 }
 
 impl LogicalKind {
@@ -481,6 +493,7 @@ impl LogicalKind {
             LogicalKind::File => "file",
             LogicalKind::GitPath => "git_path",
             LogicalKind::Manual => "manual",
+            LogicalKind::Document => "document",
         }
     }
 
@@ -489,6 +502,7 @@ impl LogicalKind {
             "file" => Some(LogicalKind::File),
             "git_path" => Some(LogicalKind::GitPath),
             "manual" => Some(LogicalKind::Manual),
+            "document" => Some(LogicalKind::Document),
             _ => None,
         }
     }

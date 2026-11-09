@@ -22,6 +22,14 @@ pub enum Error {
     #[error("{0}")]
     Setup(String),
 
+    /// A document extraction failed validation or contradicts a stored one (nothing was stored).
+    #[error("invalid document extraction: {0}")]
+    InvalidDocument(String),
+
+    /// A citation anchor is malformed, or claims more than the stored extraction supports.
+    #[error("invalid citation anchor: {0}")]
+    InvalidAnchor(String),
+
     /// An extraction result failed validation (it is dropped whole).
     #[error("invalid extraction result: {0}")]
     InvalidExtraction(String),

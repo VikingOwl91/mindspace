@@ -11,6 +11,15 @@ use crate::core::{
     TemporalDimension, TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
 
+/// The relationship resolutions that belong to one Git ingestion: run for each commit after the
+/// ingestion's code structure was recorded.
+#[derive(Debug, Clone, Copy)]
+pub struct GitResolutionPlan<'a> {
+    pub commits: &'a [String],
+    pub resolver: &'a str,
+    pub version: &'a str,
+}
+
 /// The storage boundary. Methods correspond to use cases, not tables, and
 /// traffic exclusively in `core` types. Each state-changing method owns its
 /// transaction; a future PostgreSQL backend would implement this trait
@@ -75,6 +84,19 @@ pub trait Store {
         code: Option<CodeObservation>,
         before_commit: &dyn Fn() -> Result<()>,
     ) -> Result<ObservationReport>;
+    /// Atomically records one logical Git ingestion: the git observation, then (when there is any)
+    /// the code structure derived from its blobs, then one relationship resolution per commit of
+    /// `resolutions`, which reads the rows the code write just made. Everything commits as ONE
+    /// transaction and ONE recording revision, or nothing does. `report.code` carries the code counters.
+    ///
+    /// Error contract and `before_commit`: as for [`Store::record_files_ingest`].
+    fn record_git_ingest(
+        &self,
+        observation: GitObservation,
+        code: Option<CodeObservation>,
+        resolutions: GitResolutionPlan<'_>,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<GitObservationReport>;
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>>;
     /// Symbol search over the code-structure layer: definitions whose name,
     /// qualified name, signature, or path match every query term, ranked by

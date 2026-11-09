@@ -527,7 +527,7 @@ fn append_qualified(base: &[String], relative: Option<&str>) -> Vec<String> {
 }
 
 fn rust_module_index(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     repository_id: Uuid,
     commit_oid: &str,
 ) -> Result<RustModuleIndex> {
@@ -1996,6 +1996,37 @@ impl Store for SqliteStore {
         tx.commit()?;
         Ok(report)
     }
+    fn record_git_ingest(
+        &self,
+        observation: crate::core::GitObservation,
+        code: Option<CodeObservation>,
+        resolutions: crate::storage::GitResolutionPlan<'_>,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<GitObservationReport> {
+        // ONE transaction, ONE recording revision for the whole logical ingestion. The resolutions
+        // read the rows the code write made a moment earlier: inside this transaction they see
+        // them before they are committed. Any error (or a crash before the COMMIT) leaves nothing.
+        let repository_id = observation.repository_id;
+        let conn = self.connection()?;
+        let tx = begin_write(&conn, &self.revision_state)?;
+        let mut report = record_git_observation_tx(&tx, &observation)?;
+        if let Some(code) = code {
+            report.code = record_code_observation_tx(&tx, code)?;
+            for commit in resolutions.commits {
+                resolve_git_code_relationships_tx(
+                    &tx,
+                    repository_id,
+                    commit,
+                    resolutions.resolver,
+                    resolutions.version,
+                )?;
+            }
+        }
+        // an error here drops `tx`, which rolls back: nothing of this ingestion is committed
+        before_commit()?;
+        tx.commit()?;
+        Ok(report)
+    }
     fn git_refs_current(&self, repository_id: Uuid) -> Result<Vec<GitRefObservation>> {
         let conn = self.connection()?;
         let mut stmt = conn
@@ -2402,94 +2433,8 @@ impl Store for SqliteStore {
     ) -> Result<crate::core::CodeResolutionReport> {
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let existing:Option<String>=tx.query_row("SELECT id FROM code_resolution_derivations WHERE repository_id=?1 AND commit_oid=?2 AND resolver=?3 AND resolver_version=?4",rusqlite::params![repository_id.to_string(),commit_oid,resolver,version],|r|r.get(0)).optional().map_err(dberr)?;
-        if existing.is_some() {
-            tx.commit()?;
-            return Ok(crate::core::CodeResolutionReport {
-                derivations_reused: 1,
-                ..Default::default()
-            });
-        };
-        let did = Uuid::now_v7();
-        tx.execute("INSERT INTO code_resolution_derivations(id,repository_id,commit_oid,resolver,resolver_version,created_at) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![did.to_string(),repository_id.to_string(),commit_oid,resolver,version,Ts::now().0]).map_err(dberr)?;
-        let mut report = crate::core::CodeResolutionReport {
-            derivations_created: 1,
-            ..Default::default()
-        };
-        let module_index = rust_module_index(&tx, repository_id, commit_oid)?;
-        let mut stmt=tx.prepare(&format!("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND {EFFECTIVE_DERIVATION} ORDER BY o.id,c.path")).map_err(dberr)?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![repository_id.to_string(), commit_oid],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, String>(4)?,
-                    ))
-                },
-            )
-            .map_err(dberr)?;
-        // A content-addressed observation can occur under several paths in one
-        // commit.  The v0.5 resolution table has no path key, so resolving one
-        // arbitrarily would create a false edge.  Retain one honest unresolved
-        // observation until a later schema slice adds path-local results.
-        let mut observations: BTreeMap<String, (String, String, Option<String>, Option<String>)> =
-            BTreeMap::new();
-        for row in rows {
-            let (id, kind, raw, source, path) = row.map_err(dberr)?;
-            if !module_index.reachable_paths.contains(&path) {
-                continue;
-            }
-            match observations.entry(id) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((kind, raw, source, Some(path)));
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if entry.get().3.as_deref() != Some(path.as_str()) {
-                        entry.get_mut().3 = None;
-                    }
-                }
-            }
-        }
-        drop(stmt);
-        for (oid, (kind, raw, source, path)) in observations {
-            let current_module = path
-                .as_ref()
-                .and_then(|path| module_index.module_for_observation(path, source.as_deref()));
-            let external = kind == "imports" && !is_internal_rust_path(&raw);
-            if external {
-                tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,'external',NULL,?4)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),oid,raw]).map_err(dberr)?;
-                report.external += 1;
-                continue;
-            }
-            let candidates = current_module
-                .as_deref()
-                .and_then(|module| rust_target_path(&raw, module))
-                .map(|target| module_index.candidates(&target, &kind))
-                .unwrap_or_default();
-            let state = if candidates.len() == 1 {
-                "resolved"
-            } else if candidates.is_empty() {
-                "unresolved"
-            } else {
-                "ambiguous"
-            };
-            let rid = Uuid::now_v7();
-            tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,?4,?5,NULL)",rusqlite::params![rid.to_string(),did.to_string(),oid,state,if candidates.len()==1{Some(candidates[0].clone())}else{None}]).map_err(dberr)?;
-            if state == "ambiguous" {
-                for c in candidates {
-                    tx.execute("INSERT INTO code_resolution_candidates(resolution_id,entity_id) VALUES(?1,?2)",rusqlite::params![rid.to_string(),c]).map_err(dberr)?;
-                }
-                report.ambiguous += 1
-            } else if state == "resolved" {
-                report.resolved += 1
-            } else {
-                report.unresolved += 1
-            }
-        }
+        let report =
+            resolve_git_code_relationships_tx(&tx, repository_id, commit_oid, resolver, version)?;
         tx.commit()?;
         Ok(report)
     }
@@ -3278,6 +3223,110 @@ enum Plan {
 /// What the engine believes about one logical source inside an ingest
 /// root: its expected location and the hash of its latest version.
 type KnownSource = (String, Option<String>);
+
+/// The relationship resolution of [`Store::resolve_git_code_relationships`], inside a transaction
+/// the caller owns (and commits). It reads the code rows of the given commit, so inside the
+/// transaction that wrote them it sees them before they are committed.
+fn resolve_git_code_relationships_tx(
+    tx: &Connection,
+    repository_id: Uuid,
+    commit_oid: &str,
+    resolver: &str,
+    version: &str,
+) -> Result<crate::core::CodeResolutionReport> {
+    let existing:Option<String>=tx.query_row("SELECT id FROM code_resolution_derivations WHERE repository_id=?1 AND commit_oid=?2 AND resolver=?3 AND resolver_version=?4",rusqlite::params![repository_id.to_string(),commit_oid,resolver,version],|r|r.get(0)).optional().map_err(dberr)?;
+    if existing.is_some() {
+        return Ok(crate::core::CodeResolutionReport {
+            derivations_reused: 1,
+            ..Default::default()
+        });
+    };
+    let did = Uuid::now_v7();
+    tx.execute("INSERT INTO code_resolution_derivations(id,repository_id,commit_oid,resolver,resolver_version,created_at) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![did.to_string(),repository_id.to_string(),commit_oid,resolver,version,Ts::now().0]).map_err(dberr)?;
+    let mut report = crate::core::CodeResolutionReport {
+        derivations_created: 1,
+        ..Default::default()
+    };
+    let module_index = rust_module_index(tx, repository_id, commit_oid)?;
+    let mut stmt=tx.prepare(&format!("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND {EFFECTIVE_DERIVATION} ORDER BY o.id,c.path")).map_err(dberr)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![repository_id.to_string(), commit_oid],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(dberr)?;
+    // A content-addressed observation can occur under several paths in one
+    // commit.  The v0.5 resolution table has no path key, so resolving one
+    // arbitrarily would create a false edge.  Retain one honest unresolved
+    // observation until a later schema slice adds path-local results.
+    let mut observations: BTreeMap<String, (String, String, Option<String>, Option<String>)> =
+        BTreeMap::new();
+    for row in rows {
+        let (id, kind, raw, source, path) = row.map_err(dberr)?;
+        if !module_index.reachable_paths.contains(&path) {
+            continue;
+        }
+        match observations.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((kind, raw, source, Some(path)));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().3.as_deref() != Some(path.as_str()) {
+                    entry.get_mut().3 = None;
+                }
+            }
+        }
+    }
+    drop(stmt);
+    for (oid, (kind, raw, source, path)) in observations {
+        let current_module = path
+            .as_ref()
+            .and_then(|path| module_index.module_for_observation(path, source.as_deref()));
+        let external = kind == "imports" && !is_internal_rust_path(&raw);
+        if external {
+            tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,'external',NULL,?4)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),oid,raw]).map_err(dberr)?;
+            report.external += 1;
+            continue;
+        }
+        let candidates = current_module
+            .as_deref()
+            .and_then(|module| rust_target_path(&raw, module))
+            .map(|target| module_index.candidates(&target, &kind))
+            .unwrap_or_default();
+        let state = if candidates.len() == 1 {
+            "resolved"
+        } else if candidates.is_empty() {
+            "unresolved"
+        } else {
+            "ambiguous"
+        };
+        let rid = Uuid::now_v7();
+        tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,?4,?5,NULL)",rusqlite::params![rid.to_string(),did.to_string(),oid,state,if candidates.len()==1{Some(candidates[0].clone())}else{None}]).map_err(dberr)?;
+        if state == "ambiguous" {
+            for c in candidates {
+                tx.execute(
+                    "INSERT INTO code_resolution_candidates(resolution_id,entity_id) VALUES(?1,?2)",
+                    rusqlite::params![rid.to_string(), c],
+                )
+                .map_err(dberr)?;
+            }
+            report.ambiguous += 1
+        } else if state == "resolved" {
+            report.resolved += 1
+        } else {
+            report.unresolved += 1
+        }
+    }
+    Ok(report)
+}
 
 /// The code-structure write of [`Store::record_code_observation`], inside a transaction the
 /// caller owns (and commits).

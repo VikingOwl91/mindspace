@@ -148,26 +148,40 @@ pub fn persist_git(
     extracted: ExtractedGit,
     deadline: &Deadline,
 ) -> Result<crate::core::GitObservationReport> {
-    let repository_id = extracted.observation.repository_id;
+    persist_git_gated(store, extracted, deadline, &|| Ok(()))
+}
+
+/// As [`persist_git`], with a decision taken right before the COMMIT: if `before_commit` fails the
+/// whole ingestion is rolled back and its error returned.
+///
+/// One logical Git ingestion is ONE transaction (see `Store::record_git_ingest`): the git
+/// observation, the code structure of its blobs and the relationship resolutions of its view
+/// commits commit together or not at all. (It used to be separate transactions, each with its own
+/// recording revision.)
+pub fn persist_git_gated(
+    store: &dyn Store,
+    extracted: ExtractedGit,
+    deadline: &Deadline,
+    before_commit: &dyn Fn() -> Result<()>,
+) -> Result<crate::core::GitObservationReport> {
     // Sorted, as the ordered set it was derived from.
     let views = extracted.observation.view_commits.clone();
     // The last point where the limit can stop the ingest cleanly.
     deadline.check("preparing to write")?;
-    let mut report = store.record_git_observation(extracted.observation)?;
-    if !extracted.code_inputs.is_empty() {
-        report.code = store.record_code_observation(CodeObservation {
-            inputs: extracted.code_inputs,
-        })?;
-        for commit in views {
-            let _ = store.resolve_git_code_relationships(
-                repository_id,
-                &commit,
-                "mind-rust-resolver",
-                "1",
-            )?;
-        }
-    }
-    Ok(report)
+    let has_code = !extracted.code_inputs.is_empty();
+    let code = has_code.then_some(CodeObservation {
+        inputs: extracted.code_inputs,
+    });
+    store.record_git_ingest(
+        extracted.observation,
+        code,
+        crate::storage::GitResolutionPlan {
+            commits: &views,
+            resolver: "mind-rust-resolver",
+            version: "1",
+        },
+        before_commit,
+    )
 }
 
 // ------------------------------------------------------------- validation

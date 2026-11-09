@@ -312,6 +312,7 @@ pub fn open_git_reader(
         git_dir: gitdir.proc_path(),
         common_dir: common.proc_path(),
         keep: vec![gitdir.into_file(), common.into_file()],
+        confined: None,
     };
     Ok(GitReader::pinned(anchor.proc_path(), *deadline, pin))
 }

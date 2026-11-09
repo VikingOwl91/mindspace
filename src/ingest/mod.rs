@@ -1,6 +1,7 @@
 pub mod code;
 #[cfg(target_os = "linux")]
 pub mod confined;
+pub mod confined_git;
 pub mod deadline;
 pub mod extract;
 pub mod git;

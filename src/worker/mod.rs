@@ -16,6 +16,8 @@ pub mod client;
 pub mod context;
 #[cfg(all(unix, feature = "spawn-gate"))]
 pub mod gate;
+#[cfg(all(unix, feature = "spawn-gate"))]
+pub mod git_probe;
 pub mod run;
 
 use serde::{Deserialize, Serialize};

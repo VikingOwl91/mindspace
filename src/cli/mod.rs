@@ -246,6 +246,11 @@ pub enum Command {
     #[cfg(unix)]
     #[command(hide = true, name = "extraction-worker")]
     ExtractionWorker,
+    /// TEST HARNESS (feature `spawn-gate`, never in a shipped build): confines itself like the
+    /// extraction worker with execute rights for git, then drives the confined Git reader.
+    #[cfg(all(unix, feature = "spawn-gate"))]
+    #[command(hide = true, name = "git-probe")]
+    GitProbe { scenario: String, git: PathBuf },
     /// Run the local MCP server over stdio
     Mcp {
         /// Directory the repo_outline and repo_ingest tools may use, as
@@ -908,6 +913,8 @@ License: {}",
         // handled at the top of `run`, before anything else happens
         #[cfg(unix)]
         Command::ExtractionWorker => unreachable!("the worker is started by `run`"),
+        #[cfg(all(unix, feature = "spawn-gate"))]
+        Command::GitProbe { .. } => unreachable!("the probe is started by `run`"),
         Command::Mcp {
             allow_roots,
             ingest_timeout,
@@ -1301,6 +1308,10 @@ pub fn run(cli: &Cli) -> Result<i32> {
     #[cfg(unix)]
     if let Command::ExtractionWorker = &cli.command {
         return Ok(crate::worker::run::main());
+    }
+    #[cfg(all(unix, feature = "spawn-gate"))]
+    if let Command::GitProbe { scenario, git } = &cli.command {
+        return Ok(crate::worker::git_probe::main(scenario, git));
     }
     if let Command::Doctor { json } = &cli.command {
         return Ok(doctor_command(cli, *json).unwrap_or_else(|e| {

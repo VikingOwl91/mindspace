@@ -84,6 +84,28 @@ pub struct GitPin {
     pub git_dir: PathBuf,
     pub common_dir: PathBuf,
     pub keep: Vec<std::fs::File>,
+    /// Set by the confined reader (see [`super::confined_git`]): git is started by an explicit
+    /// absolute path with a cleared environment and receives the repository ONLY as an inherited
+    /// descriptor. `None` for the in-process reader, which is unchanged.
+    pub confined: Option<ConfinedExec>,
+}
+
+/// How a confined git child is started: which binary, and which of the worker's descriptors it
+/// inherits. The numbers are valid in the worker AND in the child (the child inherits the
+/// descriptor under the same number), so `/proc/self/fd/<n>` names the same inode in both.
+#[derive(Debug, Clone)]
+pub struct ConfinedExec {
+    /// Absolute path of the git binary; never looked up through `PATH`.
+    pub exe: PathBuf,
+    /// The repository's git directory, opened beneath the verified root.
+    pub git_dir_fd: i32,
+    /// The repository root (the work tree): the child's working directory, by `fchdir`.
+    pub root_fd: i32,
+    /// `false` only in the test harness, to prove what the pins and the kernel each stop. The
+    /// field does not exist in a build without the `spawn-gate` feature: a production binary has
+    /// no way to start a confined git without the pins.
+    #[cfg(feature = "spawn-gate")]
+    pub apply_pins: bool,
 }
 
 impl GitReader {
@@ -412,6 +434,42 @@ impl GitReader {
         Ok(result)
     }
 
+    /// The object format git reports for the repository (`sha1` or `sha256`). One git call.
+    pub(super) fn object_format(&self) -> Result<String> {
+        let out = run(
+            &self.path,
+            &self.deadline,
+            self.pin.as_ref(),
+            &["rev-parse", "--show-object-format"],
+            None,
+        )?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    /// The time limit of this reader's processes.
+    #[cfg_attr(not(feature = "spawn-gate"), allow(dead_code))]
+    pub(super) fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    /// Test harness only (feature `spawn-gate`): any git arguments through the same command
+    /// builder, with the reader's pins and descriptors. Not part of any build that ships.
+    #[cfg(feature = "spawn-gate")]
+    pub fn run_raw(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        run(&self.path, &self.deadline, self.pin.as_ref(), args, stdin)
+    }
+
+    /// Test harness only: starts a git process with piped stdin/stdout and returns it unwaited.
+    #[cfg(feature = "spawn-gate")]
+    pub fn spawn_raw(&self, args: &[&str]) -> std::io::Result<Child> {
+        let mut cmd = git_command(&self.path, self.pin.as_ref());
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn()
+    }
+
     /// The commit HEAD resolves to. Errors for an unborn branch.
     pub fn head_commit(&self) -> Result<String> {
         let out = run(
@@ -652,6 +710,9 @@ const PINNED_CONFIG: &[&str] = &[
 /// The single place a `git` process is created. `dir` becomes the working
 /// directory; discovery of the repository is therefore based on it alone.
 fn git_command(dir: &Path, pin: Option<&GitPin>) -> Command {
+    if let Some(confined) = pin.and_then(|p| p.confined.as_ref()) {
+        return confined_command(confined);
+    }
     let mut cmd = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
@@ -670,6 +731,83 @@ fn git_command(dir: &Path, pin: Option<&GitPin>) -> Command {
         // a directory entry may have been swapped since it was checked.
         cmd.env("GIT_DIR", &pin.git_dir);
         cmd.env("GIT_COMMON_DIR", &pin.common_dir);
+    }
+    cmd
+}
+
+/// Extra `-c` overrides of the confined reader, on top of [`PINNED_CONFIG`]: no replacement refs,
+/// no recursion into submodules, no helper programs for the network. None of them is needed by the
+/// plumbing commands the reader runs; they keep a hostile repository configuration from changing
+/// what those commands read or start. (The kernel confinement is the real barrier; these keep git
+/// from even trying.)
+const CONFINED_CONFIG: &[&str] = &[
+    "core.useReplaceRefs=false",
+    "submodule.recurse=false",
+    "fetch.recurseSubmodules=false",
+    "core.untrackedCache=false",
+    "core.sshCommand=",
+    "core.gitProxy=",
+    "uploadpack.packObjectsHook=",
+];
+
+/// The one place a CONFINED git child is created. Nothing is inherited implicitly:
+///
+/// * the executable is an absolute path chosen by the caller (no `PATH` lookup; the environment is
+///   cleared, so there is no `PATH` to inject);
+/// * the environment is exactly the pinned values below;
+/// * the repository is `GIT_DIR=/proc/self/fd/<n>`, resolved in the CHILD, so it names a
+///   descriptor the child inherited. (`/proc/<worker pid>/fd/<n>` does not work for a child of a
+///   non-dumpable worker: the child may not open another process' descriptor links.) Git never
+///   discovers a repository itself: a `GIT_DIR` that does not resolve is an error;
+/// * between `fork` and `exec` every descriptor above stderr is marked close-on-exec, then the
+///   git directory's descriptor alone is made inheritable, and the child changes into the root by
+///   descriptor. Those calls are async-signal-safe and touch only the child's copy of the table:
+///   the worker's descriptors keep their flags.
+fn confined_command(c: &ConfinedExec) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(&c.exe);
+    cmd.env_clear();
+    for (k, v) in PINNED_ENV {
+        cmd.env(k, v);
+    }
+    let fd_path = format!("/proc/self/fd/{}", c.git_dir_fd);
+    cmd.env("GIT_DIR", &fd_path).env("GIT_COMMON_DIR", &fd_path);
+    cmd.env("GIT_NO_LAZY_FETCH", "1")
+        // dashed helper programs are never wanted; the directory does not exist
+        .env("GIT_EXEC_PATH", "/nonexistent")
+        .env("LC_ALL", "C");
+    #[cfg(feature = "spawn-gate")]
+    let apply_pins = c.apply_pins;
+    #[cfg(not(feature = "spawn-gate"))]
+    let apply_pins = true;
+    if apply_pins {
+        for cfg in PINNED_CONFIG.iter().chain(CONFINED_CONFIG) {
+            cmd.arg("-c").arg(cfg);
+        }
+    }
+    let (git_fd, root_fd) = (c.git_dir_fd, c.root_fd);
+    // SAFETY: only async-signal-safe system calls between fork and exec (close_range, fcntl,
+    // fchdir); no allocation and no locks.
+    unsafe {
+        cmd.pre_exec(move || {
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
+            if libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(git_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fchdir(root_fd) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     cmd
 }

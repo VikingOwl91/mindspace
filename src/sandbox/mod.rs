@@ -1019,6 +1019,19 @@ pub fn enter_extraction_worker(
     root: &std::os::fd::OwnedFd,
     keep: &[i32],
 ) -> Result<WorkerSandbox, String> {
+    enter_extraction_worker_with_exec(root, keep, &[])
+}
+
+/// As [`enter_extraction_worker`], and it may additionally EXECUTE exactly the listed files and
+/// nothing else (each one file, read and execute; no directory, no other file). The system
+/// directories carry no execute right in either case. The confined Git reader needs two files:
+/// the `git` binary and its ELF interpreter (see `ingest::confined_git::GitExecutable`). Every git
+/// child inherits this domain: it cannot widen it, write, open a socket, or execute anything else.
+pub fn enter_extraction_worker_with_exec(
+    root: &std::os::fd::OwnedFd,
+    keep: &[i32],
+    exec: &[PathBuf],
+) -> Result<WorkerSandbox, String> {
     use std::os::fd::AsRawFd;
     // SAFETY: plain prctl calls on this process.
     unsafe {
@@ -1039,7 +1052,17 @@ pub fn enter_extraction_worker(
         }
         other => return Err(format!("the socket filter is not enforced: {other:?}")),
     };
-    let rs = build_ruleset(&worker_rules(), &Default::default())?
+    let mut rules = worker_rules();
+    for path in exec {
+        if !path.is_absolute() {
+            return Err(format!("exec grant {} is not absolute", path.display()));
+        }
+        rules.push(Rule {
+            path: path.clone(),
+            rights: Rights::FileExec,
+        });
+    }
+    let rs = build_ruleset(&rules, &Default::default())?
         .add_rule(PathBeneath::new(
             root,
             AccessFs::ReadFile | AccessFs::ReadDir,

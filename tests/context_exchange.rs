@@ -52,6 +52,36 @@ fn db() -> Db {
 }
 
 impl Db {
+    /// What an older binary (`mind-code@3`) left behind. The store makes derivations immutable and
+    /// versions their changes with SQL functions only its own connection has; a legacy row was
+    /// written by an older binary, not updated. For this throwaway database only, the UPDATE
+    /// guards are lifted for the statement and restored (the store verifies them when it opens).
+    fn relabel_as_at3(&self) {
+        let c = rusqlite::Connection::open(&self.path).unwrap();
+        let triggers: Vec<(String, String)> = c
+            .prepare(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' \
+                 AND tbl_name='code_derivations' AND upper(sql) LIKE '% UPDATE %'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(!triggers.is_empty());
+        for (name, _) in &triggers {
+            c.execute_batch(&format!("DROP TRIGGER \"{name}\""))
+                .unwrap();
+        }
+        assert!(
+            c.execute("UPDATE code_derivations SET extractor_version='3'", [])
+                .unwrap()
+                > 0
+        );
+        for (_, sql) in &triggers {
+            c.execute_batch(sql).unwrap();
+        }
+    }
     fn store(&self) -> SqliteStore {
         open_existing(&self.path).unwrap()
     }
@@ -255,6 +285,58 @@ fn known_complete_derivations_are_reused_without_reparsing_and_match_the_in_proc
     assert_eq!(before["code_derivations"], after["code_derivations"]);
     assert_eq!(before["code_entities"], after["code_entities"]);
     assert_eq!(worker_db.rows(), direct_db.rows());
+}
+
+/// M7.3b.5b stabilization: the extractor version is part of the identity the parent answers about,
+/// so derivations an older extractor made are NOT announced as known: the worker parses again.
+#[test]
+fn derivations_of_an_older_extractor_version_are_not_announced_as_known() {
+    let d = small_tree();
+    let f = fixture(d.path());
+    let db = db();
+    let (first, s1) = run_worker(&db, &f, &cfg());
+    assert_eq!(s1.known_sent, 0);
+    persist(&db.store(), first, &Deadline::none()).unwrap();
+    let steady = db.rows();
+    // same version: everything is known and comes back as placeholders
+    let parsed = steady["code_derivations"] as u64;
+    assert!(parsed >= 2);
+    let (_, s2) = run_worker(&db, &f, &cfg());
+    assert_eq!(s2.known_sent, parsed);
+
+    // an older binary's derivations of the same, unchanged files
+    db.relabel_as_at3();
+    let (again, s3) = run_worker(&db, &f, &cfg());
+    assert_eq!(
+        s3.known_sent, 0,
+        "@3 derivations were announced as known under @4"
+    );
+    let Extracted::Files(files) = &again else {
+        panic!()
+    };
+    assert!(
+        files
+            .code_inputs
+            .iter()
+            .any(|i| !i.derivation.entities.is_empty()),
+        "the worker did not parse again"
+    );
+    persist(&db.store(), again, &Deadline::none()).unwrap();
+    let upgraded = db.rows();
+    assert_eq!(upgraded["code_derivations"], 2 * steady["code_derivations"]);
+    assert_eq!(upgraded["code_inputs"], steady["code_inputs"]);
+
+    // now the current version is known again, and a further run changes nothing
+    let (third, s4) = run_worker(&db, &f, &cfg());
+    assert_eq!(s4.known_sent, parsed);
+    persist(&db.store(), third, &Deadline::none()).unwrap();
+    // (every ingestion appends its own observation records; the derived structure does not move)
+    let code = |m: BTreeMap<String, i64>| -> BTreeMap<String, i64> {
+        m.into_iter()
+            .filter(|(k, _)| k.starts_with("code_"))
+            .collect()
+    };
+    assert_eq!(code(upgraded), code(db.rows()));
 }
 
 #[test]

@@ -254,7 +254,7 @@ fn dir_with(big_bytes: usize) -> tempfile::TempDir {
     d
 }
 
-const SKIP_1000: &str = "3+skip(p1:source_bytes>1000)";
+const SKIP_1000: &str = "4+skip(p1:source_bytes>1000)";
 
 #[test]
 fn an_oversized_source_keeps_its_text_and_gets_one_idempotent_skip_row() {
@@ -273,7 +273,7 @@ fn an_oversized_source_keeps_its_text_and_gets_one_idempotent_skip_row() {
     assert!(CodeParseStatus::parse(&skip.1).is_some());
     assert!(ds
         .iter()
-        .any(|d| d.0 == "3" && d.1 == "complete" && d.3 == 1));
+        .any(|d| d.0 == "4" && d.1 == "complete" && d.3 == 1));
     // the text of the skipped file is stored
     let len: i64 = db
         .conn()
@@ -348,7 +348,7 @@ fn a_changed_limit_or_policy_revision_re_evaluates_a_skip() {
     assert_eq!((r.skipped, r.parsed), (1, 0), "{r:?}");
     let versions: Vec<String> = db.derivations().into_iter().map(|d| d.0).collect();
     assert!(versions.contains(&SKIP_1000.to_string()));
-    assert!(versions.contains(&"3+skip(p1:source_bytes>900)".to_string()));
+    assert!(versions.contains(&"4+skip(p1:source_bytes>900)".to_string()));
     // a different revision is a different identity: simulate an older revision's row
     let store = db.store();
     let content = std::fs::read_to_string(f.root.join("big.rs")).unwrap();

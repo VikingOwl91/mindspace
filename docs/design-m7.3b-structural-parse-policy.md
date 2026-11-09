@@ -99,7 +99,7 @@ per-level source copies (Reasoned; the exact split was not profiled). A 180 KB f
 Three things are kept apart:
 | Concept | Meaning | Where it lives |
 |---|---|---|
-| Parser identity `I` | extractor, extractor version, grammar, grammar version: *what code produces entities* | the four identity columns, unchanged (`mind-code / 3 / tree-sitter-rust / 0.24.2`) |
+| Parser identity `I` | extractor, extractor version, grammar, grammar version: *what code produces entities* | the four identity columns, unchanged (`mind-code / 4 / tree-sitter-rust / 0.24.2` (3 until M7.3b.5b stabilization, see ADR-025)) |
 | Resource-policy identity `P` | *which budget refused the file*: revision `p1`, reason, limit | a suffix of `extractor_version` on **skip rows only**: `3+skip(p1:source_bytes>2097152)`, `3+skip(p1:entity_depth>256)`, `3+skip(p1:output_bytes>33554432)`, `3+skip(p1:requested)` |
 | Derivation outcome | complete / recovered / failed / skipped | `status` column (existing values only) and, for skips, `P` |
 

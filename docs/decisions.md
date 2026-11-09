@@ -667,7 +667,7 @@ closure, and the corpus oracle); every mutation of the rule is caught by at
 least one test; the benchmark gate is unchanged (ingest within noise, DB size
 identical).
 
-**ADR-025 addendum: classification in recovered trees (M7.3b.5b stabilization).**
+**ADR-025 addendum: `mind-code@4` (classification in recovered trees; M7.3b.5b stabilization).**
 `mind-code@3` decided "method or function" by looking through the `declaration_list` of an
 impl or trait and nothing else, while the traversal derives `parent_syntax_path` by passing the
 context through *every* node that is not an entity. In a tree that parsed cleanly the two agree.
@@ -679,9 +679,24 @@ Decision: the walk goes up through every non-entity node and stops at the first 
 other entity, which is the traversal's own rule. Clean trees: identical (6,108 of 6,110 derivations
 of this repository and a sample of the cargo registry byte-identical; the other two are the edited
 files themselves; 25 recovered ones included). Recovered trees: `kind` can differ, nothing else.
-**The extractor version is NOT moved** (it would re-derive every file for a corner that exists
-only in malformed input); a stored `@3` derivation of such a file keeps its old `kind` until the
-file changes. Revisit if that ever matters.
+
+**The extractor version moves to 4.** The extractor version is part of a derivation's identity:
+the store's reuse query (`has_code_derivation`), the insert's own dedupe and the worker's context
+exchange all key on extractor, extractor version, grammar and grammar version. So `@3` rows are
+never reused as `@4` (tests: `extractor_version.rs`, `context_exchange.rs`). Skip identities
+(`4+skip(p1:...)`) follow. **The relationship resolver moves with it:** a resolution is stored per
+(repository, commit, resolver, resolver version) and describes the entities of the derivations that
+were newest when it was made, so its version is now `extractor-<extractor version>` (was the fixed
+`1`). Without that, a re-derived repository kept its old resolutions, which belong to derivations
+no reader looks at any more, and the new derivations had none (observed: 2 resolved observations
+before the upgrade, 0 after).
+
+**One-time cost (intended).** The first ingestion of an unchanged file or repository after the
+upgrade parses it again and, for Git, resolves its view commits again. `@3` rows are not rewritten
+or deleted: derivations and resolutions of both versions sit side by side (pruning stays tracked
+as MIND-19), readers use the newest derivation of each input, and the following ingestion adds
+nothing. Measured on the test repository: derivation rows double once, inputs and contexts do not
+change, search results do not duplicate.
 
 ## ADR-026: Agent-driven ingest behind a restrictive allowlist (2026-11-07)
 

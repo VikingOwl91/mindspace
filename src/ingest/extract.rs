@@ -151,6 +151,12 @@ pub fn persist_git(
     persist_git_gated(store, extracted, deadline, &|| Ok(()))
 }
 
+/// The version of the relationship resolver: it moves with the extractor whose derivations it
+/// resolves (see [`persist_git_gated`]).
+pub fn resolver_version() -> String {
+    format!("extractor-{}", crate::ingest::code::IDENTITY.1)
+}
+
 /// As [`persist_git`], with a decision taken right before the COMMIT: if `before_commit` fails the
 /// whole ingestion is rolled back and its error returned.
 ///
@@ -172,13 +178,19 @@ pub fn persist_git_gated(
     let code = has_code.then_some(CodeObservation {
         inputs: extracted.code_inputs,
     });
+    // A resolution is stored per (repository, commit, resolver, resolver version) and describes the
+    // entities of the derivations that were newest when it was made. Its version therefore carries
+    // the extractor version: after the extractor changes, the existing resolution must not be
+    // reused as if it described the new derivations (it would stay attached to the old ones and
+    // the new ones would have no resolution at all).
+    let resolver_version = resolver_version();
     store.record_git_ingest(
         extracted.observation,
         code,
         crate::storage::GitResolutionPlan {
             commits: &views,
             resolver: "mind-rust-resolver",
-            version: "1",
+            version: &resolver_version,
         },
         before_commit,
     )

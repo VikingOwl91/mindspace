@@ -8,7 +8,7 @@ use crate::core::{
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
-pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "3", "tree-sitter-rust", "0.24.2");
+pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "4", "tree-sitter-rust", "0.24.2");
 pub fn identity() -> CodeParserIdentity {
     CodeParserIdentity {
         extractor: IDENTITY.0.into(),
@@ -95,7 +95,7 @@ impl SkipReason {
 }
 
 /// The identity of a skip row: the parser identity with the policy revision and reason appended to
-/// the extractor version, e.g. `3+skip(p1:source_bytes>2097152)`. Deterministic, and different
+/// the extractor version, e.g. `4+skip(p1:source_bytes>2097152)`. Deterministic, and different
 /// from the identity of a real derivation (`identity()`).
 pub fn skip_identity(reason: SkipReason) -> CodeParserIdentity {
     let mut id = identity();
@@ -1220,7 +1220,7 @@ mod tests {
         let r = SkipReason::SourceBytes { limit: 2_097_152 };
         assert_eq!(
             skip_identity(r).extractor_version,
-            "3+skip(p1:source_bytes>2097152)"
+            "4+skip(p1:source_bytes>2097152)"
         );
         assert_eq!(skip_identity(r), skip_identity(r));
         assert_ne!(skip_identity(r), identity());
@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!((d.status, d.error_count), (CodeParseStatus::Failed, 0));
         assert_eq!(
             skip_identity(SkipReason::OutputBytes { limit: 7 }).extractor_version,
-            "3+skip(p1:output_bytes>7)"
+            "4+skip(p1:output_bytes>7)"
         );
     }
 }

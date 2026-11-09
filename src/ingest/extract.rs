@@ -78,6 +78,11 @@ pub struct ExtractedFiles {
     pub observation: IngestObservation,
     /// Parsed code, recorded after the observation (empty: nothing to record).
     pub code_inputs: Vec<CodeInputDraft>,
+    /// Indexes into `code_inputs` that a record stream declared as reused derivations
+    /// (placeholders for derivations the requester announced as known). Empty for in-process
+    /// extraction. Provenance only: persistence ignores it, `worker::context::check_result` checks it.
+    #[serde(default)]
+    pub reused: std::collections::BTreeSet<usize>,
 }
 
 /// A Git repository observation, ready to persist.

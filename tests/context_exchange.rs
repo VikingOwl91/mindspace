@@ -933,16 +933,23 @@ fn a_result_for_other_spaces_or_with_foreign_identities_is_refused_before_persis
     };
     let spaces = [db.space()];
     let policy = ParsePolicy::default();
-    check_result(&files, &spaces, &policy).unwrap();
+    let op = Uuid::now_v7();
+    let sent = mindspace::worker::context::Context {
+        v: 2,
+        op,
+        identities: identities_for(&policy),
+        known: vec![],
+    };
+    check_result(&files, op, &spaces, &policy, &sent).unwrap();
     // another space than asked
-    assert!(check_result(&files, &[Uuid::now_v7()], &policy)
+    assert!(check_result(&files, op, &[Uuid::now_v7()], &policy, &sent)
         .unwrap_err()
         .contains("other spaces"));
     // a derivation with an identity the operation cannot produce
     let mut foreign = files.code_inputs[0].clone();
     foreign.derivation.identity.grammar = "evil".into();
     files.code_inputs.push(foreign);
-    assert!(check_result(&files, &spaces, &policy)
+    assert!(check_result(&files, op, &spaces, &policy, &sent)
         .unwrap_err()
         .contains("identity"));
     files.code_inputs.pop();
@@ -971,7 +978,7 @@ fn a_result_for_other_spaces_or_with_foreign_identities_is_refused_before_persis
         },
     };
     files.code_inputs.push(lie.clone());
-    assert!(check_result(&files, &spaces, &policy)
+    assert!(check_result(&files, op, &spaces, &policy, &sent)
         .unwrap_err()
         .contains("skip derivation"));
     // ...and the reverse: a depth skip claimed for an oversized source
@@ -982,7 +989,7 @@ fn a_result_for_other_spaces_or_with_foreign_identities_is_refused_before_persis
             limit: policy.max_entity_depth,
         });
     files.code_inputs.push(lie);
-    assert!(check_result(&files, &spaces, &policy)
+    assert!(check_result(&files, op, &spaces, &policy, &sent)
         .unwrap_err()
         .contains("skip derivation"));
 }

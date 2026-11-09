@@ -232,21 +232,70 @@ pub fn answer(
     })
 }
 
-/// Checks the worker's result against what the parent asked for, before anything is persisted.
-/// The root is checked by the stream consumer; this adds the spaces and the derivations' identities.
+/// Checks the worker's result against what the parent asked for and told it, before anything is
+/// persisted. The root is checked by the stream consumer; this adds the spaces, the identities and
+/// the provenance of every reuse placeholder.
+///
+/// Placeholder provenance (the index-poisoning invariant): a code input may be declared `reused`
+/// only for a `(content hash, identity)` pair that appears in `sent`, the context this very
+/// operation transmitted. A reuse claim for anything else (an unsent blob, another identity, a
+/// pair known only to another operation) is refused, and so is a freshly produced derivation that
+/// contradicts what was announced as known. Emptiness is never evidence of reuse.
+///
+/// What this does not establish: that a *fresh* derivation is what the parser would have produced.
+/// See `docs/m7.3b-context-exchange.md` (residual trust boundary).
 pub fn check_result(
     files: &crate::ingest::extract::ExtractedFiles,
+    op: Uuid,
     spaces: &[Uuid],
     policy: &ParsePolicy,
+    sent: &Context,
 ) -> std::result::Result<(), String> {
+    if sent.op != op {
+        return bad("the context belongs to another operation");
+    }
     if files.observation.spaces != spaces {
         return bad("the result names other spaces than the request");
     }
     let allowed = identities_for(policy);
-    for input in &files.code_inputs {
+    let current = &allowed[0];
+    let known: HashSet<(&str, &CodeParserIdentity)> = sent
+        .known
+        .iter()
+        .filter_map(|(h, i)| {
+            sent.identities
+                .get(usize::from(*i))
+                .map(|id| (h.as_str(), id))
+        })
+        .collect();
+    if files.reused.iter().any(|i| *i >= files.code_inputs.len()) {
+        return bad("a reuse declaration points at no code input");
+    }
+    // one decision per content: equal content must get the same identity and provenance
+    let mut decided: std::collections::HashMap<&str, (&CodeParserIdentity, bool)> =
+        std::collections::HashMap::new();
+    for (n, input) in files.code_inputs.iter().enumerate() {
         let id = &input.derivation.identity;
         if !allowed.contains(id) {
             return bad("a derivation carries an identity this operation cannot produce");
+        }
+        let hash = input.content_hash.as_str();
+        let reused = files.reused.contains(&n);
+        if reused {
+            if !known.contains(&(hash, id)) {
+                return bad("a reused derivation the parent did not announce for this operation");
+            }
+            let d = &input.derivation;
+            if !(d.entities.is_empty() && d.imports.is_empty() && d.relationships.is_empty()) {
+                return bad("a reused derivation carries structure");
+            }
+        } else if known.contains(&(hash, id)) || known.contains(&(hash, current)) {
+            return bad("a fresh derivation for content announced as known");
+        }
+        if let Some(prev) = decided.insert(hash, (id, reused)) {
+            if prev != (id, reused) {
+                return bad("conflicting derivations for the same content");
+            }
         }
         // a skip derivation must be one the policy would produce for this content
         if let Some(reason) = code::skip_reason_of(id) {

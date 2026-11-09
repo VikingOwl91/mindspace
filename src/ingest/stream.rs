@@ -237,6 +237,11 @@ pub enum Record {
     CodeInput {
         input: CodeInputDraft,
         content: ContentSource,
+        /// Explicit provenance: the producer reused a derivation the requester announced as known
+        /// (a placeholder: persistence finds the existing row). Never inferred from empty vectors:
+        /// a genuine parse of an empty file is also complete and empty. Directory operations only.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reused: bool,
     },
     // ---- both
     Chunk {
@@ -640,6 +645,7 @@ fn emit_code_input(
     sink: &mut dyn RecordSink,
     mut input: CodeInputDraft,
     shared: bool,
+    reused: bool,
 ) -> Result<()> {
     let content = std::mem::take(&mut input.content);
     let (en, im, re) = (
@@ -657,6 +663,7 @@ fn emit_code_input(
     sink.emit(&Record::CodeInput {
         input,
         content: source,
+        reused,
     })?;
     if !shared {
         emit_chunks(sink, &content)?;
@@ -730,10 +737,10 @@ pub fn stream_directory(
             })?;
         let location = anchor.real().join(&rel).display().to_string();
         let file = super::observe_bytes(&rel, bytes, location, space_ids)?;
-        let code = super::code_input_for_file(ctx, &file, deadline, &limits.parse_policy)?;
+        let code = super::code_input_for_file_marked(ctx, &file, deadline, &limits.parse_policy)?;
         emit_file(sink, file)?;
-        if let Some(input) = code {
-            emit_code_input(sink, input, true)?;
+        if let Some((input, reused)) = code {
+            emit_code_input(sink, input, true, reused)?;
         }
     }
     Ok(())
@@ -1168,7 +1175,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
                 });
             }
             if let Some(input) = code_input {
-                emit_code_input(sink, input, true)?;
+                emit_code_input(sink, input, true, false)?;
             }
         }
     }
@@ -1198,7 +1205,7 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 let input = code.remove(&file.location);
                 emit_file(sink, file)?;
                 if let Some(input) = input {
-                    emit_code_input(sink, input, false)?;
+                    emit_code_input(sink, input, false, false)?;
                 }
             }
         }
@@ -1263,7 +1270,7 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 emit_derivation(sink, d, false)?;
             }
             for c in g.code_inputs {
-                emit_code_input(sink, c, false)?;
+                emit_code_input(sink, c, false, false)?;
             }
         }
     }
@@ -1580,6 +1587,10 @@ struct Assembler<'a> {
     current_tags: Option<Vec<(String, String)>>,
     derivations: Vec<GitDerivedFile>,
     code_inputs: Vec<CodeInputDraft>,
+    /// Indexes into `code_inputs` the producer declared as reused derivations.
+    reused: std::collections::BTreeSet<usize>,
+    /// The open code input was declared reused: it must stay empty.
+    reused_open: bool,
     keys: HashSet<(&'static str, String)>,
     slot: Option<Slot>,
     owner: Option<Owner>,
@@ -1615,6 +1626,8 @@ impl<'a> Assembler<'a> {
             current_tags: None,
             derivations: Vec::new(),
             code_inputs: Vec::new(),
+            reused: std::collections::BTreeSet::new(),
+            reused_open: false,
             keys: HashSet::new(),
             slot: None,
             owner: None,
@@ -1941,9 +1954,30 @@ impl<'a> Assembler<'a> {
                 self.owner = Some(Owner::Derivation(file));
                 self.count_check()?;
             }
-            Record::CodeInput { input, content } => {
+            Record::CodeInput {
+                input,
+                content,
+                reused,
+            } => {
                 self.at(Phase::Body, name)?;
                 self.close_owner()?;
+                if reused {
+                    if self.expect != Kind::Files {
+                        return bad("a reused derivation outside a directory operation");
+                    }
+                    let d = &input.derivation;
+                    let skip = super::code::skip_reason_of(&d.identity).is_some();
+                    let (status, error_count) = if skip {
+                        (crate::core::CodeParseStatus::Failed, 0)
+                    } else {
+                        (crate::core::CodeParseStatus::Complete, 0)
+                    };
+                    if d.status != status || d.error_count != error_count {
+                        return bad(
+                            "a reused derivation with a status the placeholder cannot have",
+                        );
+                    }
+                }
                 if !input.content.is_empty()
                     || !input.derivation.entities.is_empty()
                     || !input.derivation.imports.is_empty()
@@ -2003,6 +2037,7 @@ impl<'a> Assembler<'a> {
                     }
                 }
                 self.seen.code_inputs += 1;
+                self.reused_open = reused;
                 self.owner = Some(Owner::Code(input));
             }
             Record::Chunk { data } => {
@@ -2078,6 +2113,9 @@ impl<'a> Assembler<'a> {
             (Some(Owner::Derivation(d)), Part::Evidences { items }) => d.evidences.extend(items),
             (Some(Owner::Derivation(d)), Part::Assertions { items }) => d.assertions.extend(items),
             (Some(Owner::Derivation(d)), Part::Memories { items }) => d.memories.extend(items),
+            (Some(Owner::Code(_)), _) if self.reused_open => {
+                return bad("a reused derivation must not carry parts")
+            }
             (Some(Owner::Code(c)), Part::Entities { items }) => c.derivation.entities.extend(items),
             (Some(Owner::Code(c)), Part::Imports { items }) => c.derivation.imports.extend(items),
             (Some(Owner::Code(c)), Part::Relationships { items }) => {
@@ -2127,6 +2165,9 @@ impl<'a> Assembler<'a> {
                     return bad("code content hash mismatch");
                 }
                 c.content = slot.text.clone();
+                if std::mem::take(&mut self.reused_open) {
+                    self.reused.insert(self.code_inputs.len());
+                }
                 self.code_inputs.push(c);
             }
         }
@@ -2149,6 +2190,7 @@ impl<'a> Assembler<'a> {
                     spaces: self.spaces,
                 },
                 code_inputs: self.code_inputs,
+                reused: self.reused,
             }),
             Kind::Git => {
                 // The producer sends derivations in blob order; the result is

@@ -11,6 +11,7 @@
 //! gate. Directory extraction only; the context exchange ([`context`]) carries the little database
 //! knowledge the worker needs. Git, grants and the broker are later slices.
 
+pub mod broker;
 pub mod client;
 pub mod context;
 #[cfg(all(unix, feature = "spawn-gate"))]
@@ -25,6 +26,9 @@ use crate::ingest::code::ParsePolicy;
 /// Channel and root descriptors in the worker.
 pub const CHANNEL_FD: i32 = 3;
 pub const ROOT_FD: i32 = 4;
+/// Present only when a broker started the worker: the worker reports `READY` here once it is
+/// confined and waits for `GO` (see [`broker`]). Absent for the in-frontend client.
+pub const CONTROL_FD: i32 = 5;
 /// Version 2 adds the context exchange (see [`context`]); there is no version-1 fallback.
 pub const PROTOCOL: u32 = 2;
 /// The request is one JSON line of at most this size.

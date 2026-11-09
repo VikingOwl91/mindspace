@@ -150,11 +150,22 @@ pub(crate) fn code_input_for_file(
     deadline: &Deadline,
     policy: &code::ParsePolicy,
 ) -> Result<Option<crate::core::CodeInputDraft>> {
+    Ok(code_input_for_file_marked(ctx, f, deadline, policy)?.map(|(input, _)| input))
+}
+
+/// Like [`code_input_for_file`], and says whether the derivation was reused from the context
+/// (a placeholder) rather than produced by this call.
+pub(crate) fn code_input_for_file_marked(
+    ctx: &dyn ExtractionContext,
+    f: &ObservedFile,
+    deadline: &Deadline,
+    policy: &code::ParsePolicy,
+) -> Result<Option<(crate::core::CodeInputDraft, bool)>> {
     let Some(language) = code::language_for(Path::new(&f.location)) else {
         return Ok(None);
     };
     deadline.check("parsing source files")?;
-    let derivation = structural_derivation(
+    let (derivation, reused) = structural_decision(
         ctx,
         language,
         &f.content,
@@ -164,18 +175,21 @@ pub(crate) fn code_input_for_file(
         policy,
         true,
     )?;
-    Ok(Some(crate::core::CodeInputDraft {
-        language,
-        content_hash: f.content_hash.clone(),
-        content: f.content.clone(),
-        repository_id: None,
-        blob_oid: None,
-        contexts: vec![crate::core::CodeContextDraft {
-            path: f.location.clone(),
-            commit_oid: None,
-        }],
-        derivation,
-    }))
+    Ok(Some((
+        crate::core::CodeInputDraft {
+            language,
+            content_hash: f.content_hash.clone(),
+            content: f.content.clone(),
+            repository_id: None,
+            blob_oid: None,
+            contexts: vec![crate::core::CodeContextDraft {
+                path: f.location.clone(),
+                commit_oid: None,
+            }],
+            derivation,
+        },
+        reused,
+    )))
 }
 
 /// The structural derivation of one source, under the resource policy (design:
@@ -202,6 +216,32 @@ pub fn structural_derivation(
     policy: &code::ParsePolicy,
     strict: bool,
 ) -> Result<crate::core::CodeDerivationDraft> {
+    structural_decision(
+        ctx,
+        language,
+        content,
+        content_hash,
+        repository_id,
+        blob_oid,
+        policy,
+        strict,
+    )
+    .map(|(d, _)| d)
+}
+
+/// [`structural_derivation`] plus its provenance: `true` when the derivation is a placeholder
+/// for one the context announced (steps 1 and 2), `false` when it was produced here (3 and 4).
+#[allow(clippy::too_many_arguments)]
+pub fn structural_decision(
+    ctx: &dyn ExtractionContext,
+    language: crate::core::CodeLanguage,
+    content: &str,
+    content_hash: &str,
+    repository_id: Option<Uuid>,
+    blob_oid: Option<&str>,
+    policy: &code::ParsePolicy,
+    strict: bool,
+) -> Result<(crate::core::CodeDerivationDraft, bool)> {
     let known = |identity: &crate::core::CodeParserIdentity| -> Result<bool> {
         let r = ctx.has_code_derivation(language, content_hash, repository_id, blob_oid, identity);
         if strict {
@@ -212,14 +252,17 @@ pub fn structural_derivation(
     };
     let identity = code::identity();
     if known(&identity)? {
-        return Ok(crate::core::CodeDerivationDraft {
-            identity,
-            status: crate::core::CodeParseStatus::Complete,
-            error_count: 0,
-            entities: vec![],
-            imports: vec![],
-            relationships: vec![],
-        });
+        return Ok((
+            crate::core::CodeDerivationDraft {
+                identity,
+                status: crate::core::CodeParseStatus::Complete,
+                error_count: 0,
+                entities: vec![],
+                imports: vec![],
+                relationships: vec![],
+            },
+            true,
+        ));
     }
     let oversized = content.len() as u64 > policy.max_source_bytes;
     for reason in policy.reasons() {
@@ -231,7 +274,7 @@ pub fn structural_derivation(
             continue;
         }
         if known(&code::skip_identity(reason))? {
-            return Ok(code::skip_derivation(reason));
+            return Ok((code::skip_derivation(reason), true));
         }
     }
     let outcome = code::parse_with_policy(language, content, policy);
@@ -240,7 +283,7 @@ pub fn structural_derivation(
             "structural parsing could not run: {why}"
         )));
     }
-    Ok(outcome.derivation)
+    Ok((outcome.derivation, false))
 }
 
 /// Parses the source files among `files` and assembles the observation (shared by
@@ -271,6 +314,7 @@ pub(crate) fn prepare_observed_files(
     Ok(ExtractedFiles {
         observation,
         code_inputs,
+        reused: Default::default(),
     })
 }
 

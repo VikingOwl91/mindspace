@@ -19,6 +19,9 @@ use crate::ingest::confined::Anchor;
 use crate::ingest::extract::Extracted;
 use crate::ingest::stream::{consume, Kind, ProducerLimits, StreamLimits};
 
+use super::broker::{
+    recv_with_fd, FromBroker, Observed, OpKind, ToBroker, BROKER_PROTOCOL, MAX_LINE,
+};
 use super::context::{
     answer, check_result, validate_spaces, ContextSource, Manifest, MAX_MANIFEST_LINE,
 };
@@ -76,6 +79,9 @@ impl WorkerConfig {
 #[derive(Debug)]
 pub enum WorkerError {
     Spawn(String),
+    /// The broker refused the operation (root not authorized, replay, busy, confinement not
+    /// observed, no cgroup...). Nothing was started or everything started was ended.
+    Refused(String),
     /// The worker is not confined as required (or said nothing sensible); it was killed.
     Sandbox(String),
     /// The hard wall-clock limit or the idle limit expired; the worker's group was killed.
@@ -98,6 +104,7 @@ impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(m) => write!(f, "cannot start the extraction worker: {m}"),
+            Self::Refused(m) => write!(f, "the broker refused the extraction: {m}"),
             Self::Sandbox(m) => write!(f, "the extraction worker is not confined: {m}"),
             Self::Timeout(w) => write!(f, "the extraction worker timed out ({w})"),
             Self::Cancelled => write!(f, "the extraction was cancelled"),
@@ -355,7 +362,17 @@ pub fn extract_directory(
     let stderr = child.stderr.take();
 
     let outcome = run_session(
-        cfg, anchor, spaces, ctx, cancel, parent_end, begun, pid, &mut stats,
+        cfg,
+        anchor.real(),
+        Uuid::now_v7(),
+        None,
+        spaces,
+        ctx,
+        cancel,
+        parent_end,
+        begun,
+        pid,
+        &mut stats,
     );
 
     // Did the worker end by itself? (Asked before we end it; a stream that stops short usually
@@ -433,7 +450,9 @@ pub fn extract_directory(
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     cfg: &WorkerConfig,
-    anchor: &Anchor,
+    root: &std::path::Path,
+    op: Uuid,
+    observed: Option<&Observed>,
     spaces: &[Uuid],
     ctx: &dyn ContextSource,
     cancel: &AtomicBool,
@@ -490,17 +509,29 @@ fn run_session(
     if cfg.require_sandbox_evidence {
         let hello: Hello = serde_json::from_slice(&line)
             .map_err(|e| WorkerError::Sandbox(format!("unreadable hello: {e}")))?;
-        verify_hello(&hello, pid, cfg.verify_via_proc)?;
+        verify_hello(&hello, pid, cfg.verify_via_proc && observed.is_none())?;
+        if let Some(o) = observed {
+            // the broker looked at this very process from outside (it is not the worker's word)
+            if o.pid != hello.pid {
+                return Err(WorkerError::Sandbox(
+                    "the broker observed another process than the one that said hello".into(),
+                ));
+            }
+            if o.seccomp != "2" || o.no_new_privs != "1" || o.tracer_pid != "0" {
+                return Err(WorkerError::Sandbox(format!(
+                    "the broker's observation does not show the confinement: {o:?}"
+                )));
+            }
+        }
         stats.hello = Some(hello);
     }
     stats.startup = begun.elapsed();
 
     // 2. the request: what to extract, under which limits
-    let op = Uuid::now_v7();
     let request = Request {
         v: PROTOCOL,
         op,
-        root: anchor.real().display().to_string(),
+        root: root.display().to_string(),
         spaces: spaces.to_vec(),
         max_blob_bytes: cfg.producer.max_blob_bytes,
         max_source_bytes: cfg.producer.parse_policy.max_source_bytes,
@@ -557,7 +588,7 @@ fn run_session(
         &mut reader,
         op,
         Kind::Files,
-        Some(anchor.real()),
+        Some(root),
         &cfg.stream,
         Some(cancel),
     ) {
@@ -571,7 +602,7 @@ fn run_session(
     };
     // 5. the result against what was asked, still before anything is persisted
     if let Extracted::Files(files) = &extracted {
-        check_result(files, spaces, &policy).map_err(WorkerError::Stream)?;
+        check_result(files, op, spaces, &policy, &context).map_err(WorkerError::Stream)?;
     }
     Ok(extracted)
 }
@@ -613,4 +644,170 @@ fn verify_hello(h: &Hello, pid: u32, via_proc: bool) -> Result<(), WorkerError> 
     // Not checked from outside: the worker is not dumpable, so its /proc/<pid>/fd is closed to us
     // (by design). Its descriptor table is covered by the pre-exec close_range and the probes.
     Ok(())
+}
+
+/// What the broker reported when the operation ended.
+#[derive(Debug, Clone)]
+pub struct BrokerReport {
+    pub observed: Observed,
+    pub exit: String,
+    pub exited_by_itself: bool,
+    pub descendants_killed: u32,
+    pub peak_rss_kb: i64,
+    pub cgroup_peak_bytes: Option<u64>,
+}
+
+/// Runs one directory extraction through the broker. The frontend names the root (a string the
+/// broker matches against its own authorized roots) and receives the worker's channel; it never
+/// holds the root descriptor and cannot widen what the broker grants. The broker ends and reaps
+/// the worker; this side validates the stream and returns it. The caller persists after `Ok`.
+pub fn extract_via_broker(
+    cfg: &WorkerConfig,
+    link: &UnixStream,
+    root: &std::path::Path,
+    spaces: &[Uuid],
+    ctx: &dyn ContextSource,
+    cancel: &AtomicBool,
+) -> Result<(Extracted, WorkerStats, BrokerReport), WorkerError> {
+    let begun = Instant::now();
+    validate_spaces(spaces).map_err(WorkerError::Context)?;
+    for id in spaces {
+        match ctx.space_exists(*id) {
+            Ok(true) => {}
+            Ok(false) => return Err(WorkerError::Context(format!("space {id} does not exist"))),
+            Err(e) => return Err(WorkerError::Context(format!("checking space {id}: {e}"))),
+        }
+    }
+    let op = Uuid::now_v7();
+    let send = |m: &ToBroker| -> Result<(), WorkerError> {
+        let mut b = serde_json::to_vec(m).map_err(|e| WorkerError::Io(e.to_string()))?;
+        b.push(b'\n');
+        (&*link)
+            .write_all(&b)
+            .map_err(|e| WorkerError::Io(format!("the broker link: {e}")))
+    };
+    send(&ToBroker::Begin {
+        v: BROKER_PROTOCOL,
+        op,
+        kind: OpKind::DirectoryExtract,
+        root: root.display().to_string(),
+        spaces: spaces.to_vec(),
+    })?;
+    link.set_read_timeout(Some(cfg.wall_timeout))
+        .map_err(|e| WorkerError::Io(e.to_string()))?;
+    let (bytes, fd) =
+        recv_with_fd(link).map_err(|e| WorkerError::Io(format!("the broker: {e}")))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let ready: FromBroker = serde_json::from_str(text.trim_end())
+        .map_err(|e| WorkerError::Io(format!("unreadable answer from the broker: {e}")))?;
+    let (observed, got_spaces, got_root) = match ready {
+        FromBroker::Refused { reason } => return Err(WorkerError::Refused(reason)),
+        FromBroker::Ready {
+            v,
+            op: o,
+            spaces: s,
+            root: r,
+            observed,
+            ..
+        } if v == BROKER_PROTOCOL && o == op => (observed, s, r),
+        other => {
+            return Err(WorkerError::Io(format!(
+                "the broker answered with something else than Ready for this operation: {other:?}"
+            )))
+        }
+    };
+    let Some(fd) = fd else {
+        return Err(WorkerError::Io("Ready without a channel".into()));
+    };
+    // the broker's answer must be the operation that was asked for, nothing else
+    if got_spaces != spaces || std::path::Path::new(&got_root) != root {
+        return Err(WorkerError::Io(
+            "the broker bound the operation to another root or spaces".into(),
+        ));
+    }
+    let channel = UnixStream::from(fd);
+    let pid = observed.pid;
+    let mut stats = WorkerStats {
+        pid,
+        ..Default::default()
+    };
+    if let Some(o) = &cfg.observe_pid {
+        o.store(pid, Ordering::SeqCst);
+    }
+    let outcome = run_session(
+        cfg,
+        root,
+        op,
+        Some(&observed),
+        spaces,
+        ctx,
+        cancel,
+        channel,
+        begun,
+        pid,
+        &mut stats,
+    );
+    // tell the broker how it ended; it ends the worker and everything below it either way
+    let _ = send(&if outcome.is_ok() {
+        ToBroker::Done
+    } else {
+        ToBroker::Cancel
+    });
+    link.set_read_timeout(Some(cfg.exit_grace + Duration::from_secs(15)))
+        .map_err(|e| WorkerError::Io(e.to_string()))?;
+    let mut reader = BufReader::new(
+        link.try_clone()
+            .map_err(|e| WorkerError::Io(e.to_string()))?,
+    );
+    let mut line = Vec::new();
+    let fin = (&mut reader)
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .ok()
+        .filter(|n| *n > 0 && line.last() == Some(&b'\n'))
+        .and_then(|_| serde_json::from_slice::<FromBroker>(&line).ok());
+    stats.total = begun.elapsed();
+    let Some(FromBroker::Finished {
+        op: fop,
+        exit,
+        exited_by_itself,
+        descendants_killed,
+        peak_rss_kb,
+        cgroup_peak_bytes,
+        ..
+    }) = fin
+    else {
+        return Err(outcome.err().unwrap_or(WorkerError::Io(
+            "the broker did not report how the worker ended".into(),
+        )));
+    };
+    if fop != op {
+        return Err(WorkerError::Io(
+            "the broker's report is for another operation".into(),
+        ));
+    }
+    stats.exit = exit.clone();
+    stats.worker_peak_rss_kb = peak_rss_kb;
+    let report = BrokerReport {
+        observed,
+        exit: exit.clone(),
+        exited_by_itself,
+        descendants_killed,
+        peak_rss_kb,
+        cgroup_peak_bytes,
+    };
+    match outcome {
+        Ok(extracted) if exited_by_itself && exit == "exit code 0" => {
+            Ok((extracted, stats, report))
+        }
+        Ok(_) => Err(WorkerError::Died {
+            status: exit,
+            stderr: String::new(),
+        }),
+        Err(WorkerError::Stream(m)) if exited_by_itself => Err(WorkerError::Died {
+            status: format!("{exit} ({m})"),
+            stderr: String::new(),
+        }),
+        Err(e) => Err(e),
+    }
 }

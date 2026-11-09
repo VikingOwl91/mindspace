@@ -12,7 +12,7 @@ use crate::ingest::deadline::Deadline;
 use crate::ingest::stream::{stream_directory, FrameWriter, ProducerLimits, Record, RecordSink};
 
 use super::context::{validate_spaces, Collector, Context, KnownSet, Manifest, MAX_CONTEXT_LINE};
-use super::{Hello, Request, CHANNEL_FD, MAX_REQUEST, PROTOCOL, ROOT_FD};
+use super::{Hello, Request, CHANNEL_FD, CONTROL_FD, MAX_REQUEST, PROTOCOL, ROOT_FD};
 
 /// The application-layer label of the one root. The kernel rule is read-only; this only lets the
 /// anchored reads proceed (they ask for a "writable" mode because the in-process ingest needs one).
@@ -82,10 +82,31 @@ pub fn main() -> i32 {
         )
     };
     let mut channel = channel;
-    let sandbox = match crate::sandbox::enter_extraction_worker(&root, &[CHANNEL_FD, ROOT_FD]) {
+    // a broker passes a control descriptor; its absence means the in-frontend client started us
+    // SAFETY: F_GETFD only tests whether the number is open.
+    let control = (unsafe { libc::fcntl(CONTROL_FD, libc::F_GETFD) } != -1)
+        // SAFETY: the broker placed this descriptor before exec; nothing else of ours owns it.
+        .then(|| unsafe { UnixStream::from_raw_fd(CONTROL_FD) });
+    let keep: Vec<i32> = if control.is_some() {
+        vec![CHANNEL_FD, ROOT_FD, CONTROL_FD]
+    } else {
+        vec![CHANNEL_FD, ROOT_FD]
+    };
+    let sandbox = match crate::sandbox::enter_extraction_worker(&root, &keep) {
         Ok(s) => s,
         Err(e) => return fail(&format!("sandbox: {e}"), 78),
     };
+    // Confined. A broker observes this process from outside (/proc, cgroup) before it lets the
+    // frontend see a byte: report READY, then wait for GO. Anything else, or EOF, ends us.
+    if let Some(mut ctl) = control {
+        if ctl.write_all(b"READY\n").is_err() {
+            return fail("cannot report to the broker", 2);
+        }
+        let mut go = [0u8; 3];
+        if ctl.read_exact(&mut go).is_err() || &go != b"GO\n" {
+            return fail("the broker did not release the worker", 2);
+        }
+    }
     let hello = Hello {
         v: PROTOCOL,
         pid: std::process::id(),

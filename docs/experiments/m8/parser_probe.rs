@@ -31,6 +31,39 @@ fn main() {
             let sp = d.extract_spans(0).unwrap();
             sp.iter().take(6).map(|s| format!("{:?}@{:?}", s.text, s.bbox)).collect::<Vec<_>>().join(" | ") + &format!(" ... total {}", sp.len())
         }),
+        "scancheck" => run("scan heuristic", move || {
+            let d = lopdf::Document::load(&p).unwrap();
+            let mut out = String::new();
+            for (n, id) in d.get_pages() {
+                let imgs = d.get_page_images(id).map(|v| v.len()).unwrap_or(0);
+                let txt = d.extract_text(&[n]).unwrap_or_default();
+                out.push_str(&format!("page {n}: images={imgs} text_chars={} -> {}; ", txt.trim().len(), if imgs > 0 && txt.trim().is_empty() { "NO_TEXT_LAYER(image only)" } else { "has text" }));
+            }
+            out
+        }),
+        "enccheck" => run("encryption", move || {
+            let d = pdf_oxide::PdfDocument::open(&p).unwrap();
+            format!("pdf_oxide.is_encrypted={}", d.is_encrypted())
+        }),
+        "zipmeta" => run("zip meta", move || {
+            let f = std::fs::File::open(&p).unwrap();
+            let mut z = match zip::ZipArchive::new(f) { Ok(z) => z, Err(e) => return format!("ERR zip: {e}") };
+            let n = z.len();
+            let mut names = Vec::new();
+            for i in 0..n.min(5) { if let Ok(e) = z.by_index_raw(i) { names.push(format!("{:?}(enclosed={:?})", e.name(), e.enclosed_name().is_some())); } }
+            let by = z.by_name("word/document.xml").map(|mut e| { let mut s = String::new(); let _ = e.read_to_string(&mut s); s.chars().skip(s.find("<w:t>").unwrap_or(0)).take(30).collect::<String>() }).unwrap_or_else(|e| format!("ERR {e}"));
+            format!("entries={n} first={} by_name(word/document.xml)={}", names.join(","), by)
+        }),
+        "xmlopts" => run("roxmltree", move || {
+            let f = std::fs::File::open(&p).unwrap();
+            let mut z = zip::ZipArchive::new(f).unwrap();
+            let mut buf = String::new();
+            z.by_name("word/document.xml").unwrap().take(16<<20).read_to_string(&mut buf).unwrap();
+            let def = match roxmltree::Document::parse(&buf) { Ok(_) => "parsed".to_string(), Err(e) => format!("REFUSED: {e}") };
+            let mut o = roxmltree::ParsingOptions::default(); o.allow_dtd = true; o.nodes_limit = 100_000;
+            let dtd = match roxmltree::Document::parse_with_options(&buf, o) { Ok(d) => { let t: usize = d.descendants().filter_map(|n| n.text()).map(|t| t.len()).sum(); format!("parsed with DTD allowed; text bytes={t}") } Err(e) => format!("REFUSED: {e}") };
+            format!("default: {def} | allow_dtd+nodes_limit: {dtd}")
+        }),
         "docx" => run(&format!("zip+roxmltree {p}"), move || {
             let f = std::fs::File::open(&p).unwrap();
             let mut z = match zip::ZipArchive::new(f) { Ok(z) => z, Err(e) => return format!("ERR zip: {e}") };

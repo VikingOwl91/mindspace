@@ -184,7 +184,7 @@ pub fn broker_fd_from_env() -> Option<i32> {
     }
 }
 
-/// Forks the broker. Called in stage 1 AFTER the socket-deny filter (the broker inherits it) and
+/// Forks the watchdog, which owns the cgroup tree and forks the broker (M7.3b.3b). Called in stage 1 AFTER the socket-deny filter (the broker inherits it) and
 /// BEFORE `restrict_self`, so the broker is outside the frontend's Landlock domain. Returns the
 /// frontend's end of the channel, already without close-on-exec so that it survives the exec
 /// into stage 2. The broker never returns from here.
@@ -195,22 +195,46 @@ fn spawn_broker(
     use std::os::fd::AsRawFd;
     let (front, back) =
         std::os::unix::net::UnixStream::pair().map_err(|e| format!("broker channel: {e}"))?;
+    let frontend = std::process::id() as i32;
+    // Double fork: the watchdog must not be the frontend's child (nothing would ever reap it, and
+    // it would stay a zombie while the frontend lives). The intermediate child is the frontend's
+    // child, so the frontend is certainly alive while it takes a pidfd of it (no pid reuse), then
+    // it forks the watchdog and leaves; stage 1 reaps the intermediate right here.
     // SAFETY: fork in a single-threaded process (the seccomp installation verified one thread).
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
+    let mid = unsafe { libc::fork() };
+    if mid < 0 {
         return Err(format!(
             "cannot fork the broker: {}",
             std::io::Error::last_os_error()
         ));
     }
-    if pid == 0 {
+    if mid == 0 {
         drop(front);
-        crate::worker::broker::process_main(
-            back,
-            plan.exe.clone(),
-            plan.roots.iter().map(|(p, _)| p.clone()).collect(),
-            req.grants.clone(),
-        );
+        // SAFETY: pidfd_open/fork/_exit in the intermediate child.
+        unsafe {
+            let pidfd = libc::syscall(libc::SYS_pidfd_open, frontend, 0) as i32;
+            if pidfd < 0 {
+                libc::_exit(70);
+            }
+            let wd = libc::fork();
+            if wd == 0 {
+                crate::worker::broker::watchdog_main(
+                    back,
+                    frontend,
+                    pidfd,
+                    plan.exe.clone(),
+                    plan.roots.iter().map(|(p, _)| p.clone()).collect(),
+                    req.grants.clone(),
+                );
+            }
+            libc::_exit(if wd < 0 { 70 } else { 0 });
+        }
+    }
+    let mut status = 0;
+    // SAFETY: reaping the intermediate child we just created.
+    unsafe { libc::waitpid(mid, &mut status, 0) };
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err("cannot start the watchdog".into());
     }
     drop(back);
     // SAFETY: clearing close-on-exec on our own descriptor.
@@ -848,6 +872,15 @@ pub fn enter_with_broker(
         Some(Err(e)) => return Outcome::Unavailable(format!("broker: {e}")),
         None => None,
     };
+    // Test builds only (feature `spawn-gate`): fail right after the fork, as `restrict_self` or the
+    // exec could, to observe that the watchdog and broker do not outlive a failed start.
+    #[cfg(feature = "spawn-gate")]
+    if broker_link.is_some() && std::env::var_os("MINDSPACE_BROKER_GATE_FAIL_AFTER_FORK").is_some()
+    {
+        // stay alive briefly so a test can observe the watchdog, broker and tree first
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        die("test-only failure after the broker fork");
+    }
     // From here on the process is confined (or the call failed before that).
     let status = match ruleset.restrict_self() {
         Ok(s) => s,

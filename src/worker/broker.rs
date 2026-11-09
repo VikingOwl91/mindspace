@@ -159,19 +159,26 @@ impl RootAuthority for CombinedAuthority {
 
 // ------------------------------------------------------------------ the broker process (stage 1)
 
-/// Body of the broker process forked by `sandbox::enter_with_broker`: outside the frontend's
-/// Landlock domain, under the inherited socket-deny filter, with exactly one descriptor (the
+/// Body of the broker process forked by the watchdog: outside the frontend's Landlock domain, under the inherited socket-deny filter, with exactly one descriptor (the
 /// channel to the frontend). It serves that one connection and exits when the frontend closes it
 /// (which includes the frontend dying), after ending every operation it had running.
-pub fn process_main(
+fn process_main(
     link: UnixStream,
     exe: PathBuf,
     static_roots: Vec<PathBuf>,
     grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+    scope: &CgroupScope,
+    watchdog: i32,
 ) -> ! {
-    // SAFETY: plain prctl/open/dup2 calls on this process. Not dumpable: the frontend is this
-    // process's parent and must not be able to ptrace it or read its memory.
+    ScopeHandle::adopt(scope);
+    // SAFETY: plain prctl/open/dup2 calls on this process. Not dumpable: the frontend is an
+    // ancestor and must not be able to ptrace it or read its memory. It dies with the watchdog
+    // (a broker without its supervisor must not keep serving).
     unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+        if libc::getppid() != watchdog {
+            libc::_exit(72);
+        }
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         // the broker must not keep the client's stdin/stdout pipes open (stderr stays: diagnostics)
@@ -222,6 +229,15 @@ fn run_process(
             cfg.args = vec![script.into()];
             cfg.verify_confinement = false;
         }
+        if let Some(m) = std::env::var("MINDSPACE_BROKER_GATE_MEMORY_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            cfg.cleanup = CleanupPolicy::Cgroup {
+                memory_max: Some(m),
+                pids_max: Some(256),
+            };
+        }
         if let Some(ms) = std::env::var("MINDSPACE_BROKER_GATE_WALL_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -235,6 +251,165 @@ fn run_process(
     };
     broker.serve(link);
     0
+}
+
+/// Whether the broker is configured with a per-operation limit that needs cgroup controllers. The
+/// product configures none yet; the test hook is the only source.
+fn limits_requested() -> bool {
+    #[cfg(feature = "spawn-gate")]
+    if std::env::var_os("MINDSPACE_BROKER_GATE_MEMORY_MAX").is_some() {
+        return true;
+    }
+    false
+}
+
+/// The watchdog (M7.3b.3b): forked by stage 1 outside the frontend's Landlock domain, it is the
+/// broker's PARENT and the owner of the cgroup tree. It exists because nothing inside the
+/// broker's own failure domain can clean up after the broker's SIGKILL, and because the
+/// frontend, being confined, cannot touch cgroups.
+///
+/// It holds no IPC and parses nothing: it creates the tree, forks the broker into it, and waits
+/// on two process handles (`pidfd`): the broker and the frontend. When the broker ends (for any
+/// reason) it kills every operation cgroup, reaps what was orphaned to it (it is a subreaper, so
+/// escaped descendants and the workers reach it instead of an unknown init), waits until the
+/// cgroups are empty, removes the tree and exits. When the frontend ends first it gives the
+/// broker a few seconds to end its operations by itself, then kills it and does the same.
+/// Cleanup therefore never depends on a future broker start.
+///
+/// Not covered (a double fault): the watchdog itself being killed. The broker then dies with it
+/// (PDEATHSIG) and its workers with the broker, but an escaped descendant survives until the next
+/// start sweeps the tree.
+pub fn watchdog_main(
+    back: UnixStream,
+    frontend: i32,
+    frontend_pidfd: i32,
+    exe: PathBuf,
+    static_roots: Vec<PathBuf>,
+    grants: Option<(PathBuf, crate::grants::PathPolicy)>,
+) -> ! {
+    let fail = |m: String, c: i32| -> ! {
+        eprintln!("mind broker: {m}");
+        // SAFETY: leave without running the parent's atexit handlers.
+        unsafe { libc::_exit(c) }
+    };
+    // SAFETY: plain prctl/open/dup2 calls on this process.
+    unsafe {
+        // findable and identifiable in `ps`: the frontend's pid is part of the name (15 bytes max)
+        let name = std::ffi::CString::new(format!("mind-wd-{frontend}")).unwrap_or_default();
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0);
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null >= 0 {
+            libc::dup2(null, 0);
+            libc::dup2(null, 1);
+            if null > 2 {
+                libc::close(null);
+            }
+        }
+    }
+    crate::sandbox::close_all_except(&[back.as_raw_fd(), frontend_pidfd]);
+    // Required facility: without a cgroup tree there is no broker (the frontend sees the channel
+    // close and every dynamic operation fails explicitly).
+    let scope = match CgroupScope::create(limits_requested()) {
+        Ok(s) => s,
+        Err(e) => fail(format!("cannot start (no cgroup delegation?): {e}"), 71),
+    };
+    let broker = unsafe { libc::fork() };
+    if broker < 0 {
+        scope.teardown();
+        fail("cannot fork the broker".into(), 70);
+    }
+    if broker == 0 {
+        process_main(back, exe, static_roots, grants, &scope, unsafe {
+            libc::getppid()
+        });
+    }
+    drop(back); // the broker holds the only copy; the watchdog has no channel at all
+    let pidfd = |pid: i32| -> i32 {
+        // SAFETY: pidfd_open on a pid we just obtained; the descriptor is closed with the process.
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+    };
+    let bfd = pidfd(broker);
+    let ffd = frontend_pidfd;
+    let poll = |fds: &mut [libc::pollfd], ms: i32| {
+        // SAFETY: poll over descriptors owned by this process.
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) }
+    };
+    if bfd < 0 {
+        scope.teardown();
+        fail(
+            "pidfd_open is unavailable (kernel older than 5.3?)".into(),
+            71,
+        );
+    }
+    // Either the broker ends or the frontend does (a pidfd becomes readable when its process
+    // exits, also if that already happened).
+    let mut fds = [
+        libc::pollfd {
+            fd: bfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: ffd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let r = poll(&mut fds, -1);
+        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    if fds[0].revents == 0 {
+        // the frontend ended first: the broker gets time to end its operations itself
+        let mut b = [libc::pollfd {
+            fd: bfd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        poll(&mut b, 3000);
+    }
+    // The broker is gone or is made gone now; either way its operations end.
+    // SAFETY: SIGKILL to our own child (a no-op if it already ended).
+    unsafe { libc::kill(broker, libc::SIGKILL) };
+    let mut st = 0;
+    unsafe { libc::waitpid(broker, &mut st, 0) };
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut left = 0;
+        if let Ok(rd) = std::fs::read_dir(&scope.base) {
+            for e in rd.flatten() {
+                if !e.file_name().to_string_lossy().starts_with("op-") || !e.path().is_dir() {
+                    continue;
+                }
+                let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
+                // reap what was orphaned to us (subreaper): zombies keep a cgroup populated
+                loop {
+                    let mut s = 0;
+                    // SAFETY: reaping our own (adopted) children only.
+                    let r = unsafe { libc::waitpid(-1, &mut s, libc::WNOHANG) };
+                    if r <= 0 {
+                        break;
+                    }
+                }
+                if std::fs::remove_dir(e.path()).is_err() {
+                    left += 1;
+                }
+            }
+        }
+        if left == 0 || Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    scope.teardown();
+    // SAFETY: leave without running the parent's atexit handlers.
+    unsafe { libc::_exit(0) }
 }
 
 /// Stage 2 (the frontend): the channel to the broker, once. `None` when the server was not
@@ -412,6 +587,9 @@ pub fn recv_with_fd(sock: &UnixStream) -> std::io::Result<(Vec<u8>, Option<Owned
 pub struct CgroupScope {
     base: PathBuf,
     original: PathBuf,
+    /// Only the owner (the watchdog in the product, the creating process in library use) removes
+    /// the tree. A broker that was handed the scope by its watchdog only uses it.
+    owner: bool,
     /// Controllers available for the operations (`memory`, `pids`).
     pub controllers: Vec<String>,
 }
@@ -448,10 +626,26 @@ impl ScopeHandle {
             st.refs += 1;
             return Ok(Self(s));
         }
-        let s = Arc::new(CgroupScope::create()?);
+        let s = Arc::new(CgroupScope::create(true)?);
         st.scope = Some(s.clone());
         st.refs = 1;
         Ok(Self(s))
+    }
+}
+
+impl ScopeHandle {
+    /// In the broker process forked by the watchdog: use the watchdog's scope without owning it.
+    /// The count never reaches zero in this process, so nothing here ever tears it down.
+    fn adopt(scope: &CgroupScope) {
+        if let Ok(mut st) = SCOPE.lock() {
+            st.scope = Some(Arc::new(CgroupScope {
+                base: scope.base.clone(),
+                original: scope.original.clone(),
+                owner: false,
+                controllers: scope.controllers.clone(),
+            }));
+            st.refs = 1;
+        }
     }
 }
 
@@ -492,12 +686,15 @@ fn write_file(path: &Path, text: &str) -> Result<(), String> {
 }
 
 impl CgroupScope {
-    /// Tries the broker's own cgroup as the parent first. A cgroup that holds processes cannot
-    /// delegate controllers, so when that yields none (typical for a terminal's scope) the parent's
-    /// directory is tried, where the broker's tree sits beside its original cgroup. If neither
-    /// has controllers the scope still gives `cgroup.kill`; limits that need a controller are then
-    /// refused per operation.
-    fn create() -> Result<Self, String> {
+    /// Where the tree goes. Containment first: INSIDE the cgroup the process started in, so that a
+    /// service manager that kills the unit's cgroup (`KillMode=control-group`, the default) also
+    /// ends the tree, even when the watchdog itself was killed (VERIFIED with `systemd-run
+    /// --user`). A cgroup that holds processes cannot delegate controllers, so that placement has
+    /// none: per-operation `memory.max`/`pids.max` are then unavailable and refused, never
+    /// skipped. When `need_controllers` (a limit is configured) the tree goes beside the original
+    /// cgroup, where the parent can delegate them, at the price of leaving the unit.
+    /// With no usable parent at all this fails and no broker is started.
+    fn create(need_controllers: bool) -> Result<Self, String> {
         let original = own_cgroup()?;
         if !original.join("cgroup.kill").exists() {
             return Err("cgroup.kill is not available (kernel older than 5.14?)".into());
@@ -512,7 +709,12 @@ impl CgroupScope {
         // to, to observe the real kernel refusal and the fail-closed start.
         #[cfg(feature = "spawn-gate")]
         if let Ok(p) = std::env::var("MINDSPACE_BROKER_GATE_CGROUP_PARENT") {
-            candidates = vec![PathBuf::from(p)];
+            // `own`: only inside the cgroup this process started in (e.g. a delegated unit)
+            candidates = if p == "own" {
+                vec![original.clone()]
+            } else {
+                vec![PathBuf::from(p)]
+            };
         }
         // Strictly one at a time: the process lives in at most one `supervisor`. A candidate
         // without controllers is torn down (the process goes home) before the next is tried;
@@ -521,7 +723,7 @@ impl CgroupScope {
         let mut first_ok: Option<PathBuf> = None;
         for parent in &candidates {
             match Self::create_in(parent, &original) {
-                Ok(s) if !s.controllers.is_empty() => return Ok(s),
+                Ok(s) if !need_controllers || !s.controllers.is_empty() => return Ok(s),
                 Ok(s) => {
                     s.teardown();
                     first_ok.get_or_insert_with(|| parent.clone());
@@ -617,6 +819,7 @@ impl CgroupScope {
         Ok(Self {
             base,
             original: original.to_path_buf(),
+            owner: true,
             controllers,
         })
     }
@@ -629,6 +832,9 @@ impl CgroupScope {
 impl CgroupScope {
     /// Leaves and removes the tree. The caller holds the `SCOPE` lock (or is `create`, which does).
     fn teardown(&self) {
+        if !self.owner {
+            return;
+        }
         // Leave first. If the process cannot be moved back it is still inside `supervisor`, and
         // nothing below may be touched (killing or removing it would kill this process).
         if write_file(

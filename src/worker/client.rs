@@ -682,9 +682,11 @@ pub fn extract_via_broker(
     let send = |m: &ToBroker| -> Result<(), WorkerError> {
         let mut b = serde_json::to_vec(m).map_err(|e| WorkerError::Io(e.to_string()))?;
         b.push(b'\n');
-        (&*link)
-            .write_all(&b)
-            .map_err(|e| WorkerError::Io(format!("the broker link: {e}")))
+        (&*link).write_all(&b).map_err(|e| {
+            WorkerError::Refused(format!(
+                "the broker is not available (it never started or has exited): {e}"
+            ))
+        })
     };
     send(&ToBroker::Begin {
         v: BROKER_PROTOCOL,
@@ -697,6 +699,13 @@ pub fn extract_via_broker(
         .map_err(|e| WorkerError::Io(e.to_string()))?;
     let (bytes, fd) =
         recv_with_fd(link).map_err(|e| WorkerError::Io(format!("the broker: {e}")))?;
+    if bytes.is_empty() {
+        // end of file: the broker (or its watchdog) is gone. Explicit, never a silent fallback to
+        // an in-process or unconfined extraction.
+        return Err(WorkerError::Refused(
+            "the broker is not available (it never started or has exited)".into(),
+        ));
+    }
     let text = String::from_utf8_lossy(&bytes);
     let ready: FromBroker = serde_json::from_str(text.trim_end())
         .map_err(|e| WorkerError::Io(format!("unreadable answer from the broker: {e}")))?;

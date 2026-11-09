@@ -207,13 +207,6 @@ pub fn run_broker_gate(store: &dyn Store, config: &McpConfig) -> Result<()> {
         println!("{}", json!({"fatal": "no broker channel"}));
         return Ok(());
     };
-    // SO_PEERCRED on a socketpair names whoever created it (stage 1 = this very pid), not the
-    // forked broker, so the broker is found as this process's only child.
-    let peer_pid: i32 =
-        std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", std::process::id()))
-            .ok()
-            .and_then(|t| t.split_whitespace().next().and_then(|p| p.parse().ok()))
-            .unwrap_or(0);
     let space = store.get_space("p")?.id;
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -224,7 +217,6 @@ pub fn run_broker_gate(store: &dyn Store, config: &McpConfig) -> Result<()> {
                 "pid": std::process::id(),
                 "sandbox": config.sandbox().label(),
                 "seccomp_mode": status("Seccomp:"),
-                "broker_pid": peer_pid,
                 "broker_fd_cloexec": fd_cloexec,
             }),
             "probe" => json!({
@@ -232,6 +224,7 @@ pub fn run_broker_gate(store: &dyn Store, config: &McpConfig) -> Result<()> {
                 "read_file": probe(std::fs::read(std::path::Path::new(arg).join("a.md"))),
             }),
             "broker" => {
+                let peer_pid: i32 = arg.trim().parse().unwrap_or(0);
                 // SAFETY: a null-signal probe and a ptrace attach attempt on the broker's pid.
                 let sig = unsafe { libc::kill(peer_pid, 0) };
                 let sig_errno = if sig == 0 {

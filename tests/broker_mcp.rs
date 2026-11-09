@@ -106,17 +106,31 @@ impl World {
     }
 }
 
+/// Any broker start sweeps the trees of dead watchdogs (by design), which would end the leak that
+/// the watchdog-SIGKILL test must observe. Every frontend holds the read side for its life; that
+/// test takes the write side, so no other frontend starts while it observes.
+static SWEEP: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 struct Fe {
+    _guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
     child: Child,
     stdin: Option<ChildStdin>,
     out: BufReader<ChildStdout>,
     broker_pid: i32,
+    watchdog_pid: i32,
     pid: u32,
 }
 
 impl Fe {
     /// `vars`: extra environment for the frontend (inherited by the broker forked in stage 1).
     fn start(w: &World, static_root: &Path, vars: &[(&str, String)]) -> Option<Fe> {
+        let guard = SWEEP.read().unwrap_or_else(|e| e.into_inner());
+        let mut fe = Self::start_unlocked(w, static_root, vars)?;
+        fe._guard = Some(guard);
+        Some(fe)
+    }
+
+    fn start_unlocked(w: &World, static_root: &Path, vars: &[(&str, String)]) -> Option<Fe> {
         let mut c = w.mind(&["mcp", "--allow-root"]);
         c.arg(static_root)
             .args(["--grants", "--broker"])
@@ -132,18 +146,36 @@ impl Fe {
         let out = BufReader::new(child.stdout.take().unwrap());
         let pid = child.id();
         let mut fe = Fe {
+            _guard: None,
             child,
             stdin,
             out,
             broker_pid: 0,
+            watchdog_pid: 0,
             pid,
         };
         let me = fe.cmd("self");
-        if me.get("fatal").is_some() || me["broker_pid"].as_i64().unwrap_or(0) == 0 {
-            eprintln!("SKIPPED: the broker did not start: {me}");
+        // the broker is the watchdog's child; the (unconfined) test can look, the frontend cannot
+        let wd = find_watchdog(pid).unwrap_or(0);
+        let end = Instant::now() + Duration::from_secs(3);
+        let broker = loop {
+            if let Some(b) = children_of(wd).first() {
+                break *b as i64;
+            }
+            if Instant::now() >= end {
+                break 0;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut me = me;
+        me["broker_pid"] = broker.into();
+        if me.get("fatal").is_some() || broker == 0 {
+            let err = std::fs::read_to_string(w.root.join("fe.stderr")).unwrap_or_default();
+            eprintln!("SKIPPED: the broker did not start: {me} / stderr: {err}");
             return None;
         }
         fe.broker_pid = me["broker_pid"].as_i64().unwrap() as i32;
+        fe.watchdog_pid = wd;
         // the broker must be alive (it exits at once if cgroups are unavailable)
         std::thread::sleep(Duration::from_millis(300));
         if !alive(fe.broker_pid as u32) {
@@ -252,6 +284,28 @@ fn cg_dir(line: &str) -> PathBuf {
             .trim_start_matches("0::")
             .trim_start_matches('/'),
     )
+}
+
+/// The watchdog names itself `mind-wd-<frontend pid>`; it is not the frontend's child (double
+/// fork), so it is found through `/proc` by that name.
+fn find_watchdog(frontend: u32) -> Option<i32> {
+    let want = format!("mind-wd-{frontend}");
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for e in rd.flatten() {
+                if let Ok(c) = std::fs::read_to_string(e.path().join("comm")) {
+                    if c.trim() == want {
+                        return e.file_name().to_string_lossy().parse().ok();
+                    }
+                }
+            }
+        }
+        if Instant::now() >= end {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn children_of(pid: i32) -> Vec<u32> {
@@ -385,7 +439,10 @@ fn the_worker_cannot_read_the_database_or_grant_store_and_the_frontend_cannot_to
     let p = fe.cmd(&format!("probe {}", w.state.join("mindspace").display()));
     assert_eq!(p["read_dir"], "EACCES", "{p}");
     // 11. the broker as the frontend sees it: no ptrace, no memory, no environment
-    let b = fe.cmd("broker");
+    let b = {
+        let bp = fe.broker_pid;
+        fe.cmd(&format!("broker {bp}"))
+    };
     eprintln!("broker as seen from the frontend: {b}");
     assert_ne!(b["ptrace_errno"], 0, "{b}");
     assert_ne!(b["broker_pid"].as_i64().unwrap(), fe.pid as i64, "{b}");
@@ -646,86 +703,456 @@ fn cleanup_after_normal_exit_frontend_crash_and_broker_crash() {
             tree.display()
         );
     }
-    // --- broker crash during an operation: SIGKILL. The worker dies with it (PDEATHSIG); an
-    //     escaped descendant is NOT ended by anything until the next broker start sweeps the dead
-    //     broker's cgroup tree. This is the documented limitation.
-    {
-        let pf = desc("d2.pid");
-        let mut fe = fe!(
-            w,
-            project,
-            &[
-                ("MINDSPACE_BROKER_GATE_WORKER", script(&w, "w2.sh", &pf)),
-                // the escaped descendant holds the worker channel open, so the frontend only
-                // notices through its own wall clock: that is the bound that applies here
-                ("GATE_WALL_MS", "6000".into()),
-                ("MINDSPACE_BROKER_GATE_WALL_MS", "60000".into()),
-                ("GATE_NO_EVIDENCE", "1".into()),
-            ]
-        );
-        fe.send(&format!("extract {}", project.display()));
-        let d = wait_pidfile(&pf);
-        let worker = children_of(fe.broker_pid)[0];
-        unsafe { libc::kill(fe.broker_pid, libc::SIGKILL) };
-        let r = fe.read();
-        assert_eq!(
-            r["ok"], false,
-            "the frontend gets an error, not a hang: {r}"
-        );
-        assert!(alive(fe.pid), "the frontend survives its broker");
-        assert!(gone(worker), "the worker follows the broker (PDEATHSIG)");
-        let leaked = alive(d);
-        eprintln!("broker crash: escaped descendant {d} alive after the broker died: {leaked}");
-        fe.finish();
-        // the next broker start sweeps the dead broker's tree and kills what is left
-        let fe2 = fe!(w, project, &[]);
-        assert!(
-            gone(d),
-            "the sweep at the next broker start did not end the descendant {d}"
-        );
-        let left = mindspace_cgroups();
-        eprintln!("mindspace cgroup trees after the sweep: {left:?}");
-        fe2.finish();
-    }
+}
+
+// ------------------------------------------------------------------ M7.3b.3b: crash containment
+
+/// `R`/`S`/`D`... for a live process, `Z` for a zombie (exited, not reaped), `-` when gone.
+fn pstate(pid: u32) -> char {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit_once(") ").and_then(|(_, r)| r.chars().next()))
+        .unwrap_or('-')
+}
+
+fn ppid(pid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .map(|(_, r)| r.split(' ').nth(1).unwrap_or("0").parse().unwrap_or(0))
+        })
+        .unwrap_or(0)
 }
 
 #[test]
-fn without_cgroup_delegation_the_broker_fails_closed_and_the_frontend_keeps_running() {
+fn reproduce_broker_sigkill_timeline() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
-    // test-only override: a parent the user cannot write to (the cgroup root); the real kernel
-    // answers EACCES, exactly as on a system service without delegation
+    let pf = w.root.join("desc.pid");
+    let script = standin(
+        &w,
+        "w.sh",
+        &format!(
+            "#!/bin/sh\nprintf 'READY\\n' >&5\nread go <&5\nsetsid sh -c 'echo $$ > {}; exec sleep 600' &\nsleep 600\n",
+            pf.display()
+        ),
+    );
+    let mut fe = fe!(
+        w,
+        project,
+        &[
+            ("MINDSPACE_BROKER_GATE_WORKER", script),
+            ("GATE_WALL_MS", "20000".into()),
+            ("MINDSPACE_BROKER_GATE_WALL_MS", "60000".into()),
+            ("GATE_NO_EVIDENCE", "1".into()),
+        ]
+    );
+    fe.send(&format!("extract {}", project.display()));
+    let d = wait_pidfile(&pf);
+    let worker = children_of(fe.broker_pid)[0];
+    let broker = fe.broker_pid as u32;
+    let op_cg = cg_dir(&cgroup_of(worker));
+    let tree = cg_dir(&cgroup_of(broker)).parent().unwrap().to_path_buf();
+    eprintln!(
+        "BEFORE: broker {broker} cgroup {} | worker {worker} cgroup {} | descendant {d} cgroup {}",
+        cgroup_of(broker),
+        cgroup_of(worker),
+        cgroup_of(d)
+    );
+    let t0 = Instant::now();
+    unsafe { libc::kill(broker as i32, libc::SIGKILL) };
+    for ms in [0u64, 5, 20, 50, 100, 250, 500, 1000, 3000, 8000] {
+        let target = Duration::from_millis(ms);
+        if let Some(rest) = target.checked_sub(t0.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        let procs = std::fs::read_to_string(op_cg.join("cgroup.procs"))
+            .map(|s| s.split_whitespace().count().to_string())
+            .unwrap_or_else(|_| "dir-gone".into());
+        eprintln!(
+            "t+{:>5}ms broker:{} worker:{} (ppid {}) descendant:{} (ppid {}, cgroup {}) | op-cgroup procs={procs} tree-dir-exists={}",
+            t0.elapsed().as_millis(), pstate(broker), pstate(worker), ppid(worker), pstate(d), ppid(d),
+            cgroup_of(d).rsplit('/').next().unwrap_or(""), tree.exists()
+        );
+    }
+    let r = fe.read();
+    eprintln!("frontend result after {}ms: {r}", t0.elapsed().as_millis());
+    eprintln!(
+        "AFTER frontend noticed: descendant {} cgroup {}",
+        pstate(d),
+        cgroup_of(d)
+    );
+    unsafe { libc::kill(d as i32, libc::SIGKILL) };
+    fe.finish();
+}
+
+/// Polls until every pid is reaped (gone from /proc, not merely a zombie) and the cgroup tree
+/// directory is removed. Returns how long that took, `None` past `limit`.
+fn settle(pids: &[u32], tree: &Path, limit: Duration) -> Option<Duration> {
+    let t = Instant::now();
+    loop {
+        if pids.iter().all(|p| pstate(*p) == '-') && !tree.exists() {
+            return Some(t.elapsed());
+        }
+        if t.elapsed() > limit {
+            return None;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
+fn hostile_worker(w: &World, name: &str, pidfile: &Path) -> String {
+    standin(
+        w,
+        name,
+        &format!(
+            "#!/bin/sh\nprintf 'READY\\n' >&5\nread go <&5\nsetsid sh -c 'echo $$ > {}; exec sleep 600' &\nsleep 600\n",
+            pidfile.display()
+        ),
+    )
+}
+
+/// A frontend with a running operation whose worker has an escaped (setsid) descendant.
+struct Busy {
+    w: World,
+    fe: Fe,
+    worker: u32,
+    descendant: u32,
+    tree: PathBuf,
+}
+
+fn busy(frontend_wall_ms: &str) -> Option<Busy> {
+    busy_with(frontend_wall_ms, true)
+}
+
+fn busy_with(frontend_wall_ms: &str, locked: bool) -> Option<Busy> {
+    let w = World::new();
+    let project = w.dir("project", &[("a.md", "# A\n")]);
+    let pf = w.root.join("desc.pid");
+    let script = hostile_worker(&w, "w.sh", &pf);
+    let start = if locked {
+        Fe::start
+    } else {
+        Fe::start_unlocked
+    };
+    let mut fe = start(
+        &w,
+        &project,
+        &[
+            ("MINDSPACE_BROKER_GATE_WORKER", script),
+            ("GATE_WALL_MS", frontend_wall_ms.into()),
+            ("MINDSPACE_BROKER_GATE_WALL_MS", "120000".into()),
+            ("GATE_NO_EVIDENCE", "1".into()),
+        ],
+    )?;
+    fe.send(&format!("extract {}", project.display()));
+    let descendant = wait_pidfile(&pf);
+    let worker = children_of(fe.broker_pid)[0];
+    let tree = cg_dir(&cgroup_of(fe.broker_pid as u32))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    Some(Busy {
+        w,
+        fe,
+        worker,
+        descendant,
+        tree,
+    })
+}
+
+#[test]
+fn broker_sigkill_leaves_nothing_running_and_needs_no_restart() {
+    let mut lat = vec![];
+    for i in 0..5 {
+        let Some(mut b) = busy("20000") else { return };
+        let (wd, br) = (b.fe.watchdog_pid as u32, b.fe.broker_pid as u32);
+        let t = Instant::now();
+        unsafe { libc::kill(br as i32, libc::SIGKILL) };
+        let took = settle(&[br, b.worker, b.descendant], &b.tree, Duration::from_secs(5))
+            .unwrap_or_else(|| panic!("run {i}: processes or cgroup tree left behind (broker {br}, worker {}, descendant {})", b.worker, b.descendant));
+        // the frontend is told promptly, without waiting for its own wall clock
+        let r = b.fe.read();
+        let noticed = t.elapsed();
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(noticed < Duration::from_secs(5), "{noticed:?}");
+        // the watchdog has finished too (nothing left of the failure domain)
+        assert!(gone(wd), "the watchdog did not exit");
+        assert!(alive(b.fe.pid), "the frontend survives");
+        eprintln!(
+            "run {i}: all gone + tree removed after {took:?}; frontend told after {noticed:?}"
+        );
+        lat.push(took);
+        b.fe.finish();
+    }
+    eprintln!(
+        "broker SIGKILL cleanup latency: min {:?} max {:?}",
+        lat.iter().min().unwrap(),
+        lat.iter().max().unwrap()
+    );
+}
+
+#[test]
+fn frontend_sigkill_leaves_nothing_running() {
+    let Some(mut b) = busy("120000") else { return };
+    let (wd, br) = (b.fe.watchdog_pid as u32, b.fe.broker_pid as u32);
+    let t = Instant::now();
+    unsafe { libc::kill(b.fe.pid as i32, libc::SIGKILL) };
+    let took = settle(
+        &[wd, br, b.worker, b.descendant],
+        &b.tree,
+        Duration::from_secs(10),
+    )
+    .expect("processes or cgroup tree left behind");
+    eprintln!("frontend SIGKILL: watchdog, broker, worker, descendant gone + tree removed after {took:?} (since kill {:?})", t.elapsed());
+    let _ = b.fe.child.wait();
+}
+
+#[test]
+fn watchdog_sigkill_is_a_double_fault_with_a_bounded_leak_that_the_next_start_sweeps() {
+    let _exclusive = SWEEP.write().unwrap_or_else(|e| e.into_inner());
+    let Some(mut b) = busy_with("6000", false) else {
+        return;
+    };
+    let (wd, br) = (b.fe.watchdog_pid as u32, b.fe.broker_pid as u32);
+    unsafe { libc::kill(wd as i32, libc::SIGKILL) };
+    // the broker follows its supervisor (PDEATHSIG) and the worker follows the broker
+    assert!(
+        gone(br) && gone(b.worker),
+        "broker/worker must follow the watchdog"
+    );
+    let leaked = alive(b.descendant);
+    eprintln!(
+        "watchdog SIGKILL: escaped descendant {} alive: {leaked}; tree exists: {}",
+        b.descendant,
+        b.tree.exists()
+    );
+    assert!(
+        leaked,
+        "this documents the double-fault leak; if it no longer leaks, update the docs"
+    );
+    let r = b.fe.read();
+    assert_eq!(r["ok"], false, "{r}");
+    let (w, project) = (&b.w, b.w.root.join("project"));
+    b.fe.finish();
+    // the next start (a restart of the server) sweeps the dead tree and kills the leftover
+    let _fe2 = match Fe::start_unlocked(w, &project, &[]) {
+        Some(f) => f,
+        None => return,
+    };
+    assert!(gone(b.descendant), "the sweep did not end the descendant");
+    assert!(!b.tree.exists(), "the dead watchdog's tree was not swept");
+    eprintln!(
+        "trees present after the sweep (only the new broker's own): {:?}",
+        mindspace_cgroups()
+    );
+}
+
+#[test]
+fn an_aggregate_memory_limit_holds_in_the_watchdog_owned_scope() {
+    let w = World::new();
+    let project = w.dir("project", &[("a.md", "# A\n"), ("z.rs", &slow_source())]);
+    let mut fe = fe!(
+        w,
+        project,
+        &[
+            (
+                "MINDSPACE_BROKER_GATE_MEMORY_MAX",
+                (64u64 << 20).to_string()
+            ),
+            ("GATE_WALL_MS", "60000".into()),
+        ]
+    );
+    let before = w.rows();
+    let r = fe.extract(&project);
+    assert_eq!(
+        r["ok"], false,
+        "the slow parse needs far more than 64 MiB: {r}"
+    );
+    assert_eq!(w.rows(), before);
+    let worker = r["worker_pid"].as_u64().unwrap() as u32;
+    assert!(gone(worker));
+    assert!(
+        alive(fe.broker_pid as u32) && alive(fe.watchdog_pid as u32),
+        "broker and watchdog survive an OOM kill"
+    );
+    // a small tree fits and reports its cgroup peak
+    let small = w.dir("small", &[("a.md", "# S\n")]);
+    w.ok(&["grant", "add", small.to_str().unwrap(), "--yes"]);
+    let r = fe.extract(&small);
+    assert_eq!(r["ok"], true, "{r}");
+    let peak = r["cgroup_peak_bytes"]
+        .as_u64()
+        .expect("memory controller present in this scope");
+    assert!(peak > 0 && peak <= 64 << 20, "{peak}");
+    eprintln!("memory.max 64 MiB enforced; small operation peak {peak} bytes");
+    fe.finish();
+}
+
+#[test]
+fn a_start_that_fails_after_the_fork_leaves_no_watchdog_broker_or_tree() {
+    let _exclusive = SWEEP.write().unwrap_or_else(|e| e.into_inner());
+    let w = World::new();
+    let project = w.dir("project", &[("a.md", "# A\n")]);
+    let before: Vec<PathBuf> = mindspace_cgroups();
     let mut c = w.mind(&["mcp", "--allow-root"]);
     c.arg(&project)
         .args(["--grants", "--broker"])
         .env("MINDSPACE_BROKER_GATE", "1")
-        .env("MINDSPACE_BROKER_GATE_CGROUP_PARENT", "/sys/fs/cgroup")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(std::fs::File::create(w.root.join("fe.stderr")).unwrap());
+        .env("MINDSPACE_BROKER_GATE_FAIL_AFTER_FORK", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child = c.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
-    let mut ask = |l: &str| -> Value {
-        writeln!(stdin, "{l}").unwrap();
-        let mut s = String::new();
-        out.read_line(&mut s).unwrap();
-        serde_json::from_str(s.trim()).unwrap_or_else(|_| panic!("no answer: `{s}`"))
+    let pid = child.id();
+    // phase 1: while stage 1 is held after the fork, the watchdog, its broker and the tree exist
+    let wd = find_watchdog(pid).expect("the watchdog never appeared");
+    let end = Instant::now() + Duration::from_secs(3);
+    let broker = loop {
+        if let Some(b) = children_of(wd).first() {
+            break *b;
+        }
+        assert!(Instant::now() < end, "no broker below the watchdog");
+        std::thread::sleep(Duration::from_millis(2));
     };
-    let before = w.rows();
-    let r = ask(&format!("extract {}", project.display()));
-    assert_eq!(r["ok"], false, "{r}");
-    assert_eq!(r["worker_pid"], 0, "no worker may be started: {r}");
-    assert_eq!(w.rows(), before);
-    // the frontend itself is unaffected
-    let me = ask("self");
-    assert!(me["sandbox"].as_str().unwrap().contains("enforced"), "{me}");
-    let err = std::fs::read_to_string(w.root.join("fe.stderr")).unwrap();
-    assert!(err.contains("no cgroup delegation"), "{err}");
-    eprintln!(
-        "fail-closed diagnostic: {}",
-        err.lines().find(|l| l.contains("broker")).unwrap_or("")
+    assert!(
+        mindspace_cgroups().iter().any(|t| !before.contains(t)),
+        "no cgroup tree while running"
     );
-    drop(stdin);
-    let _ = child.wait();
+    eprintln!("startup failure: stage 1 {pid} held after fork; watchdog {wd}, broker {broker}, tree present");
+    // phase 2: stage 1 fails; everything must follow
+    let status = child.wait().unwrap();
+    let t0 = Instant::now();
+    assert_eq!(
+        status.code(),
+        Some(78),
+        "stage 1 must have failed after the fork"
+    );
+    let took = settle(
+        &[wd as u32, broker],
+        &PathBuf::from("/nonexistent-tree"),
+        Duration::from_secs(10),
+    )
+    .expect("watchdog or broker outlived the failed start");
+    let end = Instant::now() + Duration::from_secs(10);
+    while mindspace_cgroups().iter().any(|t| !before.contains(t)) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        mindspace_cgroups().iter().all(|t| before.contains(t)),
+        "a cgroup tree outlived the failed start: {:?}",
+        mindspace_cgroups()
+    );
+    let took = took.max(t0.elapsed());
+    eprintln!("startup failure after fork: stage 1 exited 78; watchdog, broker reaped and tree removed {took:?} after that");
+}
+
+#[test]
+fn sequential_operations_clean_up_after_each_one_and_shutdown_leaves_nothing() {
+    let w = World::new();
+    let project = w.dir(
+        "project",
+        &[("a.md", "# A\n"), ("src/lib.rs", "pub fn f() {}\n")],
+    );
+    let other = w.dir("other", &[("a.md", "# O\n")]);
+    let mut fe = fe!(w, project, &[]);
+    let (wd, br) = (fe.watchdog_pid as u32, fe.broker_pid as u32);
+    let tree = cg_dir(&cgroup_of(br)).parent().unwrap().to_path_buf();
+    let ops = |tree: &Path| -> usize {
+        std::fs::read_dir(tree)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("op-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let mut workers = vec![];
+    for i in 0..3 {
+        let r = fe.extract(&project);
+        assert_eq!(r["ok"], true, "operation {i}: {r}");
+        workers.push(r["worker_pid"].as_u64().unwrap() as u32);
+        assert_eq!(ops(&tree), 0, "operation {i} left its cgroup");
+        assert!(
+            children_of(br as i32).is_empty(),
+            "operation {i} left a child of the broker"
+        );
+    }
+    let r = fe.extract(&other);
+    assert_eq!(r["ok"], false);
+    assert_eq!(ops(&tree), 0);
+    // a worker killed mid-operation
+    std::fs::write(project.join("z.rs"), slow_source()).unwrap();
+    fe.send(&format!("extract {}", project.display()));
+    let end = Instant::now() + Duration::from_secs(20);
+    let victim = loop {
+        if let Some(p) = children_of(br as i32).first() {
+            break *p;
+        }
+        assert!(Instant::now() < end, "no worker appeared");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let r = fe.read();
+    assert_eq!(r["ok"], false, "{r}");
+    workers.push(victim);
+    assert!(settle(
+        &[victim],
+        &PathBuf::from("/nonexistent"),
+        Duration::from_secs(5)
+    )
+    .is_some());
+    assert_eq!(ops(&tree), 0, "the killed operation left its cgroup");
+    // and the broker still works afterwards
+    std::fs::remove_file(project.join("z.rs")).unwrap();
+    let r = fe.extract(&project);
+    assert_eq!(r["ok"], true, "{r}");
+    workers.push(r["worker_pid"].as_u64().unwrap() as u32);
+    assert_eq!(ops(&tree), 0);
+    assert!(
+        workers.iter().all(|p| pstate(*p) == '-'),
+        "a worker was left or not reaped: {workers:?}"
+    );
+    fe.finish();
+    let took =
+        settle(&[wd, br], &tree, Duration::from_secs(10)).expect("watchdog/broker/tree left");
+    eprintln!("normal shutdown after 5 sequential operations (3 ok, 1 refused, 1 killed, 1 ok): watchdog and broker reaped, tree removed in {took:?}");
+}
+
+#[test]
+fn no_zombie_watchdog_after_normal_shutdown_or_a_broker_crash() {
+    let w = World::new();
+    let project = w.dir("project", &[("a.md", "# A\n")]);
+    let fe = fe!(w, project, &[]);
+    let (wd, br) = (fe.watchdog_pid as u32, fe.broker_pid as u32);
+    fe.finish();
+    assert!(settle(
+        &[wd, br],
+        &PathBuf::from("/nonexistent"),
+        Duration::from_secs(10)
+    )
+    .is_some());
+    // a broker crash while the frontend keeps running: the watchdog ends and is reaped by
+    // someone other than the still-running frontend
+    let mut fe = fe!(w, project, &[]);
+    let (wd, br) = (fe.watchdog_pid as u32, fe.broker_pid as u32);
+    unsafe { libc::kill(br as i32, libc::SIGKILL) };
+    let took = settle(
+        &[wd, br],
+        &PathBuf::from("/nonexistent"),
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "watchdog {wd} is in state {} (Z = nobody reaps it)",
+            pstate(wd)
+        )
+    });
+    assert!(alive(fe.pid), "the frontend keeps running");
+    eprintln!(
+        "broker crash with a live frontend: watchdog and broker reaped (no zombie) after {took:?}"
+    );
+    let _ = fe.cmd("self");
+    fe.finish();
 }

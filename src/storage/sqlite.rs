@@ -58,10 +58,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         13,
         include_str!("../../migrations/0013_legacy_ownership.sql"),
     ),
+    (
+        14,
+        include_str!("../../migrations/0014_document_preparation.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 14;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -71,6 +75,7 @@ const FILE_PRODUCER_FAMILY: &str = "file:legacy";
 const GIT_PRODUCER_FAMILY: &str = "git:legacy";
 const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
 
+pub(crate) mod document_preparation;
 mod documents;
 pub(crate) mod ownership;
 
@@ -78,6 +83,7 @@ pub struct SqliteStore {
     conn: Mutex<Option<Connection>>,
     revision_state: Arc<RevisionState>,
     ownership_state: Arc<ownership::OwnershipState>,
+    preparation_state: Arc<document_preparation::PreparationState>,
     fts_integrity: AtomicBool,
 }
 
@@ -378,6 +384,8 @@ impl SqliteStore {
         register_revision_context(&conn, &revision_state)?;
         let ownership_state = Arc::new(ownership::OwnershipState::default());
         ownership::register_context(&conn, &ownership_state)?;
+        let preparation_state = Arc::new(document_preparation::PreparationState::default());
+        document_preparation::register_context(&conn, &preparation_state)?;
         reject_future_schema(&conn)?;
         run_migrations(&conn, &revision_state)?;
         validate_fence_inventory(&conn)?;
@@ -386,6 +394,7 @@ impl SqliteStore {
             conn: Mutex::new(Some(conn)),
             revision_state,
             ownership_state,
+            preparation_state,
             fts_integrity: AtomicBool::new(fts_integrity),
         })
     }
@@ -996,9 +1005,9 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
                 tx.commit().map_err(dberr)?;
                 continue;
             }
-            // Schema 13 records its own metadata birth in this already-owned transaction.
+            // Ownership metadata records its own birth in this already-owned transaction.
             // Migration 8 must remain the sole installer of the original baseline/fences.
-            let metadata_scope = if *version == 13 {
+            let metadata_scope = if matches!(*version, 13 | 14) {
                 Some(MigrationRevisionScope::enter(&tx, state)?)
             } else {
                 None
@@ -1016,8 +1025,13 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
                 install_m6_write_fence(&tx)?;
                 validate_fence_inventory(&tx)?;
             }
-            if *version == 13 {
-                tx.execute("INSERT INTO m6_row_availability(table_name,entity_key,revision_id) VALUES('asset_ownership_schema','local-enroll@1',m6_write_revision())", []).map_err(dberr)?;
+            if matches!(*version, 13 | 14) {
+                let (table, key) = if *version == 13 {
+                    ("asset_ownership_schema", "local-enroll@1")
+                } else {
+                    ("document_preparation_schema", "local-doc-prepare@1")
+                };
+                tx.execute("INSERT INTO m6_row_availability(table_name,entity_key,revision_id) VALUES(?1,?2,m6_write_revision())", [table,key]).map_err(dberr)?;
                 let violations: i64 = tx
                     .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                         row.get(0)
@@ -1646,6 +1660,33 @@ fn validate_fence_inventory(conn: &Connection) -> Result<()> {
             .map_err(dberr)?;
         expected.extend(
             ownership::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
+    }
+    let preparation_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if preparation_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='document_preparation_schema' AND a.entity_key='local-doc-prepare@1' AND r.kind='write'", [], |r| r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "document preparation schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            document_preparation::enforcement_names()
                 .into_iter()
                 .filter(|name| !installed.contains(name)),
         );
@@ -5634,3 +5675,7 @@ impl SqliteStore {
 #[cfg(test)]
 #[path = "sqlite/ownership_migration_tests.rs"]
 mod ownership_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/document_preparation_migration_tests.rs"]
+mod document_preparation_migration_tests;

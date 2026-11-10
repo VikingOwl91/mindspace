@@ -156,7 +156,7 @@ fn migration_seven_adds_embedding_tables_to_phase_one_database() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration, 13);
+    assert_eq!(migration, 14);
 
     // New tables exist.
     for table in ["assertion_embeddings", "mind_meta"] {
@@ -202,7 +202,7 @@ fn reopening_migrated_database_is_idempotent() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(v, 13);
+    assert_eq!(v, 14);
     drop(store);
     drop(store2);
 }

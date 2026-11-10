@@ -338,7 +338,7 @@ fn receipt(
 }
 
 #[cfg(unix)]
-fn validate_connection(conn: &Connection, ctx: &AdminContext) -> Result<()> {
+pub(super) fn validate_connection(conn: &Connection, ctx: &AdminContext) -> Result<()> {
     ctx.validate()?;
     if conn.path() != ctx.path().to_str() {
         return Err(refuse(
@@ -710,3 +710,70 @@ fn test_pause(phase: &str) {
 #[cfg(test)]
 #[path = "ownership_tests.rs"]
 mod tests;
+
+/// Storage-unit fixture only: exercises the real S3b permit/SQL constraints without a CLI context.
+#[cfg(test)]
+pub(super) fn enroll_test_source(store: &SqliteStore, source: Uuid) -> Uuid {
+    let conn = store.connection().unwrap();
+    let tx = begin_write(&conn, &store.revision_state).unwrap();
+    let revision = store.revision_state.active_revision.load(Ordering::SeqCst);
+    let base = source_base(&tx, source).unwrap();
+    let i = Intent {
+        nonce: Uuid::now_v7(),
+        db_path: "/unit-fixture.db".into(),
+        db_dev: 1,
+        db_ino: 1,
+        actor_uid: 1000,
+        source,
+        expected: revision - 1,
+        base: base.fingerprint,
+    };
+    let operation = i.id().unwrap();
+    let digest = i.digest().unwrap();
+    let canonical = i.canonical().unwrap();
+    let asset = Uuid::now_v7();
+    *store.ownership_state.permit.lock().unwrap() = Some(Permit {
+        receipt: vec![
+            operation.clone().into(),
+            i.nonce.to_string().into(),
+            digest.clone().into(),
+            canonical.clone().into(),
+            i.db_path.clone().into(),
+            i.db_dev.to_string().into(),
+            i.db_ino.to_string().into(),
+            i64::from(i.actor_uid).into(),
+            source.to_string().into(),
+            i.expected.into(),
+            i.base.clone().into(),
+            asset.to_string().into(),
+            revision.into(),
+            1_i64.into(),
+            ACTOR.to_owned().into(),
+        ],
+        owner: vec![
+            asset.to_string().into(),
+            source.to_string().into(),
+            operation.clone().into(),
+            "legacy".to_owned().into(),
+            1_i64.into(),
+            base.location.clone().map_or(Value::Null, Value::Text),
+            revision.into(),
+            revision.into(),
+        ],
+    });
+    let _scope = PermitScope(&store.ownership_state);
+    tx.execute(
+        "INSERT INTO asset_ownership VALUES(?1,?2,'legacy',1,?3,?4,?5,?5)",
+        rusqlite::params![
+            asset.to_string(),
+            source.to_string(),
+            base.location,
+            operation,
+            revision
+        ],
+    )
+    .unwrap();
+    tx.execute("INSERT INTO asset_control_intents VALUES(?1,?2,?3,?4,1,?5,?6,?7,'local-os-account@1',?8,?9,'enroll_legacy@1','Unmanaged',0,?10,?11,'LegacyEnrolled','legacy',1,?12,?13)", rusqlite::params![operation, i.nonce.to_string(), digest, canonical, i.db_path, i.db_dev.to_string(), i.db_ino.to_string(), i64::from(i.actor_uid), source.to_string(), i.expected, i.base, asset.to_string(), revision]).unwrap();
+    tx.commit().unwrap();
+    asset
+}

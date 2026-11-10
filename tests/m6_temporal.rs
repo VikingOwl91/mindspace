@@ -61,8 +61,8 @@ fn migration_eight_records_baseline_and_coverage() {
     let conn = db.raw();
     assert_eq!(
         max_revision(&conn),
-        2,
-        "baseline plus one schema-13 metadata cutover"
+        3,
+        "baseline plus schema-13 and schema-14 metadata cutovers"
     );
     let metadata_revision: i64 = conn
         .query_row(
@@ -72,6 +72,8 @@ fn migration_eight_records_baseline_and_coverage() {
         )
         .unwrap();
     assert_eq!(metadata_revision, 2);
+    let preparation_revision: i64 = conn.query_row("SELECT revision_id FROM m6_row_availability WHERE table_name='document_preparation_schema'", [], |r|r.get(0)).unwrap();
+    assert_eq!(preparation_revision, 3);
     let kind: String = conn
         .query_row(
             "SELECT kind FROM m6_revisions WHERE revision_id = 1",

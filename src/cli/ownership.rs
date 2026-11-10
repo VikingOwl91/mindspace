@@ -44,6 +44,32 @@ pub enum OwnershipCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Associate a legacy-enrolled asset with one exact stored document extraction.
+    /// This preparation changes no retrieval owner, index or active memory.
+    EnrollDocumentPreparation {
+        #[arg(long, value_parser = full_uuid)]
+        asset_id: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        legacy_source_version: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        document_id: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        document_source_version: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        extraction_id: Uuid,
+        #[arg(long, value_parser = positive_revision)]
+        expected_revision: i64,
+        #[arg(long, value_parser = full_uuid, conflicts_with_all = ["operation_id", "apply", "confirm_intent"])]
+        nonce: Option<Uuid>,
+        #[arg(long, requires = "apply")]
+        operation_id: Option<String>,
+        #[arg(long, requires_all = ["operation_id", "confirm_intent"])]
+        apply: bool,
+        #[arg(long, requires_all = ["apply", "operation_id"])]
+        confirm_intent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn full_uuid(raw: &str) -> std::result::Result<Uuid, String> {
@@ -281,15 +307,33 @@ fn check_local_filesystem(_file: &File) -> Result<()> {
 }
 
 pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
-    let OwnershipCommand::EnrollLegacy {
-        source_id,
-        expected_revision,
-        nonce,
-        operation_id,
-        apply,
-        confirm_intent,
-        json,
-    } = command;
+    let (expected_revision, nonce, operation_id, apply, confirm_intent, json) = match command {
+        OwnershipCommand::EnrollLegacy {
+            expected_revision,
+            nonce,
+            operation_id,
+            apply,
+            confirm_intent,
+            json,
+            ..
+        }
+        | OwnershipCommand::EnrollDocumentPreparation {
+            expected_revision,
+            nonce,
+            operation_id,
+            apply,
+            confirm_intent,
+            json,
+            ..
+        } => (
+            expected_revision,
+            nonce,
+            operation_id,
+            apply,
+            confirm_intent,
+            json,
+        ),
+    };
     // Check mode even for constructed library Cli values; clap is not an authority check.
     let mode = match (apply, nonce, operation_id, confirm_intent) {
         (false, Some(nonce), None, None) => Some(*nonce),
@@ -304,24 +348,62 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
     let context = AdminContext::establish(cli)?;
     let store = SqliteStore::open_ownership_admin(&context)?;
     context.validate()?;
-    match mode {
-        Some(nonce) => write_output(
-            &store.ownership_preview(&context, *source_id, *expected_revision, nonce)?,
-            *json,
-        ),
-        None => {
-            let receipt = store.ownership_enroll(
-                &context,
-                *source_id,
-                *expected_revision,
-                operation_id.as_deref().expect("validated apply mode"),
-                confirm_intent.as_deref().expect("validated apply mode"),
-            )?;
-            write_output(&receipt, *json).map_err(|error| Error::CommitOutcomeUnknown {
-                detail: format!("enrollment committed but the receipt could not be written: {error}; retry the same operation"),
-            })
+    match command {
+        OwnershipCommand::EnrollLegacy { source_id, .. } => match mode {
+            Some(nonce) => write_output(
+                &store.ownership_preview(&context, *source_id, *expected_revision, nonce)?,
+                *json,
+            ),
+            None => {
+                let receipt = store.ownership_enroll(
+                    &context,
+                    *source_id,
+                    *expected_revision,
+                    operation_id.as_deref().expect("validated apply mode"),
+                    confirm_intent.as_deref().expect("validated apply mode"),
+                )?;
+                committed_output(&receipt, *json)
+            }
+        },
+        OwnershipCommand::EnrollDocumentPreparation {
+            asset_id,
+            legacy_source_version,
+            document_id,
+            document_source_version,
+            extraction_id,
+            ..
+        } => {
+            let target = crate::storage::sqlite::document_preparation::PreparationTarget {
+                asset_id: *asset_id,
+                legacy_source_version: *legacy_source_version,
+                document_id: *document_id,
+                document_source_version: *document_source_version,
+                extraction_id: *extraction_id,
+            };
+            match mode {
+                Some(nonce) => write_output(
+                    &store.preparation_preview(&context, &target, *expected_revision, nonce)?,
+                    *json,
+                ),
+                None => {
+                    let receipt = store.preparation_enroll(
+                        &context,
+                        &target,
+                        *expected_revision,
+                        operation_id.as_deref().expect("validated apply mode"),
+                        confirm_intent.as_deref().expect("validated apply mode"),
+                    )?;
+                    committed_output(&receipt, *json)
+                }
+            }
         }
     }
+}
+
+fn committed_output(value: &impl Serialize, json: bool) -> Result<()> {
+    write_output(value, json).map_err(|error| Error::CommitOutcomeUnknown {
+        detail: format!("enrollment committed but the receipt could not be written: {error}; retry the same operation"),
+    })
 }
 
 fn write_output(value: &impl Serialize, json: bool) -> Result<()> {

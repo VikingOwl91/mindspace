@@ -325,7 +325,7 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
         )
     };
 
-    // Opening applies 9 through 13, including one new metadata R; M6 baseline is not repeated.
+    // Opening applies 9 through 14, including two metadata R; M6 baseline is not repeated.
     let (_, err, ok) = m.run(&["space", "list"]);
     assert!(ok, "{err}");
     let conn = Connection::open(m.db()).unwrap();
@@ -334,7 +334,7 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     for t in ["scopes", "scope_spaces", "repository_remotes", "git_views"] {
         let n: i64 = conn
             .query_row(
@@ -345,12 +345,12 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
             .unwrap();
         assert_eq!(n, 1, "{t} missing");
     }
-    // Original baseline and public query coverage remain unchanged. Schema 13 records
-    // exactly one new metadata availability revision, without a knowledge mutation.
+    // Original baseline and public query coverage remain unchanged. Schemas 13/14 record
+    // one metadata availability revision each, without a knowledge mutation.
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM m6_revisions", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(total, before.0 + 1);
+    assert_eq!(total, before.0 + 2);
     let after: (i64, i64) = (
         conn.query_row(
             "SELECT COUNT(*) FROM m6_revisions WHERE kind = 'baseline'",

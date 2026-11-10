@@ -70,10 +70,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         16,
         include_str!("../../migrations/0016_semantic_staging.sql"),
     ),
+    (
+        17,
+        include_str!("../../migrations/0017_passive_fence_plans.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -85,6 +89,7 @@ const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
 
 pub(crate) mod document_preparation;
 mod documents;
+pub(crate) mod fence_plans;
 pub(crate) mod lexical_input;
 pub(crate) mod lexical_staging;
 pub(crate) mod ownership;
@@ -98,6 +103,7 @@ pub struct SqliteStore {
     preparation_state: Arc<document_preparation::PreparationState>,
     lexical_state: Arc<lexical_staging::LexicalState>,
     semantic_state: Arc<semantic_staging::SemanticState>,
+    fence_plan_state: Arc<fence_plans::FencePlanState>,
     fts_integrity: AtomicBool,
 }
 
@@ -404,6 +410,8 @@ impl SqliteStore {
         lexical_staging::register_context(&conn, &lexical_state)?;
         let semantic_state = Arc::new(semantic_staging::SemanticState::default());
         semantic_staging::register_context(&conn, &semantic_state)?;
+        let fence_plan_state = Arc::new(fence_plans::FencePlanState::default());
+        fence_plans::register_context(&conn, &fence_plan_state)?;
         reject_future_schema(&conn)?;
         run_migrations(&conn, &revision_state)?;
         validate_fence_inventory(&conn)?;
@@ -415,8 +423,42 @@ impl SqliteStore {
             preparation_state,
             lexical_state,
             semantic_state,
+            fence_plan_state,
             fts_integrity: AtomicBool::new(fts_integrity),
         })
+    }
+
+    /// Inspect passive metadata with normal SQLite locking, without migrating.
+    #[cfg(unix)]
+    pub(crate) fn open_fence_plan_inspection(
+        ctx: &crate::cli::ownership::AdminContext,
+    ) -> Result<Self> {
+        let conn = ownership::open_admin_read_only(ctx, |conn| {
+            let version: i64 = conn
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                    r.get(0)
+                })
+                .map_err(dberr)?;
+            if version != CURRENT_SCHEMA_VERSION {
+                return Err(Error::Storage("passive reads require checkpointed initialized schema 17; perform a separate trusted upgrade/checkpoint; read commands never migrate or recover".into()));
+            }
+            validate_fence_inventory(conn)
+        })?;
+        let store = Self {
+            conn: Mutex::new(Some(conn)),
+            revision_state: Arc::new(RevisionState {
+                active_revision: AtomicI64::new(0),
+                poisoned: AtomicBool::new(false),
+            }),
+            ownership_state: Arc::new(ownership::OwnershipState::default()),
+            preparation_state: Arc::new(document_preparation::PreparationState::default()),
+            lexical_state: Arc::new(lexical_staging::LexicalState::default()),
+            semantic_state: Arc::new(semantic_staging::SemanticState::default()),
+            fence_plan_state: Arc::new(fence_plans::FencePlanState::default()),
+            fts_integrity: AtomicBool::new(true),
+        };
+        ctx.validate()?;
+        Ok(store)
     }
 
     fn connection(&self) -> Result<ConnectionGuard<'_>> {
@@ -1027,7 +1069,7 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
             }
             // Ownership metadata records its own birth in this already-owned transaction.
             // Migration 8 must remain the sole installer of the original baseline/fences.
-            let metadata_scope = if matches!(*version, 13..=16) {
+            let metadata_scope = if matches!(*version, 13..=17) {
                 Some(MigrationRevisionScope::enter(&tx, state)?)
             } else {
                 None
@@ -1045,12 +1087,13 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
                 install_m6_write_fence(&tx)?;
                 validate_fence_inventory(&tx)?;
             }
-            if matches!(*version, 13..=16) {
+            if matches!(*version, 13..=17) {
                 let (table, key) = match *version {
                     13 => ("asset_ownership_schema", "local-enroll@1"),
                     14 => ("document_preparation_schema", "local-doc-prepare@1"),
                     15 => ("lexical_staging_schema", "local-doc-stage-lexical@1"),
-                    _ => ("semantic_staging_schema", "local-doc-stage-semantic@1"),
+                    16 => ("semantic_staging_schema", "local-doc-stage-semantic@1"),
+                    _ => ("fence_plan_schema", "local-fence-plan@1"),
                 };
                 tx.execute("INSERT INTO m6_row_availability(table_name,entity_key,revision_id) VALUES(?1,?2,m6_write_revision())", [table,key]).map_err(dberr)?;
                 let violations: i64 = tx
@@ -1064,6 +1107,16 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
                     ));
                 }
                 validate_fence_inventory(&tx)?;
+                // Test-only pause uses the existing SQLite COMMIT hook; absent in production.
+                #[cfg(feature = "spawn-gate")]
+                if *version == 17 {
+                    if let Some(prefix) =
+                        std::env::var_os("MINDSPACE_FENCE_PLAN_MIGRATION_GATE_PATH")
+                    {
+                        std::env::set_var("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", prefix);
+                        gate::PAUSE_IN_COMMIT.store(true, Ordering::SeqCst);
+                    }
+                }
                 WriteTransaction {
                     tx: Some(tx),
                     conn,
@@ -1764,6 +1817,34 @@ fn validate_fence_inventory(conn: &Connection) -> Result<()> {
             semantic_staging::enforcement_names()
                 .into_iter()
                 .filter(|name| !installed.contains(name)),
+        );
+    }
+    let passive_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if passive_installed {
+        fence_plans::validate_schema(conn)?;
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='fence_plan_schema' AND a.entity_key='local-fence-plan@1' AND r.kind='write'", [], |r|r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "passive fence schema marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            fence_plans::enforcement_names()
+                .into_iter()
+                .filter(|n| !installed.contains(n)),
         );
     }
     if !expected.is_empty() {
@@ -5762,3 +5843,7 @@ mod lexical_staging_migration_tests;
 #[cfg(test)]
 #[path = "sqlite/semantic_staging_migration_tests.rs"]
 mod semantic_staging_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/fence_plan_migration_tests.rs"]
+mod fence_plan_migration_tests;

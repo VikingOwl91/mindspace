@@ -125,6 +125,42 @@ pub enum OwnershipCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Record an advisory writer-fence plan without reserving aliases or blocking writes.
+    /// This never activates a fence, changes ownership or publishes document content.
+    PrepareFencePlan {
+        #[arg(long, value_parser = full_uuid)]
+        asset_id: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        legacy_source_version: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        document_id: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        document_source_version: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        extraction_id: Uuid,
+        /// Explicit proposed bindings as JSON; witnesses remain unchecked statements.
+        #[arg(long, default_value = "[]")]
+        bindings_json: String,
+        #[arg(long, value_parser = positive_revision)]
+        expected_revision: i64,
+        #[arg(long, value_parser = full_uuid, conflicts_with_all = ["operation_id", "apply", "confirm_intent"])]
+        nonce: Option<Uuid>,
+        #[arg(long, requires = "apply")]
+        operation_id: Option<String>,
+        #[arg(long, requires_all = ["operation_id", "confirm_intent"])]
+        apply: bool,
+        #[arg(long, requires_all = ["apply", "operation_id"])]
+        confirm_intent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a passive receipt and current freshness without migration or write authority.
+    InspectFencePlan {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect canonical and stored-vector integrity, without inference or publication.
     InspectSemanticStage {
         #[arg(long, value_parser = full_sha256)]
@@ -162,6 +198,18 @@ fn positive_revision(raw: &str) -> std::result::Result<i64, String> {
         Ok(revision) if revision > 0 => Ok(revision),
         _ => Err("expected a positive recording revision".into()),
     }
+}
+
+fn fence_bindings(raw: &str) -> Result<Vec<crate::storage::sqlite::fence_plans::FenceBinding>> {
+    if raw.len() > 65536 {
+        return Err(refused("fence binding JSON exceeds 64 KiB"));
+    }
+    let bindings: Vec<crate::storage::sqlite::fence_plans::FenceBinding> =
+        serde_json::from_str(raw).map_err(|_| refused("invalid fence binding JSON"))?;
+    if bindings.len() > 128 {
+        return Err(refused("fence plan exceeds 128 proposed bindings"));
+    }
+    Ok(bindings)
 }
 
 fn refused(message: impl Into<String>) -> Error {
@@ -384,6 +432,12 @@ fn check_local_filesystem(_file: &File) -> Result<()> {
 }
 
 pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
+    if let OwnershipCommand::InspectFencePlan { operation_id, json } = command {
+        let context = AdminContext::establish(cli)?;
+        let store = SqliteStore::open_fence_plan_inspection(&context)?;
+        context.validate()?;
+        return write_output(&store.fence_plan_inspect(&context, operation_id)?, *json);
+    }
     if let OwnershipCommand::InspectLexicalStage { stage_id, json } = command {
         let context = AdminContext::establish(cli)?;
         let store = SqliteStore::open_ownership_admin(&context)?;
@@ -432,6 +486,15 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
             confirm_intent,
             json,
             ..
+        }
+        | OwnershipCommand::PrepareFencePlan {
+            expected_revision,
+            nonce,
+            operation_id,
+            apply,
+            confirm_intent,
+            json,
+            ..
         } => (
             expected_revision,
             nonce,
@@ -441,7 +504,8 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
             json,
         ),
         OwnershipCommand::InspectLexicalStage { .. }
-        | OwnershipCommand::InspectSemanticStage { .. } => {
+        | OwnershipCommand::InspectSemanticStage { .. }
+        | OwnershipCommand::InspectFencePlan { .. } => {
             unreachable!("inspection returned above")
         }
     };
@@ -456,8 +520,20 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
     if *expected_revision <= 0 {
         return Err(refused("expected revision must be positive"));
     }
+    // Reject malformed caller metadata before opening or migrating the database.
+    let plan_bindings = match command {
+        OwnershipCommand::PrepareFencePlan { bindings_json, .. } => {
+            Some(fence_bindings(bindings_json)?)
+        }
+        _ => None,
+    };
     let context = AdminContext::establish(cli)?;
-    let store = SqliteStore::open_ownership_admin(&context)?;
+    let store = if matches!(command, OwnershipCommand::PrepareFencePlan { .. }) && mode.is_some() {
+        // A preview never performs an implicit schema upgrade, even if it later refuses.
+        SqliteStore::open_fence_plan_inspection(&context)?
+    } else {
+        SqliteStore::open_ownership_admin(&context)?
+    };
     context.validate()?;
     match command {
         OwnershipCommand::EnrollLegacy { source_id, .. } => match mode {
@@ -591,8 +667,44 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
                 }
             }
         }
+        OwnershipCommand::PrepareFencePlan {
+            asset_id,
+            legacy_source_version,
+            document_id,
+            document_source_version,
+            extraction_id,
+            ..
+        } => {
+            let target = crate::storage::sqlite::fence_plans::FencePlanTarget {
+                selected: crate::storage::sqlite::document_preparation::PreparationTarget {
+                    asset_id: *asset_id,
+                    legacy_source_version: *legacy_source_version,
+                    document_id: *document_id,
+                    document_source_version: *document_source_version,
+                    extraction_id: *extraction_id,
+                },
+                bindings: plan_bindings.expect("fence bindings validated before database open"),
+            };
+            match mode {
+                Some(nonce) => write_output(
+                    &store.fence_plan_preview(&context, &target, *expected_revision, nonce)?,
+                    *json,
+                ),
+                None => {
+                    let receipt = store.fence_plan_prepare(
+                        &context,
+                        &target,
+                        *expected_revision,
+                        operation_id.as_deref().expect("validated apply mode"),
+                        confirm_intent.as_deref().expect("validated apply mode"),
+                    )?;
+                    committed_output(&receipt, *json)
+                }
+            }
+        }
         OwnershipCommand::InspectLexicalStage { .. }
-        | OwnershipCommand::InspectSemanticStage { .. } => {
+        | OwnershipCommand::InspectSemanticStage { .. }
+        | OwnershipCommand::InspectFencePlan { .. } => {
             unreachable!("inspection returned above")
         }
     }
@@ -701,6 +813,55 @@ mod tests {
     }
 
     #[test]
+    fn closed_inspection_reader_observes_later_wal_commits_without_write_authority() {
+        use crate::storage::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mind.db");
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store.create_space("before", "checkpointed").unwrap();
+        }
+        assert!(!dir.path().join("mind.db-wal").exists());
+
+        let context = AdminContext::establish(&cli(&path)).unwrap();
+        let reader = SqliteStore::open_fence_plan_inspection(&context).unwrap();
+        assert_eq!(reader.list_spaces().unwrap().len(), 1);
+        assert_eq!(reader.get_meta("inspection-wal-canary").unwrap(), None);
+
+        // Keep this writer open so the new committed pages remain in its WAL.
+        let writer = SqliteStore::open(&path).unwrap();
+        writer.create_space("after", "committed in WAL").unwrap();
+        writer.set_meta("inspection-wal-canary", "current").unwrap();
+        assert!(dir.path().join("mind.db-wal").exists());
+        let names: Vec<String> = reader
+            .list_spaces()
+            .unwrap()
+            .into_iter()
+            .map(|space| space.name)
+            .collect();
+        assert_eq!(names, ["after", "before"]);
+        assert_eq!(
+            reader.get_meta("inspection-wal-canary").unwrap(),
+            Some("current".into())
+        );
+
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let revision = || {
+            raw.query_row("SELECT MAX(revision_id) FROM m6_revisions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        let before = revision();
+        assert!(reader
+            .create_space("forbidden", "read-only handle")
+            .is_err());
+        assert_eq!(revision(), before);
+        assert_eq!(writer.list_spaces().unwrap().len(), 2);
+    }
+
+    #[test]
     fn source_ids_and_revisions_have_one_unambiguous_form() {
         let uuid = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
         assert_eq!(full_uuid(&uuid.to_string()).unwrap(), uuid);
@@ -713,5 +874,63 @@ mod tests {
         assert!(full_sha256(&"A".repeat(64)).is_err());
         assert!(full_sha256(&"a".repeat(63)).is_err());
         assert!(full_sha256(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn fence_binding_input_is_bounded_and_cannot_smuggle_authority_fields() {
+        assert!(fence_bindings("[]").unwrap().is_empty());
+        let valid = serde_json::json!({
+            "namespace": "opaque@1", "key": "proposed-alias",
+            "witness_digest": "a".repeat(64)
+        });
+        assert_eq!(
+            fence_bindings(&serde_json::json!([valid.clone()]).to_string())
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut escalated = valid.clone();
+        escalated["active"] = true.into();
+        assert!(fence_bindings(&serde_json::json!([escalated]).to_string()).is_err());
+        assert!(fence_bindings(&" ".repeat(65537)).is_err());
+        assert!(fence_bindings(&serde_json::json!(vec![valid; 129]).to_string()).is_err());
+    }
+
+    #[test]
+    fn fence_cli_exposes_only_passive_modes_and_requires_explicit_confirmation() {
+        use clap::Parser;
+
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut base = vec!["mind", "ownership", "prepare-fence-plan"];
+        for flag in [
+            "--asset-id",
+            "--legacy-source-version",
+            "--document-id",
+            "--document-source-version",
+            "--extraction-id",
+        ] {
+            base.extend([flag, id]);
+        }
+        base.extend(["--expected-revision", "1"]);
+        let mut preview = base.clone();
+        preview.extend(["--nonce", id]);
+        assert!(super::super::Cli::try_parse_from(preview.clone()).is_ok());
+        preview.push("--activate");
+        assert!(super::super::Cli::try_parse_from(preview).is_err());
+        let mut incomplete_apply = base;
+        incomplete_apply.push("--apply");
+        assert!(super::super::Cli::try_parse_from(incomplete_apply).is_err());
+        assert!(super::super::Cli::try_parse_from([
+            "mind",
+            "ownership",
+            "inspect-fence-plan",
+            "--operation-id",
+            "local-fence-plan@1:placeholder"
+        ])
+        .is_ok());
+        assert!(
+            super::super::Cli::try_parse_from(["mind", "ownership", "activate-fence-plan"])
+                .is_err()
+        );
     }
 }

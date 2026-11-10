@@ -424,6 +424,43 @@ fn reject_rollback_journal(ctx: &AdminContext) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn immutable_main_connection(ctx: &AdminContext) -> Result<Connection> {
+    // Immutable is MAIN-only with this locked SQLite build. Never retain it for live data.
+    let mut uri = String::from("file:");
+    for byte in ctx
+        .path()
+        .to_str()
+        .ok_or_else(|| refuse("database path must be UTF-8"))?
+        .bytes()
+    {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
+                uri.push(byte as char)
+            }
+            byte => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(dberr)
+}
+
+#[cfg(unix)]
+fn recognize_immutable_main(ctx: &AdminContext) -> Result<()> {
+    let conn = immutable_main_connection(ctx)?;
+    let read = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred).map_err(dberr)?;
+    require_initialized_database(&read)?;
+    read.rollback().map_err(dberr)?;
+    ctx.validate()?;
+    reject_rollback_journal(ctx)
+}
+
+#[cfg(unix)]
 fn recognize_read_only(ctx: &AdminContext, with_wal: bool) -> Result<()> {
     ctx.validate()?;
     reject_rollback_journal(ctx)?;
@@ -437,24 +474,7 @@ fn recognize_read_only(ctx: &AdminContext, with_wal: bool) -> Result<()> {
         }
         Connection::open_with_flags(ctx.path(), flags)
     } else {
-        // Like doctor inspection: an immutable read creates no WAL/SHM for a closed
-        // WAL-mode database. This internal URI encodes the pinned path, never caller URI options.
-        let mut uri = String::from("file:");
-        for byte in ctx
-            .path()
-            .to_str()
-            .ok_or_else(|| refuse("database path must be UTF-8"))?
-            .bytes()
-        {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
-                    uri.push(byte as char)
-                }
-                byte => uri.push_str(&format!("%{byte:02X}")),
-            }
-        }
-        uri.push_str("?immutable=1");
-        Connection::open_with_flags(uri, flags | rusqlite::OpenFlags::SQLITE_OPEN_URI)
+        return recognize_immutable_main(ctx);
     }
     .map_err(dberr)?;
     let read = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred).map_err(dberr)?;
@@ -475,6 +495,47 @@ fn recognize_before_write(ctx: &AdminContext) -> Result<()> {
     } else {
         first
     }
+}
+
+/// Retained inspectors need SQLite locking/change detection. The immutable
+/// connection used for recognition above is always discarded before this open.
+#[cfg(unix)]
+pub(super) fn open_admin_read_only(
+    ctx: &AdminContext,
+    admission: impl Fn(&Connection) -> Result<()>,
+) -> Result<Connection> {
+    ctx.validate()?;
+    reject_rollback_journal(ctx)?;
+    {
+        // Admission only: a stale MAIN must refuse, never stand in for a live snapshot.
+        // Foreign/old/incomplete MAIN is rejected without touching its WAL/SHM.
+        let main = immutable_main_connection(ctx)?;
+        let read =
+            Transaction::new_unchecked(&main, TransactionBehavior::Deferred).map_err(dberr)?;
+        require_initialized_database(&read)?;
+        admission(&read)?;
+        read.rollback().map_err(dberr)?;
+    }
+    ctx.validate()?;
+    reject_rollback_journal(ctx)?;
+    if sidecar_path(ctx, "-wal").is_file() && !sidecar_path(ctx, "-shm").is_file() {
+        return Err(refuse(
+            "WAL without shared memory requires separate SQLite recovery before passive reads",
+        ));
+    }
+    let conn = Connection::open_with_flags(
+        ctx.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(dberr)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(dberr)?;
+    let read = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred).map_err(dberr)?;
+    require_initialized_database(&read)?;
+    admission(&read)?;
+    read.rollback().map_err(dberr)?;
+    ctx.validate()?;
+    reject_rollback_journal(ctx)?;
+    Ok(conn)
 }
 
 #[cfg(unix)]

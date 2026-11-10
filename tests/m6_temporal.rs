@@ -61,8 +61,8 @@ fn migration_eight_records_baseline_and_coverage() {
     let conn = db.raw();
     assert_eq!(
         max_revision(&conn),
-        5,
-        "baseline plus schema-13, schema-14, schema-15 and schema-16 metadata cutovers"
+        6,
+        "baseline plus schema-13 through schema-17 metadata cutovers"
     );
     let metadata_revision: i64 = conn
         .query_row(

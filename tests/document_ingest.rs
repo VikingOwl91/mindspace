@@ -1748,7 +1748,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 16);
+    assert_eq!(max, 17);
     // foreign keys: the migration ran with them off, so nothing checked them. Check now.
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1928,7 +1928,7 @@ fn a_migration_that_fails_late_rolls_back_to_the_exact_schema_ten_state() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 16);
+    assert_eq!(max, 17);
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)

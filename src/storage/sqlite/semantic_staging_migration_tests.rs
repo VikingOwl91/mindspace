@@ -8,7 +8,7 @@ fn revision(c: &Connection) -> i64 {
     .unwrap()
 }
 fn old_rows(c: &Connection) -> BTreeMap<String, Vec<String>> {
-    let tables:Vec<String>=c.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations','m6_revisions','m6_row_availability','doc_staged_semantic_sets','doc_staged_vectors','doc_semantic_stage_receipts') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+    let tables:Vec<String>=c.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'asset_fence_%' AND name NOT IN ('schema_migrations','m6_revisions','m6_row_availability','doc_staged_semantic_sets','doc_staged_vectors','doc_semantic_stage_receipts') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
     tables
         .into_iter()
         .map(|t| {
@@ -156,7 +156,7 @@ fn populated_fifteen_upgrade_preserves_lexical_receipts_citations_vectors_and_ow
     );
     let c = new.connection().unwrap();
     assert_eq!(old_rows(&c), before);
-    assert_eq!(revision(&c), r + 1);
+    assert_eq!(revision(&c), r + 2);
     assert_eq!(c.query_row("SELECT revision_id FROM m6_row_availability WHERE table_name='semantic_staging_schema' AND entity_key='local-doc-stage-semantic@1'",[],|r|r.get::<_,i64>(0)).unwrap(),r+1);
     assert_eq!(
         c.query_row(
@@ -195,7 +195,7 @@ fn populated_fifteen_upgrade_preserves_lexical_receipts_citations_vectors_and_ow
     drop(c);
     drop(new);
     let again = SqliteStore::open(&db).unwrap();
-    assert_eq!(revision(&again.connection().unwrap()), r + 1);
+    assert_eq!(revision(&again.connection().unwrap()), r + 2);
 }
 #[test]
 fn late_sixteen_ddl_and_commit_veto_preserve_fifteen() {
@@ -277,7 +277,7 @@ fn lost_sixteen_ack_stays_unknown_and_reopen_is_idempotent() {
     for _ in 0..2 {
         let new = SqliteStore::open(&db).unwrap();
         let c = new.connection().unwrap();
-        assert_eq!(revision(&c), r + 1);
+        assert_eq!(revision(&c), r + 2);
         assert_eq!(c.query_row("SELECT COUNT(*) FROM m6_row_availability WHERE table_name='semantic_staging_schema'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(
             c.query_row(
@@ -343,7 +343,7 @@ fn six_processes_install_one_semantic_metadata_cutover() {
     }
     let new = SqliteStore::open(&db).unwrap();
     let c = new.connection().unwrap();
-    assert_eq!(revision(&c), r + 1);
+    assert_eq!(revision(&c), r + 2);
     assert_eq!(
         c.query_row(
             "SELECT count(*) FROM m6_row_availability WHERE table_name='semantic_staging_schema'",

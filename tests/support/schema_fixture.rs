@@ -141,6 +141,7 @@ fn remove_empty_lexical_metadata(conn: &rusqlite::Connection) {
 }
 
 fn remove_empty_semantic_metadata(conn: &rusqlite::Connection) {
+    remove_empty_fence_plan_metadata(conn);
     for table in [
         "doc_staged_semantic_sets",
         "doc_staged_vectors",
@@ -174,5 +175,53 @@ fn remove_empty_semantic_metadata(conn: &rusqlite::Connection) {
     ] {
         let definition:String=conn.query_row("SELECT sql FROM sqlite_schema WHERE name=?1",[name],|r|r.get(0)).unwrap();
         conn.execute_batch(&format!("DROP TRIGGER {name}; {sql}; {definition};")).unwrap();
+    }
+}
+
+pub fn remove_empty_fence_plan_metadata(conn: &rusqlite::Connection) {
+    for table in [
+        "asset_fence_plans",
+        "asset_fence_plan_bindings",
+        "asset_fence_plan_receipts",
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "old-schema fixture must not erase a passive plan"
+        );
+    }
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision_id FROM m6_row_availability WHERE table_name='fence_plan_schema'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name IN ('asset_fence_plans','asset_fence_plan_bindings','asset_fence_plan_receipts')").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    for name in names {
+        conn.execute_batch(&format!("DROP TRIGGER \"{name}\""))
+            .unwrap();
+    }
+    conn.execute_batch("DROP TABLE asset_fence_plan_bindings; DROP TABLE asset_fence_plans; DROP TABLE asset_fence_plan_receipts; DELETE FROM schema_migrations WHERE version=17").unwrap();
+    for (name, sql) in [
+        (
+            "m6_fence_m6_row_availability_d",
+            "DELETE FROM m6_row_availability WHERE table_name='fence_plan_schema'".to_owned(),
+        ),
+        (
+            "m6_fence_revisions_delete",
+            format!("DELETE FROM m6_revisions WHERE revision_id={revision}"),
+        ),
+    ] {
+        let definition: String = conn
+            .query_row("SELECT sql FROM sqlite_schema WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute_batch(&format!("DROP TRIGGER {name}; {sql}; {definition};"))
+            .unwrap();
     }
 }

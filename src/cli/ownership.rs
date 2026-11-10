@@ -70,6 +70,45 @@ pub enum OwnershipCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Build an isolated content-only lexical artifact with exact canonical citations.
+    /// This never publishes content or changes legacy ownership/retrieval.
+    StageDocumentLexical {
+        #[arg(long, value_parser = full_uuid)]
+        asset_id: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        legacy_source_version: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        document_id: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        document_source_version: Uuid,
+        #[arg(long, value_parser = full_uuid)]
+        extraction_id: Uuid,
+        #[arg(long)]
+        chunker_version: String,
+        #[arg(long)]
+        budget_identity: String,
+        #[arg(long, value_parser = full_sha256)]
+        plan_hash: String,
+        #[arg(long, value_parser = positive_revision)]
+        expected_revision: i64,
+        #[arg(long, value_parser = full_uuid, conflicts_with_all = ["operation_id", "apply", "confirm_intent"])]
+        nonce: Option<Uuid>,
+        #[arg(long, requires = "apply")]
+        operation_id: Option<String>,
+        #[arg(long, requires_all = ["operation_id", "confirm_intent"])]
+        apply: bool,
+        #[arg(long, requires_all = ["apply", "operation_id"])]
+        confirm_intent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect current integrity of one unpublished lexical artifact without changing it.
+    InspectLexicalStage {
+        #[arg(long, value_parser = full_sha256)]
+        stage_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn full_uuid(raw: &str) -> std::result::Result<Uuid, String> {
@@ -78,6 +117,14 @@ fn full_uuid(raw: &str) -> std::result::Result<Uuid, String> {
         return Err("expected a full lowercase hyphenated UUID (no prefix or aliases)".into());
     }
     Ok(id)
+}
+
+fn full_sha256(raw: &str) -> std::result::Result<String, String> {
+    if crate::core::is_sha256_hex(raw) {
+        Ok(raw.to_owned())
+    } else {
+        Err("expected a full lowercase SHA-256 digest".into())
+    }
 }
 
 fn positive_revision(raw: &str) -> std::result::Result<i64, String> {
@@ -307,6 +354,12 @@ fn check_local_filesystem(_file: &File) -> Result<()> {
 }
 
 pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
+    if let OwnershipCommand::InspectLexicalStage { stage_id, json } = command {
+        let context = AdminContext::establish(cli)?;
+        let store = SqliteStore::open_ownership_admin(&context)?;
+        context.validate()?;
+        return write_output(&store.lexical_stage_inspect(&context, stage_id)?, *json);
+    }
     let (expected_revision, nonce, operation_id, apply, confirm_intent, json) = match command {
         OwnershipCommand::EnrollLegacy {
             expected_revision,
@@ -325,6 +378,15 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
             confirm_intent,
             json,
             ..
+        }
+        | OwnershipCommand::StageDocumentLexical {
+            expected_revision,
+            nonce,
+            operation_id,
+            apply,
+            confirm_intent,
+            json,
+            ..
         } => (
             expected_revision,
             nonce,
@@ -333,6 +395,7 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
             confirm_intent,
             json,
         ),
+        OwnershipCommand::InspectLexicalStage { .. } => unreachable!("inspection returned above"),
     };
     // Check mode even for constructed library Cli values; clap is not an authority check.
     let mode = match (apply, nonce, operation_id, confirm_intent) {
@@ -397,6 +460,49 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
                 }
             }
         }
+        OwnershipCommand::StageDocumentLexical {
+            asset_id,
+            legacy_source_version,
+            document_id,
+            document_source_version,
+            extraction_id,
+            chunker_version,
+            budget_identity,
+            plan_hash,
+            ..
+        } => {
+            let target = crate::storage::sqlite::lexical_staging::LexicalStageTarget {
+                asset_id: *asset_id,
+                legacy_source_version: *legacy_source_version,
+                document_id: *document_id,
+                document_source_version: *document_source_version,
+                extraction_id: *extraction_id,
+                chunker_version: chunker_version.clone(),
+                budget_identity: budget_identity.clone(),
+                plan_hash: plan_hash.clone(),
+            };
+            match mode {
+                Some(nonce) => write_output(
+                    &store.lexical_stage_preview(&context, &target, *expected_revision, nonce)?,
+                    *json,
+                ),
+                None => {
+                    let outcome = store.lexical_stage_apply(
+                        &context,
+                        &target,
+                        *expected_revision,
+                        operation_id.as_deref().expect("validated apply mode"),
+                        confirm_intent.as_deref().expect("validated apply mode"),
+                    )?;
+                    if outcome.committed_revision.is_some() {
+                        committed_output(&outcome, *json)
+                    } else {
+                        write_output(&outcome, *json)
+                    }
+                }
+            }
+        }
+        OwnershipCommand::InspectLexicalStage { .. } => unreachable!("inspection returned above"),
     }
 }
 
@@ -511,5 +617,9 @@ mod tests {
         assert!(positive_revision("0").is_err());
         assert!(positive_revision("-1").is_err());
         assert_eq!(positive_revision("7").unwrap(), 7);
+        assert!(full_sha256(&"a".repeat(64)).is_ok());
+        assert!(full_sha256(&"A".repeat(64)).is_err());
+        assert!(full_sha256(&"a".repeat(63)).is_err());
+        assert!(full_sha256(&"g".repeat(64)).is_err());
     }
 }

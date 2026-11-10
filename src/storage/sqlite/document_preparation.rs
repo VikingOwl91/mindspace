@@ -518,7 +518,10 @@ fn nodes(conn: &Connection, x: &Extraction) -> Result<Vec<DocNodeDraft>> {
     }
     Ok(nodes)
 }
-fn snapshot(conn: &Connection, target: &PreparationTarget) -> Result<Snapshot> {
+fn snapshot_with_draft(
+    conn: &Connection,
+    target: &PreparationTarget,
+) -> Result<(Snapshot, DocumentExtractionDraft)> {
     let (f,legacy_operation_id,legacy_revision)=conn.query_row("SELECT a.source_id,a.operation_id,a.created_revision FROM asset_ownership a JOIN asset_control_intents r ON r.operation_id=a.operation_id AND r.asset_id=a.asset_id AND r.source_id=a.source_id AND r.committed_revision=a.created_revision JOIN asset_ownership_history h ON h.asset_id=a.asset_id AND h.source_id=a.source_id AND h.operation_id=a.operation_id AND h.revision_id=a.created_revision WHERE a.asset_id=?1 AND a.owner='legacy' AND a.epoch=1",[target.asset_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).optional().map_err(dberr)?.ok_or_else(||refuse("existing legacy asset enrollment required"))?;
     let f = id(f)?;
     let legacy_base = logical(conn, f, "file")?;
@@ -561,7 +564,108 @@ fn snapshot(conn: &Connection, target: &PreparationTarget) -> Result<Snapshot> {
         extraction: x,
     };
     value.validate_links()?;
-    Ok(value)
+    Ok((value, draft))
+}
+
+fn snapshot(conn: &Connection, target: &PreparationTarget) -> Result<Snapshot> {
+    snapshot_with_draft(conn, target).map(|(snapshot, _)| snapshot)
+}
+
+/// A single hash-checked source/structure snapshot, shared by all staged citations.
+pub(super) struct ValidatedStagingSnapshot {
+    pub source_id: Uuid,
+    pub provenance: Vec<u8>,
+    pub logical_base: Vec<u8>,
+    pub draft: DocumentExtractionDraft,
+}
+pub(super) fn validated_staging_snapshot(
+    conn: &Connection,
+    target: &PreparationTarget,
+) -> Result<ValidatedStagingSnapshot> {
+    let (snapshot, draft) = snapshot_with_draft(conn, target)?;
+    let mut logical_base = Vec::new();
+    snapshot.legacy_base.canonical(&mut logical_base);
+    snapshot.document_base.canonical(&mut logical_base);
+    let mut provenance = Vec::new();
+    string(&mut provenance, "mindspace.s3d.selected-provenance@1");
+    for v in [&snapshot.legacy_version, &snapshot.document_version] {
+        provenance.extend_from_slice(v.id.as_bytes());
+        provenance.extend_from_slice(v.logical_id.as_bytes());
+        for field in [&v.kind, &v.location, &v.title, &v.hash, &v.media_type] {
+            string(&mut provenance, field);
+        }
+        provenance.extend_from_slice(&v.size.to_be_bytes());
+    }
+    let x = &snapshot.extraction;
+    for v in [x.id, x.logical_id, x.source_id] {
+        provenance.extend_from_slice(v.as_bytes());
+    }
+    string(&mut provenance, &x.bytes_hash);
+    provenance.extend_from_slice(&x.source_size.to_be_bytes());
+    provenance.push(u8::from(x.text_is_source));
+    string(&mut provenance, &x.format);
+    optional(&mut provenance, &x.format_hint);
+    for field in [
+        &x.detector_version,
+        &x.extractor_id,
+        &x.extractor_version,
+        &x.params_hash,
+        &x.structure_hash,
+    ] {
+        string(&mut provenance, field);
+    }
+    provenance.extend_from_slice(&x.node_count.to_be_bytes());
+    Ok(ValidatedStagingSnapshot {
+        source_id: snapshot.legacy_source_id,
+        provenance,
+        logical_base,
+        draft,
+    })
+}
+
+/// Test fixtures use exactly the production receipt/permit constraints, without a CLI principal.
+#[cfg(test)]
+pub(super) fn enroll_test_preparation(store: &SqliteStore, target: &PreparationTarget) {
+    let conn = store.connection().unwrap();
+    let tx = begin_write(&conn, &store.revision_state).unwrap();
+    let revision = store.revision_state.active_revision.load(Ordering::SeqCst);
+    let intent = Intent {
+        nonce: Uuid::now_v7(),
+        db_path: "/unit-fixture.db".into(),
+        db_dev: 1,
+        db_ino: 1,
+        actor_uid: 1000,
+        expected_revision: revision - 1,
+        snapshot: snapshot(&tx, target).unwrap(),
+    };
+    let operation = intent.operation_id().unwrap();
+    *store.preparation_state.permit.lock().unwrap() = Some(Permit {
+        enrollment: intent.enrollment_values(&operation, revision),
+        receipt: intent.receipt_values(&operation, revision).unwrap(),
+    });
+    let _scope = PermitScope(&store.preparation_state);
+    insert_values(
+        &tx,
+        "document_preparation_enrollments",
+        ENROLL_COLUMNS,
+        &intent.enrollment_values(&operation, revision),
+    )
+    .unwrap();
+    insert_values(
+        &tx,
+        "document_preparation_receipts",
+        RECEIPT_COLUMNS,
+        &intent.receipt_values(&operation, revision).unwrap(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+#[cfg(test)]
+pub(super) fn prepared_test_fixture() -> (SqliteStore, PreparationTarget) {
+    let (store, target) = tests::fixture();
+    enroll_test_preparation(&store, &target);
+    (store, target)
 }
 
 #[derive(Serialize)]

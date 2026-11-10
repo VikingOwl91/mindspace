@@ -344,7 +344,7 @@ fn chunk_storage_is_immutable_and_upgrade_from_populated_schema_eleven_preserves
     for table in ["logical_sources", "sources", "doc_extractions", "doc_nodes"] {
         assert_eq!(before[table], after[table]);
     }
-    assert_eq!(after["m6_revisions"], before["m6_revisions"] + 2);
+    assert_eq!(after["m6_revisions"], before["m6_revisions"] + 3);
     assert_eq!(
         store
             .resolve_document_anchor(&chunks[0].anchor)
@@ -584,7 +584,7 @@ fn migration_twelve_failure_after_first_table_creation_rolls_back_the_whole_upgr
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
 }
 

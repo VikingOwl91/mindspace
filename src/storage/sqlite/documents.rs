@@ -110,11 +110,104 @@ struct PreparedChunks {
     hash: String,
     chunks: Vec<PreparedChunk>,
 }
-struct PreparedChunk {
-    start: u64,
-    end: u64,
-    tokens: usize,
-    context: Vec<Vec<u32>>,
+#[derive(Debug, Clone)]
+pub(super) struct PreparedChunk {
+    pub start: u64,
+    pub end: u64,
+    pub tokens: usize,
+    pub context: Vec<Vec<u32>>,
+}
+
+/// Authoritative persisted S3 codec, deliberately available without model support.
+pub(super) fn chunk_plan_hash(version: &str, budget: &str, chunks: &[PreparedChunk]) -> String {
+    sha256_hex(
+        serde_json::json!([
+            version,
+            budget,
+            chunks
+                .iter()
+                .map(|c| serde_json::json!([c.start, c.end, c.tokens, c.context]))
+                .collect::<Vec<_>>()
+        ])
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+pub(super) struct ChunkIdentity<'a> {
+    pub logical_id: Uuid,
+    pub draft: &'a DocumentExtractionDraft,
+    pub text_hash: &'a str,
+    pub structure_hash: &'a str,
+    pub version: &'a str,
+    pub budget_identity: &'a str,
+}
+pub(super) fn chunk_identity(identity: &ChunkIdentity<'_>, c: &PreparedChunk) -> String {
+    let d = identity.draft;
+    sha256_hex(
+        serde_json::json!([
+            identity.logical_id.to_string(),
+            d.source_bytes_hash,
+            identity.text_hash,
+            d.detector_version,
+            d.extractor_id,
+            d.extractor_version,
+            d.params_hash,
+            identity.structure_hash,
+            identity.version,
+            identity.budget_identity,
+            c.start,
+            c.end,
+            c.context
+        ])
+        .to_string()
+        .as_bytes(),
+    )
+}
+pub(super) fn root_chunk_anchor(
+    logical_id: Uuid,
+    d: &DocumentExtractionDraft,
+    range: (u64, u64),
+) -> Result<Anchor> {
+    Anchor::new(
+        logical_id,
+        &d.source_bytes_hash,
+        &d.detector_version,
+        &d.extractor_id,
+        &d.extractor_version,
+        &d.params_hash,
+        vec![],
+        Some(range),
+        None,
+        None,
+        AnchorPrecision::ByteExact,
+    )
+}
+/// Shared S1 byte-range rule. Never coerces invalid UTF-8 endpoints or falls forward a revision.
+pub(super) fn canonical_slice(text: &str, range: (u64, u64)) -> Result<&str> {
+    let bad = || {
+        Error::InvalidAnchor(
+            "the text range is outside the canonical text or splits a character".into(),
+        )
+    };
+    let a = usize::try_from(range.0).map_err(|_| bad())?;
+    let b = usize::try_from(range.1).map_err(|_| bad())?;
+    text.get(a..b).ok_or_else(bad)
+}
+pub(super) fn verify_root_chunk<'a>(
+    logical_id: Uuid,
+    d: &'a DocumentExtractionDraft,
+    range: (u64, u64),
+    raw: &str,
+) -> Result<&'a str> {
+    let anchor: Anchor = raw.parse()?;
+    let expected = root_chunk_anchor(logical_id, d, range)?;
+    if anchor != expected || anchor.to_string() != raw {
+        return Err(Error::InvalidAnchor(
+            "chunk citation does not name its exact canonical source range".into(),
+        ));
+    }
+    canonical_slice(&d.canonical_text, range)
 }
 
 #[cfg(feature = "embeddings")]
@@ -124,32 +217,21 @@ pub(super) fn record_with_chunks(
     plan: Option<crate::ingest::document::chunk::ChunkPlan>,
 ) -> Result<DocumentExtractionReport> {
     let plan = plan.map(|p| {
-        let hash = sha256_hex(
-            serde_json::json!([
-                p.version,
-                p.budget_identity,
-                p.chunks
-                    .iter()
-                    .map(|c| serde_json::json!([c.start, c.end, c.tokens, c.context]))
-                    .collect::<Vec<_>>()
-            ])
-            .to_string()
-            .as_bytes(),
-        );
+        let chunks = p
+            .chunks
+            .into_iter()
+            .map(|c| PreparedChunk {
+                start: c.start,
+                end: c.end,
+                tokens: c.tokens,
+                context: c.context,
+            })
+            .collect::<Vec<_>>();
         PreparedChunks {
+            hash: chunk_plan_hash(&p.version, &p.budget_identity, &chunks),
             version: p.version,
             budget_identity: p.budget_identity,
-            hash,
-            chunks: p
-                .chunks
-                .into_iter()
-                .map(|c| PreparedChunk {
-                    start: c.start,
-                    end: c.end,
-                    tokens: c.tokens,
-                    context: c.context,
-                })
-                .collect(),
+            chunks,
         }
     });
     record_inner(store, draft, plan)
@@ -407,37 +489,17 @@ fn record_inner(
                 params![extraction_id.to_string(), plan.version, plan.budget_identity, plan.hash, plan.chunks.len() as i64],
             ).map_err(dberr)?;
             for (ordinal, c) in plan.chunks.iter().enumerate() {
-                let anchor = Anchor::new(
-                    logical_id,
-                    &draft.source_bytes_hash,
-                    &draft.detector_version,
-                    &draft.extractor_id,
-                    &draft.extractor_version,
-                    &draft.params_hash,
-                    vec![],
-                    Some((c.start, c.end)),
-                    None,
-                    None,
-                    AnchorPrecision::ByteExact,
-                )?;
-                let id = sha256_hex(
-                    serde_json::json!([
-                        logical_id.to_string(),
-                        draft.source_bytes_hash,
-                        text_hash,
-                        draft.detector_version,
-                        draft.extractor_id,
-                        draft.extractor_version,
-                        draft.params_hash,
-                        structure_hash,
-                        plan.version,
-                        plan.budget_identity,
-                        c.start,
-                        c.end,
-                        c.context,
-                    ])
-                    .to_string()
-                    .as_bytes(),
+                let anchor = root_chunk_anchor(logical_id, &draft, (c.start, c.end))?;
+                let id = chunk_identity(
+                    &ChunkIdentity {
+                        logical_id,
+                        draft: &draft,
+                        text_hash: &text_hash,
+                        structure_hash: &structure_hash,
+                        version: &plan.version,
+                        budget_identity: &plan.budget_identity,
+                    },
+                    c,
                 );
                 tx.execute(
                     "INSERT INTO doc_chunks (id, extraction_id, version, budget_identity, ordinal, text_start, text_end, token_count, context_json, anchor) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -600,13 +662,7 @@ pub(super) fn resolve(store: &SqliteStore, anchor: &Anchor) -> Result<Option<Sto
         (None, r) => r,
     };
     let quoted = match range {
-        Some((a, b)) => {
-            let (a, b) = (a as usize, b as usize);
-            if b > text.len() || !text.is_char_boundary(a) || !text.is_char_boundary(b) {
-                return bad("the text range is outside the canonical text or splits a character");
-            }
-            Some(text[a..b].to_string())
-        }
+        Some(range) => Some(canonical_slice(&text, range)?.to_string()),
         None => None,
     };
 

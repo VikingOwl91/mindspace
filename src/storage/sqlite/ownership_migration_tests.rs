@@ -14,9 +14,11 @@ pub(super) fn old_store(path: &Path, version: i64) -> SqliteStore {
     ownership::register_context(&conn, &ownership_state).unwrap();
     let preparation_state = Arc::new(document_preparation::PreparationState::default());
     document_preparation::register_context(&conn, &preparation_state).unwrap();
+    let lexical_state = Arc::new(lexical_staging::LexicalState::default());
+    lexical_staging::register_context(&conn, &lexical_state).unwrap();
     for (number, sql) in MIGRATIONS.iter().filter(|(number, _)| *number <= version) {
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let metadata_scope = if *number == 13 {
+        let metadata_scope = if matches!(*number, 13 | 14) {
             Some(MigrationRevisionScope::enter(&tx, &state).unwrap())
         } else {
             None
@@ -30,8 +32,17 @@ pub(super) fn old_store(path: &Path, version: i64) -> SqliteStore {
         if *number == M6_VERSION {
             install_m6_write_fence(&tx).unwrap();
         }
-        if *number == 13 {
-            tx.execute("INSERT INTO m6_row_availability VALUES('asset_ownership_schema','local-enroll@1',m6_write_revision())", []).unwrap();
+        if matches!(*number, 13 | 14) {
+            let (table, key) = if *number == 13 {
+                ("asset_ownership_schema", "local-enroll@1")
+            } else {
+                ("document_preparation_schema", "local-doc-prepare@1")
+            };
+            tx.execute(
+                "INSERT INTO m6_row_availability VALUES(?1,?2,m6_write_revision())",
+                [table, key],
+            )
+            .unwrap();
             WriteTransaction {
                 tx: Some(tx),
                 conn: &conn,
@@ -50,6 +61,7 @@ pub(super) fn old_store(path: &Path, version: i64) -> SqliteStore {
         revision_state: state,
         ownership_state,
         preparation_state,
+        lexical_state,
         fts_integrity: AtomicBool::new(true),
     }
 }
@@ -93,7 +105,7 @@ fn populated_eleven_and_twelve_upgrade_without_rewriting_legacy_or_capabilities(
         );
         assert_eq!(after_caps.baseline_revision, caps.baseline_revision);
         let conn = upgraded.connection().unwrap();
-        assert_eq!(revision(&conn), before_r + 2);
+        assert_eq!(revision(&conn), before_r + 3);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM asset_ownership", [], |r| r
                 .get::<_, i64>(0))
@@ -112,7 +124,7 @@ fn populated_eleven_and_twelve_upgrade_without_rewriting_legacy_or_capabilities(
         drop(conn);
         drop(upgraded);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(revision(&reopened.connection().unwrap()), before_r + 2);
+        assert_eq!(revision(&reopened.connection().unwrap()), before_r + 3);
     }
 }
 
@@ -210,12 +222,12 @@ fn lost_migration_ack_is_unknown_and_reopen_applies_no_second_revision() {
     );
     let reopened = SqliteStore::open(&path).unwrap();
     let conn = reopened.connection().unwrap();
-    assert_eq!(revision(&conn), before + 2);
+    assert_eq!(revision(&conn), before + 3);
     assert_eq!(
         conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
     assert_eq!(
         conn.query_row(
@@ -235,5 +247,5 @@ fn lost_migration_ack_is_unknown_and_reopen_applies_no_second_revision() {
     drop(conn);
     drop(reopened);
     let again = SqliteStore::open(&path).unwrap();
-    assert_eq!(revision(&again.connection().unwrap()), before + 2);
+    assert_eq!(revision(&again.connection().unwrap()), before + 3);
 }

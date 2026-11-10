@@ -1748,7 +1748,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 14);
+    assert_eq!(max, 15);
     // foreign keys: the migration ran with them off, so nothing checked them. Check now.
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1762,7 +1762,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ok, "ok");
-    // Original triggers survive; schema 14 adds three preparation-only sealing guards.
+    // Original triggers survive; schemas 14/15 add preparation and staging sealing guards.
     let triggers_after: Vec<String> = c.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='doc_nodes' ORDER BY 1").unwrap().query_map([], |r| r.get(0)).unwrap().flatten().collect();
     let mut expected_triggers = triggers_before;
     expected_triggers.extend(
@@ -1770,6 +1770,9 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             "m6_s3c_nodes_delete",
             "m6_s3c_nodes_insert",
             "m6_s3c_nodes_update",
+            "m6_s3d_node_delete",
+            "m6_s3d_node_insert",
+            "m6_s3d_node_update",
         ]
         .map(str::to_owned),
     );
@@ -1792,6 +1795,14 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             "doc_chunks",
             "doc_extractions",
             "doc_nodes",
+            "doc_stage_receipts",
+            "doc_staged_entries",
+            "doc_staged_fts",
+            "doc_staged_fts_config",
+            "doc_staged_fts_data",
+            "doc_staged_fts_docsize",
+            "doc_staged_fts_idx",
+            "doc_staged_lexical_sets",
             "document_preparation_enrollments",
             "document_preparation_receipts"
         ]
@@ -1914,7 +1925,7 @@ fn a_migration_that_fails_late_rolls_back_to_the_exact_schema_ten_state() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 14);
+    assert_eq!(max, 15);
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)

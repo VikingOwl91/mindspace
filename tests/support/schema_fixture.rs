@@ -44,6 +44,7 @@ pub fn remove_empty_ownership_metadata(conn: &rusqlite::Connection) {
 }
 
 fn remove_empty_preparation_metadata(conn: &rusqlite::Connection) {
+    remove_empty_lexical_metadata(conn);
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM document_preparation_enrollments",
@@ -92,5 +93,48 @@ fn remove_empty_preparation_metadata(conn: &rusqlite::Connection) {
             .unwrap();
         conn.execute_batch(&format!("DROP TRIGGER {name}; {sql}; {definition};"))
             .unwrap();
+    }
+}
+
+fn remove_empty_lexical_metadata(conn: &rusqlite::Connection) {
+    for table in [
+        "doc_staged_lexical_sets",
+        "doc_staged_entries",
+        "doc_stage_receipts",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "downgrade fixture must never erase lexical stage rows in {table}"
+        );
+    }
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision_id FROM m6_row_availability WHERE table_name='lexical_staging_schema'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let triggers: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'm6_s3d_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for name in triggers {
+        conn.execute_batch(&format!("DROP TRIGGER \"{name}\""))
+            .unwrap();
+    }
+    conn.execute_batch("DROP TABLE doc_staged_fts; DROP TABLE doc_staged_entries; DROP TABLE doc_staged_lexical_sets; DROP TABLE doc_stage_receipts; DELETE FROM schema_migrations WHERE version=15").unwrap();
+    for (name,sql) in [
+        ("m6_fence_m6_row_availability_d", "DELETE FROM m6_row_availability WHERE table_name='lexical_staging_schema' OR table_name LIKE 'doc_stage%'".to_owned()),
+        ("m6_fence_revisions_delete",format!("DELETE FROM m6_revisions WHERE revision_id={revision}")),
+    ] {
+        let definition:String=conn.query_row("SELECT sql FROM sqlite_schema WHERE name=?1",[name],|r|r.get(0)).unwrap();
+        conn.execute_batch(&format!("DROP TRIGGER {name}; {sql}; {definition};")).unwrap();
     }
 }

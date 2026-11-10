@@ -13,6 +13,8 @@
 //! two competing active memory sets cannot arise. Existing legacy memories are never rewritten or
 //! retired by this path, and old Markdown/text sources are not migrated.
 
+#[cfg(feature = "embeddings")]
+pub mod chunk;
 pub mod detect;
 pub mod structure;
 
@@ -307,4 +309,25 @@ pub fn ingest_document_file_as(
         persisted,
         ..report
     })
+}
+
+/// Explicit S3 opt-in: read/extract, token-validate and atomically persist a complete chunk set.
+/// Creates no retrieval projection. A tokenizer is required, model weights/inference are not.
+#[cfg(feature = "embeddings")]
+pub fn ingest_chunked_document_file(
+    store: &dyn Store,
+    path: &Path,
+    options: &DocumentIngestOptions,
+    budget: &crate::embeddings::budget::TokenBudget,
+) -> Result<DocumentExtractionReport> {
+    let (location, bytes) = read_regular_file(path, options.max_input_bytes)?;
+    let extraction = extract_document_bytes(
+        &location,
+        &bytes,
+        path.extension().and_then(|e| e.to_str()),
+        options,
+        &Identity::default(),
+        Ts::now(),
+    )?;
+    store.record_chunked_document(extraction.draft, budget)
 }

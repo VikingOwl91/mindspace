@@ -4,6 +4,9 @@
 //! build. Only the Candle runtime is gated on `embeddings`. Without the feature,
 //! `CandleRuntime::load` returns a controlled "not available" error.
 
+#[cfg(feature = "embeddings")]
+pub mod budget;
+
 pub mod manager;
 pub mod manifest;
 

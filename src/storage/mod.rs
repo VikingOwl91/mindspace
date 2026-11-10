@@ -64,6 +64,14 @@ pub trait Store {
         &self,
         draft: DocumentExtractionDraft,
     ) -> Result<DocumentExtractionReport>;
+    /// Explicit document chunking. Validates the actual tokenizer budget before one atomic
+    /// extraction + chunk-set write; never creates assertions or memories.
+    #[cfg(feature = "embeddings")]
+    fn record_chunked_document(
+        &self,
+        draft: DocumentExtractionDraft,
+        budget: &crate::embeddings::budget::TokenBudget,
+    ) -> Result<DocumentExtractionReport>;
     /// The stored side of a citation: `None` when no extraction with the anchor's identity exists
     /// (wrong revision, other extractor, unknown document). An anchor that names more than the stored
     /// extraction supports is an error, never a downgrade.
@@ -215,4 +223,19 @@ pub trait Store {
     // -- lifecycle -----------------------------------------------------------
 
     fn retire_memory(&self, id: Uuid, reason: Option<String>, at: Ts) -> Result<Memory>;
+}
+
+/// One immutable, revision-bound document chunk. `context` names structure nodes only; it is
+/// never copied into the cited source range. Retrieval projection is deliberately deferred.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredDocumentChunk {
+    pub id: String,
+    pub extraction_id: crate::core::Uuid,
+    pub version: String,
+    pub budget_identity: String,
+    pub start: u64,
+    pub end: u64,
+    pub tokens: usize,
+    pub context: Vec<Vec<u32>>,
+    pub anchor: crate::core::Anchor,
 }

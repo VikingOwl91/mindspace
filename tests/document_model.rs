@@ -1435,8 +1435,8 @@ fn an_existing_database_migrates_and_keeps_everything_it_had() {
     // make it a schema-9 database: no document tables, no migration-10 record
     let c = db.raw();
     c.execute_batch(
-        "DELETE FROM schema_migrations WHERE version IN (10, 11);
-         DROP TABLE doc_nodes; DROP TABLE doc_extractions; DROP TABLE doc_blobs;
+        "DELETE FROM schema_migrations WHERE version IN (10, 11, 12);
+         DROP TABLE doc_chunks; DROP TABLE doc_chunk_sets; DROP TABLE doc_nodes; DROP TABLE doc_extractions; DROP TABLE doc_blobs;
          DROP INDEX uq_logical_documents_location;",
     )
     .unwrap();
@@ -1462,7 +1462,7 @@ fn an_existing_database_migrates_and_keeps_everything_it_had() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 11);
+    assert_eq!(max, 12);
     assert_eq!(
         search_texts(&store, "zebra"),
         before_hits,

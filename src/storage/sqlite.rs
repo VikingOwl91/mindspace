@@ -53,10 +53,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
         11,
         include_str!("../../migrations/0011_doc_code_blocks.sql"),
     ),
+    (12, include_str!("../../migrations/0012_doc_chunks.sql")),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -1926,6 +1927,15 @@ impl Store for SqliteStore {
         draft: DocumentExtractionDraft,
     ) -> Result<DocumentExtractionReport> {
         documents::record(self, draft)
+    }
+    #[cfg(feature = "embeddings")]
+    fn record_chunked_document(
+        &self,
+        draft: DocumentExtractionDraft,
+        budget: &crate::embeddings::budget::TokenBudget,
+    ) -> Result<DocumentExtractionReport> {
+        let plan = crate::ingest::document::chunk::chunk_document(&draft, budget)?;
+        documents::record_with_chunks(self, draft, Some(plan))
     }
     fn resolve_document_anchor(&self, anchor: &Anchor) -> Result<Option<StoredCitation>> {
         documents::resolve(self, anchor)
@@ -5473,5 +5483,15 @@ mod commit_failure_tests {
             commit_failure(rusqlite::Error::InvalidQuery),
             Error::CommitOutcomeUnknown { .. }
         ));
+    }
+}
+
+impl SqliteStore {
+    /// Lists immutable chunk sets of this extraction, ordered by version, budget and source offset.
+    pub fn list_document_chunks(
+        &self,
+        extraction_id: Uuid,
+    ) -> Result<Vec<crate::storage::StoredDocumentChunk>> {
+        documents::list_chunks(self, extraction_id)
     }
 }

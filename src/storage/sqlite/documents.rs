@@ -101,6 +101,140 @@ pub(super) fn record(
     store: &SqliteStore,
     draft: DocumentExtractionDraft,
 ) -> Result<DocumentExtractionReport> {
+    record_inner(store, draft, None)
+}
+
+struct PreparedChunks {
+    version: String,
+    budget_identity: String,
+    hash: String,
+    chunks: Vec<PreparedChunk>,
+}
+struct PreparedChunk {
+    start: u64,
+    end: u64,
+    tokens: usize,
+    context: Vec<Vec<u32>>,
+}
+
+#[cfg(feature = "embeddings")]
+pub(super) fn record_with_chunks(
+    store: &SqliteStore,
+    draft: DocumentExtractionDraft,
+    plan: Option<crate::ingest::document::chunk::ChunkPlan>,
+) -> Result<DocumentExtractionReport> {
+    let plan = plan.map(|p| {
+        let hash = sha256_hex(
+            serde_json::json!([
+                p.version,
+                p.budget_identity,
+                p.chunks
+                    .iter()
+                    .map(|c| serde_json::json!([c.start, c.end, c.tokens, c.context]))
+                    .collect::<Vec<_>>()
+            ])
+            .to_string()
+            .as_bytes(),
+        );
+        PreparedChunks {
+            version: p.version,
+            budget_identity: p.budget_identity,
+            hash,
+            chunks: p
+                .chunks
+                .into_iter()
+                .map(|c| PreparedChunk {
+                    start: c.start,
+                    end: c.end,
+                    tokens: c.tokens,
+                    context: c.context,
+                })
+                .collect(),
+        }
+    });
+    record_inner(store, draft, plan)
+}
+
+fn chunks_present(
+    conn: &Connection,
+    extraction: Uuid,
+    plan: Option<&PreparedChunks>,
+) -> Result<bool> {
+    let Some(p) = plan else {
+        return Ok(true);
+    };
+    let hash: Option<String> = conn.query_row(
+        "SELECT plan_hash FROM doc_chunk_sets WHERE extraction_id = ?1 AND version = ?2 AND budget_identity = ?3",
+        params![extraction.to_string(), p.version, p.budget_identity], |r| r.get(0)
+    ).optional().map_err(dberr)?;
+    match hash {
+        None => Ok(false),
+        Some(hash) if hash == p.hash => {
+            // The completion marker is not sufficient on its own: refuse incomplete or corrupt
+            // rows instead of treating them as a successfully derived set on retry.
+            let mut stmt = conn.prepare(
+                "SELECT ordinal, text_start, text_end, token_count, context_json FROM doc_chunks WHERE extraction_id=?1 AND version=?2 AND budget_identity=?3 ORDER BY ordinal",
+            ).map_err(dberr)?;
+            let rows = stmt
+                .query_map(
+                    params![extraction.to_string(), p.version, p.budget_identity],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .map_err(dberr)?;
+            let mut count = 0;
+            for row in rows {
+                let (ordinal, start, end, tokens, context) = row.map_err(dberr)?;
+                let agrees = p
+                    .chunks
+                    .get(count)
+                    .map(|c| {
+                        ordinal == count as i64
+                            && start == c.start as i64
+                            && end == c.end as i64
+                            && tokens == c.tokens as i64
+                            && serde_json::from_str::<Vec<Vec<u32>>>(&context)
+                                .ok()
+                                .as_ref()
+                                == Some(&c.context)
+                    })
+                    .unwrap_or(false);
+                if !agrees {
+                    return Err(Error::InvalidDocument(
+                        "stored chunk rows disagree with their derivation".into(),
+                    ));
+                }
+                count += 1;
+            }
+            let recorded_count: i64 = conn.query_row(
+                "SELECT chunk_count FROM doc_chunk_sets WHERE extraction_id=?1 AND version=?2 AND budget_identity=?3",
+                params![extraction.to_string(), p.version, p.budget_identity], |r| r.get(0),
+            ).map_err(dberr)?;
+            if count != p.chunks.len() || recorded_count != count as i64 {
+                return Err(Error::InvalidDocument(
+                    "stored chunk set is incomplete".into(),
+                ));
+            }
+            Ok(true)
+        }
+        Some(_) => Err(Error::InvalidDocument(
+            "same chunker identity produced a different chunk plan".into(),
+        )),
+    }
+}
+
+fn record_inner(
+    store: &SqliteStore,
+    draft: DocumentExtractionDraft,
+    chunks: Option<PreparedChunks>,
+) -> Result<DocumentExtractionReport> {
     draft.validate()?;
     let text_hash = draft.text_hash();
     let structure_hash = draft.structure_hash();
@@ -110,7 +244,9 @@ pub(super) fn record(
     if let Some(e) = find_existing(&conn, &draft)? {
         check_agrees(&e, &draft)?;
         let present = blob_present(&conn, &draft.source_bytes_hash)?;
-        if draft.retain_bytes.is_none() || present {
+        if (draft.retain_bytes.is_none() || present)
+            && chunks_present(&conn, e.extraction_id, chunks.as_ref())?
+        {
             return Ok(DocumentExtractionReport {
                 extraction_id: e.extraction_id,
                 logical_id: e.logical_id,
@@ -127,6 +263,28 @@ pub(super) fn record(
 
     let at = draft.observed_at;
     let tx = begin_write(&conn, &store.revision_state)?;
+
+    // An independent connection may have completed the same extraction while this writer waited
+    // for SQLite's IMMEDIATE lock. Returning drops/rolls back this unused recording revision.
+    if let Some(e) = find_existing(&tx, &draft)? {
+        check_agrees(&e, &draft)?;
+        let present = blob_present(&tx, &draft.source_bytes_hash)?;
+        if (draft.retain_bytes.is_none() || present)
+            && chunks_present(&tx, e.extraction_id, chunks.as_ref())?
+        {
+            return Ok(DocumentExtractionReport {
+                extraction_id: e.extraction_id,
+                logical_id: e.logical_id,
+                source_id: e.source_id,
+                document_created: false,
+                revision_created: false,
+                extraction_created: false,
+                nodes: draft.nodes.len() as u64,
+                bytes_retained_now: false,
+                bytes_retained: present,
+            });
+        }
+    }
 
     // the document: one logical source of kind 'document' per location
     let logical: Option<String> = tx
@@ -242,6 +400,54 @@ pub(super) fn record(
         bytes_retained_now = added > 0;
     }
     let bytes_retained = blob_present(&tx, &draft.source_bytes_hash)?;
+    if let Some(plan) = chunks.as_ref() {
+        if !chunks_present(&tx, extraction_id, Some(plan))? {
+            tx.execute(
+                "INSERT INTO doc_chunk_sets (extraction_id, version, budget_identity, plan_hash, chunk_count) VALUES (?1,?2,?3,?4,?5)",
+                params![extraction_id.to_string(), plan.version, plan.budget_identity, plan.hash, plan.chunks.len() as i64],
+            ).map_err(dberr)?;
+            for (ordinal, c) in plan.chunks.iter().enumerate() {
+                let anchor = Anchor::new(
+                    logical_id,
+                    &draft.source_bytes_hash,
+                    &draft.detector_version,
+                    &draft.extractor_id,
+                    &draft.extractor_version,
+                    &draft.params_hash,
+                    vec![],
+                    Some((c.start, c.end)),
+                    None,
+                    None,
+                    AnchorPrecision::ByteExact,
+                )?;
+                let id = sha256_hex(
+                    serde_json::json!([
+                        logical_id.to_string(),
+                        draft.source_bytes_hash,
+                        text_hash,
+                        draft.detector_version,
+                        draft.extractor_id,
+                        draft.extractor_version,
+                        draft.params_hash,
+                        structure_hash,
+                        plan.version,
+                        plan.budget_identity,
+                        c.start,
+                        c.end,
+                        c.context,
+                    ])
+                    .to_string()
+                    .as_bytes(),
+                );
+                tx.execute(
+                    "INSERT INTO doc_chunks (id, extraction_id, version, budget_identity, ordinal, text_start, text_end, token_count, context_json, anchor) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![id, extraction_id.to_string(), plan.version, plan.budget_identity,
+                        ordinal as i64, c.start as i64, c.end as i64, c.tokens as i64,
+                        serde_json::to_string(&c.context).map_err(|e| Error::Storage(e.to_string()))?, anchor.to_string()],
+                ).map_err(dberr)?;
+            }
+        }
+    }
     tx.commit()?;
     Ok(DocumentExtractionReport {
         extraction_id,
@@ -504,4 +710,45 @@ pub(super) fn erase(store: &SqliteStore, source_bytes_hash: &str) -> Result<bool
         )
         .map_err(dberr)?;
     Ok(n > 0)
+}
+
+pub(super) fn list_chunks(
+    store: &SqliteStore,
+    extraction_id: Uuid,
+) -> Result<Vec<crate::storage::StoredDocumentChunk>> {
+    let conn = store.connection()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, version, budget_identity, text_start, text_end, token_count, context_json, anchor \
+         FROM doc_chunks WHERE extraction_id = ?1 ORDER BY version, budget_identity, ordinal",
+    ).map_err(dberr)?;
+    let rows = stmt
+        .query_map(params![extraction_id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(dberr)?;
+    rows.map(|r| {
+        let (id, version, budget_identity, start, end, tokens, context, anchor) =
+            r.map_err(dberr)?;
+        Ok(crate::storage::StoredDocumentChunk {
+            id,
+            extraction_id,
+            version,
+            budget_identity,
+            start: start as u64,
+            end: end as u64,
+            tokens: tokens as usize,
+            context: serde_json::from_str(&context).map_err(|e| Error::Storage(e.to_string()))?,
+            anchor: anchor.parse()?,
+        })
+    })
+    .collect()
 }

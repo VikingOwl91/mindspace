@@ -1700,7 +1700,7 @@ fn populated_schema_ten(env: &Env) -> (Vec<Row>, Vec<Row>, Vec<mindspace::core::
          INSERT INTO doc_nodes SELECT * FROM doc_nodes_saved;
          DROP TABLE doc_nodes_saved;
          {} {} {}
-         DELETE FROM schema_migrations WHERE version = 11;",
+         DROP TABLE doc_chunks; DROP TABLE doc_chunk_sets; DELETE FROM schema_migrations WHERE version IN (11, 12);",
         stmts[0], stmts[1], stmts[2], stmts[3]
     ))
     .unwrap();
@@ -1744,7 +1744,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 11);
+    assert_eq!(max, 12);
     // foreign keys: the migration ran with them off, so nothing checked them. Check now.
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1770,7 +1770,16 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
         .unwrap()
         .flatten()
         .collect();
-    assert_eq!(tables, vec!["doc_blobs", "doc_extractions", "doc_nodes"]);
+    assert_eq!(
+        tables,
+        vec![
+            "doc_blobs",
+            "doc_chunk_sets",
+            "doc_chunks",
+            "doc_extractions",
+            "doc_nodes"
+        ]
+    );
     let pk: i64 = c
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('doc_nodes') WHERE pk > 0",
@@ -1889,7 +1898,7 @@ fn a_migration_that_fails_late_rolls_back_to_the_exact_schema_ten_state() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 11);
+    assert_eq!(max, 12);
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)

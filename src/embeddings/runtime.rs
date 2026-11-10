@@ -125,7 +125,40 @@ impl CandleRuntime {
         format!("{prefix}{text}")
     }
 
+    /// Explicit strict document path. The existing trait retains legacy truncation semantics.
+    /// Validation happens before loading model weights, and the exact verified encoding is used.
+    pub fn embed_document_validated(&self, text: &str) -> Result<Vec<f32>> {
+        let entry = crate::embeddings::manifest::find_model(&self.model_id).ok_or_else(|| {
+            Error::InvalidVector {
+                detail: "unsupported strict embedding model".into(),
+            }
+        })?;
+        if self.max_seq_len != entry.max_seq_len as usize
+            || self.prefix_document != entry.prefix_document
+            || self.dimension != entry.dimension as usize
+        {
+            return Err(Error::InvalidVector {
+                detail: "strict runtime differs from trusted manifest".into(),
+            });
+        }
+        let budget = crate::embeddings::budget::TokenBudget::from_file(
+            &self.model_dir.join("tokenizer.json"),
+            entry,
+        )?;
+        let encoding = budget.encode_document(text)?;
+        self.encode_inner(text, false, Some(encoding))
+    }
+
     fn encode(&self, text: &str, is_query: bool) -> Result<Vec<f32>> {
+        self.encode_inner(text, is_query, None)
+    }
+
+    fn encode_inner(
+        &self,
+        text: &str,
+        is_query: bool,
+        validated: Option<tokenizers::Encoding>,
+    ) -> Result<Vec<f32>> {
         self.ensure_loaded(&self.model_dir)?;
         let guard = self
             .inner
@@ -135,13 +168,22 @@ impl CandleRuntime {
             .as_ref()
             .ok_or_else(|| Error::Storage("model not loaded".to_string()))?;
         let full = self.prefixed(text, is_query);
-        let encoding = loaded
-            .tokenizer
-            .encode(full.as_str(), true)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let strict = validated.is_some();
+        let encoding = match validated {
+            Some(encoding) => encoding,
+            None => loaded
+                .tokenizer
+                .encode(full.as_str(), true)
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        };
         let mut ids = encoding.get_ids().to_vec();
         let mut mask = encoding.get_attention_mask().to_vec();
         if ids.len() > self.max_seq_len {
+            if strict {
+                return Err(Error::InvalidVector {
+                    detail: "validated document encoding exceeds runtime token limit".into(),
+                });
+            }
             ids.truncate(self.max_seq_len);
             mask.truncate(self.max_seq_len);
         }

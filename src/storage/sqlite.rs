@@ -49,10 +49,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../../migrations/0009_scopes_and_views.sql"),
     ),
     (10, include_str!("../../migrations/0010_documents.sql")),
+    (
+        11,
+        include_str!("../../migrations/0011_doc_code_blocks.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables

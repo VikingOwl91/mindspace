@@ -154,6 +154,8 @@ pub enum NodeKind {
     Footnote,
     Reference,
     Appendix,
+    /// A fenced or indented code block (Markdown).
+    CodeBlock,
 }
 
 impl NodeKind {
@@ -173,6 +175,7 @@ impl NodeKind {
             NodeKind::Footnote => "footnote",
             NodeKind::Reference => "reference",
             NodeKind::Appendix => "appendix",
+            NodeKind::CodeBlock => "code_block",
         }
     }
 
@@ -192,6 +195,7 @@ impl NodeKind {
             "footnote" => NodeKind::Footnote,
             "reference" => NodeKind::Reference,
             "appendix" => NodeKind::Appendix,
+            "code_block" => NodeKind::CodeBlock,
             _ => return None,
         })
     }
@@ -250,6 +254,49 @@ fn check_shape(
         }
     }
     Ok(())
+}
+
+/// Why a document was refused before anything was stored. Every refusal is explicit; none is a
+/// silent skip or a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DocumentRefusal {
+    /// Zero bytes, or nothing but whitespace.
+    Empty,
+    /// Larger than the configured input limit.
+    TooLarge,
+    /// Not valid UTF-8 (the detail names the first invalid byte offset).
+    NotUtf8,
+    /// A UTF-16/UTF-32 byte-order mark: not transcoded.
+    UnsupportedEncoding,
+    /// NUL bytes: binary content.
+    Binary,
+    /// Control characters other than tab, newline, carriage return and form feed.
+    ControlCharacters,
+    /// A recognised format this adapter does not read (PDF, ZIP/OOXML, HTML, images, ...).
+    UnsupportedFormat,
+    /// The structure would exceed the node limit.
+    TooManyNodes,
+    /// Not a regular file (directory, device, pipe...).
+    NotARegularFile,
+    /// The path is not valid UTF-8 and cannot be a stored location.
+    UnsupportedPath,
+}
+
+impl DocumentRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocumentRefusal::Empty => "empty",
+            DocumentRefusal::TooLarge => "too_large",
+            DocumentRefusal::NotUtf8 => "not_utf8",
+            DocumentRefusal::UnsupportedEncoding => "unsupported_encoding",
+            DocumentRefusal::Binary => "binary",
+            DocumentRefusal::ControlCharacters => "control_characters",
+            DocumentRefusal::UnsupportedFormat => "unsupported_format",
+            DocumentRefusal::TooManyNodes => "too_many_nodes",
+            DocumentRefusal::NotARegularFile => "not_a_regular_file",
+            DocumentRefusal::UnsupportedPath => "unsupported_path",
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------ anchors

@@ -4,7 +4,8 @@ pub mod error;
 pub use document::{
     is_sha256_hex, params_hash, source_precision_claim, Anchor, AnchorPrecision, BBox,
     CitationStatus, DocNodeDraft, DocumentExtractionDraft, DocumentExtractionInfo,
-    DocumentExtractionReport, LiveObservation, NodeKind, Resolution, RetainedBytes, StoredCitation,
+    DocumentExtractionReport, DocumentRefusal, LiveObservation, NodeKind, Resolution,
+    RetainedBytes, StoredCitation, MAX_NODES,
 };
 pub use error::{Error, Result};
 

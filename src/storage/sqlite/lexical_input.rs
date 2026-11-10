@@ -395,6 +395,41 @@ pub(super) fn build(conn: &Connection, target: &LexicalStageTarget) -> Result<Le
     Ok(LexicalCandidate { input, entries })
 }
 
+/// Reconstruct an immutable canonical parent using its authenticated historical policy.
+/// Only the known lexical@1 definition is supported; this does not attest cache health.
+/// Fresh lexical builds deliberately continue to use the currently linked SQLite version.
+pub(super) fn pin_historical_descriptor(
+    candidate: &mut LexicalCandidate,
+    descriptor: &str,
+) -> Result<()> {
+    const PREFIX: &str =
+        "sqlite-fts5@1;unicode61 remove_diacritics 1;content-only;detail=full;prefix=none;sqlite=";
+    let version = descriptor
+        .strip_prefix(PREFIX)
+        .ok_or_else(|| refuse("unsupported historical lexical descriptor"))?;
+    if version.len() > 20 {
+        return Err(refuse("unsupported historical SQLite descriptor"));
+    }
+    let parts = version
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| refuse("invalid historical SQLite descriptor"))?;
+    if parts.len() != 3
+        || parts[0] != 3
+        || format!("{}.{}.{}", parts[0], parts[1], parts[2]) != version
+    {
+        return Err(refuse("unsupported historical SQLite descriptor"));
+    }
+    candidate.input.lexical_descriptor = descriptor.to_owned();
+    candidate.input.stage_id = sha256_hex(&candidate.input.artifact_canonical());
+    candidate.input.validate()?;
+    for entry in &mut candidate.entries {
+        entry.entry_id = entry.identity(&candidate.input.stage_id);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "lexical_input_tests.rs"]
 mod tests;

@@ -1748,7 +1748,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 15);
+    assert_eq!(max, 16);
     // foreign keys: the migration ran with them off, so nothing checked them. Check now.
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1795,6 +1795,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             "doc_chunks",
             "doc_extractions",
             "doc_nodes",
+            "doc_semantic_stage_receipts",
             "doc_stage_receipts",
             "doc_staged_entries",
             "doc_staged_fts",
@@ -1803,6 +1804,8 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             "doc_staged_fts_docsize",
             "doc_staged_fts_idx",
             "doc_staged_lexical_sets",
+            "doc_staged_semantic_sets",
+            "doc_staged_vectors",
             "document_preparation_enrollments",
             "document_preparation_receipts"
         ]
@@ -1925,7 +1928,7 @@ fn a_migration_that_fails_late_rolls_back_to_the_exact_schema_ten_state() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 15);
+    assert_eq!(max, 16);
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)

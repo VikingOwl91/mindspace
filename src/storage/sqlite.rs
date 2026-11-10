@@ -66,10 +66,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         15,
         include_str!("../../migrations/0015_lexical_staging.sql"),
     ),
+    (
+        16,
+        include_str!("../../migrations/0016_semantic_staging.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -84,6 +88,8 @@ mod documents;
 pub(crate) mod lexical_input;
 pub(crate) mod lexical_staging;
 pub(crate) mod ownership;
+pub(crate) mod semantic_input;
+pub(crate) mod semantic_staging;
 
 pub struct SqliteStore {
     conn: Mutex<Option<Connection>>,
@@ -91,6 +97,7 @@ pub struct SqliteStore {
     ownership_state: Arc<ownership::OwnershipState>,
     preparation_state: Arc<document_preparation::PreparationState>,
     lexical_state: Arc<lexical_staging::LexicalState>,
+    semantic_state: Arc<semantic_staging::SemanticState>,
     fts_integrity: AtomicBool,
 }
 
@@ -395,6 +402,8 @@ impl SqliteStore {
         document_preparation::register_context(&conn, &preparation_state)?;
         let lexical_state = Arc::new(lexical_staging::LexicalState::default());
         lexical_staging::register_context(&conn, &lexical_state)?;
+        let semantic_state = Arc::new(semantic_staging::SemanticState::default());
+        semantic_staging::register_context(&conn, &semantic_state)?;
         reject_future_schema(&conn)?;
         run_migrations(&conn, &revision_state)?;
         validate_fence_inventory(&conn)?;
@@ -405,6 +414,7 @@ impl SqliteStore {
             ownership_state,
             preparation_state,
             lexical_state,
+            semantic_state,
             fts_integrity: AtomicBool::new(fts_integrity),
         })
     }
@@ -1017,7 +1027,7 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
             }
             // Ownership metadata records its own birth in this already-owned transaction.
             // Migration 8 must remain the sole installer of the original baseline/fences.
-            let metadata_scope = if matches!(*version, 13..=15) {
+            let metadata_scope = if matches!(*version, 13..=16) {
                 Some(MigrationRevisionScope::enter(&tx, state)?)
             } else {
                 None
@@ -1035,11 +1045,12 @@ fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
                 install_m6_write_fence(&tx)?;
                 validate_fence_inventory(&tx)?;
             }
-            if matches!(*version, 13..=15) {
+            if matches!(*version, 13..=16) {
                 let (table, key) = match *version {
                     13 => ("asset_ownership_schema", "local-enroll@1"),
                     14 => ("document_preparation_schema", "local-doc-prepare@1"),
-                    _ => ("lexical_staging_schema", "local-doc-stage-lexical@1"),
+                    15 => ("lexical_staging_schema", "local-doc-stage-lexical@1"),
+                    _ => ("semantic_staging_schema", "local-doc-stage-semantic@1"),
                 };
                 tx.execute("INSERT INTO m6_row_availability(table_name,entity_key,revision_id) VALUES(?1,?2,m6_write_revision())", [table,key]).map_err(dberr)?;
                 let violations: i64 = tx
@@ -1724,6 +1735,33 @@ fn validate_fence_inventory(conn: &Connection) -> Result<()> {
             .map_err(dberr)?;
         expected.extend(
             lexical_staging::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
+    }
+    let semantic_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=16)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if semantic_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='semantic_staging_schema' AND a.entity_key='local-doc-stage-semantic@1' AND r.kind='write'", [], |r|r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "semantic staging schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            semantic_staging::enforcement_names()
                 .into_iter()
                 .filter(|name| !installed.contains(name)),
         );
@@ -5720,3 +5758,7 @@ mod document_preparation_migration_tests;
 #[cfg(test)]
 #[path = "sqlite/lexical_staging_migration_tests.rs"]
 mod lexical_staging_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/semantic_staging_migration_tests.rs"]
+mod semantic_staging_migration_tests;

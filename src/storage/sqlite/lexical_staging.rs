@@ -515,7 +515,7 @@ fn verify_cache(conn: &Connection) -> Result<()> {
     Ok(())
 }
 /// Full exact comparison against a freshly bounded, citation-validated source snapshot.
-fn verify_candidate(conn: &Connection, c: &LexicalCandidate) -> Result<Stored> {
+fn verify_canonical_candidate(conn: &Connection, c: &LexicalCandidate) -> Result<Stored> {
     let op: String = conn
         .query_row(
             "SELECT operation_id FROM doc_staged_lexical_sets WHERE stage_id=?1",
@@ -549,8 +549,84 @@ fn verify_candidate(conn: &Connection, c: &LexicalCandidate) -> Result<Stored> {
             "staged canonical entries differ from exact citations",
         ));
     }
-    verify_cache(conn)?;
     Ok(s)
+}
+fn verify_candidate(conn: &Connection, c: &LexicalCandidate) -> Result<Stored> {
+    let stored = verify_canonical_candidate(conn, c)?;
+    verify_cache(conn)?;
+    Ok(stored)
+}
+/// Canonical source evidence is independent of the mutable lexical FTS cache.
+/// The existing lexical callers still validate both canonical rows and FTS.
+pub(super) struct CanonicalParent {
+    pub candidate: LexicalCandidate,
+    pub operation_id: String,
+    pub revision: i64,
+    pub result_digest: String,
+}
+pub(super) fn canonical_parent(conn: &Connection, stage: &str) -> Result<CanonicalParent> {
+    if !crate::core::is_sha256_hex(stage) {
+        return Err(refuse("invalid lexical parent identity"));
+    }
+    let operation: String = conn
+        .query_row(
+            "SELECT operation_id FROM doc_staged_lexical_sets WHERE stage_id=?1",
+            [stage],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(dberr)?
+        .ok_or_else(|| refuse("lexical parent does not exist"))?;
+    let original =
+        stored(conn, &operation)?.ok_or_else(|| refuse("lexical parent receipt is missing"))?;
+    let mut candidate = lexical_input::build(conn, &original.intent.input.target)?;
+    // Use only the immutable descriptor authenticated by its original receipt.
+    // Engine compatibility of the current mutable FTS cache is not asserted here.
+    lexical_input::pin_historical_descriptor(
+        &mut candidate,
+        &original.intent.input.lexical_descriptor,
+    )?;
+    let verified = verify_canonical_candidate(conn, &candidate)?;
+    Ok(CanonicalParent {
+        candidate,
+        operation_id: operation,
+        revision: verified.revision,
+        result_digest: verified.intent.result_digest,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn enroll_test_lexical(store: &SqliteStore, target: &LexicalStageTarget) -> String {
+    enroll_test_lexical_descriptor(store, target, None)
+}
+#[cfg(test)]
+pub(super) fn enroll_test_lexical_descriptor(
+    store: &SqliteStore,
+    target: &LexicalStageTarget,
+    descriptor: Option<&str>,
+) -> String {
+    let conn = store.connection().unwrap();
+    let tx = begin_write(&conn, &store.revision_state).unwrap();
+    let r = store.revision_state.active_revision.load(Ordering::SeqCst);
+    let mut candidate = lexical_input::build(&tx, target).unwrap();
+    if let Some(descriptor) = descriptor {
+        lexical_input::pin_historical_descriptor(&mut candidate, descriptor).unwrap();
+    }
+    let intent = Intent {
+        nonce: Uuid::now_v7(),
+        db_path: "/unit-lexical-fixture.db".into(),
+        db_dev: 1,
+        db_ino: 1,
+        actor_uid: 1000,
+        expected_revision: r - 1,
+        input: candidate.input.clone(),
+        result_digest: candidate.result_digest(),
+    };
+    let op = intent.operation_id().unwrap();
+    let _permit = arm(&store.lexical_state, &intent, &candidate, &op, r).unwrap();
+    insert_candidate(&tx, &intent, &candidate, &op, r).unwrap();
+    tx.commit().unwrap();
+    candidate.input.stage_id
 }
 #[cfg(unix)]
 impl SqliteStore {

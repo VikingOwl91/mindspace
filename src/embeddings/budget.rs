@@ -44,13 +44,30 @@ impl TokenBudget {
                 path: path.display().to_string(),
                 source,
             })?;
-        if bytes.len() as u64 != artifact.size || sha256_hex(&bytes) != artifact.sha256 {
+        Self::from_verified_bytes(&bytes, entry)
+    }
+
+    /// Same authenticated bytes/encoding policy as the file path; used by owned strict jobs.
+    pub(crate) fn from_verified_bytes(bytes: &[u8], entry: &ModelManifestEntry) -> Result<Self> {
+        if manifest::find_model(entry.id) != Some(entry) {
+            return Err(Error::InvalidVector {
+                detail: "unsupported embedding token-budget configuration".into(),
+            });
+        }
+        let artifact = entry
+            .artifacts
+            .iter()
+            .find(|a| a.filename == "tokenizer.json")
+            .ok_or_else(|| Error::InvalidVector {
+                detail: "model has no tokenizer artifact".into(),
+            })?;
+        if bytes.len() as u64 != artifact.size || sha256_hex(bytes) != artifact.sha256 {
             return Err(Error::InvalidVector {
                 detail: "tokenizer artifact does not match the pinned manifest".into(),
             });
         }
         let mut tokenizer =
-            tokenizers::Tokenizer::from_bytes(&bytes).map_err(|e| Error::InvalidVector {
+            tokenizers::Tokenizer::from_bytes(bytes).map_err(|e| Error::InvalidVector {
                 detail: e.to_string(),
             })?;
         tokenizer
@@ -59,17 +76,7 @@ impl TokenBudget {
                 detail: e.to_string(),
             })?;
         tokenizer.with_padding(None);
-        let identity = sha256_hex(
-            serde_json::json!({
-                "contract": "complete-input@1", "engine": "tokenizers@0.23.2",
-                "model": entry.id, "revision": entry.revision,
-                "tokenizer": artifact.sha256, "limit": entry.max_seq_len,
-                "document_prefix": entry.prefix_document, "query_prefix": entry.prefix_query,
-                "special_tokens": true, "padding": false, "truncation": false,
-            })
-            .to_string()
-            .as_bytes(),
-        );
+        let identity = crate::embeddings::strict_contract::budget_identity(entry)?;
         Ok(Self {
             tokenizer,
             entry: *entry,

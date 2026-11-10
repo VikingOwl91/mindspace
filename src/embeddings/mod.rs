@@ -11,6 +11,10 @@ pub mod manager;
 pub mod manifest;
 
 #[cfg(feature = "embeddings")]
+pub(crate) mod strict;
+pub(crate) mod strict_contract;
+
+#[cfg(feature = "embeddings")]
 pub mod runtime;
 
 use crate::core::Result;

@@ -1466,7 +1466,7 @@ fn an_existing_database_migrates_and_keeps_everything_it_had() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 15);
+    assert_eq!(max, 16);
     assert_eq!(
         search_texts(&store, "zebra"),
         before_hits,

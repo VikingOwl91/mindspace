@@ -10,7 +10,7 @@ fn revision(conn: &Connection) -> i64 {
 }
 
 fn snapshot(conn: &Connection) -> BTreeMap<String, Vec<String>> {
-    let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'document_preparation_%' AND name NOT LIKE 'doc_stage%' AND name NOT IN ('schema_migrations','m6_revisions','m6_row_availability') ORDER BY name").unwrap().query_map([], |r|r.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+    let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'document_preparation_%' AND name NOT LIKE 'doc_stage%' AND name NOT LIKE 'doc_semantic_%' AND name NOT IN ('schema_migrations','m6_revisions','m6_row_availability') ORDER BY name").unwrap().query_map([], |r|r.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
     tables
         .into_iter()
         .map(|table| {
@@ -110,7 +110,7 @@ fn populated_thirteen_preserves_owner_receipts_documents_indexes_and_history() {
     );
     let c = upgraded.connection().unwrap();
     assert_eq!(snapshot(&c), before);
-    assert_eq!(revision(&c), r + 2);
+    assert_eq!(revision(&c), r + 3);
     assert_eq!(c.query_row("SELECT revision_id FROM m6_row_availability WHERE table_name='document_preparation_schema' AND entity_key='local-doc-prepare@1'",[],|r|r.get::<_,i64>(0)).unwrap(),r+1);
     assert_eq!(
         c.query_row(
@@ -148,7 +148,7 @@ fn populated_thirteen_preserves_owner_receipts_documents_indexes_and_history() {
     drop(c);
     drop(upgraded);
     let again = SqliteStore::open(&path).unwrap();
-    assert_eq!(revision(&again.connection().unwrap()), r + 2);
+    assert_eq!(revision(&again.connection().unwrap()), r + 3);
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn lost_fourteen_migration_ack_is_unknown_and_reopen_does_not_repeat_cutover() {
     for _ in 0..2 {
         let reopened = SqliteStore::open(&path).unwrap();
         let c = reopened.connection().unwrap();
-        assert_eq!(revision(&c), r + 2);
+        assert_eq!(revision(&c), r + 3);
         assert_eq!(c.query_row("SELECT COUNT(*) FROM m6_row_availability WHERE table_name='document_preparation_schema'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(
             c.query_row(

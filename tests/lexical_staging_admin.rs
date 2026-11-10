@@ -1407,6 +1407,7 @@ fn later_selected_versions_stage_and_seal_independently_while_corrupt_new_fs_is_
             "s3b_availability_valid",
             "s3c_availability_valid",
             "s3d_availability_valid",
+            "s3d2_availability_valid",
         ] {
             raw.create_scalar_function(
                 name,

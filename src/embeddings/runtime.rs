@@ -77,25 +77,7 @@ impl CandleRuntime {
         if guard.is_some() {
             return Ok(());
         }
-        let config = Config {
-            vocab_size: 30528,
-            n_embd: self.dimension,
-            n_head: 12,
-            n_layer: 12,
-            n_inner: 3072,
-            n_positions: 8192,
-            type_vocab_size: 2,
-            layer_norm_epsilon: 1e-12,
-            rotary_emb_fraction: 1.0,
-            rotary_emb_base: 1000.0,
-            rotary_emb_interleaved: false,
-            qkv_proj_bias: false,
-            mlp_fc1_bias: false,
-            mlp_fc2_bias: false,
-            activation_function: "swiglu".to_string(),
-            prenorm: false,
-            model_type: Some("nomic_bert".to_string()),
-        };
+        let config = nomic_config(self.dimension)?;
         let st_path = model_dir.join("model.safetensors");
         let tok_path = model_dir.join("tokenizer.json");
         if !st_path.is_file() || !tok_path.is_file() {
@@ -192,48 +174,64 @@ impl CandleRuntime {
                 detail: "empty tokenized input".to_string(),
             });
         }
-        let seq = ids.len();
-        let device = Device::Cpu;
-        let input_ids = Tensor::new(ids.as_slice(), &device)
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .reshape((1, seq))
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let attention_mask = Tensor::new(mask.as_slice(), &device)
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .reshape((1, seq))
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let hidden = loaded
-            .model
-            .forward(&input_ids, None, Some(&attention_mask))
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let pooled = nomic_bert::mean_pooling(&hidden, &attention_mask)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let normed =
-            nomic_bert::l2_normalize(&pooled).map_err(|e| Error::Storage(e.to_string()))?;
-        let vec = normed
-            .squeeze(0)
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .to_vec1::<f32>()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        // validate
-        if vec.len() != self.dimension {
+        forward_model(&loaded.model, &ids, &mask, self.dimension)
+    }
+}
+
+/// Effective parameters are shared with the new strict descriptor; legacy values are unchanged.
+pub(super) fn nomic_config(dimension: usize) -> Result<Config> {
+    serde_json::from_value(crate::embeddings::strict_contract::effective_config(
+        dimension,
+    ))
+    .map_err(|e| Error::Storage(e.to_string()))
+}
+
+/// Shared inference only. Callers own their distinct legacy/strict tokenization policies.
+pub(super) fn forward_model(
+    model: &NomicBertModel,
+    ids: &[u32],
+    mask: &[u32],
+    dimension: usize,
+) -> Result<Vec<f32>> {
+    let seq = ids.len();
+    let device = Device::Cpu;
+    let input_ids = Tensor::new(ids, &device)
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .reshape((1, seq))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let attention_mask = Tensor::new(mask, &device)
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .reshape((1, seq))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let hidden = model
+        .forward(&input_ids, None, Some(&attention_mask))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let pooled = nomic_bert::mean_pooling(&hidden, &attention_mask)
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let normed = nomic_bert::l2_normalize(&pooled).map_err(|e| Error::Storage(e.to_string()))?;
+    let vec = normed
+        .squeeze(0)
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .to_vec1::<f32>()
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    // validate
+    if vec.len() != dimension {
+        return Err(Error::InvalidVector {
+            detail: format!(
+                "dimension mismatch: got {}, expected {}",
+                vec.len(),
+                dimension
+            ),
+        });
+    }
+    for v in &vec {
+        if !v.is_finite() {
             return Err(Error::InvalidVector {
-                detail: format!(
-                    "dimension mismatch: got {}, expected {}",
-                    vec.len(),
-                    self.dimension
-                ),
+                detail: "non-finite embedding output".to_string(),
             });
         }
-        for v in &vec {
-            if !v.is_finite() {
-                return Err(Error::InvalidVector {
-                    detail: "non-finite embedding output".to_string(),
-                });
-            }
-        }
-        Ok(vec)
     }
+    Ok(vec)
 }
 
 impl EmbeddingRuntime for CandleRuntime {

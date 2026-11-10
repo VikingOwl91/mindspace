@@ -102,6 +102,36 @@ pub enum OwnershipCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Stage isolated document embeddings under an explicit model contract.
+    /// This changes no active search, ownership or publication state.
+    StageDocumentSemantic {
+        #[arg(long, value_parser = full_sha256)]
+        lexical_stage_id: String,
+        #[arg(long)]
+        model_id: String,
+        /// Optional in preview to discover the compiled contract; mandatory for apply.
+        #[arg(long, value_parser = full_sha256)]
+        pipeline_key: Option<String>,
+        #[arg(long, value_parser = positive_revision)]
+        expected_revision: i64,
+        #[arg(long, value_parser = full_uuid, conflicts_with_all = ["operation_id", "apply", "confirm_intent"])]
+        nonce: Option<Uuid>,
+        #[arg(long, requires = "apply")]
+        operation_id: Option<String>,
+        #[arg(long, requires_all = ["operation_id", "confirm_intent", "pipeline_key"])]
+        apply: bool,
+        #[arg(long, requires_all = ["apply", "operation_id"])]
+        confirm_intent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect canonical and stored-vector integrity, without inference or publication.
+    InspectSemanticStage {
+        #[arg(long, value_parser = full_sha256)]
+        semantic_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect current integrity of one unpublished lexical artifact without changing it.
     InspectLexicalStage {
         #[arg(long, value_parser = full_sha256)]
@@ -360,6 +390,12 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
         context.validate()?;
         return write_output(&store.lexical_stage_inspect(&context, stage_id)?, *json);
     }
+    if let OwnershipCommand::InspectSemanticStage { semantic_id, json } = command {
+        let context = AdminContext::establish(cli)?;
+        let store = SqliteStore::open_ownership_admin(&context)?;
+        context.validate()?;
+        return write_output(&store.semantic_stage_inspect(&context, semantic_id)?, *json);
+    }
     let (expected_revision, nonce, operation_id, apply, confirm_intent, json) = match command {
         OwnershipCommand::EnrollLegacy {
             expected_revision,
@@ -387,6 +423,15 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
             confirm_intent,
             json,
             ..
+        }
+        | OwnershipCommand::StageDocumentSemantic {
+            expected_revision,
+            nonce,
+            operation_id,
+            apply,
+            confirm_intent,
+            json,
+            ..
         } => (
             expected_revision,
             nonce,
@@ -395,7 +440,10 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
             confirm_intent,
             json,
         ),
-        OwnershipCommand::InspectLexicalStage { .. } => unreachable!("inspection returned above"),
+        OwnershipCommand::InspectLexicalStage { .. }
+        | OwnershipCommand::InspectSemanticStage { .. } => {
+            unreachable!("inspection returned above")
+        }
     };
     // Check mode even for constructed library Cli values; clap is not an authority check.
     let mode = match (apply, nonce, operation_id, confirm_intent) {
@@ -502,13 +550,57 @@ pub(super) fn run(cli: &super::Cli, command: &OwnershipCommand) -> Result<()> {
                 }
             }
         }
-        OwnershipCommand::InspectLexicalStage { .. } => unreachable!("inspection returned above"),
+        OwnershipCommand::StageDocumentSemantic {
+            lexical_stage_id,
+            model_id,
+            pipeline_key,
+            ..
+        } => {
+            // Historical apply must reach stored receipts before any current model,
+            // feature or build-contract lookup. Only preview discovers a new key.
+            let key = match (mode, pipeline_key) {
+                (_, Some(key)) => key.clone(),
+                (Some(_), None) => {
+                    crate::embeddings::strict_contract::StrictContract::current(model_id)?.key()
+                }
+                (None, None) => return Err(refused("semantic apply requires --pipeline-key")),
+            };
+            let target = crate::storage::sqlite::semantic_staging::SemanticTarget {
+                lexical_stage_id: lexical_stage_id.clone(),
+                model_id: model_id.clone(),
+                pipeline_key: key,
+            };
+            match mode {
+                Some(nonce) => write_output(
+                    &store.semantic_stage_preview(&context, &target, *expected_revision, nonce)?,
+                    *json,
+                ),
+                None => {
+                    let outcome = store.semantic_stage_apply(
+                        &context,
+                        &target,
+                        *expected_revision,
+                        operation_id.as_deref().expect("validated apply mode"),
+                        confirm_intent.as_deref().expect("validated apply mode"),
+                    )?;
+                    if outcome.committed_revision.is_some() {
+                        committed_output(&outcome, *json)
+                    } else {
+                        write_output(&outcome, *json)
+                    }
+                }
+            }
+        }
+        OwnershipCommand::InspectLexicalStage { .. }
+        | OwnershipCommand::InspectSemanticStage { .. } => {
+            unreachable!("inspection returned above")
+        }
     }
 }
 
 fn committed_output(value: &impl Serialize, json: bool) -> Result<()> {
     write_output(value, json).map_err(|error| Error::CommitOutcomeUnknown {
-        detail: format!("enrollment committed but the receipt could not be written: {error}; retry the same operation"),
+        detail: format!("administrative operation committed but the receipt could not be written: {error}; retry the same operation"),
     })
 }
 

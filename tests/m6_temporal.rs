@@ -61,8 +61,8 @@ fn migration_eight_records_baseline_and_coverage() {
     let conn = db.raw();
     assert_eq!(
         max_revision(&conn),
-        4,
-        "baseline plus schema-13, schema-14 and schema-15 metadata cutovers"
+        5,
+        "baseline plus schema-13, schema-14, schema-15 and schema-16 metadata cutovers"
     );
     let metadata_revision: i64 = conn
         .query_row(
@@ -82,6 +82,8 @@ fn migration_eight_records_baseline_and_coverage() {
         )
         .unwrap();
     assert_eq!(lexical_revision, 4);
+    let semantic_revision: i64 = conn.query_row("SELECT revision_id FROM m6_row_availability WHERE table_name='semantic_staging_schema'",[],|r|r.get(0)).unwrap();
+    assert_eq!(semantic_revision, 5);
     let kind: String = conn
         .query_row(
             "SELECT kind FROM m6_revisions WHERE revision_id = 1",

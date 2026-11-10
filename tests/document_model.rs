@@ -5,6 +5,9 @@
 //! the honesty of anchors and citations, and that nothing existing moved (memories, producer
 //! families, the file lifecycle, retrieval, migration of an existing database).
 
+#[path = "support/schema_fixture.rs"]
+mod schema_fixture;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -1434,6 +1437,7 @@ fn an_existing_database_migrates_and_keeps_everything_it_had() {
     assert!(!before_hits.is_empty());
     // make it a schema-9 database: no document tables, no migration-10 record
     let c = db.raw();
+    schema_fixture::remove_empty_ownership_metadata(&c);
     c.execute_batch(
         "DELETE FROM schema_migrations WHERE version IN (10, 11, 12);
          DROP TABLE doc_chunks; DROP TABLE doc_chunk_sets; DROP TABLE doc_nodes; DROP TABLE doc_extractions; DROP TABLE doc_blobs;
@@ -1462,7 +1466,7 @@ fn an_existing_database_migrates_and_keeps_everything_it_had() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 12);
+    assert_eq!(max, 13);
     assert_eq!(
         search_texts(&store, "zebra"),
         before_hits,

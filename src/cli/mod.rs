@@ -1,5 +1,7 @@
 #[cfg(unix)]
 pub mod grant;
+#[cfg(unix)]
+pub mod ownership;
 pub mod render;
 
 use std::path::PathBuf;
@@ -240,6 +242,12 @@ pub enum Command {
     Grant {
         #[command(subcommand)]
         command: grant::GrantCommand,
+    },
+    /// Trusted local legacy enrollment administration (no MCP route or search changes).
+    #[cfg(unix)]
+    Ownership {
+        #[command(subcommand)]
+        command: ownership::OwnershipCommand,
     },
     /// EXPERIMENT (M7.3b.2a): one confined extraction worker, started by a parent process
     /// that hands it a root directory descriptor and a channel. Not for users.
@@ -941,6 +949,8 @@ License: {}",
         },
         #[cfg(unix)]
         Command::Grant { command } => grant::run(cli, command)?,
+        #[cfg(unix)]
+        Command::Ownership { command } => ownership::run(cli, command)?,
         // handled at the top of `run`, before anything else happens
         #[cfg(unix)]
         Command::ExtractionWorker => unreachable!("the worker is started by `run`"),

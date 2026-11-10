@@ -59,7 +59,19 @@ fn max_revision(conn: &Connection) -> i64 {
 fn migration_eight_records_baseline_and_coverage() {
     let db = TestDb::new();
     let conn = db.raw();
-    assert_eq!(max_revision(&conn), 1);
+    assert_eq!(
+        max_revision(&conn),
+        2,
+        "baseline plus one schema-13 metadata cutover"
+    );
+    let metadata_revision: i64 = conn
+        .query_row(
+            "SELECT revision_id FROM m6_row_availability WHERE table_name='asset_ownership_schema'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(metadata_revision, 2);
     let kind: String = conn
         .query_row(
             "SELECT kind FROM m6_revisions WHERE revision_id = 1",
@@ -842,6 +854,7 @@ fn discarded_connection_refuses_writes_but_keeps_reads() {
     // still work (no poisoning), and a busy lock maps to DatabaseBusy.
     let db = TestDb::new();
     let store = db.open();
+    let before = max_revision(&db.raw());
     let blocker = Connection::open(&db.path).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let result = store.create_space("blocked", "");
@@ -850,5 +863,5 @@ fn discarded_connection_refuses_writes_but_keeps_reads() {
     // The failed attempt must not poison the store; its next write reuses
     // the never-committed revision number.
     store.create_space("after", "").unwrap();
-    assert_eq!(max_revision(&db.raw()), 2);
+    assert_eq!(max_revision(&db.raw()), before + 1);
 }

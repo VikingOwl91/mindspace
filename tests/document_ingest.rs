@@ -3,6 +3,9 @@
 //! The path under test is `mindspace::ingest::document::ingest_document_file`; the legacy path is
 //! `mindspace::ingest::ingest_path`. The two are compared where they can meet (the same file).
 
+#[path = "support/schema_fixture.rs"]
+mod schema_fixture;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -1691,6 +1694,7 @@ fn populated_schema_ten(env: &Env) -> (Vec<Row>, Vec<Row>, Vec<mindspace::core::
     drop(store);
     // revert to schema 10: the real 0010 doc_nodes, same rows, migration 11 forgotten
     let c = env.raw();
+    schema_fixture::remove_empty_ownership_metadata(&c);
     let rows = all_rows(&c, "doc_nodes");
     let stmts = schema_ten_doc_nodes();
     c.execute_batch(&format!(
@@ -1744,7 +1748,7 @@ fn migration_eleven_upgrades_a_populated_schema_ten_database_without_losing_anyt
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 12);
+    assert_eq!(max, 13);
     // foreign keys: the migration ran with them off, so nothing checked them. Check now.
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1898,7 +1902,7 @@ fn a_migration_that_fails_late_rolls_back_to_the_exact_schema_ten_state() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 12);
+    assert_eq!(max, 13);
     let violations: i64 = c
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)

@@ -1,5 +1,8 @@
 #![cfg(feature = "embeddings")]
 
+#[path = "support/schema_fixture.rs"]
+mod schema_fixture;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Barrier, RwLock};
@@ -333,19 +336,15 @@ fn chunk_storage_is_immutable_and_upgrade_from_populated_schema_eleven_preserves
         assert!(db.raw().execute(sql, []).is_err(), "{sql}");
     }
     drop(store);
+    schema_fixture::remove_empty_ownership_metadata(&db.raw());
     db.raw().execute_batch("DROP TABLE doc_chunks; DROP TABLE doc_chunk_sets; DELETE FROM schema_migrations WHERE version=12").unwrap();
     let before = db.counts();
     let store = db.open();
     let after = db.counts();
-    for table in [
-        "logical_sources",
-        "sources",
-        "doc_extractions",
-        "doc_nodes",
-        "m6_revisions",
-    ] {
+    for table in ["logical_sources", "sources", "doc_extractions", "doc_nodes"] {
         assert_eq!(before[table], after[table]);
     }
+    assert_eq!(after["m6_revisions"], before["m6_revisions"] + 1);
     assert_eq!(
         store
             .resolve_document_anchor(&chunks[0].anchor)
@@ -546,6 +545,7 @@ fn migration_twelve_failure_after_first_table_creation_rolls_back_the_whole_upgr
         .record_document_extraction(draft("/source.md", "retained source\n"))
         .unwrap();
     drop(store);
+    schema_fixture::remove_empty_ownership_metadata(&db.raw());
     db.raw().execute_batch("DROP TABLE doc_chunks; DROP TABLE doc_chunk_sets; DELETE FROM schema_migrations WHERE version=12; CREATE TABLE doc_chunks (sentinel TEXT); INSERT INTO doc_chunks VALUES ('preserve me');").unwrap();
     let schema = |db: &Db| -> Vec<(String, String)> {
         db.raw()
@@ -584,7 +584,7 @@ fn migration_twelve_failure_after_first_table_creation_rolls_back_the_whole_upgr
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
 }
 

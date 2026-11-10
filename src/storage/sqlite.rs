@@ -54,10 +54,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../../migrations/0011_doc_code_blocks.sql"),
     ),
     (12, include_str!("../../migrations/0012_doc_chunks.sql")),
+    (
+        13,
+        include_str!("../../migrations/0013_legacy_ownership.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -68,10 +72,12 @@ const GIT_PRODUCER_FAMILY: &str = "git:legacy";
 const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
 
 mod documents;
+pub(crate) mod ownership;
 
 pub struct SqliteStore {
     conn: Mutex<Option<Connection>>,
     revision_state: Arc<RevisionState>,
+    ownership_state: Arc<ownership::OwnershipState>,
     fts_integrity: AtomicBool,
 }
 
@@ -370,13 +376,16 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(dberr)?;
         register_revision_context(&conn, &revision_state)?;
+        let ownership_state = Arc::new(ownership::OwnershipState::default());
+        ownership::register_context(&conn, &ownership_state)?;
         reject_future_schema(&conn)?;
-        run_migrations(&conn)?;
+        run_migrations(&conn, &revision_state)?;
         validate_fence_inventory(&conn)?;
         let fts_integrity = verify_fts_counts(&conn).is_ok();
         Ok(Self {
             conn: Mutex::new(Some(conn)),
             revision_state,
+            ownership_state,
             fts_integrity: AtomicBool::new(fts_integrity),
         })
     }
@@ -892,12 +901,61 @@ fn validate_migration_prefix(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn run_migrations(conn: &Connection) -> Result<()> {
+/// A migration-owned revision scope. It never starts or commits a nested transaction.
+struct MigrationRevisionScope {
+    state: Arc<RevisionState>,
+}
+
+impl MigrationRevisionScope {
+    fn enter(conn: &Connection, state: &Arc<RevisionState>) -> Result<Self> {
+        if conn.is_autocommit() || state.poisoned.load(Ordering::SeqCst) {
+            return Err(Error::Storage(
+                "metadata migration requires a healthy owned transaction".into(),
+            ));
+        }
+        let previous: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(revision_id),0) FROM m6_revisions",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(dberr)?;
+        let revision = previous
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("recording revision space exhausted".into()))?;
+        state
+            .active_revision
+            .compare_exchange(0, revision, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| {
+                Error::Storage(
+                    "metadata migration cannot replace active write authorization".into(),
+                )
+            })?;
+        let scope = Self {
+            state: Arc::clone(state),
+        };
+        conn.execute(
+            "INSERT INTO m6_revisions(revision_id,recorded_at,kind) VALUES(?1,?2,'write')",
+            rusqlite::params![revision, Ts::now().0],
+        )
+        .map_err(dberr)?;
+        Ok(scope)
+    }
+}
+
+impl Drop for MigrationRevisionScope {
+    fn drop(&mut self) {
+        self.state.active_revision.store(0, Ordering::SeqCst);
+    }
+}
+
+fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
     reject_future_schema(conn)?;
     validate_migration_prefix(conn)?;
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(dberr)?;
 
+    let metadata_committed = std::cell::Cell::new(false);
     let migration_result = (|| {
         let has_migration_table: bool = conn
             .query_row(
@@ -938,6 +996,13 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 tx.commit().map_err(dberr)?;
                 continue;
             }
+            // Schema 13 records its own metadata birth in this already-owned transaction.
+            // Migration 8 must remain the sole installer of the original baseline/fences.
+            let metadata_scope = if *version == 13 {
+                Some(MigrationRevisionScope::enter(&tx, state)?)
+            } else {
+                None
+            };
             tx.execute_batch(sql).map_err(dberr)?;
             if *version == M6_VERSION {
                 apply_m6_baseline(&tx)?;
@@ -951,7 +1016,30 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 install_m6_write_fence(&tx)?;
                 validate_fence_inventory(&tx)?;
             }
-            tx.commit().map_err(dberr)?;
+            if *version == 13 {
+                tx.execute("INSERT INTO m6_row_availability(table_name,entity_key,revision_id) VALUES('asset_ownership_schema','local-enroll@1',m6_write_revision())", []).map_err(dberr)?;
+                let violations: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(dberr)?;
+                if violations != 0 {
+                    return Err(Error::Storage(
+                        "ownership metadata migration failed foreign_key_check".into(),
+                    ));
+                }
+                validate_fence_inventory(&tx)?;
+                WriteTransaction {
+                    tx: Some(tx),
+                    conn,
+                    revision_state: Arc::clone(state),
+                }
+                .commit()?;
+                metadata_committed.set(true);
+            } else {
+                tx.commit().map_err(dberr)?;
+            }
+            drop(metadata_scope);
         }
         validate_migration_prefix(conn)?;
         let current: i64 = conn
@@ -970,8 +1058,28 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     let restore_result = conn
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(dberr);
-    migration_result?;
-    restore_result?;
+    if let Err(error) = migration_result {
+        if metadata_committed.get() {
+            state.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::CommitOutcomeUnknown {
+                detail: format!(
+                    "ownership metadata committed but final verification failed: {error}"
+                ),
+            });
+        }
+        return Err(error);
+    }
+    if let Err(error) = restore_result {
+        if metadata_committed.get() {
+            state.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::CommitOutcomeUnknown {
+                detail: format!(
+                    "ownership metadata committed but connection restoration failed: {error}"
+                ),
+            });
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1514,6 +1622,33 @@ fn validate_fence_inventory(conn: &Connection) -> Result<()> {
         .map_err(dberr)?;
     for row in rows {
         expected.remove(&row.map_err(dberr)?);
+    }
+    let ownership_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=13)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if ownership_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='asset_ownership_schema' AND a.entity_key='local-enroll@1' AND r.kind='write'", [], |r| r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "ownership schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            ownership::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
     }
     if !expected.is_empty() {
         let mut missing: Vec<String> = expected.into_iter().collect();
@@ -5495,3 +5630,7 @@ impl SqliteStore {
         documents::list_chunks(self, extraction_id)
     }
 }
+
+#[cfg(test)]
+#[path = "sqlite/ownership_migration_tests.rs"]
+mod ownership_migration_tests;

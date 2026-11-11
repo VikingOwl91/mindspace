@@ -809,9 +809,48 @@ fn competing_operation_ids_cannot_replace_the_committed_artifact() {
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let results = children
+    // Reap every contender before any result assertion can unwind World and
+    // delete the database shared with its siblings. Do not short-circuit on Err.
+    let outputs = children
         .into_iter()
-        .map(|c| output_json(c.wait_with_output().unwrap()))
+        .map(Child::wait_with_output)
+        .collect::<Vec<_>>();
+    if outputs
+        .iter()
+        .any(|result| !matches!(result, Ok(output) if output.status.success()))
+    {
+        // Retain first: even a logging/quota failure must not remove evidence.
+        let retained = w.dir.keep();
+        for (n, result) in outputs.iter().enumerate() {
+            match result {
+                Ok(output) => {
+                    std::fs::write(retained.join(format!("child-{n}.stdout")), &output.stdout)
+                        .unwrap();
+                    std::fs::write(retained.join(format!("child-{n}.stderr")), &output.stderr)
+                        .unwrap();
+                    std::fs::write(
+                        retained.join(format!("child-{n}.status")),
+                        output.status.to_string(),
+                    )
+                    .unwrap();
+                }
+                Err(error) => {
+                    std::fs::write(
+                        retained.join(format!("child-{n}.wait-error")),
+                        error.to_string(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        panic!(
+            "a contender failed; all contenders were awaited; fixture retained at {}",
+            retained.display()
+        );
+    }
+    let results = outputs
+        .into_iter()
+        .map(|output| output_json(output.unwrap()))
         .collect::<Vec<_>>();
     assert!(results.iter().any(|r| r["outcome"] == "committed"));
     for result in results {

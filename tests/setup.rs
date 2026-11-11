@@ -1931,7 +1931,16 @@ fn real_codex_registers_backs_up_keeps_foreign_servers_and_never_overwrites() {
         eprintln!("skipped: `codex` is not installed");
         return;
     };
-    let r = real_world(&codex);
+    let mut r = real_world(&codex);
+    // Exercise the selected real runtime without reintroducing other installed
+    // Codex binaries through /usr/bin. Production ambiguity checks remain intact.
+    r.path = codex.parent().unwrap().display().to_string();
+    let detection = mindspace::setup::client::detect(
+        mindspace::setup::Client::Codex,
+        Some(std::ffi::OsStr::new(&r.path)),
+    );
+    assert_eq!(detection.paths.len(), 1);
+    assert_eq!(canon(&detection.paths[0]), canon(&codex));
     let repos = r.root.join("repos");
     std::fs::create_dir(&repos).unwrap();
     let repos = canon(&repos);

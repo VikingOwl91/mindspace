@@ -3276,6 +3276,18 @@ enum Plan {
     },
 }
 
+/// Captured file identity/lifecycle classification for one serialized operation.
+/// This is neither a persisted plan nor proof of physical file or alias identity.
+/// Application still performs ordinary version/knowledge reconciliation.
+struct FileObservationPlan<'conn> {
+    conn: &'conn Connection,
+    session: crate::core::SessionDraft,
+    files: Vec<ObservedFile>,
+    spaces: Vec<Uuid>,
+    classifications: Vec<Plan>,
+    residual_disappearances: BTreeMap<Uuid, String>,
+}
+
 /// What the engine believes about one logical source inside an ingest
 /// root: its expected location and the hash of its latest version.
 type KnownSource = (String, Option<String>);
@@ -3469,31 +3481,20 @@ fn record_code_observation_tx(
     Ok(report)
 }
 
-fn record_observation_tx(
-    conn: &Connection,
+/// Read the complete file classification before any ordinary mutation effects.
+/// The caller retains the existing serialized M6 transaction throughout planning
+/// and application; supplied roots/locations remain ordinary strings.
+fn plan_file_observation<'conn>(
+    conn: &'conn Connection,
     observation: IngestObservation,
-) -> Result<ObservationReport> {
+) -> Result<FileObservationPlan<'conn>> {
     let IngestObservation {
         session,
         mut files,
         spaces,
     } = observation;
-    let at = session.observed_at;
     let full = session.scope == IngestScope::Directory;
     let root = session.root.clone();
-
-    let session_id = Uuid::now_v7();
-    conn.execute(
-        "INSERT INTO ingest_sessions (id, root, scope, observed_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            session_id.to_string(),
-            session.root,
-            session.scope.as_str(),
-            at.0,
-        ],
-    )
-    .map_err(dberr)?;
-    upsert_scope(conn, None, Some(&session.root), &spaces, at)?;
 
     // Deterministic processing order.
     files.sort_by(|a, b| a.location.cmp(&b.location));
@@ -3652,7 +3653,9 @@ fn record_observation_tx(
             }
             let hash_of = |logical: &Uuid| -> Option<String> {
                 if gone.contains_key(logical) {
-                    latest_version_hash(conn, logical).ok().flatten()
+                    // This hash was read fallibly while capturing `present`.
+                    // A failed lookup must never become missing move evidence.
+                    present[logical].1.clone()
                 } else {
                     absent.get(logical).and_then(|(_, h)| h.clone())
                 }
@@ -3692,11 +3695,65 @@ fn record_observation_tx(
         }
     }
 
+    // Continued moves are already represented by their per-file classification.
+    // Only unmatched disappearances remain for application; partial observations
+    // never populate this map.
+    gone.retain(|logical, _| !matched.contains_key(logical));
+    Ok(FileObservationPlan {
+        conn,
+        session,
+        files,
+        spaces,
+        classifications: plans,
+        residual_disappearances: gone,
+    })
+}
+
+fn record_observation_tx(
+    conn: &Connection,
+    observation: IngestObservation,
+) -> Result<ObservationReport> {
+    #[cfg(test)]
+    observation_planning_tests::checkpoint("before_plan", conn)?;
+    let plan = plan_file_observation(conn, observation)?;
+    #[cfg(test)]
+    observation_planning_tests::checkpoint("after_plan", conn)?;
+    apply_file_observation(plan)
+}
+
+/// Apply captured file classifications; ordinary version/knowledge reconciliation remains here.
+fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationReport> {
+    let FileObservationPlan {
+        conn,
+        session,
+        files,
+        spaces,
+        classifications,
+        residual_disappearances,
+    } = plan;
+    let at = session.observed_at;
+    let root = session.root.clone();
+
+    // Preserve the original relative UUID allocation order: session first, then
+    // any new logical sources/versions created by the existing execution path.
+    let session_id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO ingest_sessions (id, root, scope, observed_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            session_id.to_string(),
+            session.root,
+            session.scope.as_str(),
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+    upsert_scope(conn, None, Some(&session.root), &spaces, at)?;
+
     // --- execution -----------------------------------------------------------
     let mut report_files: Vec<FileObservation> = Vec::new();
     let mut events: Vec<SourceEvent> = Vec::new();
 
-    for plan in plans {
+    for plan in classifications {
         match plan {
             Plan::Unchanged {
                 location,
@@ -3814,28 +3871,23 @@ fn record_observation_tx(
     // Disappearances: full observations only, scoped to the observed root.
     // This records absence; it does NOT retire derived memories
     // (disappearance is not falsehood).
-    if full {
-        for (logical, location) in &gone {
-            if matched.contains_key(logical) {
-                continue;
-            }
-            conn.execute(
-                "UPDATE logical_sources SET state = 'absent' WHERE id = ?1",
-                rusqlite::params![logical.to_string()],
-            )
-            .map_err(dberr)?;
-            let event = insert_source_event(
-                conn,
-                *logical,
-                SourceEventKind::Disappeared {
-                    from_location: Some(location.clone()),
-                },
-                None,
-                session_id,
-                at,
-            )?;
-            events.push(event);
-        }
+    for (logical, location) in &residual_disappearances {
+        conn.execute(
+            "UPDATE logical_sources SET state = 'absent' WHERE id = ?1",
+            rusqlite::params![logical.to_string()],
+        )
+        .map_err(dberr)?;
+        let event = insert_source_event(
+            conn,
+            *logical,
+            SourceEventKind::Disappeared {
+                from_location: Some(location.clone()),
+            },
+            None,
+            session_id,
+            at,
+        )?;
+        events.push(event);
     }
 
     Ok(ObservationReport {
@@ -5546,3 +5598,7 @@ mod settings_tests;
 #[cfg(test)]
 #[path = "sqlite/read_session_tests.rs"]
 mod read_session_tests;
+
+#[cfg(test)]
+#[path = "sqlite/observation_planning_tests.rs"]
+mod observation_planning_tests;

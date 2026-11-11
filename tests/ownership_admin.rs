@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -1023,4 +1023,168 @@ fn foreign_wal_preflight_preserves_main_and_does_not_repair_missing_shm() {
         !shm.exists(),
         "refusal must not repair an unsupported missing SHM"
     );
+}
+
+// These are deliberately synthetic metadata-transition fixtures. No SQLite
+// connection owns the synthetic WAL, and the administrative child pauses before
+// it opens SQLite. Real native last-close ordering is separately exercised by
+// the retained controlled-unlink experiment, not inferred from this fixture.
+fn synthetic_wal(w: &World) -> PathBuf {
+    let path = w.db.with_file_name("mind.db-wal");
+    assert!(!path.exists());
+    assert!(!w.db.with_file_name("mind.db-shm").exists());
+    std::fs::write(&path, b"").unwrap();
+    path
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PhysicalState {
+    bytes: Vec<u8>,
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+fn physical_state(path: &Path) -> PhysicalState {
+    let bytes = std::fs::read(path).unwrap();
+    let metadata = std::fs::metadata(path).unwrap();
+    PhysicalState {
+        bytes,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        ctime: (metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+fn immutable_revision(path: &Path) -> i64 {
+    let uri = format!("file:{}?immutable=1", path.display());
+    Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap()
+    .query_row("SELECT MAX(revision_id) FROM m6_revisions", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+#[test]
+fn transient_missing_shm_repeats_admission_without_losing_the_exact_intent() {
+    let w = World::new();
+    let plan = w.preview();
+    let revision = w.revision();
+    let knowledge = w.unchanged_knowledge();
+    let before = physical_state(&w.db);
+    let wal = synthetic_wal(&w);
+    let old = Paused::start(&w, &plan, "missing_shm");
+    assert_eq!(physical_state(&w.db), before);
+    assert!(!w.db.with_file_name("mind.db-shm").exists());
+    // Retain the synthetic entry rather than deleting any real SQLite sidecar.
+    std::fs::rename(&wal, w.dir.path().join("synthetic-wal-retained")).unwrap();
+    let committed = output_json(old.release());
+    assert_eq!(committed["operation_id"], plan["operation_id"]);
+    assert_eq!(committed["committed_revision"], revision + 1);
+    assert_eq!(w.revision(), revision + 1);
+    assert_eq!(w.count("asset_control_intents"), 1);
+    assert_eq!(w.count("asset_ownership"), 1);
+    assert_eq!(w.unchanged_knowledge(), knowledge);
+    assert_eq!(w.apply(&plan), committed);
+    assert_eq!(w.revision(), revision + 1);
+}
+
+#[test]
+fn stable_missing_shm_is_bounded_and_never_repaired_or_written() {
+    let w = World::new();
+    let plan = w.preview();
+    let revision = w.revision();
+    let wal = synthetic_wal(&w);
+    let before = physical_state(&w.db);
+    let wal_before = physical_state(&wal);
+    let started = Instant::now();
+    let error = refused(w.apply_command(&plan).output().unwrap());
+    assert!(
+        error.contains("WAL without an existing shared-memory file"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "missing-SHM retry did not wait for its bounded deadline"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "missing-SHM retry exceeded its bound"
+    );
+    assert_eq!(physical_state(&w.db), before);
+    assert_eq!(physical_state(&wal), wal_before);
+    assert!(!w.db.with_file_name("mind.db-shm").exists());
+    assert_eq!(immutable_revision(&w.db), revision);
+}
+
+#[test]
+fn missing_shm_retry_revalidates_identity_journal_and_nonregular_sidecar() {
+    for hazard in ["identity", "journal", "directory", "permissions"] {
+        let w = World::new();
+        let plan = w.preview();
+        let revision = w.revision();
+        let wal = synthetic_wal(&w);
+        let old = Paused::start(&w, &plan, "missing_shm");
+        let extra = match hazard {
+            "identity" => {
+                let retained = w.dir.path().join("retained-original.db");
+                std::fs::rename(&w.db, &retained).unwrap();
+                std::fs::copy(&retained, &w.db).unwrap();
+                Some(retained)
+            }
+            "journal" => {
+                let journal = w.db.with_file_name("mind.db-journal");
+                // Existing admission rejects even a cold journal; this does not
+                // claim to synthesize hot-journal recovery or its contents.
+                std::fs::write(&journal, b"").unwrap();
+                Some(journal)
+            }
+            "directory" => {
+                std::fs::create_dir(w.db.with_file_name("mind.db-shm")).unwrap();
+                None
+            }
+            "permissions" => {
+                std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o666)).unwrap();
+                None
+            }
+            _ => unreachable!(),
+        };
+        let before = physical_state(&w.db);
+        let wal_before = physical_state(&wal);
+        let extra_before = extra.as_ref().map(|path| physical_state(path));
+        let started = Instant::now();
+        let error = refused(old.release());
+        match hazard {
+            "identity" => assert!(error.contains("changed"), "{error}"),
+            "journal" => assert!(error.contains("rollback-journal"), "{error}"),
+            "directory" => assert!(
+                error.contains("SQLite sidecar must be a regular"),
+                "{error}"
+            ),
+            "permissions" => assert!(error.contains("not writable by group/others"), "{error}"),
+            _ => unreachable!(),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "invalid state entered the missing-SHM wait: {hazard}"
+        );
+        assert_eq!(physical_state(&w.db), before);
+        assert_eq!(physical_state(&wal), wal_before);
+        if let Some(path) = extra {
+            assert_eq!(Some(physical_state(&path)), extra_before);
+        }
+        assert_eq!(immutable_revision(&w.db), revision);
+    }
 }

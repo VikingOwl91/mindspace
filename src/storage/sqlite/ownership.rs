@@ -461,39 +461,73 @@ fn recognize_immutable_main(ctx: &AdminContext) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn recognize_read_only(ctx: &AdminContext, with_wal: bool) -> Result<()> {
+enum Recognition {
+    Ready,
+    MissingShm,
+}
+
+#[cfg(unix)]
+fn missing_shm() -> Error {
+    refuse("WAL without an existing shared-memory file requires separate SQLite recovery")
+}
+
+#[cfg(unix)]
+fn recognize_read_only(ctx: &AdminContext, with_wal: bool) -> Result<Recognition> {
     ctx.validate()?;
     reject_rollback_journal(ctx)?;
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let conn = if with_wal {
-        if !sidecar_path(ctx, "-shm").is_file() {
-            return Err(refuse(
-                "WAL without an existing shared-memory file requires separate SQLite recovery",
-            ));
+        match std::fs::metadata(sidecar_path(ctx, "-shm")) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Recognition::MissingShm);
+            }
+            // Only a definite absence can be a transient SQLite last-close window.
+            // Permission errors and non-file entries must not enter the retry path.
+            _ => return Err(missing_shm()),
         }
         Connection::open_with_flags(ctx.path(), flags)
     } else {
-        return recognize_immutable_main(ctx);
+        recognize_immutable_main(ctx)?;
+        return Ok(Recognition::Ready);
     }
     .map_err(dberr)?;
     let read = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred).map_err(dberr)?;
     require_initialized_database(&read)?;
     read.rollback().map_err(dberr)?;
     ctx.validate()?;
-    reject_rollback_journal(ctx)
+    reject_rollback_journal(ctx)?;
+    Ok(Recognition::Ready)
 }
 
 #[cfg(unix)]
 fn recognize_before_write(ctx: &AdminContext) -> Result<()> {
-    let with_wal = sidecar_path(ctx, "-wal").is_file();
-    let first = recognize_read_only(ctx, with_wal);
-    // Another legitimate connection may have started writing after the WAL check.
-    // Do not accept a stale immutable schema view when its WAL has appeared.
-    if !with_wal && sidecar_path(ctx, "-wal").is_file() {
-        recognize_read_only(ctx, true)
-    } else {
-        first
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let with_wal = sidecar_path(ctx, "-wal").is_file();
+        let first = recognize_read_only(ctx, with_wal);
+        // Another legitimate connection may have started writing after the WAL check.
+        // Do not accept a stale immutable schema view when its WAL has appeared.
+        let result = if !with_wal && sidecar_path(ctx, "-wal").is_file() {
+            recognize_read_only(ctx, true)
+        } else {
+            first
+        };
+        match result? {
+            Recognition::Ready => return Ok(()),
+            Recognition::MissingShm => {
+                // SQLite's last close removes SHM before WAL. Wait only for that
+                // metadata state to change, then repeat every admission check.
+                // Never open/recover SQLite while its WAL has no existing SHM.
+                #[cfg(feature = "spawn-gate")]
+                test_pause("missing_shm");
+                if std::time::Instant::now() >= deadline {
+                    return Err(missing_shm());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 

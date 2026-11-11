@@ -1,0 +1,846 @@
+diff --git a/src/storage/sqlite.rs b/src/storage/sqlite.rs
+index a56bcb8..6b9747f 100644
+--- a/src/storage/sqlite.rs
++++ b/src/storage/sqlite.rs
+@@ -3278,7 +3278,7 @@ enum Plan {
+ 
+ /// Captured file identity/lifecycle classification for one serialized operation.
+ /// This is neither a persisted plan nor proof of physical file or alias identity.
+-/// Application still performs ordinary version/knowledge reconciliation.
++/// Application retains ordinary effect and UUID allocation order.
+ struct FileObservationPlan<'conn> {
+     conn: &'conn Connection,
+     session: crate::core::SessionDraft,
+@@ -3286,6 +3286,89 @@ struct FileObservationPlan<'conn> {
+     spaces: Vec<Uuid>,
+     classifications: Vec<Plan>,
+     residual_disappearances: BTreeMap<Uuid, String>,
++    reconciliations: FileReconciliations,
++}
++
++/// Only disjoint existing targets are eligible for pre-effect reconciliation.
++/// New-source and repeated-target operations retain ordered legacy execution.
++enum FileReconciliations {
++    Ordered,
++    Captured(HashMap<usize, Result<ReconciliationPlan>>),
++}
++
++impl FileReconciliations {
++    fn capture(conn: &Connection, files: &[ObservedFile], plans: &[Plan]) -> Self {
++        let mut locations = HashSet::new();
++        let mut logicals = HashSet::new();
++        for plan in plans {
++            let (location, logical) = match plan {
++                Plan::Unchanged {
++                    location, logical, ..
++                }
++                | Plan::Changed {
++                    location, logical, ..
++                }
++                | Plan::Continue {
++                    location, logical, ..
++                } => (location, logical),
++                Plan::Created { .. } => return Self::Ordered,
++            };
++            if !locations.insert(location) || !logicals.insert(*logical) {
++                return Self::Ordered;
++            }
++        }
++        let mut captured = HashMap::new();
++        for plan in plans {
++            if let Plan::Unchanged {
++                logical, file_idx, ..
++            }
++            | Plan::Changed {
++                logical, file_idx, ..
++            } = plan
++            {
++                // Do not surface errors yet: earlier session/scope/version
++                // effects and genuine UUID allocations retain their old order.
++                captured.insert(
++                    *file_idx,
++                    plan_reconciliation(
++                        conn,
++                        *logical,
++                        &files[*file_idx],
++                        FILE_PRODUCER_FAMILY,
++                        true,
++                    ),
++                );
++            }
++        }
++        Self::Captured(captured)
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn apply(
++        &mut self,
++        conn: &Connection,
++        file_idx: usize,
++        logical: Uuid,
++        file: &ObservedFile,
++        evidence_ids: &[Uuid],
++        at: Ts,
++    ) -> Result<Vec<MemoryAction>> {
++        match self {
++            Self::Ordered => {
++                reconcile_logical(conn, logical, file, evidence_ids, at, FILE_PRODUCER_FAMILY)
++            }
++            Self::Captured(plans) => apply_reconciliation(
++                conn,
++                plans
++                    .remove(&file_idx)
++                    .expect("one captured reconciliation per existing target")?,
++                file,
++                evidence_ids,
++                at,
++                FILE_PRODUCER_FAMILY,
++            ),
++        }
++    }
+ }
+ 
+ /// What the engine believes about one logical source inside an ingest
+@@ -3699,6 +3782,7 @@ fn plan_file_observation<'conn>(
+     // Only unmatched disappearances remain for application; partial observations
+     // never populate this map.
+     gone.retain(|logical, _| !matched.contains_key(logical));
++    let reconciliations = FileReconciliations::capture(conn, &files, &plans);
+     Ok(FileObservationPlan {
+         conn,
+         session,
+@@ -3706,6 +3790,7 @@ fn plan_file_observation<'conn>(
+         spaces,
+         classifications: plans,
+         residual_disappearances: gone,
++        reconciliations,
+     })
+ }
+ 
+@@ -3730,6 +3815,7 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
+         spaces,
+         classifications,
+         residual_disappearances,
++        mut reconciliations,
+     } = plan;
+     let at = session.observed_at;
+     let root = session.root.clone();
+@@ -3767,13 +3853,13 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
+                 // reconciliation can only reuse (never supersede).
+                 let (_, _, evidence_ids) =
+                     ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
+-                let actions = reconcile_logical(
++                let actions = reconciliations.apply(
+                     conn,
++                    file_idx,
+                     logical,
+                     &files[file_idx],
+                     &evidence_ids,
+                     at,
+-                    FILE_PRODUCER_FAMILY,
+                 )?;
+                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
+                 report_files.push(FileObservation {
+@@ -3790,13 +3876,13 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
+             } => {
+                 let (_, _, evidence_ids) =
+                     ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
+-                let actions = reconcile_logical(
++                let actions = reconciliations.apply(
+                     conn,
++                    file_idx,
+                     logical,
+                     &files[file_idx],
+                     &evidence_ids,
+                     at,
+-                    FILE_PRODUCER_FAMILY,
+                 )?;
+                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
+                 report_files.push(FileObservation {
+@@ -4282,10 +4368,36 @@ fn insert_source_event(
+     })
+ }
+ 
+-/// Reconciles the active memory episodes of one logical source against the
+-/// fragments of an observed version (docs/memory-model.md section 6).
+-/// Identity is per logical source, so a moved-but-unchanged source never
+-/// duplicates knowledge; this runs only when content changed.
++/// Captured targets, lifecycle actions and membership requests. No UUIDs are
++/// reserved here; assertion/episode creation remains lazy during application.
++struct ReconciliationPlan {
++    steps: Vec<ReconciliationStep>,
++    requested_by_assertion: HashMap<usize, Vec<Uuid>>,
++    space_names: BTreeMap<Uuid, String>,
++}
++
++enum ReconciliationStep {
++    Reuse {
++        memory_id: Uuid,
++        assertion_idx: usize,
++        // None is the ordered path; a captured error is raised only at this
++        // action's original add_spaces position, after preceding real effects.
++        additions: Option<Result<Vec<Uuid>>>,
++    },
++    Supersede {
++        memory_id: Uuid,
++        assertion_idx: usize,
++    },
++    Create {
++        assertion_idx: usize,
++    },
++    Retire {
++        old: MemorySummary,
++    },
++}
++
++/// Ordered reconciliation, also used at the existing Git invocation point.
++/// Selection remains scoped to one logical source and producer family.
+ fn reconcile_logical(
+     conn: &Connection,
+     logical: Uuid,
+@@ -4294,6 +4406,17 @@ fn reconcile_logical(
+     at: Ts,
+     producer_family: &str,
+ ) -> Result<Vec<MemoryAction>> {
++    let plan = plan_reconciliation(conn, logical, file, producer_family, false)?;
++    apply_reconciliation(conn, plan, file, evidence_ids, at, producer_family)
++}
++
++fn plan_reconciliation(
++    conn: &Connection,
++    logical: Uuid,
++    file: &ObservedFile,
++    producer_family: &str,
++    capture_memberships: bool,
++) -> Result<ReconciliationPlan> {
+     let mut olds_by_subject: BTreeMap<String, Vec<MemorySummary>> = BTreeMap::new();
+     let olds = load_summaries(
+         conn,
+@@ -4348,19 +4471,7 @@ fn reconcile_logical(
+         }
+     }
+ 
+-    let mut assertion_cache: Vec<Option<Uuid>> = vec![None; file.assertions.len()];
+-    let mut get_assertion = |conn: &Connection, idx: usize| -> Result<Uuid> {
+-        if let Some(id) = assertion_cache[idx] {
+-            return Ok(id);
+-        }
+-        let d = &file.assertions[idx];
+-        let evidence_id = evidence_ids[d.evidence_idx];
+-        let id = get_or_create_assertion(conn, evidence_id, d, at)?;
+-        assertion_cache[idx] = Some(id);
+-        Ok(id)
+-    };
+-
+-    let mut actions: Vec<MemoryAction> = Vec::new();
++    let mut steps = Vec::new();
+     let mut pending_news: Vec<usize> = Vec::new();
+     let mut pending_olds: Vec<MemorySummary> = Vec::new();
+     let subjects: BTreeSet<String> = olds_by_subject
+@@ -4377,114 +4488,170 @@ fn reconcile_logical(
+             .get(&subject)
+             .map(Vec::as_slice)
+             .unwrap_or(&[]);
+-        let pairs = olds.len().max(news.len());
+-        for i in 0..pairs {
++        for i in 0..olds.len().max(news.len()) {
+             match (olds.get(i), news.get(i)) {
+                 (Some(old), Some(&ai)) => {
+-                    let draft = &file.assertions[ai];
+-                    if old.content == draft.content {
+-                        let requested =
+-                            requested_by_assertion.get(&ai).cloned().unwrap_or_default();
+-                        let added = add_spaces(conn, old.memory_id, &requested, at)?;
+-                        if added.is_empty() {
+-                            push_action(
+-                                conn,
+-                                &mut actions,
+-                                old.memory_id,
+-                                &draft.subject,
+-                                MemoryActionKind::Unchanged,
+-                            )?;
+-                        } else {
+-                            let names: Vec<String> =
+-                                added.iter().map(|id| space_names[id].clone()).collect();
+-                            push_action(
+-                                conn,
+-                                &mut actions,
+-                                old.memory_id,
+-                                &draft.subject,
+-                                MemoryActionKind::Reused {
+-                                    spaces_added: names,
+-                                },
+-                            )?;
+-                        }
++                    if old.content == file.assertions[ai].content {
++                        let requested = requested_by_assertion
++                            .get(&ai)
++                            .map(Vec::as_slice)
++                            .unwrap_or(&[]);
++                        steps.push(ReconciliationStep::Reuse {
++                            memory_id: old.memory_id,
++                            assertion_idx: ai,
++                            additions: capture_memberships
++                                .then(|| missing_spaces(conn, old.memory_id, requested)),
++                        });
+                     } else {
+-                        supersede(
+-                            conn,
+-                            old.memory_id,
+-                            &draft.subject,
+-                            ai,
+-                            &mut get_assertion,
+-                            at,
+-                            &requested_by_assertion,
+-                            &mut actions,
+-                            producer_family,
+-                        )?;
++                        steps.push(ReconciliationStep::Supersede {
++                            memory_id: old.memory_id,
++                            assertion_idx: ai,
++                        });
+                     }
+                 }
+-                (Some(old), None) => {
+-                    pending_olds.push(old.clone());
+-                }
+-                (None, Some(&ai)) => {
+-                    pending_news.push(ai);
+-                }
++                (Some(old), None) => pending_olds.push(old.clone()),
++                (None, Some(&ai)) => pending_news.push(ai),
+                 (None, None) => unreachable!("pairing loop bounds"),
+             }
+         }
+     }
+-
+-    // Content that survived a rename or a move keeps its lineage.
+-    let mut unmatched_olds: Vec<MemorySummary> = Vec::new();
++    // Keep the exact pairing/action order of the existing receiver.
++    let mut unmatched_olds = Vec::new();
+     for old in pending_olds {
+         match pending_news
+             .iter()
+             .position(|&ai| file.assertions[ai].content == old.content)
+         {
+-            Some(pos) => {
+-                let ai = pending_news.remove(pos);
+-                supersede(
++            Some(pos) => steps.push(ReconciliationStep::Supersede {
++                memory_id: old.memory_id,
++                assertion_idx: pending_news.remove(pos),
++            }),
++            None => unmatched_olds.push(old),
++        }
++    }
++    steps.extend(
++        pending_news
++            .into_iter()
++            .map(|assertion_idx| ReconciliationStep::Create { assertion_idx }),
++    );
++    steps.extend(
++        unmatched_olds
++            .into_iter()
++            .map(|old| ReconciliationStep::Retire { old }),
++    );
++    Ok(ReconciliationPlan {
++        steps,
++        requested_by_assertion,
++        space_names,
++    })
++}
++
++fn apply_reconciliation(
++    conn: &Connection,
++    plan: ReconciliationPlan,
++    file: &ObservedFile,
++    evidence_ids: &[Uuid],
++    at: Ts,
++    producer_family: &str,
++) -> Result<Vec<MemoryAction>> {
++    let ReconciliationPlan {
++        steps,
++        requested_by_assertion,
++        space_names,
++    } = plan;
++    let mut assertion_cache: Vec<Option<Uuid>> = vec![None; file.assertions.len()];
++    let mut get_assertion = |conn: &Connection, idx: usize| -> Result<Uuid> {
++        if let Some(id) = assertion_cache[idx] {
++            return Ok(id);
++        }
++        let d = &file.assertions[idx];
++        let evidence_id = evidence_ids[d.evidence_idx];
++        let id = get_or_create_assertion(conn, evidence_id, d, at)?;
++        assertion_cache[idx] = Some(id);
++        Ok(id)
++    };
++    let mut actions = Vec::new();
++    for step in steps {
++        match step {
++            ReconciliationStep::Reuse {
++                memory_id,
++                assertion_idx,
++                additions,
++            } => {
++                let requested = requested_by_assertion
++                    .get(&assertion_idx)
++                    .map(Vec::as_slice)
++                    .unwrap_or(&[]);
++                let added = match additions {
++                    Some(additions) => {
++                        let added = additions?;
++                        insert_spaces(conn, memory_id, &added, at)?;
++                        added
++                    }
++                    None => add_spaces(conn, memory_id, requested, at)?,
++                };
++                let action = if added.is_empty() {
++                    MemoryActionKind::Unchanged
++                } else {
++                    MemoryActionKind::Reused {
++                        spaces_added: added.iter().map(|id| space_names[id].clone()).collect(),
++                    }
++                };
++                push_action(
++                    conn,
++                    &mut actions,
++                    memory_id,
++                    &file.assertions[assertion_idx].subject,
++                    action,
++                )?;
++            }
++            ReconciliationStep::Supersede {
++                memory_id,
++                assertion_idx,
++            } => supersede(
++                conn,
++                memory_id,
++                &file.assertions[assertion_idx].subject,
++                assertion_idx,
++                &mut get_assertion,
++                at,
++                &requested_by_assertion,
++                &mut actions,
++                producer_family,
++            )?,
++            ReconciliationStep::Create { assertion_idx } => {
++                let assertion_id = get_assertion(conn, assertion_idx)?;
++                let new_id = create_memory(conn, assertion_id, at, producer_family)?;
++                let requested = requested_by_assertion
++                    .get(&assertion_idx)
++                    .map(Vec::as_slice)
++                    .unwrap_or(&[]);
++                add_spaces(conn, new_id, requested, at)?;
++                push_action(
++                    conn,
++                    &mut actions,
++                    new_id,
++                    &file.assertions[assertion_idx].subject,
++                    MemoryActionKind::Created,
++                )?;
++            }
++            ReconciliationStep::Retire { old } => {
++                retire_conn(
+                     conn,
+                     old.memory_id,
+-                    &file.assertions[ai].subject,
+-                    ai,
+-                    &mut get_assertion,
+                     at,
+-                    &requested_by_assertion,
++                    "subject no longer present in source at re-ingest",
++                )?;
++                push_action(
++                    conn,
+                     &mut actions,
+-                    producer_family,
++                    old.memory_id,
++                    &old.subject,
++                    MemoryActionKind::Retired,
+                 )?;
+             }
+-            None => unmatched_olds.push(old),
+         }
+     }
+-    for ai in pending_news {
+-        let assertion_id = get_assertion(conn, ai)?;
+-        let new_id = create_memory(conn, assertion_id, at, producer_family)?;
+-        let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
+-        add_spaces(conn, new_id, &requested, at)?;
+-        push_action(
+-            conn,
+-            &mut actions,
+-            new_id,
+-            &file.assertions[ai].subject,
+-            MemoryActionKind::Created,
+-        )?;
+-    }
+-    for old in unmatched_olds {
+-        retire_conn(
+-            conn,
+-            old.memory_id,
+-            at,
+-            "subject no longer present in source at re-ingest",
+-        )?;
+-        push_action(
+-            conn,
+-            &mut actions,
+-            old.memory_id,
+-            &old.subject,
+-            MemoryActionKind::Retired,
+-        )?;
+-    }
+-
+     Ok(actions)
+ }
+ 
+@@ -4592,6 +4759,12 @@ fn supersede(
+ 
+ /// Adds the missing space memberships and returns the ids that were added.
+ fn add_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) -> Result<Vec<Uuid>> {
++    let added = missing_spaces(conn, memory_id, space_ids)?;
++    insert_spaces(conn, memory_id, &added, at)?;
++    Ok(added)
++}
++
++fn missing_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+     let mut existing: HashSet<String> = {
+         let mut stmt = conn
+             .prepare("SELECT space_id FROM memory_spaces WHERE memory_id = ?1")
+@@ -4609,18 +4782,22 @@ fn add_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) ->
+     };
+     let mut added = Vec::new();
+     for sid in space_ids {
+-        if existing.contains(&sid.to_string()) {
+-            continue;
++        if existing.insert(sid.to_string()) {
++            added.push(*sid);
+         }
++    }
++    Ok(added)
++}
++
++fn insert_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) -> Result<()> {
++    for sid in space_ids {
+         conn.execute(
+             "INSERT INTO memory_spaces (memory_id, space_id, created_at) VALUES (?1, ?2, ?3)",
+             rusqlite::params![memory_id.to_string(), sid.to_string(), at.0],
+         )
+         .map_err(dberr)?;
+-        added.push(*sid);
+-        existing.insert(sid.to_string());
+     }
+-    Ok(added)
++    Ok(())
+ }
+ 
+ fn create_memory(
+diff --git a/src/storage/sqlite/observation_planning_tests.rs b/src/storage/sqlite/observation_planning_tests.rs
+index 7f74d9a..3d57962 100644
+--- a/src/storage/sqlite/observation_planning_tests.rs
++++ b/src/storage/sqlite/observation_planning_tests.rs
+@@ -1052,3 +1052,5 @@ fn modified_disappeared_and_reappeared_files_preserve_historical_vector_bytes_an
+     assert_eq!(historic[0].score, 1.0);
+     assert_integrity(&w.store);
+ }
++
++include!("reconciliation_planning_tests.rs");
+diff --git a/src/storage/sqlite/reconciliation_planning_tests.rs b/src/storage/sqlite/reconciliation_planning_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/src/storage/sqlite/reconciliation_planning_tests.rs
+@@ -0,0 +1,294 @@
++// Compatibility-bound existing-target reconciliation, using the real M6 receiver.
++
++#[test]
++fn reconciliation_capture_is_read_only_and_retains_reuse_memberships() {
++    let w = World::new();
++    let seed = w.record(
++        IngestScope::File,
++        &[("a.md", "SYNTHETIC_A")],
++        &[w.notes],
++        100,
++    );
++    let c = w.store.connection().unwrap();
++    let tx = begin_write(&c, &w.store.revision_state).unwrap();
++    let changes = c.total_changes();
++    let rows = dump(&c, true);
++    c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
++        AuthAction::Insert { .. } | AuthAction::Update { .. } | AuthAction::Delete { .. } => {
++            Authorization::Deny
++        }
++        _ => Authorization::Allow,
++    }))
++    .unwrap();
++    let plan = plan_file_observation(
++        &tx,
++        w.observation(
++            IngestScope::File,
++            &[("a.md", "SYNTHETIC_A")],
++            &[w.notes, w.other, w.other],
++            200,
++        ),
++    )
++    .unwrap();
++    assert_eq!(c.total_changes(), changes);
++    assert_eq!(dump(&c, true), rows);
++    match &plan.reconciliations {
++        FileReconciliations::Captured(plans) => {
++            let recon = plans[&0].as_ref().unwrap();
++            assert_eq!(recon.steps.len(), 1);
++            assert!(
++                matches!(&recon.steps[0], ReconciliationStep::Reuse { memory_id, additions: Some(Ok(ids)), .. } if *memory_id == seed.files[0].actions[0].memory_id && ids == &[w.other])
++            );
++        }
++        FileReconciliations::Ordered => panic!("existing disjoint target must be captured"),
++    }
++    clear_authorizer(&c);
++    let report = apply_file_observation(plan).unwrap();
++    assert!(
++        matches!(&report.files[0].actions[0].action, MemoryActionKind::Reused { spaces_added } if spaces_added == &["other"])
++    );
++    tx.commit().unwrap();
++    drop(c);
++    assert_integrity(&w.store);
++}
++
++#[test]
++fn captured_reconciliation_does_not_select_targets_again_during_apply() {
++    for combined in [false, true] {
++        let w = World::new();
++        w.record(
++            IngestScope::File,
++            &[("a.md", "SYNTHETIC_A")],
++            &[w.notes],
++            100,
++        );
++        let report = with_hook(
++            move |stage, c| {
++                if stage == "after_plan" {
++                    c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
++                        AuthAction::Read {
++                            table_name: "memories",
++                            column_name: "id",
++                        } => Authorization::Deny,
++                        _ => Authorization::Allow,
++                    }))
++                    .map_err(dberr)?;
++                }
++                Ok(())
++            },
++            || {
++                let obs = w.observation(
++                    IngestScope::File,
++                    &[("a.md", "SYNTHETIC_A")],
++                    &[w.notes],
++                    200,
++                );
++                if combined {
++                    w.store.record_files_ingest(obs, None, &|| Ok(()))
++                } else {
++                    w.store.record_observation(obs)
++                }
++            },
++        );
++        clear_authorizer(&w.store.connection().unwrap());
++        let report = report.unwrap();
++        assert!(matches!(
++            report.files[0].actions[0].action,
++            MemoryActionKind::Unchanged
++        ));
++        assert_integrity(&w.store);
++    }
++}
++
++#[test]
++fn new_duplicate_and_repeated_logical_operations_keep_ordered_execution() {
++    let w = World::new();
++    let first = w.record(
++        IngestScope::File,
++        &[("a.md", "SYNTHETIC_A")],
++        &[w.notes],
++        100,
++    );
++    let c = w.store.connection().unwrap();
++    let tx = begin_write(&c, &w.store.revision_state).unwrap();
++    for inputs in [
++        vec![("new.md", "SYNTHETIC_NEW")],
++        vec![("a.md", "SYNTHETIC_A"), ("a.md", "SYNTHETIC_A")],
++        vec![("a.md", "SYNTHETIC_A"), ("new.md", "SYNTHETIC_NEW")],
++    ] {
++        let plan = plan_file_observation(
++            &tx,
++            w.observation(IngestScope::File, &inputs, &[w.notes], 200),
++        )
++        .unwrap();
++        assert!(matches!(plan.reconciliations, FileReconciliations::Ordered));
++    }
++    let classifications = [
++        Plan::Unchanged {
++            location: "one".into(),
++            logical: first.files[0].logical_id,
++            file_idx: 0,
++        },
++        Plan::Unchanged {
++            location: "two".into(),
++            logical: first.files[0].logical_id,
++            file_idx: 1,
++        },
++    ];
++    assert!(matches!(
++        FileReconciliations::capture(&tx, &[], &classifications),
++        FileReconciliations::Ordered
++    ));
++}
++
++#[test]
++fn summary_and_requested_space_errors_are_retained_until_original_apply_point() {
++    for space_failure in [false, true] {
++        let w = World::new();
++        let seed = w.record(
++            IngestScope::File,
++            &[("a.md", "SYNTHETIC_A")],
++            &[w.notes],
++            100,
++        );
++        if space_failure {
++            w.store
++                .retire_memory(seed.files[0].actions[0].memory_id, None, Ts(150))
++                .unwrap();
++        }
++        let before = ledger(&w.store);
++        let rows = dump(&w.store.connection().unwrap(), true);
++        let c = w.store.connection().unwrap();
++        let tx = begin_write(&c, &w.store.revision_state).unwrap();
++        let changes = c.total_changes();
++        c.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
++            AuthAction::Read {
++                table_name: "memories",
++                column_name: "id",
++            } if !space_failure => Authorization::Deny,
++            AuthAction::Read {
++                table_name: "spaces",
++                column_name: "name",
++            } if space_failure => Authorization::Deny,
++            _ => Authorization::Allow,
++        }))
++        .unwrap();
++        let plan = plan_file_observation(
++            &tx,
++            w.observation(
++                IngestScope::File,
++                &[("a.md", "SYNTHETIC_CHANGED")],
++                &[w.notes],
++                200,
++            ),
++        )
++        .unwrap();
++        assert!(
++            matches!(&plan.reconciliations, FileReconciliations::Captured(p) if p[&0].is_err())
++        );
++        assert_eq!(c.total_changes(), changes);
++        clear_authorizer(&c);
++        let error = apply_file_observation(plan).unwrap_err();
++        assert!(
++            matches!(error, Error::Storage(ref s) if s.contains("prohibited")),
++            "{error:?}"
++        );
++        assert!(
++            c.total_changes() > changes,
++            "original session/version effects precede this error"
++        );
++        drop(tx);
++        assert!(c.is_autocommit());
++        drop(c);
++        assert_eq!(ledger(&w.store), before);
++        assert_eq!(dump(&w.store.connection().unwrap(), true), rows);
++        assert_integrity(&w.store);
++    }
++}
++
++fn reconciliation_two_fragment_file(text: &str, spaces: &[Uuid]) -> ObservedFile {
++    crate::ingest::observe_bytes(
++        Path::new("a.md"),
++        format!("# A\n\n{text}\n\n# Z\n\nSYNTHETIC_KEEP\n").into_bytes(),
++        format!("{ROOT}/a.md"),
++        spaces,
++    )
++    .unwrap()
++}
++
++#[test]
++fn captured_membership_error_waits_for_preceding_supersession_and_then_rolls_back() {
++    let w = World::new();
++    let mut seed = w.observation(IngestScope::File, &[], &[w.notes], 100);
++    seed.files.push(reconciliation_two_fragment_file(
++        "SYNTHETIC_OLD",
++        &[w.notes],
++    ));
++    w.store.record_observation(seed).unwrap();
++    let before = ledger(&w.store);
++    let rows = dump(&w.store.connection().unwrap(), true);
++    let c = w.store.connection().unwrap();
++    let tx = begin_write(&c, &w.store.revision_state).unwrap();
++    let reads = Arc::new(AtomicUsize::new(0));
++    let count = Arc::clone(&reads);
++    c.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
++        AuthAction::Read {
++            table_name: "memory_spaces",
++            column_name: "space_id",
++        } if count.fetch_add(1, AtomicOrdering::SeqCst) == 1 => Authorization::Deny,
++        _ => Authorization::Allow,
++    }))
++    .unwrap();
++    let mut input = w.observation(IngestScope::File, &[], &[w.notes], 200);
++    input.files.push(reconciliation_two_fragment_file(
++        "SYNTHETIC_NEW",
++        &[w.notes, w.other],
++    ));
++    let changes = c.total_changes();
++    let plan = plan_file_observation(&tx, input).unwrap();
++    match &plan.reconciliations {
++        FileReconciliations::Captured(plans) => {
++            let recon = plans[&0].as_ref().unwrap();
++            assert!(matches!(
++                recon.steps[0],
++                ReconciliationStep::Supersede { .. }
++            ));
++            assert!(matches!(
++                &recon.steps[1],
++                ReconciliationStep::Reuse {
++                    additions: Some(Err(_)),
++                    ..
++                }
++            ));
++        }
++        FileReconciliations::Ordered => panic!("must capture unique existing target"),
++    }
++    assert_eq!(c.total_changes(), changes);
++    clear_authorizer(&c);
++    let error = apply_file_observation(plan).unwrap_err();
++    assert!(
++        matches!(error, Error::Storage(ref s) if s.contains("prohibited")),
++        "{error:?}"
++    );
++    assert_eq!(
++        c.query_row(
++            "SELECT COUNT(*) FROM memories WHERE state='superseded'",
++            [],
++            |r| r.get::<_, i64>(0)
++        )
++        .unwrap(),
++        1,
++        "earlier genuine action executed before deferred error"
++    );
++    assert_eq!(
++        c.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
++            .unwrap(),
++        3
++    );
++    drop(tx);
++    assert!(c.is_autocommit());
++    drop(c);
++    assert_eq!(ledger(&w.store), before);
++    assert_eq!(dump(&w.store.connection().unwrap(), true), rows);
++    assert_integrity(&w.store);
++}

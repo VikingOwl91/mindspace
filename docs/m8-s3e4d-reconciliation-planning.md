@@ -1,13 +1,17 @@
 # M8 S3e.4d: pre-effect file-memory reconciliation
 
-**PARTIAL — production implementation stopped under the clarified observable-effects condition. Publication remains BLOCKED.**
+**PARTIAL — the compatibility-preserving follow-up candidate is rejected. Publication remains BLOCKED.**
+
+**DO NOT APPLY** the [rejected candidate patch](experiments/m8/s3e4d_rejected_candidate.patch)
+to any worktree or production database. It is retained only for disposable archive
+reproduction. Unused experimental additions remain **UNEXECUTED** evidence.
 
 No production reconciliation seam was installed. This slice establishes the exact
 behavior inventory and executable baseline counterexamples. Passing probe cases
 mean those baseline behaviors reproduced, not that pre-effect reconciliation or
 writer exclusion has been implemented.
 
-## Baseline and scope decision
+## Original baseline investigation (committed evidence)
 
 Verified `feat/m8-s3d2-semantic-staging`, signed HEAD
 `3f7fd3422047b40f9dc6fa787d4b523d7d90d857`, initially clean worktree/index.
@@ -30,8 +34,9 @@ This meets the stated stop condition. A separate baseline case shows that
 unconditional duplicate-location rejection can also replace a different existing
 constraint diagnostic. Neither issue was silently excluded from equivalence.
 
-Only this report and two reproducible experiment sources are added. All tracked
-production, migration, Cargo, existing test and API files remain unchanged.
+The original investigation added this report and two experiment sources, committed
+as `6aeb6a7753d2610837edc30f2a190eeccc6dd017`. Its production, migration, Cargo,
+existing test and API files were unchanged. The follow-up below is separate evidence.
 
 ## Exact decision and effect inventory
 
@@ -131,7 +136,13 @@ also affect that caller. SQLite filesystem effects remain a separate unknown:
 row rollback does not establish byte/inode/WAL/SHM equivalence or absence of spill.
 Those stronger guarantees were not tested or assumed.
 
-## Reproducible evidence
+## Original reproducible evidence
+
+The commands and four-case counts in this section describe the original committed
+runner and its recorded hashes. The current default runner retains two additional
+unexecuted success/nonfatal traces (six cases total); those additions are not
+qualified by the original results. Only the follow-up `--fatal-read` invocations
+below were newly verified. The original four native probe bodies remain unchanged.
 
 Sources: [runner](experiments/m8/s3e4d_probe.py) and
 [native probe](experiments/m8/s3e4d_reconciliation_probe.rs).
@@ -206,9 +217,10 @@ mislabelled as complete planning.
 
 No migration, active guard/write denial, source/alias admission, metadata quarantine,
 memory relocation, ownership/publication change, new receipt, public API, merge,
-push or S4. All new evidence files remain uncommitted for review.
+push or S4. The original evidence was committed separately; follow-up evidence
+remains uncommitted for review.
 
-## Verification and independent adversarial review
+## Original verification and independent adversarial review
 
 | Executed check | Result and scope |
 | --- | --- |
@@ -260,3 +272,253 @@ responses and committed rows. That wording was corrected without changing any
 probe or rerunning tests. No other findings were reported. The low/high controlled
 ID fixtures are separate from D04, which uses ordinary Store ingestion without
 controlled episode-ID inserts.
+
+
+## Compatibility-preserving follow-up: rejected bounded candidate
+
+Current baseline: signed `6aeb6a7753d2610837edc30f2a190eeccc6dd017`, branch
+`feat/m8-s3d2-semantic-staging`, initially clean index/worktree. The expected GPG
+fingerprint verified. Its production source is identical to the original signed
+3f7 baseline used by the reproducer. This follow-up does not amend the accepted
+publication or UUID compatibility contracts.
+
+**Earlier generic duplicate rejection is not an accepted compatibility-preserving
+optimization.** D01–D04 remain binding. No fabricated SQLite error, UUID burning,
+allocator rewind, new transaction, persisted plan or receipt is accepted here.
+
+The attempted private seam captured ordered Reuse/Supersede/Create/Retire actions,
+requested spaces and reuse-membership deltas only for operations with distinct
+existing logical targets and unique exact locations. A new source, duplicate
+location or repeated logical target kept the whole operation on ordered execution.
+Continue retained its source-only behavior. Both file receivers used the same M6
+transaction; the shared Git invocation stayed in place. One selection algorithm
+served captured and ordered execution. UUID allocation remained lazy in the existing
+session/version/assertion/memory helpers. No physical identity was inferred.
+
+Summary/requested-space failures were retained until the original reconciliation
+entry after `ensure_version`. Reuse-membership failures were retained until their
+original action position; new-memory membership reads remained lazy. These rules
+preserved tested nonfatal failures but overlooked transaction-ending read faults.
+
+The rejected candidate and five focused regression additions are preserved only
+in [this disposable patch](experiments/m8/s3e4d_rejected_candidate.patch), SHA256
+`51831b1eedb29a1545938b3108400bbdaca22dc431c2de5e20613a0ae333524e`.
+It changes exactly `sqlite.rs`, the existing private observation test include and
+one new private test source **inside an archive**. The active production files were
+restored byte-for-byte to HEAD, with their complete rejected versions backed up.
+The patch is not an implementation proposal selected for production.
+
+### Concrete conflicting invariant
+
+The locked `libsqlite3-sys 0.38.2` amalgamation, SQLite 3.53.2,
+`sqlite3.c:91065–91134`, rolls back the whole transaction on a read-only IOERR;
+`sqlite3RollbackAll` closes savepoints and sets `autoCommit=1`. M6's rollback hook
+clears its active recording revision. A saved Rust `Err` cannot preserve that
+transaction. Authorization-denial tests do not exercise this behavior.
+
+An independent native xRead probe and actual public `Store::record_observation`
+pair demonstrated the resulting incompatibility:
+
+| Oracle | Signed baseline | Rejected candidate | Disposition |
+| --- | --- | --- | --- |
+| Actual file xRead failure | IOERR_READ, extended code266 | Same | Reproduced native fault, not an invented callback error. |
+| Transaction immediately after fault | Automatically rolled back | Automatically rolled back | A read-only planner is not transaction-neutral on this failure. |
+| Returned error | `disk I/O error` | `revisioned write required` | FAIL: original error is replaced by a later M6 refusal. |
+| Fixed-clock failed UUID component gap | 4 | 2 | FAIL: externally observable allocation progression differs. |
+| Full table rows and M6 revision | Rolled back | Rolled back | PASS for durable logical rollback; not sufficient compatibility. |
+| Cleanup / healthy reopened next session | Autocommit / next gap1 | Autocommit / next gap1 | PASS for this controlled recovery, not a universal I/O guarantee. |
+| FTS/FK/passive inventory after next success | Valid | Valid | Does not repair the error or UUID mismatch. |
+
+Both runs validate Unix millis1800000000123 and adjacent public UUID component
+gap1 before measurement. The low26-bit interpretation has the same locked-version
+limits as D04. The host clock is unchanged. No artificial allocation reproduces
+an expected count. The baseline allocates real session/version/evidence IDs before
+its failing summary read; the candidate reaches that read before those effects,
+then consumes a session ID while attempting application after automatic rollback.
+This is an error/observable-state incompatibility, **not a demonstrated durable
+row escape or new security vulnerability**.
+
+Immediate propagation would avoid application after transaction loss but still
+omit the baseline's preceding genuine UUID allocations. Deferral already fails.
+A savepoint does not contain this SQLite IOERR branch; a replacement transaction
+would lose the required lifetime/serialization boundary. Artificial UUID consumption
+is explicitly prohibited. No small mechanism satisfying all those constraints was
+demonstrated. This rejects this candidate, not every conceivable future design.
+
+### Reproducible fatal-read evidence
+
+The [existing runner](experiments/m8/s3e4d_probe.py) now selects one marked block
+from the [native fatal-read template](experiments/m8/s3e4d_fatal_read_probe.rs).
+It authenticates signed 3f7 sources and the existing process supervisor. Optional
+`--candidate-patch` accepts only the three reviewed regular-file patch paths and
+applies them inside a fresh disposable archive. It never changes the worktree.
+
+A test-only RAII guard is inserted at the original reconciliation entry, or at
+candidate capture entry. It releases clean pager pages, installs the existing
+connection-local xRead fault, records automatic rollback, and restores the real
+file methods. The test calls the actual public Store receiver. Removing the
+instrumentation must restore all protected source bytes. Neither M6 authorization
+nor the allocator is replaced. Each exact native case has a 60-second timeout,
+private configuration/storage and retained logs, source archives and structured
+results. The fatal-read native database is disposed by its TempDir after the
+asserted recovery; no surviving database fixture is claimed.
+
+Use fresh private directories, sequentially; the target may be shared only with
+no other build running:
+
+```sh
+verification_root=$(mktemp -d "$HOME/.cache/m4d-compat.XXXXXX")
+python3 -B docs/experiments/m8/s3e4d_probe.py --work-root "$verification_root/baseline" --target-dir target/s3e3c-build/native --fatal-read
+python3 -B docs/experiments/m8/s3e4d_probe.py --work-root "$verification_root/rejected" --target-dir target/s3e3c-build/native --fatal-read --candidate-patch docs/experiments/m8/s3e4d_rejected_candidate.patch
+```
+
+`PASS` means the expected unsafe characterization reproduced. It is not an
+isolation guarantee. Equality comparison is refused in fatal-read mode because
+the observed mismatch is the rejection oracle. `--release` selects an optimized
+build; unsupported platform/tool prerequisites are SKIPPED, not PASS.
+
+Shared-target Cargo freshness proved material: an initial independent candidate
+run actually executed a cached baseline binary. That run was rejected and retained,
+not counted. Qualified replays force the disposable root module's mtime newer,
+verify unchanged bytes, require Cargo `fresh:false`, bind executable hashes and
+assert the emitted mode. The first public-probe compilation also found a private
+test-helper visibility error; it was corrected before that test ran. Those failed
+verification attempts remain separate from qualified observations.
+
+### Executed verification and limits
+
+Evidence root: `/home/cnachtigall/.cache/m4dp-zebka02w`.
+
+| Check | Actual result / scope |
+| --- | --- |
+| Candidate targeted debug observation/reconciliation tests | 21 passed, 0 failed, 0 ignored; five new regressions plus existing receiver/queued-writer/veto/UNKNOWN/history cases. Log: `targeted-debug`. |
+| Candidate full `cargo test --locked --offline --no-fail-fast -- --nocapture` | Exit0; 71 result summaries: 1,319 passed, 0 failed, **34 ignored**. Log: `full`. This passing gate did not detect the fatal-read incompatibility. |
+| Independent bundled SQLite core xRead test | IOERR_READ automatically rolls back tentative ledger write. Log/source: `reviewer-ioerr`. |
+| Independent actual-M6 component pair | Baseline error/gap4 versus candidate refusal/gap2, both clean durable rollback. Qualified results: `reviewer-m6-ioerr/qualified-results.json`. |
+| Independent actual public Store pair | Same mismatch; fixed-clock controls, distinct fresh binary hashes, cleanup and subsequent integrity verified. `reviewer-public-ioerr/qualified-results.json` and `qualified-postcheck.json`. |
+| Final reusable fatal-read replay | Parent executed `replay-baseline` and `replay-rejected`: each exactly1 passed, 0 failed, 0 ignored. Actual public receiver reproduces error/gap4 versus error/gap2; original extended code266, rollback, clock, mode and next-session assertions passed. |
+| New populated-success/nonfatal compatibility traces in experiment source | NOT RUN. Their original D01–D04 prefix is unchanged; additional sources/options are retained, not acceptance evidence. |
+| Final formatting / source checks | `cargo fmt --check`, standalone fixture rustfmt, Python AST, `git diff --check`, all74 Markdown link files, original D01–D04 prefix equality, empty index and production-byte equality: PASS. |
+| New candidate release/full-Clippy/production/no-embeddings gates | NOT RUN after the mandatory compatibility rejection. The active production source is restored; prior build evidence is not relabelled as this candidate's coverage. |
+
+All executed gates use private btrfs fixtures, locked offline dependencies and two
+build jobs. The broad suite uses the pinned static Codex0.166.0 runtime on PATH.
+The native fatal-read test needs no model or Codex invocation. The system
+Codex/OpenSSL incompatibility and prior `/tmp` quota problem were not repaired or
+qualified. Linux/libc interposition and DELETE-journal fault control bound this
+reproducer; WAL/SHM/physical-file equivalence is not asserted.
+
+The five new focused tests prove no planning mutation SQL, retained reuse additions,
+no second target selection in both file receivers, explicit ordered eligibility,
+summary/space error deferral and membership-error deferral after prior genuine
+supersession. Their successful nonfatal results do not qualify fatal errors.
+The broad suite covers existing CLI/MCP/library/Git behavior only to its executed
+coverage; the known runtime gaps and 34 ignored tests remain. No final feature,
+optimized compatibility, novel M6 permissions/accounting or universal recovery
+acceptance is claimed.
+
+Final reusable replay executable SHA256:
+
+- Baseline: `e08aefc08e2b2957e9eab35684d0f5b09321dbcfea7b41fc6b79d0da9cbe93e8`.
+- Rejected fixture: `05609f45070cef596eb0e8ad133de5e0230adc34aef6736b85ee62cc2233eabc`.
+
+The selected template, runner, patch, archive and post-overlay inputs are bound in
+each `source-manifest.json`/`result.json`. Replayed native template SHA256:
+`a287ac7a05ff04246d31751c9da618fa681b97121d039de6cac671024038a738`.
+
+### Independent disposition and residual requirements
+
+Final independent evidence review verified the source/artifact hashes and result
+counts. Two LOW wording findings were corrected: historical default-runner scope
+and disposal of the new fatal-read database fixture. No executable source or
+executed oracle changed for those corrections.
+
+Read-only Sol review found one HIGH rejection: fatal read deferral loses the M6
+transaction and changes both error origin and UUID effects. It found no additional
+ordinary action-order mismatch in the bounded algorithm. Sol planning independently
+confirmed that early propagation, savepoints, transaction replacement and fake
+allocations do not satisfy the agreed invariants. Production was withheld.
+
+R06 still requires a complete compatible pre-effect file-memory footprint, including
+new/repeated targets and combined session/scope/code/Git domains, followed by
+separately authorized storage guards and stale-vector/lifecycle coverage. R07 still
+requires qualified source/locator/alias closure. This attempt grants no source
+admission or physical identity, adds no guard, and changes no publication authority.
+Old-reader isolation, diagnostic metadata, writer exclusion, atomic publication,
+retrieval/index coherence and ambiguous-outcome recovery remain publication blockers.
+
+The smallest next decision is the exact acceptable boundary for fatal-read
+observability: the original reconciliation-entry split preserves the original
+ordering but occurs after session/scope/version effects; accepting that narrower
+prerequisite would need explicit review. Alternatively, a distinct mechanism must
+prove pre-effect classification without changing the required error/UUID contract.
+Neither option is silently accepted here. Further happy-path tests cannot settle
+this concrete conflict. **PARTIAL; publication BLOCKED.**
+
+Automatic approval review refused removal of generated bytecode and reduction of
+this task's unused experiment extensions. Those are retained for review rather
+than deleted; `scripts/__pycache__/m8-s3e3b-harness.cpython-314.pyc` is an untracked
+execution artifact, not a deliverable or source. The complete rejected production
+candidate is preserved in the patch and private backups; only hash-verified changes
+created by this task were removed from active production source. The index stays
+empty. The implementation attempt performed no commit, migration, fencing, alias admission,
+ownership change, publication, merge, push or S4. The separately authorized evidence
+preservation below permits one signed local evidence commit.
+
+
+## Rejected-candidate evidence preservation
+
+The preservation baseline is signed `6aeb6a7753d2610837edc30f2a190eeccc6dd017`,
+branch `feat/m8-s3d2-semantic-staging`, with an initially empty index. All five
+uncommitted evidence-file hashes matched the previous final-scope record before
+this task added labels. Production source, migrations and Cargo inputs remain
+byte-identical to HEAD; no rejected implementation is being retried.
+
+The [artifact inventory](experiments/m8/s3e4d_evidence_inventory.json) records every
+initial Git-visible modified/untracked artifact, original and preservation hashes,
+retained private evidence locations, exact native result objects and proposed
+exclusions. It is included as the sixth justified evidence file:
+
+| Artifact under `docs/` | Preservation scope / reason |
+| --- | --- |
+| `m8-s3e4d-reconciliation-planning.md` | Report, failure attribution, coverage limits, publication blockers and explicit DO NOT APPLY labels. |
+| `experiments/m8/s3e4d_probe.py` | Existing reproducible archive harness, strict candidate patch scope and freshness/mode safeguards; DO NOT APPLY notice added to its docstring only. |
+| `experiments/m8/s3e4d_reconciliation_probe.rs` | Original D01–D04 prefix plus both unused success/nonfatal source additions retained in full. Comment marks additions UNEXECUTED / DO NOT APPLY; no test body changed. |
+| `experiments/m8/s3e4d_fatal_read_probe.rs` | Public-receiver baseline/candidate counterexamples. DO NOT APPLY comment is outside both selected blocks; executed block bytes remain exact. |
+| `experiments/m8/s3e4d_rejected_candidate.patch` | **DO NOT APPLY TO A WORKTREE.** Raw rejected code and five focused tests, preserved byte-for-byte at SHA256 `51831b1eedb29a1545938b3108400bbdaca22dc431c2de5e20613a0ae333524e`. Disposable replay is its only documented use. |
+| `experiments/m8/s3e4d_evidence_inventory.json` | Provenance, precise counterexamples, source-body preservation and explicit commit/exclusion inventory. |
+
+**Proposed exclusion for human review, retained untracked:**
+`scripts/__pycache__/m8-s3e3b-harness.cpython-314.pyc`, 26,000 bytes, SHA256
+`98c676333df096db78c33899bc818eb2efa7c3a8beb710b0d4ecdf8914f13632`.
+Its header matches the signed supervisor source's timestamp/size. Read-only parsing
+compared all executable/metadata fields across16 code objects to compilation of
+that source: structurally identical, without execution. Raw marshal serialization
+bytes differ; no raw payload identity is claimed. It is generated interpreter cache,
+not authored evidence or a production modification. It is neither deleted nor staged.
+Its final presence is intentional and must be reported after the evidence commit.
+
+Ignored `target/` build outputs and the previously referenced private btrfs evidence
+root remain in place, outside the proposed commit. The inventory identifies these
+as explicit generated/host-local exclusions, including unused-source backups,
+rejected-source backups, invalid/failed verification attempts, qualified logs and
+replay manifests. Nothing is deleted or silently discarded. Raw local outputs are
+not newly represented as portable artifacts; the retained executable sources,
+patch and recorded result objects support independent reproduction.
+
+No unchanged test suite was rerun. This task's checks concern inventory, labels,
+source-body equality, existing result/artifact hashes, syntax, links, whitespace
+and signed commit scope. Successful prior test execution remains separate from
+the demonstrated compatibility failure. The preserved public-receiver values are
+exactly **baseline `disk I/O error`, gap4**, and **rejected candidate
+`revisioned write required`, gap2**. Both still have logical rollback and cleanup;
+that does not grant compatibility or publication safety. Status remains **PARTIAL**;
+publication remains **BLOCKED**.
+
+Staging the raw patch exposes eight expected whitespace reports at its lines
+6, 102, 119, 163, 222, 496, 498 and 536. Each is exactly one space: the required
+unified-diff marker for a blank context line. The patch SHA256 remains unchanged.
+The check excludes only this raw fixture and requires every other staged evidence
+file to pass; no repository-wide whitespace policy or test assertion is relaxed.
+The exact fixture bytes and all eight exceptions are verified separately. This
+was a pre-signing scope check, not a GPG failure or a new test execution.

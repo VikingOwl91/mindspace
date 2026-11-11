@@ -416,3 +416,330 @@ fn s3e4d_uuid_observability_fixed_clock() {
     assert_eq!(final_ledger.1, ledger_before.1 + 1);
     assert_integrity(&w.store);
 }
+
+// DO NOT APPLY: retained, UNEXECUTED experimental additions below.
+// These are evidence of the rejected investigation, not production acceptance.
+
+// Source-independent successful-operation trace. The same source is compiled
+// against the signed baseline and candidate. The runner compares table rows,
+// reports and validated UUID allocation offsets, not random UUID suffix bytes.
+#[test]
+fn s3e4d_success_compatibility_fixed_clock() {
+    let fixed_ms = std::env::var("MINDSPACE_S3E4D_FIXED_REALTIME_SECONDS")
+        .expect("run this exact test with the fixed-CLOCK_REALTIME shim")
+        .parse::<u64>()
+        .unwrap()
+        * 1000
+        + std::env::var("MINDSPACE_S3E4D_FIXED_REALTIME_NANOS")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            / 1_000_000;
+    let anchor = Uuid::now_v7();
+    let control = Uuid::now_v7();
+    assert_eq!((anchor.as_u128() >> 80) as u64, fixed_ms);
+    assert_eq!((control.as_u128() >> 80) as u64, fixed_ms);
+    assert_eq!(s3e4d_public_uuid_gap(anchor, control), 1);
+    let w = World::new();
+    let file = |name: &str, text: &str, spaces: &[Uuid]| {
+        crate::ingest::observe_bytes(
+            Path::new(name),
+            text.as_bytes().to_vec(),
+            format!("{ROOT}/{name}"),
+            spaces,
+        )
+        .unwrap()
+    };
+    let input = |scope: IngestScope, files: Vec<ObservedFile>, at: i64| IngestObservation {
+        session: SessionDraft {
+            root: ROOT.into(),
+            scope,
+            observed_at: Ts(at),
+        },
+        files,
+        spaces: vec![w.notes, w.other],
+    };
+    let mut trace = Vec::new();
+    let mut capture = |stage: &str, report: &ObservationReport| {
+        assert_integrity(&w.store);
+        let observed_uuid = Uuid::now_v7();
+        assert_eq!((observed_uuid.as_u128() >> 80) as u64, fixed_ms);
+        trace.push(serde_json::json!({
+            "stage":stage, "report":report,
+            "all_table_rows":dump(&w.store.connection().unwrap(),true),
+            "ledger":ledger(&w.store), "observed_uuid":observed_uuid.to_string(),
+        }));
+    };
+    let a_old = "# Same\n\nSYNTHETIC_A_OLD\n\n# Same\n\nSYNTHETIC_A_KEEP\n\n# Removed\n\nSYNTHETIC_REMOVED\n";
+    let a_new =
+        "# Same\n\nSYNTHETIC_A_NEW\n\n# Same\n\nSYNTHETIC_A_KEEP\n\n# Added\n\nSYNTHETIC_ADDED\n";
+    let b_text = "# Other\n\nSYNTHETIC_B\n";
+    let seed = w
+        .store
+        .record_observation(input(
+            IngestScope::Directory,
+            vec![
+                file("b.md", b_text, &[w.notes]),
+                file("a.md", a_old, &[w.notes]),
+            ],
+            100,
+        ))
+        .unwrap();
+    assert_eq!(seed.files.len(), 2);
+    capture("populated_seed", &seed);
+    let first_assertion = w.store.list_memories_by_subject("same").unwrap()[0].assertion_id;
+    w.store
+        .save_embeddings(&[AssertionEmbedding {
+            assertion_id: first_assertion,
+            derivation_key: "synthetic-s3e4d@1".into(),
+            model: "synthetic".into(),
+            model_version: "1".into(),
+            dimension: 2,
+            embedding: vec![1.0, 0.0],
+        }])
+        .unwrap();
+    let mut changed = file("a.md", a_new, &[w.notes, w.other]);
+    // Repeated and overlapping membership specifications must not duplicate
+    // additions or independently reconcile the same old target.
+    changed.memories.push(changed.memories[0].clone());
+    changed.memories[0]
+        .spaces
+        .extend([w.other, w.notes, w.other]);
+    let changed = w
+        .store
+        .record_observation(input(
+            IngestScope::Directory,
+            vec![changed, file("b.md", b_text, &[w.notes, w.other])],
+            200,
+        ))
+        .unwrap();
+    assert_eq!(changed.files[0].logical_id, seed.files[0].logical_id);
+    assert!(changed.files[0]
+        .actions
+        .iter()
+        .any(|a| matches!(a.action, MemoryActionKind::Superseded { .. })));
+    assert!(changed.files[0]
+        .actions
+        .iter()
+        .any(|a| matches!(a.action, MemoryActionKind::Retired)));
+    assert!(changed.files[0]
+        .actions
+        .iter()
+        .any(|a| matches!(a.action, MemoryActionKind::Created)));
+    capture("existing_targets_repeated_specs", &changed);
+    let b_memory = changed.files[1].actions[0].memory_id;
+    w.store
+        .retire_memory(
+            b_memory,
+            Some("SYNTHETIC_MANUAL_RETIREMENT".into()),
+            Ts(250),
+        )
+        .unwrap();
+    let recreated = w
+        .store
+        .record_observation(input(
+            IngestScope::File,
+            vec![file("b.md", b_text, &[w.notes, w.other])],
+            300,
+        ))
+        .unwrap();
+    assert!(matches!(
+        recreated.files[0].actions[0].action,
+        MemoryActionKind::Created
+    ));
+    assert_ne!(recreated.files[0].actions[0].memory_id, b_memory);
+    capture("partial_manual_retirement_recreation", &recreated);
+    let moved = w
+        .store
+        .record_observation(input(
+            IngestScope::Directory,
+            vec![
+                file("moved.md", a_new, &[w.notes, w.other]),
+                file("b.md", b_text, &[w.notes, w.other]),
+            ],
+            400,
+        ))
+        .unwrap();
+    assert!(matches!(
+        moved.files[1].outcome,
+        FileOutcome::Continued { .. }
+    ));
+    assert!(moved.files[1].actions.is_empty());
+    capture("full_move", &moved);
+    let disappeared = w
+        .store
+        .record_observation(input(
+            IngestScope::Directory,
+            vec![file("b.md", b_text, &[w.notes, w.other])],
+            500,
+        ))
+        .unwrap();
+    assert_eq!(disappeared.events.len(), 1);
+    capture("full_disappearance", &disappeared);
+    let reappeared = w
+        .store
+        .record_observation(input(
+            IngestScope::Directory,
+            vec![
+                file("moved.md", a_new, &[w.notes, w.other]),
+                file("b.md", b_text, &[w.notes, w.other]),
+            ],
+            600,
+        ))
+        .unwrap();
+    assert!(matches!(
+        reappeared.files[1].outcome,
+        FileOutcome::Continued { .. }
+    ));
+    assert!(reappeared.files[1].actions.is_empty());
+    capture("full_reappearance", &reappeared);
+    let fixture = w._dir.keep();
+    s3e4d_probe_save(
+        "success_compatibility_fixed_clock",
+        serde_json::json!({
+            "baseline":"3f7fd3422047b40f9dc6fa787d4b523d7d90d857",
+            "category":"successful-operation compatibility trace, not publication acceptance",
+            "fixed_unix_millis":fixed_ms,"uuid_anchor":anchor.to_string(),
+            "adjacent_control_gap":s3e4d_public_uuid_gap(anchor,control),
+            "trace":trace,"all_integrity_checks_passed":true,
+            "retained_fixture":fixture.to_string_lossy(),
+        }),
+    );
+}
+
+#[test]
+fn s3e4d_read_failure_compatibility_fixed_clock() {
+    let seconds = std::env::var("MINDSPACE_S3E4D_FIXED_REALTIME_SECONDS")
+        .expect("run this exact test with the fixed-CLOCK_REALTIME shim")
+        .parse::<u64>()
+        .unwrap();
+    let nanos = std::env::var("MINDSPACE_S3E4D_FIXED_REALTIME_NANOS")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let fixed_ms = seconds * 1000 + nanos / 1_000_000;
+    let anchor = Uuid::now_v7();
+    let control = Uuid::now_v7();
+    assert_eq!((anchor.as_u128() >> 80) as u64, fixed_ms);
+    assert_eq!(s3e4d_public_uuid_gap(anchor, control), 1);
+    let mut trace = Vec::new();
+    for phase in ["summary", "requested_space", "reuse_membership"] {
+        let w = World::new();
+        let seed_input = if phase == "reuse_membership" {
+            let file = crate::ingest::observe_bytes(
+                Path::new("a.md"),
+                b"# A\n\nSYNTHETIC_OLD\n\n# Z\n\nSYNTHETIC_KEEP\n".to_vec(),
+                format!("{ROOT}/a.md"),
+                &[w.notes],
+            )
+            .unwrap();
+            s3e4d_probe_observation(vec![file], &[w.notes])
+        } else {
+            w.observation(
+                IngestScope::File,
+                &[("a.md", "SYNTHETIC_READ_SEED")],
+                &[w.notes],
+                100,
+            )
+        };
+        let seed = w.store.record_observation(seed_input).unwrap();
+        let membership_stage = if phase == "reuse_membership" {
+            let old = seed.files[0]
+                .actions
+                .iter()
+                .find(|a| a.subject == "Z")
+                .unwrap();
+            Some(format!("membership_read:{}", old.memory_id))
+        } else {
+            None
+        };
+        let failed_input = if phase == "reuse_membership" {
+            let file = crate::ingest::observe_bytes(
+                Path::new("a.md"),
+                b"# A\n\nSYNTHETIC_NEW\n\n# Z\n\nSYNTHETIC_KEEP\n".to_vec(),
+                format!("{ROOT}/a.md"),
+                &[w.notes, w.other],
+            )
+            .unwrap();
+            let mut input = s3e4d_probe_observation(vec![file], &[w.notes, w.other]);
+            input.session.observed_at = Ts(200);
+            input
+        } else {
+            w.observation(
+                IngestScope::File,
+                &[("a.md", "SYNTHETIC_READ_CHANGED")],
+                &[w.notes, w.other],
+                200,
+            )
+        };
+        if phase == "requested_space" {
+            w.store
+                .retire_memory(
+                    seed.files[0].actions[0].memory_id,
+                    Some("SYNTHETIC_EMPTY_ACTIVE_SUMMARY".into()),
+                    Ts(150),
+                )
+                .unwrap();
+        }
+        let before_rows = dump(&w.store.connection().unwrap(), true);
+        let before_ledger = ledger(&w.store);
+        let read_before = Uuid::now_v7();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&hits);
+        let outcome = with_hook(
+            move |stage, conn| {
+                if membership_stage.as_deref() == Some(stage) {
+                    count.fetch_add(1, AtomicOrdering::SeqCst);
+                    return Err(Error::Storage(
+                        "synthetic target-specific membership read failure".into(),
+                    ));
+                }
+                if stage == "before_plan" {
+                    let count = Arc::clone(&count);
+                    conn.authorizer(Some(move |ctx:AuthContext<'_>| {
+                    let rejected = matches!(ctx.action,
+                        AuthAction::Read {table_name:"memories",column_name:"id"} if phase=="summary")
+                        || matches!(ctx.action,
+                        AuthAction::Read {table_name:"spaces",column_name:"name"} if phase=="requested_space");
+                    if rejected { count.fetch_add(1,AtomicOrdering::SeqCst); Authorization::Deny }
+                    else { Authorization::Allow }
+                })).map_err(dberr)?;
+                }
+                Ok(())
+            },
+            || w.store.record_observation(failed_input.clone()),
+        );
+        clear_authorizer(&w.store.connection().unwrap());
+        let read_after = Uuid::now_v7();
+        assert!(outcome.is_err(), "the selected read boundary must fail");
+        assert!(hits.load(AtomicOrdering::SeqCst) > 0);
+        assert_eq!(before_rows, dump(&w.store.connection().unwrap(), true));
+        assert_eq!(before_ledger, ledger(&w.store));
+        assert!(w.store.connection().unwrap().is_autocommit());
+        let mut next_input = failed_input;
+        next_input.session.observed_at = Ts(300);
+        let next = w.store.record_observation(next_input).unwrap();
+        assert_eq!(s3e4d_public_uuid_gap(read_after, next.session_id), 1);
+        assert_integrity(&w.store);
+        trace.push(serde_json::json!({
+            "phase":phase,"actual_error":format!("{outcome:?}"),
+            "injection_kind":if phase=="reuse_membership" {"synthetic target-specific read-boundary failure"} else {"actual SQLite authorizer read denial"},
+            "read_before":read_before.to_string(),"read_after":read_after.to_string(),
+            "failed_gap":s3e4d_public_uuid_gap(read_before,read_after),
+            "all_rows_rolled_back":true,"ledger_before":before_ledger,
+            "next_report":next,"all_table_rows":dump(&w.store.connection().unwrap(),true),
+            "next_session_gap_from_failed_after":s3e4d_public_uuid_gap(read_after,next.session_id),
+        }));
+        w._dir.keep();
+    }
+    s3e4d_probe_save(
+        "read_failure_compatibility_fixed_clock",
+        serde_json::json!({
+            "baseline":"3f7fd3422047b40f9dc6fa787d4b523d7d90d857",
+            "category":"read-failure compatibility trace, not publication acceptance",
+            "fixed_unix_millis":fixed_ms,"uuid_anchor":anchor.to_string(),
+            "adjacent_control_gap":s3e4d_public_uuid_gap(anchor,control),
+            "trace":trace,"all_rows_rolled_back":true,"all_integrity_checks_passed":true,
+        }),
+    );
+}

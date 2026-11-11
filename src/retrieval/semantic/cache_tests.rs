@@ -557,3 +557,306 @@ fn malformed_model_setting_is_not_disabled_for_cached_or_uncached_readiness() {
         .hits
         .is_empty());
 }
+
+fn shared_fixture() -> (tempfile::TempDir, Arc<SqliteStore>, Arc<Calls>) {
+    let Fixture {
+        dir, store, calls, ..
+    } = Fixture::new();
+    (dir, Arc::new(store), calls)
+}
+
+fn shared_query() -> SearchQuery {
+    SearchQuery {
+        text: "retrieval marker".into(),
+        space_ids: None,
+        limit: 5,
+        at: None,
+        include_superseded: false,
+        include_retired: false,
+    }
+}
+
+fn shared_factory<'a>(
+    calls: &'a Arc<Calls>,
+) -> impl Fn(&ModelManifestEntry, &Path) -> Result<Box<dyn EmbeddingRuntime>> + 'a {
+    move |entry, _| {
+        calls.factories.fetch_add(1, Ordering::SeqCst);
+        if let Some(action) = calls.on_factory.lock().unwrap().take() {
+            action();
+        }
+        Ok(Box::new(Runtime {
+            id: entry.id.into(),
+            calls: Arc::clone(calls),
+        }) as Box<dyn EmbeddingRuntime>)
+    }
+}
+
+type ModelWriters = Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>;
+
+fn bounded_model_write(
+    store: Arc<SqliteStore>,
+    key: &'static str,
+    value: &'static str,
+    writers: ModelWriters,
+) -> Box<dyn FnOnce() + Send> {
+    Box::new(move || {
+        let (sent, received) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = store.set_meta(key, value);
+            let _ = sent.send(result);
+        });
+        writers.lock().unwrap().push(writer);
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("model preparation must not retain the Store connection mutex")
+            .unwrap();
+    })
+}
+
+fn with_model_writers<T>(writers: &ModelWriters, operation: impl FnOnce() -> T) -> T {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+    for writer in writers.lock().unwrap().drain(..) {
+        writer.join().unwrap();
+    }
+    match result {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[test]
+fn model_factory_and_query_can_write_through_the_same_store_before_final_snapshot() {
+    let (dir, store, calls) = shared_fixture();
+    let writers = ModelWriters::default();
+    *calls.on_factory.lock().unwrap() = Some(bounded_model_write(
+        Arc::clone(&store),
+        "fixture.factory",
+        "SYNTHETIC",
+        Arc::clone(&writers),
+    ));
+    *calls.on_query.lock().unwrap() = Some(bounded_model_write(
+        Arc::clone(&store),
+        "fixture.query",
+        "SYNTHETIC",
+        Arc::clone(&writers),
+    ));
+    let outcome = with_model_writers(&writers, || {
+        crate::retrieval::search_with_preparer(
+            store.as_ref(),
+            shared_query(),
+            SearchMode::Hybrid,
+            None,
+            |store| super::super::prepare_with(store, dir.path(), lookup, &shared_factory(&calls)),
+        )
+    })
+    .unwrap();
+    assert_eq!(outcome.effective, EffectiveMode::Hybrid);
+    assert_eq!(calls.factories.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.get_meta("fixture.factory").unwrap().as_deref(),
+        Some("SYNTHETIC")
+    );
+    assert_eq!(
+        store.get_meta("fixture.query").unwrap().as_deref(),
+        Some("SYNTHETIC")
+    );
+}
+
+#[test]
+fn unavailable_preflight_is_revalidated_and_restarts_once_after_enablement() {
+    for mode in [SearchMode::Auto, SearchMode::Semantic, SearchMode::Hybrid] {
+        let (dir, store, calls) = shared_fixture();
+        store.set_meta("embedding.enabled", "false").unwrap();
+        let mut preparations = 0;
+        let outcome = crate::retrieval::search_with_preparer(
+            store.as_ref(),
+            shared_query(),
+            mode,
+            None,
+            |store| {
+                preparations += 1;
+                let prepared =
+                    super::super::prepare_with(store, dir.path(), lookup, &shared_factory(&calls))?;
+                if preparations == 1 {
+                    store.set_meta("embedding.enabled", "true")?;
+                }
+                Ok(prepared)
+            },
+        )
+        .unwrap();
+        assert_eq!(preparations, 2);
+        assert_eq!(
+            outcome.effective,
+            if mode == SearchMode::Semantic {
+                EffectiveMode::Semantic
+            } else {
+                EffectiveMode::Hybrid
+            }
+        );
+        assert_eq!(calls.factories.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.queries.load(Ordering::SeqCst), 1);
+    }
+}
+#[test]
+fn uncached_profile_changes_twice_exhaust_exactly_one_restart() {
+    let (dir, store, calls) = shared_fixture();
+    let mut preparations = 0;
+    let result = crate::retrieval::search_with_preparer(
+        store.as_ref(),
+        shared_query(),
+        SearchMode::Hybrid,
+        None,
+        |store| {
+            preparations += 1;
+            let prepared =
+                super::super::prepare_with(store, dir.path(), lookup, &shared_factory(&calls))?;
+            store.set_meta(
+                "embedding.model",
+                if preparations == 1 {
+                    OTHER.id
+                } else {
+                    MODEL.id
+                },
+            )?;
+            Ok(prepared)
+        },
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("changed concurrently"));
+    assert_eq!(preparations, 2);
+    assert_eq!(calls.factories.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.queries.load(Ordering::SeqCst), 2);
+    // Both final sessions ended before the caller retries or writes again.
+    store
+        .set_meta("fixture.after_exhaustion", "SYNTHETIC")
+        .unwrap();
+}
+
+#[test]
+fn cached_profile_change_restarts_once_and_does_not_reuse_stale_model() {
+    let (dir, store, calls) = shared_fixture();
+    let writers = ModelWriters::default();
+    let mut cache = SemanticCache::default();
+    let run = |cache: &mut SemanticCache| {
+        cache.search_with(
+            store.as_ref(),
+            shared_query(),
+            SearchMode::Hybrid,
+            dir.path(),
+            lookup,
+            &shared_factory(&calls),
+            &|| SystemTime::now() + Duration::from_secs(10),
+            &|_| true,
+        )
+    };
+    run(&mut cache).unwrap();
+    *calls.on_query.lock().unwrap() = Some(bounded_model_write(
+        Arc::clone(&store),
+        "embedding.model",
+        OTHER.id,
+        Arc::clone(&writers),
+    ));
+    let outcome = with_model_writers(&writers, || run(&mut cache)).unwrap();
+    assert_eq!(outcome.effective, EffectiveMode::Hybrid);
+    assert_eq!(calls.factories.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.queries.load(Ordering::SeqCst), 3);
+    assert_eq!(cache.entry.as_ref().unwrap().model.entry.id, OTHER.id);
+}
+
+#[test]
+fn supplied_unavailable_is_explicit_policy_while_ready_capabilities_are_validated() {
+    let (dir, store, calls) = shared_fixture();
+    let deliberate = SemanticCapability::Unavailable(FallbackReason::EmbeddingsDisabled);
+    let outcome = crate::retrieval::search_with_mode(
+        store.as_ref(),
+        shared_query(),
+        SearchMode::Auto,
+        &deliberate,
+        RetrievalOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(outcome.effective, EffectiveMode::Lexical);
+    assert_eq!(outcome.fallback, Some(FallbackReason::EmbeddingsDisabled));
+    for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+        assert!(matches!(
+            crate::retrieval::search_with_mode(
+                store.as_ref(),
+                shared_query(),
+                mode,
+                &deliberate,
+                RetrievalOptions::default()
+            ),
+            Err(Error::SemanticUnavailable { .. })
+        ));
+    }
+    let ready =
+        super::super::resolve_with(store.as_ref(), dir.path(), lookup, &shared_factory(&calls))
+            .unwrap();
+    store.set_meta("embedding.model", OTHER.id).unwrap();
+    assert!(crate::retrieval::search_with_mode(
+        store.as_ref(),
+        shared_query(),
+        SearchMode::Semantic,
+        &ready,
+        RetrievalOptions::default()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("changed concurrently"));
+    store
+        .set_meta_blob_for_test("embedding.model", b"SYNTHETIC_BLOB")
+        .unwrap();
+    assert!(crate::retrieval::search_with_mode(
+        store.as_ref(),
+        shared_query(),
+        SearchMode::Lexical,
+        &ready,
+        RetrievalOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn cached_profile_change_twice_exhausts_one_restart_and_evicts_runtime() {
+    let (dir, store, calls) = shared_fixture();
+    let writers = ModelWriters::default();
+    let mut cache = SemanticCache::default();
+    let factory = |entry: &ModelManifestEntry, _: &Path| -> Result<Box<dyn EmbeddingRuntime>> {
+        let attempt = calls.factories.fetch_add(1, Ordering::SeqCst);
+        bounded_model_write(
+            Arc::clone(&store),
+            "embedding.model",
+            if attempt == 0 { OTHER.id } else { MODEL.id },
+            Arc::clone(&writers),
+        )();
+        Ok(Box::new(Runtime {
+            id: entry.id.into(),
+            calls: Arc::clone(&calls),
+        }))
+    };
+    let result = with_model_writers(&writers, || {
+        cache.search_with(
+            store.as_ref(),
+            shared_query(),
+            SearchMode::Hybrid,
+            dir.path(),
+            lookup,
+            &factory,
+            &|| SystemTime::now() + Duration::from_secs(10),
+            &|_| true,
+        )
+    });
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("changed concurrently"));
+    assert_eq!(calls.factories.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.queries.load(Ordering::SeqCst), 2);
+    assert!(cache.entry.is_none());
+    store
+        .set_meta("fixture.after_cached_exhaustion", "SYNTHETIC")
+        .unwrap();
+}

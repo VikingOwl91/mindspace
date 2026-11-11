@@ -28,7 +28,7 @@ use serde::Serialize;
 use crate::core::{
     Error, Result, SearchHit, SearchHitRaw, SearchQuery, Space, SpaceLink, SpaceMatch, Uuid,
 };
-use crate::storage::Store;
+use crate::storage::{MemoryRead, Store};
 
 pub use semantic::{SemanticCapability, SemanticSource};
 
@@ -261,28 +261,89 @@ pub fn candidate_pool_size(limit: u32, override_pool: Option<u32>) -> u32 {
 /// Lexical search with directed space traversal. This is the path existing
 /// callers use, and its output is unchanged.
 pub fn search(store: &dyn Store, query: SearchQuery) -> Result<Vec<SearchHit>> {
-    let (scoped, traversal) = expand_scope(store, query)?;
-    let raw = store.search(&scoped)?;
-    Ok(raw
+    search_named(store, query, None)
+}
+
+/// Caller-side space-name resolution belongs to the response snapshot too.
+pub(crate) fn search_named(
+    store: &dyn Store,
+    query: SearchQuery,
+    names: Option<&[String]>,
+) -> Result<Vec<SearchHit>> {
+    let read = store.read_session()?;
+    let query = resolve_names(read.as_ref(), query, names)?;
+    let (scoped, traversal) = expand_scope(read.as_ref(), query)?;
+    let raw = read.search(&scoped)?;
+    let hits = raw
         .into_iter()
         .map(|hit| {
             let score = hit.score;
             decorate(hit, traversal.as_ref(), score)
         })
-        .collect())
+        .collect();
+    read.finish()?;
+    Ok(hits)
 }
 
-/// Resolves the current semantic capability once for an explicit mode request,
-/// then delegates to [`search_with_mode`]. Lexical requests never inspect model
-/// metadata or artifacts. Blank queries fail before capability resolution.
 pub fn search_with_mode_resolving_capability(
     store: &dyn Store,
     query: SearchQuery,
     mode: SearchMode,
 ) -> Result<SearchOutcome> {
-    search_with_mode_and_resolver(store, query, mode, semantic::resolve)
+    search_with_mode_resolving_capability_named(store, query, mode, None)
 }
 
+pub(crate) fn search_with_mode_resolving_capability_named(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+    names: Option<&[String]>,
+) -> Result<SearchOutcome> {
+    if query.text.trim().is_empty() {
+        return Err(Error::EmptyQuery);
+    }
+    if mode == SearchMode::Lexical {
+        return search_with_mode_named(
+            store,
+            query,
+            mode,
+            &SemanticCapability::Unavailable(FallbackReason::EmbeddingsDisabled),
+            RetrievalOptions::default(),
+            names,
+        );
+    }
+    search_with_preparer(store, query, mode, names, semantic::prepare)
+}
+
+fn search_with_preparer(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+    names: Option<&[String]>,
+    mut prepare: impl FnMut(&dyn Store) -> Result<semantic::PreparedCapability>,
+) -> Result<SearchOutcome> {
+    for attempt in 0..=1 {
+        let prepared = prepare(store)?;
+        let plan = prepare_plan(mode, &prepared.capability, &query.text, query.limit)?;
+        if let Some(result) = collect_prepared(
+            store,
+            query.clone(),
+            mode,
+            plan,
+            RetrievalOptions::default(),
+            names,
+            prepared.profile.as_ref(),
+        )? {
+            return Ok(result);
+        }
+        if attempt == 1 {
+            return Err(concurrent_profile_change());
+        }
+    }
+    unreachable!("bounded preparation loop returns")
+}
+
+#[cfg(test)]
 fn search_with_mode_and_resolver(
     store: &dyn Store,
     query: SearchQuery,
@@ -300,15 +361,16 @@ fn search_with_mode_and_resolver(
     search_with_mode(store, query, mode, &capability, RetrievalOptions::default())
 }
 
-/// Runs `query` in `mode`.
+/// Runs a request using the caller's capability. A Ready capability is bound to
+/// its original settings/profile; stale supplied capabilities are refused rather
+/// than silently re-resolved with a different model. Model work precedes BEGIN.
 ///
-/// `semantic` is the capability resolved for this call (see
-/// [`semantic::resolve`]). Lexical mode ignores it. Semantic and Hybrid fail
-/// with [`Error::SemanticUnavailable`] when it is unavailable or the query
-/// cannot be embedded. Auto degrades to lexical and records the reason.
-///
-/// Storage and traversal errors always propagate. Blank query text is rejected
-/// in every mode. The result never holds more than `query.limit` hits.
+/// An explicitly supplied `Unavailable` is caller policy, not a live database
+/// readiness observation. In particular, a prior `resolve_with` that returned
+/// `Unavailable` followed later by this function is not an atomic readiness/query
+/// operation. Operational callers use `search_with_mode_resolving_capability`,
+/// which captures and revalidates even unavailable database readiness. Explicit
+/// Lexical mode ignores the capability and never reads embedding settings.
 pub fn search_with_mode(
     store: &dyn Store,
     query: SearchQuery,
@@ -316,13 +378,130 @@ pub fn search_with_mode(
     semantic: &SemanticCapability,
     options: RetrievalOptions,
 ) -> Result<SearchOutcome> {
-    let text = query.text.trim().to_string();
-    if text.is_empty() {
+    search_with_mode_named(store, query, mode, semantic, options, None)
+}
+
+fn search_with_mode_named(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+    semantic: &SemanticCapability,
+    options: RetrievalOptions,
+    names: Option<&[String]>,
+) -> Result<SearchOutcome> {
+    if query.text.trim().is_empty() {
         return Err(Error::EmptyQuery);
     }
+    let plan = prepare_plan(mode, semantic, &query.text, query.limit)?;
+    let profile = match (mode, semantic) {
+        (SearchMode::Lexical, _) | (_, SemanticCapability::Unavailable(_)) => None,
+        (_, SemanticCapability::Ready(source)) => Some(source.profile()),
+    };
+    collect_prepared(store, query, mode, plan, options, names, profile)?
+        .ok_or_else(concurrent_profile_change)
+}
+
+pub(crate) fn concurrent_profile_change() -> Error {
+    Error::Storage("retrieval settings/profile changed concurrently; retry the request".into())
+}
+
+pub(crate) enum PreparedPlan {
+    NotRun,
+    Unavailable(FallbackReason),
+    Lexical { fallback: Option<FallbackReason> },
+    Semantic { vector: Vec<f32>, key: String },
+    Fusion { vector: Vec<f32>, key: String },
+}
+
+/// Hashing/runtime initialization and this embedding step run without a session.
+pub(crate) fn prepare_plan(
+    mode: SearchMode,
+    semantic: &SemanticCapability,
+    text: &str,
+    limit: u32,
+) -> Result<PreparedPlan> {
+    if matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) {
+        if let SemanticCapability::Unavailable(reason) = semantic {
+            // Database-derived unavailability is a hint until the response
+            // snapshot has revalidated its profile. Preserve its final error.
+            return Ok(PreparedPlan::Unavailable(reason.clone()));
+        }
+    }
     let plan = choose_plan(mode, semantic)?;
-    let limit = query.limit;
     if limit == 0 {
+        return Ok(PreparedPlan::NotRun);
+    }
+    match plan {
+        Plan::Lexical { fallback } => Ok(PreparedPlan::Lexical { fallback }),
+        Plan::Semantic(source) => Ok(PreparedPlan::Semantic {
+            vector: source
+                .embed_query(text.trim())
+                .map_err(|reason| unavailable(&reason))?,
+            key: source.derivation_key().to_string(),
+        }),
+        Plan::Fusion { source, auto } => match source.embed_query(text.trim()) {
+            Ok(vector) => Ok(PreparedPlan::Fusion {
+                vector,
+                key: source.derivation_key().to_string(),
+            }),
+            Err(reason) if auto => Ok(PreparedPlan::Lexical {
+                fallback: Some(reason),
+            }),
+            Err(reason) => Err(unavailable(&reason)),
+        },
+    }
+}
+
+/// None requests one complete restart. The session is finished before returning
+/// either a result or that restart signal; errors unwind through its Drop guard.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_prepared(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+    plan: PreparedPlan,
+    options: RetrievalOptions,
+    names: Option<&[String]>,
+    profile: Option<&semantic::ReadProfile>,
+) -> Result<Option<SearchOutcome>> {
+    let read = store.read_session()?;
+    if let Some(profile) = profile {
+        if !profile.matches(read.as_ref())? {
+            read.finish()?;
+            return Ok(None);
+        }
+    }
+    let query = resolve_names(read.as_ref(), query, names)?;
+    let result = search_prepared_in(read.as_ref(), query, mode, plan, options)?;
+    read.finish()?;
+    Ok(Some(result))
+}
+
+fn resolve_names(
+    read: &dyn MemoryRead,
+    mut query: SearchQuery,
+    names: Option<&[String]>,
+) -> Result<SearchQuery> {
+    if let Some(names) = names {
+        query.space_ids = Some(
+            names
+                .iter()
+                .map(|name| read.get_space(name).map(|s| s.id))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    Ok(query)
+}
+
+fn search_prepared_in(
+    read: &dyn MemoryRead,
+    query: SearchQuery,
+    mode: SearchMode,
+    plan: PreparedPlan,
+    options: RetrievalOptions,
+) -> Result<SearchOutcome> {
+    let limit = query.limit;
+    if matches!(plan, PreparedPlan::NotRun) {
         return Ok(SearchOutcome {
             requested: mode,
             effective: EffectiveMode::NotRun,
@@ -332,23 +511,21 @@ pub fn search_with_mode(
             hits: Vec::new(),
         });
     }
-
-    // One expansion serves both branches, so their filters cannot diverge.
-    let (scoped, traversal) = expand_scope(store, query)?;
+    let plan = match plan {
+        PreparedPlan::Unavailable(reason) => return Err(unavailable(&reason)),
+        plan => plan,
+    };
+    let (scoped, traversal) = expand_scope(read, query)?;
     let traversal = traversal.as_ref();
     match plan {
-        Plan::Lexical { fallback } => {
-            lexical_outcome(store, mode, &scoped, traversal, limit, fallback)
+        PreparedPlan::NotRun => unreachable!("returned above"),
+        PreparedPlan::Unavailable(_) => unreachable!("returned above"),
+        PreparedPlan::Lexical { fallback } => {
+            lexical_outcome(read, mode, &scoped, traversal, limit, fallback)
         }
-        Plan::Semantic(source) => {
-            let vector = source
-                .embed_query(&text)
-                .map_err(|reason| unavailable(&reason))?;
-            let raw = dedupe_hits(store.search_vectors(
-                &vector,
-                &with_limit(&scoped, limit),
-                source.derivation_key(),
-            )?);
+        PreparedPlan::Semantic { vector, key } => {
+            let raw =
+                dedupe_hits(read.search_vectors(&vector, &with_limit(&scoped, limit), &key)?);
             Ok(SearchOutcome {
                 requested: mode,
                 effective: EffectiveMode::Semantic,
@@ -358,25 +535,12 @@ pub fn search_with_mode(
                 hits: semantic_hits(raw, traversal, limit),
             })
         }
-        Plan::Fusion { source, auto } => {
-            let vector = match source.embed_query(&text) {
-                Ok(vector) => vector,
-                Err(reason) if auto => {
-                    return lexical_outcome(store, mode, &scoped, traversal, limit, Some(reason));
-                }
-                Err(reason) => return Err(unavailable(&reason)),
-            };
+        PreparedPlan::Fusion { vector, key } => {
             let pool = candidate_pool_size(limit, options.candidate_pool);
-            let lexical_episodes = dedupe_hits(store.search(&with_limit(&scoped, pool))?);
-            let semantic_episodes = dedupe_hits(store.search_vectors(
-                &vector,
-                &with_limit(&scoped, pool),
-                source.derivation_key(),
-            )?);
+            let lexical_episodes = dedupe_hits(read.search(&with_limit(&scoped, pool))?);
+            let semantic_episodes =
+                dedupe_hits(read.search_vectors(&vector, &with_limit(&scoped, pool), &key)?);
             if semantic_episodes.is_empty() {
-                // The vector branch contributed nothing. The lexical ranking is
-                // the honest result, so it is reported as lexical and keeps
-                // legacy episode-level behavior.
                 return Ok(SearchOutcome {
                     requested: mode,
                     effective: EffectiveMode::Lexical,
@@ -386,10 +550,13 @@ pub fn search_with_mode(
                     hits: lexical_hits(lexical_episodes, traversal, limit),
                 });
             }
-            let lexical = dedupe_assertions(lexical_episodes);
-            let semantic = dedupe_assertions(semantic_episodes);
             Ok(fused_outcome(
-                mode, lexical, semantic, traversal, limit, options,
+                mode,
+                dedupe_assertions(lexical_episodes),
+                dedupe_assertions(semantic_episodes),
+                traversal,
+                limit,
+                options,
             ))
         }
     }
@@ -434,7 +601,7 @@ fn unavailable(reason: &FallbackReason) -> Error {
 }
 
 fn lexical_outcome(
-    store: &dyn Store,
+    store: &dyn MemoryRead,
     mode: SearchMode,
     scoped: &SearchQuery,
     traversal: Option<&Traversal>,
@@ -619,7 +786,7 @@ impl Traversal {
 /// Expands the requested spaces to everything reachable from them, once. The
 /// returned query carries the expanded set, and both branches of a search use it.
 fn expand_scope(
-    store: &dyn Store,
+    store: &dyn MemoryRead,
     mut query: SearchQuery,
 ) -> Result<(SearchQuery, Option<Traversal>)> {
     let roots: Vec<Uuid> = query.space_ids.clone().unwrap_or_default();
@@ -762,7 +929,9 @@ pub fn search_code(
             include_superseded: false,
             include_retired: false,
         };
-        query.space_ids = expand_scope(store, probe)?.0.space_ids;
+        let read = store.read_session()?;
+        query.space_ids = expand_scope(read.as_ref(), probe)?.0.space_ids;
+        read.finish()?;
     }
     store.search_code(&query)
 }

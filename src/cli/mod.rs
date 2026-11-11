@@ -453,12 +453,22 @@ fn search_for_cli(
     store: &dyn Store,
     query: SearchQuery,
     mode: Option<retrieval::SearchMode>,
+    space_names: Option<&[String]>,
 ) -> Result<SearchResults> {
     match mode {
         Some(mode) => Ok(SearchResults::Mode(
-            retrieval::search_with_mode_resolving_capability(store, query, mode)?,
+            retrieval::search_with_mode_resolving_capability_named(
+                store,
+                query,
+                mode,
+                space_names,
+            )?,
         )),
-        None => Ok(SearchResults::Legacy(retrieval::search(store, query)?)),
+        None => Ok(SearchResults::Legacy(retrieval::search_named(
+            store,
+            query,
+            space_names,
+        )?)),
     }
 }
 
@@ -622,22 +632,20 @@ pub fn execute(cli: &Cli) -> Result<()> {
             mode,
         } => {
             let store = open(cli)?;
-            let space_ids = match space {
-                Some(name) => Some(vec![store.get_space(name)?.id]),
-                None => None,
-            };
+            let space_names = space.as_ref().map(|name| vec![name.clone()]);
             let at = at.as_deref().map(Ts::parse).transpose()?;
             let results = search_for_cli(
                 &store,
                 SearchQuery {
                     text: query.clone(),
-                    space_ids,
+                    space_ids: None,
                     limit: *limit,
                     at,
                     include_superseded: *include_superseded,
                     include_retired: *include_retired,
                 },
                 mode.map(Into::into),
+                space_names.as_deref(),
             )?;
             match results {
                 SearchResults::Legacy(hits) => render::search_hits(&hits, *json),
@@ -652,21 +660,19 @@ pub fn execute(cli: &Cli) -> Result<()> {
             mode,
         } => {
             let store = open(cli)?;
-            let space_ids = match space {
-                Some(name) => Some(vec![store.get_space(name)?.id]),
-                None => None,
-            };
+            let space_names = space.as_ref().map(|name| vec![name.clone()]);
             let results = search_for_cli(
                 &store,
                 SearchQuery {
                     text: query.clone(),
-                    space_ids,
+                    space_ids: None,
                     limit: *limit,
                     at: None,
                     include_superseded: false,
                     include_retired: false,
                 },
                 mode.map(Into::into),
+                space_names.as_deref(),
             )?;
             match results {
                 SearchResults::Legacy(hits) => render::recall_hits(&hits, *json),
@@ -675,18 +681,12 @@ pub fn execute(cli: &Cli) -> Result<()> {
         }
         Command::Inspect { id, json } => {
             let store = open(cli)?;
-            let memory_id = resolve_memory_id(&store, id)?;
-            let detail = store
-                .get_memory_detail(memory_id)?
-                .ok_or_else(|| Error::MemoryNotFound { prefix: id.clone() })?;
+            let detail = crate::memory_detail_for_prefix(&store, id)?;
             render::inspect(&detail, *json);
         }
         Command::Trace { id, json } => {
             let store = open(cli)?;
-            let memory_id = resolve_memory_id(&store, id)?;
-            let detail = store
-                .get_memory_detail(memory_id)?
-                .ok_or_else(|| Error::MemoryNotFound { prefix: id.clone() })?;
+            let detail = crate::memory_detail_for_prefix(&store, id)?;
             render::trace(&detail, *json);
         }
         Command::History { subject, json } => {

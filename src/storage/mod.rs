@@ -22,11 +22,44 @@ pub struct GitResolutionPlan<'a> {
     pub version: &'a str,
 }
 
+/// Read-only database dependencies of one legacy memory retrieval response.
+///
+/// The returned session retains one connection and snapshot until `finish` or
+/// drop. It exposes no mutation or nested-session operation. Collect owned data,
+/// finish the session, then render or perform external model work.
+pub trait MemoryRead {
+    fn get_space(&self, name: &str) -> Result<Space>;
+    fn list_spaces(&self) -> Result<Vec<Space>>;
+    fn list_spaces_with_counts(&self) -> Result<Vec<(Space, u64)>>;
+    fn list_space_links(&self) -> Result<Vec<SpaceLink>>;
+    fn embedding_index_status(&self, derivation_key: &str) -> Result<EmbeddingIndexStatus>;
+    fn read_embedding_settings(&self) -> Result<EmbeddingSettings>;
+    fn search_vectors(
+        &self,
+        query_vector: &[f32],
+        query: &SearchQuery,
+        derivation_key: &str,
+    ) -> Result<Vec<SearchHitRaw>>;
+    fn get_memory_detail(&self, id: Uuid) -> Result<Option<MemoryDetail>>;
+    fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>>;
+    fn list_replaced_by(&self, id: Uuid) -> Result<Vec<MemorySummary>>;
+    fn memory_id_prefix_matches(&self, prefix: &str) -> Result<Vec<Uuid>>;
+    fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHitRaw>>;
+    fn list_conflicts(&self) -> Result<Vec<ConflictGroup>>;
+    /// End the read transaction and report cleanup failures. Early errors and
+    /// unwinding also clean up through Drop; an unusable connection is discarded.
+    fn finish(self: Box<Self>) -> Result<()>;
+}
+
 /// The storage boundary. Methods correspond to use cases, not tables, and
 /// traffic exclusively in `core` types. Each state-changing method owns its
 /// transaction; a future PostgreSQL backend would implement this trait
 /// without exposing transaction handles to callers.
 pub trait Store {
+    /// Retain one read-only snapshot for complete memory response collection.
+    /// This must not be implemented as independently executed Store getters.
+    fn read_session(&self) -> Result<Box<dyn MemoryRead + '_>>;
+
     fn temporal_history_capabilities(&self) -> Result<TemporalHistoryCapabilities>;
     fn require_temporal_coverage(
         &self,

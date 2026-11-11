@@ -390,7 +390,7 @@ unsafe extern "C" fn fail_settings_file_read(
     rusqlite::ffi::SQLITE_IOERR_READ
 }
 
-struct FileReadFault<'connection> {
+pub(super) struct FileReadFault<'connection> {
     file: *mut rusqlite::ffi::sqlite3_file,
     original: *const rusqlite::ffi::sqlite3_io_methods,
     _methods: Box<rusqlite::ffi::sqlite3_io_methods>,
@@ -398,7 +398,7 @@ struct FileReadFault<'connection> {
 }
 
 impl<'connection> FileReadFault<'connection> {
-    fn install(connection: &'connection Connection) -> Self {
+    pub(super) fn install(connection: &'connection Connection) -> Self {
         let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
         // SAFETY: the caller retains the Store mutex guard for this connection,
         // with no active statements. SQLITE_FCNTL_FILE_POINTER writes one file

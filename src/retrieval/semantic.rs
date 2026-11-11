@@ -13,12 +13,12 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::core::{Error, Result};
+use crate::core::{EmbeddingSettings, Error, Result};
 use crate::embeddings::manager;
 use crate::embeddings::manifest::{self, ModelManifestEntry};
 use crate::embeddings::EmbeddingRuntime;
 use crate::retrieval::FallbackReason;
-use crate::storage::Store;
+use crate::storage::{MemoryRead, Store};
 
 #[cfg(all(target_os = "linux", feature = "embeddings"))]
 mod cache;
@@ -31,13 +31,14 @@ pub(crate) struct SemanticCache {}
 
 #[cfg(not(all(target_os = "linux", feature = "embeddings")))]
 impl SemanticCache {
-    pub(crate) fn search(
+    pub(crate) fn search_named(
         &mut self,
         store: &dyn Store,
         query: crate::core::SearchQuery,
         mode: crate::retrieval::SearchMode,
+        names: Option<&[String]>,
     ) -> Result<crate::retrieval::SearchOutcome> {
-        crate::retrieval::search_with_mode_resolving_capability(store, query, mode)
+        crate::retrieval::search_with_mode_resolving_capability_named(store, query, mode, names)
     }
 }
 
@@ -62,9 +63,14 @@ pub struct SemanticSource {
     model_id: String,
     dimension: usize,
     runtime: Box<dyn EmbeddingRuntime>,
+    profile: ReadProfile,
 }
 
 impl SemanticSource {
+    pub(super) fn profile(&self) -> &ReadProfile {
+        &self.profile
+    }
+
     /// The active derivation key. Vectors are matched on this exact value.
     pub fn derivation_key(&self) -> &str {
         &self.derivation_key
@@ -129,10 +135,32 @@ pub fn resolve_with(
     lookup: ModelLookup,
     factory: RuntimeFactory<'_>,
 ) -> Result<SemanticCapability> {
-    match readiness(store, base, lookup)? {
-        Readiness::Ready(model) => resolve_ready(&model, factory),
-        Readiness::Unavailable(reason) => Ok(SemanticCapability::Unavailable(reason)),
+    Ok(prepare_with(store, base, lookup, factory)?.capability)
+}
+
+/// Database readiness observed during preflight. Counts are not cached authority:
+/// the final response snapshot rechecks presence and reads its own candidates.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ReadProfile {
+    settings: EmbeddingSettings,
+    index: Option<(String, bool)>,
+}
+
+impl ReadProfile {
+    pub(crate) fn matches(&self, read: &dyn MemoryRead) -> Result<bool> {
+        if read.read_embedding_settings()? != self.settings {
+            return Ok(false);
+        }
+        if let Some((key, present)) = &self.index {
+            return Ok((read.embedding_index_status(key)?.embedded > 0) == *present);
+        }
+        Ok(true)
     }
+}
+
+pub(crate) struct PreparedCapability {
+    pub(crate) profile: Option<ReadProfile>,
+    pub(crate) capability: SemanticCapability,
 }
 
 #[derive(PartialEq, Eq)]
@@ -140,6 +168,7 @@ struct ReadyModel {
     entry: &'static ModelManifestEntry,
     dir: PathBuf,
     derivation_key: String,
+    profile: ReadProfile,
 }
 
 enum Readiness {
@@ -147,32 +176,66 @@ enum Readiness {
     Unavailable(FallbackReason),
 }
 
-fn readiness(store: &dyn Store, base: &Path, lookup: ModelLookup) -> Result<Readiness> {
-    let (enabled, selected) = manager::read_settings(store)?;
-    if !enabled {
-        return Ok(Readiness::Unavailable(FallbackReason::EmbeddingsDisabled));
-    }
-    let Some(selected) = selected else {
-        return Ok(Readiness::Unavailable(FallbackReason::NoModelSelected));
+fn readiness(
+    store: &dyn Store,
+    base: &Path,
+    lookup: ModelLookup,
+) -> Result<(ReadProfile, Readiness)> {
+    let read = store.read_session()?;
+    let mut profile = ReadProfile {
+        settings: read.read_embedding_settings()?,
+        index: None,
     };
-    let Some(entry) = lookup(&selected) else {
-        return Ok(Readiness::Unavailable(FallbackReason::UnknownModel {
-            id: selected,
-        }));
+    let state = (|| -> Result<Readiness> {
+        if profile.settings.enabled.as_deref() != Some("true") {
+            return Ok(Readiness::Unavailable(FallbackReason::EmbeddingsDisabled));
+        }
+        let Some(selected) = profile.settings.model.as_deref() else {
+            return Ok(Readiness::Unavailable(FallbackReason::NoModelSelected));
+        };
+        let Some(entry) = lookup(selected) else {
+            return Ok(Readiness::Unavailable(FallbackReason::UnknownModel {
+                id: selected.to_string(),
+            }));
+        };
+        let dir = manager::model_dir_in(base, entry.id);
+        // These are bounded metadata checks only. Hashing, construction and
+        // inference happen after the preflight session has finished.
+        if let Some(reason) = artifacts_present(base, &dir, entry) {
+            return Ok(Readiness::Unavailable(reason));
+        }
+        let derivation_key = manifest::derivation_from_manifest(entry).derivation_key();
+        let present = read.embedding_index_status(&derivation_key)?.embedded > 0;
+        profile.index = Some((derivation_key.clone(), present));
+        if !present {
+            return Ok(Readiness::Unavailable(FallbackReason::NoCompatibleIndex));
+        }
+        Ok(Readiness::Ready(ReadyModel {
+            entry,
+            dir,
+            derivation_key,
+            profile: profile.clone(),
+        }))
+    })()?;
+    read.finish()?;
+    Ok((profile, state))
+}
+
+fn prepare_with(
+    store: &dyn Store,
+    base: &Path,
+    lookup: ModelLookup,
+    factory: RuntimeFactory<'_>,
+) -> Result<PreparedCapability> {
+    let (profile, state) = readiness(store, base, lookup)?;
+    let capability = match state {
+        Readiness::Ready(model) => resolve_ready(&model, factory)?,
+        Readiness::Unavailable(reason) => SemanticCapability::Unavailable(reason),
     };
-    let dir = manager::model_dir_in(base, entry.id);
-    if let Some(reason) = artifacts_present(base, &dir, entry) {
-        return Ok(Readiness::Unavailable(reason));
-    }
-    let derivation_key = manifest::derivation_from_manifest(entry).derivation_key();
-    if store.embedding_index_status(&derivation_key)?.embedded == 0 {
-        return Ok(Readiness::Unavailable(FallbackReason::NoCompatibleIndex));
-    }
-    Ok(Readiness::Ready(ReadyModel {
-        entry,
-        dir,
-        derivation_key,
-    }))
+    Ok(PreparedCapability {
+        profile: Some(profile),
+        capability,
+    })
 }
 
 fn resolve_ready(model: &ReadyModel, factory: RuntimeFactory<'_>) -> Result<SemanticCapability> {
@@ -222,34 +285,41 @@ fn resolve_ready(model: &ReadyModel, factory: RuntimeFactory<'_>) -> Result<Sema
         model_id: entry.id.to_string(),
         dimension: entry.dimension as usize,
         runtime,
+        profile: model.profile.clone(),
     }))
 }
 
 /// Resolves the capability for the user's data directory and the compiled-in
 /// manifest. Without the `embeddings` feature it is always unavailable.
 pub fn resolve(store: &dyn Store) -> Result<SemanticCapability> {
+    Ok(prepare(store)?.capability)
+}
+
+pub(crate) fn prepare(store: &dyn Store) -> Result<PreparedCapability> {
     #[cfg(feature = "embeddings")]
     {
-        // No usable data directory means no model can be found: semantic search
-        // is unavailable (Auto falls back to lexical), it does not guess a path.
         let base = match manager::data_dir() {
             Ok(base) => base,
             Err(e) => {
-                return Ok(SemanticCapability::Unavailable(
-                    FallbackReason::RuntimeUnavailable {
-                        detail: e.to_string(),
-                    },
-                ))
+                return Ok(PreparedCapability {
+                    profile: None,
+                    capability: SemanticCapability::Unavailable(
+                        FallbackReason::RuntimeUnavailable {
+                            detail: e.to_string(),
+                        },
+                    ),
+                })
             }
         };
-        resolve_with(store, &base, manifest::find_model, &candle_runtime)
+        prepare_with(store, &base, manifest::find_model, &candle_runtime)
     }
     #[cfg(not(feature = "embeddings"))]
     {
         let _ = store;
-        Ok(SemanticCapability::Unavailable(
-            FallbackReason::FeatureDisabled,
-        ))
+        Ok(PreparedCapability {
+            profile: None,
+            capability: SemanticCapability::Unavailable(FallbackReason::FeatureDisabled),
+        })
     }
 }
 

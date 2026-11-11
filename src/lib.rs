@@ -57,7 +57,26 @@ pub fn open_existing(path: &Path) -> Result<SqliteStore> {
 
 /// Resolves a full UUID or an unambiguous prefix (minimum 4 characters).
 pub fn resolve_memory_id(store: &dyn Store, prefix: &str) -> Result<Uuid> {
-    let mut ids = store.memory_id_prefix_matches(prefix)?;
+    resolve_memory_ids(store.memory_id_prefix_matches(prefix)?, prefix)
+}
+
+/// Collect a complete read response, including prefix resolution, before rendering.
+pub(crate) fn memory_detail_for_prefix(
+    store: &dyn Store,
+    prefix: &str,
+) -> Result<core::MemoryDetail> {
+    let session = store.read_session()?;
+    let id = resolve_memory_ids(session.memory_id_prefix_matches(prefix)?, prefix)?;
+    let detail = session
+        .get_memory_detail(id)?
+        .ok_or_else(|| Error::MemoryNotFound {
+            prefix: prefix.to_string(),
+        })?;
+    session.finish()?;
+    Ok(detail)
+}
+
+fn resolve_memory_ids(mut ids: Vec<Uuid>, prefix: &str) -> Result<Uuid> {
     if prefix.len() < 4 || ids.is_empty() {
         return Err(Error::MemoryNotFound {
             prefix: prefix.to_string(),

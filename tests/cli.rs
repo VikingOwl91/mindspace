@@ -476,3 +476,97 @@ fn expected_unavailable_reason() -> &'static str {
         "feature_disabled"
     }
 }
+
+fn index_run_with_isolated_home(root: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_mind"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TMPDIR", root)
+        .arg("--db")
+        .arg(root.join("mind.db"))
+        .args(["index", "run"])
+        .output()
+        .expect("run isolated index command")
+}
+
+#[test]
+fn index_run_preserves_legitimate_settings_outcomes() {
+    use mindspace::storage::Store;
+
+    for (enabled, model, expected) in [
+        (None, None, "embeddings disabled"),
+        (
+            Some("TRUE"),
+            Some("synthetic-unknown"),
+            "embeddings disabled",
+        ),
+        (
+            Some("false"),
+            Some("synthetic-unknown"),
+            "embeddings disabled",
+        ),
+        (Some("true"), None, "no model selected"),
+        (Some("true"), Some(""), "unknown model:"),
+        (
+            Some("true"),
+            Some("synthetic-unknown"),
+            "unknown model: synthetic-unknown",
+        ),
+        (
+            Some("true"),
+            Some(mindspace::embeddings::manifest::NOMIC_V1_5.id),
+            "not installed",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mindspace::SqliteStore::open(&dir.path().join("mind.db")).unwrap();
+        if let Some(value) = enabled {
+            store.set_meta("embedding.enabled", value).unwrap();
+        }
+        if let Some(value) = model {
+            store.set_meta("embedding.model", value).unwrap();
+        }
+        drop(store);
+        let output = index_run_with_isolated_home(dir.path());
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "expected {expected:?}, got {stderr}"
+        );
+    }
+}
+
+#[test]
+fn index_run_propagates_settings_storage_errors_instead_of_disabled() {
+    use mindspace::storage::Store;
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("mind.db");
+    let store = mindspace::SqliteStore::open(&database).unwrap();
+    store.set_meta("embedding.enabled", "false").unwrap();
+    store
+        .set_meta("embedding.model", "SYNTHETIC_MODEL")
+        .unwrap();
+    drop(store);
+    // Deliberately malformed disposable schema: constructor inventory still
+    // exists, while decoding the required legacy settings query must fail.
+    let raw = rusqlite::Connection::open(&database).unwrap();
+    raw.execute_batch("ALTER TABLE mind_meta RENAME COLUMN value TO synthetic_unavailable")
+        .unwrap();
+    drop(raw);
+
+    let output = index_run_with_isolated_home(dir.path());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no such column"), "{stderr}");
+    assert!(stderr.contains("value"), "{stderr}");
+    assert!(!stderr.contains("embeddings disabled"), "{stderr}");
+    assert!(!stderr.contains("no model selected"), "{stderr}");
+}

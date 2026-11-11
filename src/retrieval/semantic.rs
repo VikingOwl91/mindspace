@@ -148,10 +148,11 @@ enum Readiness {
 }
 
 fn readiness(store: &dyn Store, base: &Path, lookup: ModelLookup) -> Result<Readiness> {
-    if !manager::read_enabled(store)? {
+    let (enabled, selected) = manager::read_settings(store)?;
+    if !enabled {
         return Ok(Readiness::Unavailable(FallbackReason::EmbeddingsDisabled));
     }
-    let Some(selected) = manager::read_selected_model(store)? else {
+    let Some(selected) = selected else {
         return Ok(Readiness::Unavailable(FallbackReason::NoModelSelected));
     };
     let Some(entry) = lookup(&selected) else {

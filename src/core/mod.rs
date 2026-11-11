@@ -661,6 +661,14 @@ pub struct UnembeddedAssertion {
     pub created_at: Ts,
 }
 
+/// Related legacy embedding settings read from one coherent storage snapshot.
+/// Raw optional values preserve absence, empty strings and unknown identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingSettings {
+    pub enabled: Option<String>,
+    pub model: Option<String>,
+}
+
 /// Coverage of one derivation key over the assertion population.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingIndexStatus {

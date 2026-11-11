@@ -521,3 +521,39 @@ fn empty_filtered_semantic_branch_retains_successfully_loaded_runtime() {
     assert!(cache.entry.is_some());
     assert_eq!(f.factories(), 1);
 }
+
+#[test]
+fn malformed_model_setting_is_not_disabled_for_cached_or_uncached_readiness() {
+    let f = Fixture::new();
+    let mut cache = SemanticCache::default();
+    f.run(&mut cache, SearchMode::Semantic).unwrap();
+    assert_eq!(f.factories(), 1);
+
+    f.store.set_meta("embedding.enabled", "false").unwrap();
+    // Deliberate malformed fixture value, written through the actual M6 scope.
+    // The old split reader returned Disabled before ever decoding this model.
+    f.store
+        .set_meta_blob_for_test("embedding.model", b"SYNTHETIC_INVALID_MODEL_TYPE")
+        .unwrap();
+    let uncached = super::super::resolve_with(&f.store, f.dir.path(), lookup, &|_, _| {
+        panic!("malformed settings must not construct a runtime")
+    })
+    .unwrap_err();
+    assert!(matches!(&uncached, Error::Storage(_)));
+    assert!(uncached.to_string().to_lowercase().contains("blob"));
+
+    for mode in [SearchMode::Auto, SearchMode::Semantic, SearchMode::Hybrid] {
+        let error = f.run(&mut cache, mode).unwrap_err();
+        assert!(matches!(&error, Error::Storage(_)));
+        assert!(error.to_string().to_lowercase().contains("blob"));
+        assert!(cache.entry.is_none());
+    }
+    assert_eq!(f.factories(), 1);
+    assert_eq!(f.calls.queries.load(Ordering::SeqCst), 1);
+    // Explicit lexical retrieval still bypasses semantic settings as before.
+    assert!(!f
+        .run(&mut cache, SearchMode::Lexical)
+        .unwrap()
+        .hits
+        .is_empty());
+}

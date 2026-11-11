@@ -875,15 +875,15 @@ License: {}",
         Command::Index { command } => match command {
             IndexCommand::Run { batch_size, limit } => {
                 let store = open(cli)?;
-                if !crate::embeddings::manager::is_enabled(&store) {
+                let (enabled, selected) = crate::embeddings::manager::read_settings(&store)?;
+                if !enabled {
                     return Err(Error::Storage(
                         "embeddings disabled; run: mind embeddings enable".to_string(),
                     ));
                 }
-                let selected =
-                    crate::embeddings::manager::selected_model(&store).ok_or_else(|| {
-                        Error::Storage("no model selected; run: mind model use <id>".to_string())
-                    })?;
+                let selected = selected.ok_or_else(|| {
+                    Error::Storage("no model selected; run: mind model use <id>".to_string())
+                })?;
                 let entry = crate::embeddings::manifest::find_model(&selected)
                     .ok_or_else(|| Error::Storage(format!("unknown model: {selected}")))?;
                 if !crate::embeddings::manager::is_installed(entry) {

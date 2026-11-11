@@ -6,10 +6,11 @@ use crate::core::{
     Anchor, AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation,
     CodeObservationReport, CodeParserIdentity, CodeResolutionReport, CodeSearchQuery,
     ConflictGroup, DocumentExtractionDraft, DocumentExtractionInfo, DocumentExtractionReport,
-    EmbeddingIndexStatus, GitObservation, GitObservationReport, GitRefObservation,
-    IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory, MemoryDetail, MemorySummary,
-    ObservationReport, Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink,
-    StoredCitation, TemporalDimension, TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
+    EmbeddingIndexStatus, EmbeddingSettings, GitObservation, GitObservationReport,
+    GitRefObservation, IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory,
+    MemoryDetail, MemorySummary, ObservationReport, Result, SearchHitRaw, SearchQuery,
+    SourceLifecycle, Space, SpaceLink, StoredCitation, TemporalDimension,
+    TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
 
 /// The relationship resolutions that belong to one Git ingestion: run for each commit after the
@@ -186,6 +187,10 @@ pub trait Store {
     /// Remove all embeddings for one derivation key (rebuild / model switch).
     /// Returns the number of rows removed.
     fn clear_embeddings(&self, derivation_key: &str) -> Result<usize>;
+
+    /// Read enablement and model together from one storage snapshot.
+    /// Missing keys remain optional; storage errors must not become missing values.
+    fn read_embedding_settings(&self) -> Result<EmbeddingSettings>;
 
     /// Read a database-level setting.
     fn get_meta(&self, key: &str) -> Result<Option<String>>;

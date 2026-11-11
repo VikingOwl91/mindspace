@@ -14,15 +14,15 @@ use crate::core::{
     cosine_similarity, decode_f32_le, encode_f32_le, sha256_hex, Anchor, Assertion, AssertionDraft,
     AssertionEmbedding, AssertionKind, CodeDerivation, CodeEntity, CodeImport, CodeObservation,
     CodeObservationReport, ConflictGroup, DocumentExtractionDraft, DocumentExtractionInfo,
-    DocumentExtractionReport, EmbeddingIndexStatus, Error, Evidence, EvidenceDraft, EvidenceKind,
-    FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
-    GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
-    IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft, ManualMemoryReport, Memory,
-    MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
-    ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
-    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, StoredCitation,
-    TemporalCoverage, TemporalCoverageStatus, TemporalDimension, TemporalHistoryCapabilities, Ts,
-    UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
+    DocumentExtractionReport, EmbeddingIndexStatus, EmbeddingSettings, Error, Evidence,
+    EvidenceDraft, EvidenceKind, FileObservation, FileOutcome, GitFileOutcome, GitFileReport,
+    GitObservation, GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation,
+    IngestObservation, IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft,
+    ManualMemoryReport, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
+    MemorySummary, ObservationReport, ObservedFile, Result, SearchHitRaw, SearchQuery, Source,
+    SourceEvent, SourceEventKind, SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink,
+    StoredCitation, TemporalCoverage, TemporalCoverageStatus, TemporalDimension,
+    TemporalHistoryCapabilities, Ts, UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
 
@@ -2060,6 +2060,22 @@ fn space_names_by_memory(
     Ok(map)
 }
 
+/// One statement snapshot, also usable within an already-owned read transaction.
+fn read_embedding_settings_on(conn: &Connection) -> Result<EmbeddingSettings> {
+    conn.query_row(
+        "SELECT (SELECT value FROM mind_meta WHERE key = 'embedding.enabled'), \
+                (SELECT value FROM mind_meta WHERE key = 'embedding.model')",
+        [],
+        |row| {
+            Ok(EmbeddingSettings {
+                enabled: row.get(0)?,
+                model: row.get(1)?,
+            })
+        },
+    )
+    .map_err(dberr)
+}
+
 // ---------------------------------------------------------------------------
 // Store implementation
 // ---------------------------------------------------------------------------
@@ -3090,6 +3106,11 @@ impl Store for SqliteStore {
             .map_err(dberr)?;
         tx.commit()?;
         Ok(n)
+    }
+
+    fn read_embedding_settings(&self) -> Result<EmbeddingSettings> {
+        let conn = self.connection()?;
+        read_embedding_settings_on(&conn)
     }
 
     fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -5847,3 +5868,7 @@ mod semantic_staging_migration_tests;
 #[cfg(test)]
 #[path = "sqlite/fence_plan_migration_tests.rs"]
 mod fence_plan_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/settings_tests.rs"]
+mod settings_tests;

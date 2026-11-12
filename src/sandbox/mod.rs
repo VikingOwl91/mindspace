@@ -858,7 +858,12 @@ pub fn enter_with_broker(
         return Outcome::Unavailable(e);
     }
     let tmp = plan.tmp_dir();
-    if let Err(e) = std::fs::create_dir_all(&tmp) {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&tmp)
+    {
         return Outcome::Unavailable(format!(
             "cannot create the private temp directory {}: {e}",
             tmp.display()

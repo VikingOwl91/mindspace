@@ -25,6 +25,7 @@ use crate::core::{
     TemporalHistoryCapabilities, Ts, UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
+mod files;
 mod read_session;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -280,8 +281,9 @@ pub struct DatabaseInspection {
 ///  - no WAL file: the file is opened `immutable=1`. SQLite then creates no
 ///    `-wal`/`-shm` file (a plain read-only open of a WAL-mode database leaves
 ///    both behind) and there is no log to ignore;
-///  - WAL file present (a server may be writing): `mode=ro`, which reads the log
-///    and, because the files already exist, creates nothing new.
+///  - WAL file present (a server may be writing): `mode=ro`, which reads the log.
+///    SQLite may recreate missing SHM with MAIN's permissions; read-only is not
+///    a promise of no auxiliary filesystem activity.
 ///
 /// A writer that starts between the check and the open is not detected; the
 /// result is a snapshot.
@@ -374,17 +376,12 @@ fn read_inspection(abs: &Path, with_wal: bool) -> Result<DatabaseInspection> {
 
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| Error::Io {
-                    path: parent.display().to_string(),
-                    source: e,
-                })?;
-            }
-        }
-        let conn = Connection::open(path)
-            .map_err(|e| Error::Storage(format!("cannot open database {}: {e}", path.display())))?;
+        let conn = files::open(path, true)?;
         Self::init_conn(conn)
+    }
+
+    pub(crate) fn open_existing_file(path: &Path) -> Result<Self> {
+        Self::init_conn(files::open(path, false)?)
     }
 
     pub fn open_in_memory() -> Result<Self> {

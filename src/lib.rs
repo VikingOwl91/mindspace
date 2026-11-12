@@ -47,12 +47,7 @@ pub fn initialize(path: &Path) -> Result<PathBuf> {
 /// Opens an initialized database. Any command other than `init` requires an
 /// existing database file.
 pub fn open_existing(path: &Path) -> Result<SqliteStore> {
-    if !path.exists() {
-        return Err(Error::NotInitialized {
-            path: path.display().to_string(),
-        });
-    }
-    SqliteStore::open(path)
+    SqliteStore::open_existing_file(path)
 }
 
 /// Resolves a full UUID or an unambiguous prefix (minimum 4 characters).

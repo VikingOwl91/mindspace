@@ -294,7 +294,11 @@ pub fn run_in(tmp_base: &Path, exe: &Path, timeout: Duration) -> Result<Selftest
     let (dbdir, root, outside) = (base.join("db"), base.join("root"), base.join("outside"));
     let probe = root.join("probe");
     for d in [&dbdir, &root, &outside, &probe] {
-        std::fs::create_dir_all(d)
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(d)
             .map_err(|e| SelftestError::Setup(format!("{}: {e}", d.display())))?;
     }
     std::fs::write(probe.join("note.md"), "# probe\n")

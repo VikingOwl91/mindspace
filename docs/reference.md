@@ -1,6 +1,8 @@
 # Mindspace reference
 
 Detailed design principles, command reference, MCP notes and implementation status.
+
+For the current unreleased `0.1.0-alpha.1` candidate, use the [source-install and operator guide](source-install.md). Its source-access, build-variant, installation and recovery instructions take precedence over historical setup steps below. No public release/tag or anonymous download is implied; the explicitly labeled v0.5.0 snapshot is retained as history.
 This is the long-form material that used to be the README; the README now
 covers the short path. How to read it: "Design principles", "Optional
 intelligence", "Local and remote operation" and "Storage" state design

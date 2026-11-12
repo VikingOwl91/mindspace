@@ -12,28 +12,24 @@ Git repositories (Rust code is parsed into definitions), answers "where is X
 defined?" and "what did we decide about Y?", and can tell you where each
 answer came from.
 
-**Status: pre-alpha, version 0.5.0** (the crate version; earlier 0.x numbers
-were internal milestones, only `v0.2.0` and `v0.3.0` are tagged). Command-line
-output, JSON shapes and the database schema can still change. Read [Known limits](#known-limits) before you
-point it at anything you care about.
+**Status: unreleased `0.1.0-alpha.1` review candidate.** No public tag or release is asserted. Earlier0.x numbers, including0.5.0 and tags `v0.2.0`/`v0.3.0`, were internal milestones. The initial Legacy/Git profile is source-only Linux without embedding models. Canonical document publication and document-complete Alpha remain blocked; PDF extraction is incomplete. Command-line/JSON shapes and schema can change. Read [Known limits](#known-limits) and the [source-install/operator guide](docs/source-install.md) before using existing data.
 
-- **Local.** One binary (`mind`), one SQLite file. No server and no account.
-  In Mindspace's own source the only network client is the optional
-  embedding-model download (`mind model install`, from Hugging Face, checked
-  against a pinned manifest); a search of the source found no other HTTP or
-  socket use outside tests. This was not verified for external processes such
-  as the `git` binary it runs, nor by observing traffic, so it is not a
-  guarantee of network silence.
-  The sandbox does not block network access (see [Security model](#security-model)).
+- **Local.** One binary (`mind`), one SQLite database. No remote server or
+  account is required. The optional model installer explicitly downloads pinned
+  Hugging Face assets. Qualified model-free CLI and zero-root MCP search flows
+  had no observed network syscalls; this is not a promise that every flow or
+  external Git/client process is network-silent. Sandbox startup actively probes
+  its denied interfaces. Confined MCP also restricts new sockets and selected
+  syscall paths; see [Security model](#security-model).
 - **Deterministic.** Parsing, Git facts and lexical search need no AI model.
   Semantic search is an optional extra.
 - **Inspectable.** A memory traces back to its evidence and source. Old
   versions are superseded, never silently overwritten.
 - **Sandboxed for agents.** The MCP repository tools restrict their *file
   system* access with a Linux Landlock sandbox to the directories you allow,
-  the database directory and what the process needs to run. Network access,
-  signals and reading `/proc` are not restricted (details and limits under
-  [Security model](#security-model)).
+  the database directory and what the process needs to run. Additional scoped
+  syscall controls apply to confined MCP, with residual stdio/inherited-descriptor
+  and other interface limits (details under [Security model](#security-model)).
 
 ## What it does today
 
@@ -45,7 +41,7 @@ point it at anything you care about.
 
 **Memory.** Three different things feed it, and they are kept apart:
 *explicit creation* (you or an agent deliberately write a fact or decision,
-for example through the MCP tool `memory_create`), *document-based ingestion*
+for example through the MCP tool `memory_create`), *legacy file ingestion*
 (`mind ingest` turns Markdown/text files and Git repositories into memories
 through deterministic parsing, each tied to its source file and commit) and
 *automatic conversation capture*, which **does not exist**: Mindspace does not
@@ -61,56 +57,78 @@ true at an earlier time (`mind search --at`) and list conflicting memories.
 uncommitted working tree) into the database. Markdown and text files become
 searchable documents. Rust files are parsed with Tree-sitter into definitions
 (functions, methods, structs, enums, traits, modules, constants, ...) with file, line range and signature, tied to
-the commit they came from. Re-ingesting an unchanged repository does no new
-work.
+the commit they came from. Re-ingesting an unchanged repository reuses derived content; session/revision
+journals need not be unchanged. This is existing legacy Git ingestion, not M8
+canonical document publication.
 
-**Semantic search (optional).** Search by meaning with a local embedding model
+**Semantic search (optional, outside the initial model-free Alpha profile).** Search by meaning with a local embedding model
 (nomic-embed-text v1.5, run on the CPU through Candle). It is off until you
 enable it, install the model and run the indexer. Lexical search (SQLite FTS5)
 always works and is the default.
 
 ## Install
 
-Requirements: Linux (the MCP repository tools need Linux 6.2 or newer with
-Landlock; only Linux has been built and tested), Git, a C compiler (SQLite and
-Tree-sitter are built from source) and a Rust toolchain. The repository pins Rust 1.98.1 in
-`rust-toolchain.toml`, which `rustup` installs for you (install Rust with
-[rustup](https://rustup.rs) if you do not have it).
+**Public source delivery is still blocked.** The repository address is
+`https://github.com/VikingOwl91/mindspace.git`, but anonymous acquisition requested
+credentials in the clean-user check. No release-download URL, public tag or
+credentials are supplied here. Obtain an authorized reviewed source tree and its
+provenance first; otherwise stop. The currently reviewed identity changes are not
+claimed to be present in an already signed source commit.
+
+Use the [source-install/operator guide](docs/source-install.md) for the full
+validated local-candidate path, stable version-specific installation/PATH,
+configuration, MCP, Git, recovery and uninstall instructions.
+
+Requirements: pinned Rust/Cargo1.98.1, Git, a C compiler and development headers.
+The recommended no-embeddings profile needs no weights. The alternative default
+build also requires a **C++ compiler** (`g++` on Debian) and libstdc++ at runtime.
+SQLite/FTS5 is bundled; a system SQLite server/CLI is not required. Linux is the
+qualified platform; MCP repository tools require effective Landlock ABI3+.
+
+From the authorized candidate tree:
 
 ```sh
-git clone https://github.com/VikingOwl91/mindspace.git
-cd mindspace
-cargo build --release          # produces target/release/mind
+cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed
+./target/alpha-noembed/release/mind --version   # must report mind 0.1.0-alpha.1
 ```
 
-```sh
-export PATH="$PWD/target/release:$PATH"   # so that `mind` works in this shell
-mind --version
-```
-
-This is the only install path that has been tested; there are no prebuilt
-binaries yet. The build takes a few minutes.
+The guide installs this ordinary binary into a new stable prefix. Do not copy a
+test/`--all-targets` artifact; the dev self-dependency enables a test-only entrypoint.
+No prebuilt package or public installation channel has been qualified.
 
 ## Quickstart (no AI model needed)
 
-This ingests the Mindspace checkout itself, so the example queries have
-something to find. Run it from the repository directory after building:
+After the guide's installation/PATH step, this creates a new demo database and a
+small committed repository. It needs no existing Git identity/signing setup and
+works even when the authorized source tree was supplied without `.git`.
 
 ```sh
-export MINDSPACE_DB="$HOME/.local/share/mindspace-demo/mind.db"   # any path outside a repository; created if missing
+export DEMO_ROOT="$(mktemp -d "$HOME/mindspace-alpha-demo.XXXXXXXX")"
+export MINDSPACE_DB="$DEMO_ROOT/data/mind.db"
 mind init
 mind space create demo
-mind ingest . --space demo                        # a Git repository with at least one commit, or a folder of notes
-mind symbols ingest_confined --space demo         # where is this defined? (Rust definitions)
-mind search "sandbox minimum ABI" --space demo    # keyword search over the documents
-mind space list                                   # see what is stored
-mind doctor                                       # check the installation (read-only, no network)
+mkdir -m 700 "$DEMO_ROOT/repo"
+git -C "$DEMO_ROOT/repo" init -q -b main
+printf '# Decision\n\nAlphaGitToken records a committed decision.\n' > "$DEMO_ROOT/repo/decision.md"
+printf 'pub fn alpha_demo_symbol() {}\n' > "$DEMO_ROOT/repo/lib.rs"
+git -C "$DEMO_ROOT/repo" add .
+git -C "$DEMO_ROOT/repo" -c user.name='Mindspace Demo' -c user.email='demo@example.invalid' -c commit.gpgsign=false commit -qm initial
+mind ingest "$DEMO_ROOT/repo" --space demo
+mind ingest "$DEMO_ROOT/repo" --space demo
+mind symbols alpha_demo_symbol --space demo
+mind search AlphaGitToken --space demo --json
+mind space list
+mind doctor
 ```
 
-To use your own project, replace `.` with its path. Code definitions appear
-only for Rust files; Markdown and text files are searchable for any project.
-A real run on this repository (commit `5cfacb1`, 0.9 s to ingest) printed, for
-`mind symbols`:
+Explicit manual memory creation/update/retirement uses MCP/library operations;
+there is no corresponding CLI create command. The guide includes a small stdio
+MCP example. Legacy Markdown/text ingestion and Git notes remain distinct from
+blocked canonical document publication. Doctor does not migrate the selected DB
+or download models; it may create SQLite coordination files and temporary self-test
+storage. Keep the demo path separate from existing user data.
+
+Historical self-ingestion example: at commit `5cfacb1`, the symbol output was:
 
 ```text
 1. function ingest_confined
@@ -119,9 +137,9 @@ A real run on this repository (commit `5cfacb1`, 0.9 s to ingest) printed, for
    spaces: demo
 ```
 
-and, for `mind search`, the matching section of the architecture decision
-record with its source file and commit, so you can see where it came from.
-Add `--json` to any command for machine-readable output (unstable format).
+That old snapshot is not a promise of current line numbers or complete Rust grammar
+coverage. Current self-ingestion reports a recovered struct-pattern attribute in
+`src/cli/mod.rs`; recovered derivations may be partial.
 
 ## Connect your agent (`mind setup`)
 
@@ -174,14 +192,14 @@ Rules that matter:
   lie inside, an allowed root. (The default location qualifies.)
 - `:rw` roots may be ingested; `:ro` roots may only be outlined. Always write
   the suffix. Allow specific project folders, not your home directory.
-- Without `--allow-root`, `repo_outline` and `repo_ingest` are off; the memory
-  tools still work.
+- Without `--allow-root`, ordinary repository tools remain advertised but their
+  calls are refused; the memory tools still work.
 - Check the sandbox: every `repo_ingest`/`repo_outline` result (visible in the
   tool-call details of your client) contains a `sandbox` field. It must read `enforced (Landlock, ABI 3 or newer, fully
   enforced, canary verified)`. If the sandbox cannot be established, the
   repository tools switch themselves off and say why.
 
-What was verified: a project-level `.mcp.json` with this content was picked up
+Historical client evidence: a project-level `.mcp.json` with this content was picked up
 by Claude Code 2.1.319 (headless) as a connected project server and answered a
 tool call. The same configuration (loaded with `--mcp-config`) was exercised with a real Claude Code 2.1.319 client in headless mode by
 [`scripts/mcp-e2e-claude.py`](scripts/mcp-e2e-claude.py): tool discovery,
@@ -192,6 +210,10 @@ outside the roots, restart, re-ingest, repository changes and crash recovery
 directories (registration, read-back, refusal of an existing entry, foreign entries). Not
 verified: the interactive UI of the clients, and OpenCode registration (preview only). A Codex and an OpenCode example are
 in [`docs/reference.md`](docs/reference.md).
+
+The clean-user qualification additionally exercised Codex0.166.0 native
+registration/readback/undo with fresh configuration, not a client UI or
+model-driven agent session. Keep the installed executable path stable.
 
 Typical agent use: `repo_outline` (see what is there), `repo_ingest` with
 `paths` for the parts you need, `code_search` for definitions,
@@ -204,9 +226,10 @@ Please read these; they are the difference between a surprise and a plan.
 - **Only Rust code is indexed.** Other source files are not parsed. A C++
   repository ingests its Markdown/text documents but yields no code
   definitions, and `code_search` finds nothing for its functions.
-- **Only committed content is indexed.** Uncommitted and untracked files are not
-  read. Symbolic links are skipped when ingesting a folder (checked with a
-  link to a file outside the folder) and are not read from Git trees.
+- **Git ingestion reads committed content.** Dirty/untracked worktree content is
+  not read through that route. Existing legacy file/directory ingestion reads the
+  selected filesystem input instead. Symbolic links are skipped in directory
+  ingestion and are not read from Git trees.
 - **First ingest of a large repository can take minutes.** `--ingest-timeout`
   (default 30 s) is a deadline for the *preparation* of an ingest, **not** an
   end-to-end timeout. Once the database write starts it always runs to its
@@ -215,27 +238,38 @@ Please read these; they are the difference between a surprise and a plan.
   (3,003 files, 220 documents, 629 MB `.git`) took 96 to 102 s, and the Claude
   Code client waited for it. There is no progress report, and a client with a short
   tool timeout may give up. Use `repo_outline` and `paths` to ingest a part.
-- **A crash during an ingest can leave a partial state.** After `SIGKILL` the
-  database stays consistent (SQLite integrity check passes) but may hold Git
-  trees without their code entities; re-running the ingest repairs it.
+- **Crash/commit outcomes need care.** Current ordinary Git/code persistence is
+  one atomic transaction in the qualified failure controls; do not rely on the
+  older partial-tree warning. An error can be `CommitOutcomeUnknown`, and a
+  process-kill check is not power-loss certification. Preserve state and use the
+  [offline recovery procedure](docs/releases/v0.1.0-alpha.1-recovery-qualification.md);
+  never delete WAL/SHM or copy only live MAIN as a repair.
 - **Re-ingesting a changed repository re-derives all its documents** (they are
   bound to the commit), which costs time on big repos.
-- **Setting up semantic search is simpler than `docs/reference.md` describes.**
-  `mind embeddings enable` itself asks to download the default model (about 550 MB)
-  and selects it; `mind model install` and `mind model use` are only needed to pick
-  another model, and `mind index run` is still required. The reference lists them as
-  separate steps because it predates this behaviour. `mind doctor` reports the state
-  and never downloads anything.
+- **Models are optional and outside the initial model-free profile.** The default
+  build can request the pinned model when you explicitly run `mind embeddings enable`
+  (about550MB); indexing is also required. Search never downloads/indexes automatically.
+  Noembed strict semantic/hybrid requests refuse and Auto reports lexical fallback.
+  Real weights/inference are not newly qualified here; see the [operator guide](docs/source-install.md).
 - **Local and unauthenticated.** MCP is stdio only. Anyone who can start or
   talk to the process can call all its tools, including writes. Spaces
   organize retrieval; they are not access control.
-- **Platforms.** The repository tools need Linux 6.2+ with Landlock. They have
-  been tested on one kernel (7.2) and one distribution. Containers, Nix/Guix,
-  overlay, NFS/FUSE, `hidepid` and genuinely old kernels are untested. On
-  other operating systems the repository tools stay off and the code paths
-  have not been compiled.
-- **Pre-alpha.** The database schema has migrations, but formats may change;
-  keep a copy of data you cannot recreate.
+- **Platforms.** The repository tools need Linux6.2+ with effective Landlock ABI3+.
+  Qualification includes named native/private-btrfs and rootless Debian13/vfs
+  profiles on kernel7.2, not arbitrary containers, distributions or kernels.
+  Nix/Guix, overlay, NFS/FUSE, `hidepid` and other operating systems are not
+  implied qualified by those runs.
+- **Private local data.** New admitted DB/WAL/SHM files are0600 and new private
+  directories0700. Existing permissive files are not silently changed. Storage
+  is not encrypted and history/source text can remain after source deletion.
+  Ordinary opens can migrate; preserve a validated backup and old binary before
+  an upgrade. See the [operator guide](docs/source-install.md) for STOP conditions.
+- **Partial Rust structure.** Tree-sitter can retain a `recovered` derivation,
+  including for valid syntax its pinned grammar does not fully cover. Check parse
+  status; complete structural coverage is not promised.
+- **Unreleased candidate.** Schema17 and protocol versions are independent of the
+  deliberate reset from internal0.5.0 to package0.1.0-alpha.1. No public release
+  support or arbitrary downgrade/migration compatibility is implied.
 
 ## Security model
 
@@ -263,8 +297,12 @@ measured gap: a file that appears in the Git directory *after* the checks
 (for example an alternates file) can be read (1 leak in 5,626 randomized
 attempts, 0 in 700 targeted ones). Use the opt-out only for trusted input.
 
-Not restricted by the sandbox: network access, signals and reading `/proc`.
-The full analysis, test method and residual risks are in ADR-029 (ADR =
+Confined MCP with roots on the qualified x86_64 profile additionally denies new
+sockets, `io_uring_setup`, `pidfd_getfd`, `ptrace`, `process_vm_readv` and
+`process_vm_writev`. Ordinary `readv` is not that cross-process operation.
+Pipe/socketpair and already-open descriptors such as stdio remain available;
+this is not complete network/IPC isolation. CLI and zero-root MCP do not receive
+that repository filter. The full analysis, test method and residual risks are in ADR-029 (ADR =
 architecture decision record) in
 [`docs/decisions.md`](docs/decisions.md). Before a release, run
 `scripts/security-profile.sh` (about 5 minutes, needs the kernel support).
@@ -314,7 +352,7 @@ Details: [`docs/architecture.md`](docs/architecture.md),
 | Git ingest (objects, refs journal, worktrees) | Implemented | `tests/git_ingest.rs`, `tests/git_hardening.rs` |
 | Rust definitions (Tree-sitter), `mind symbols`, `code_search` | Implemented | `tests/code_structure.rs`, `tests/code_search.rs`, `tests/code_classification.rs` |
 | Lexical search (FTS5), temporal queries (`--at`), conflicts, spaces | Implemented | `tests/retrieval.rs`, `tests/m6_temporal.rs`, `tests/scopes.rs` |
-| MCP server, 14 tools, real-binary protocol tests | Implemented | `tests/mcp*.rs` |
+| Stdio MCP tools, real-binary protocol tests | Implemented | `tests/mcp*.rs` |
 | Separate read-only and read-write roots | Implemented | `tests/mcp_allowlist_modes.rs` |
 | Landlock sandbox + application layer for repository tools | Implemented (Linux) | `tests/ingest_confinement.rs`, `tests/sandbox_failure_modes.rs`, `scripts/security-profile.sh` |
 | Preparation deadline for ingest (`--ingest-timeout`) | Implemented, see limits | `tests/mcp_ingest_timeout.rs` |
@@ -358,8 +396,9 @@ other tools has been made.
 ## Develop and test
 
 ```sh
-cargo test                              # about 430 tests, no model download needed
-cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
+cargo test --locked                     # inspect ignored/optional coverage separately
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo deny check && cargo audit         # dependencies: advisories, licenses
 python3 scripts/check-doc-links.py      # relative links in the docs
 scripts/security-profile.sh             # sandbox gate (Linux, ~5 min)
@@ -368,6 +407,8 @@ scripts/bench-baseline.sh               # benchmarks
 ```
 
 ## More documentation
+
+- [Source installation and operator guide](docs/source-install.md): candidate acquisition, prerequisites, stable install, MCP/Git, private storage, recovery and uninstall.
 
 - [`docs/setup.md`](docs/setup.md): `mind setup`, `--ro`/`--rw`, the three clients, undo and limits
 - [`docs/doctor.md`](docs/doctor.md): what `mind doctor` checks, its exit codes and JSON format

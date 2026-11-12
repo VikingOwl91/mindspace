@@ -1,10 +1,12 @@
 # Security policy
 
-Mindspace is pre-alpha software (see the README). Security reports are welcome and taken seriously.
+This source carries the **unreleased `0.1.0-alpha.1` candidate** identity (see the README). Security reports are welcome and taken seriously.
 
 ## Supported versions
 
-Only the latest commit on `main` is supported. There are no maintained release branches yet.
+There is no published or maintained `0.1.0-alpha.1` release yet. Development support follows the latest commit on `main`; no maintained release branch is implied by this candidate identity. Qualification reports apply to their exact source/artifact inputs, not every build carrying the same version string.
+
+The intended initial profile is Linux, local private storage, ordinary CLI/stdio MCP and Legacy/Git ingestion, built without embeddings. See the [source-install and operator guide](docs/source-install.md) for source-access blockers, qualified prerequisites, recovery and support limits. Canonical document publication remains blocked under the accepted R01–R17 contracts; private staging is not public knowledge ingestion.
 
 ## Reporting a vulnerability
 
@@ -38,6 +40,6 @@ The threat model, the tests behind it and the known residual risks are in ADR-02
 
 - Running with `--insecure-no-sandbox` (documented to have a remaining gap; use for trusted input only).
 - Anyone who can already start or talk to the local process: MCP is local stdio without authentication.
-- Network access, signals and reading `/proc` by the process (not restricted by the sandbox).
+- General network/IPC isolation and hostile same-UID/root processes. Sandboxed MCP with allowed roots applies scoped new-socket and selected cross-process syscall restrictions on supported x86_64 Linux; this is not a blanket network guarantee. Inherited stdio, socketpair and permitted signal paths remain outside that claim. CLI and zero-root MCP do not receive this socket filter. See [sandbox capabilities](docs/sandbox-capabilities.md); `/proc` is not generally hidden.
 - Platforms other than Linux 6.2+ with Landlock: the repository tools are off there.
 - Denial of service by very large repositories (a first ingest can take minutes).

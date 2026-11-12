@@ -1,12 +1,12 @@
 # Contributing
 
-Thanks for your interest. Mindspace is pre-alpha; please open an issue before starting larger work.
+Thanks for your interest. Mindspace is an unreleased `0.1.0-alpha.1` candidate; please open an issue before starting larger work.
 
 ## Build and test
 
 ```sh
-cargo build --release
-cargo test --locked                                   # about 430 tests, no model download needed
+cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed
+cargo test --locked                                   # ignored/optional coverage must be reported
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo deny check advisories licenses bans sources     # config: deny.toml (no ignored advisories)
@@ -14,7 +14,17 @@ cargo audit
 python3 scripts/check-doc-links.py                    # relative links and anchors in the Markdown files
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. Linux is the only tested platform.
+The toolchain is pinned to Rust1.98.1 in `rust-toolchain.toml`. Linux is the qualified platform.
+The noembed profile requires a C compiler/development headers; the alternative default build
+(`cargo build --locked --release --bin mind --target-dir target/alpha-default`) also requires a
+C++ compiler. SQLite is bundled. See [source installation](docs/source-install.md) for the
+source-access blocker, stable prefix, runtime dependencies and supported scope. No public
+tag/release or anonymous acquisition is asserted.
+
+Build installable ordinary artifacts in their separate target directories. The dev self-dependency
+enables a test-only spawn-gate; do not distribute a test or all-targets artifact. Current historical
+qualification totals are recorded in `docs/releases/`; a Cargo pass count does not execute ignored
+model/resource/actor endpoints or optional early-return branches.
 
 Changes that touch the MCP repository tools, the sandbox or path handling must also pass
 `scripts/security-profile.sh` (needs Linux 6.2+ with Landlock, about 5 minutes; run

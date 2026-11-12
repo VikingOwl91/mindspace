@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "mindspace"
-version = "0.5.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "candle-core",
  "candle-nn",

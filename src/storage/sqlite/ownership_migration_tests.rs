@@ -3,13 +3,13 @@ use super::*;
 use tempfile::TempDir;
 
 pub(super) fn old_store(path: &Path, version: i64) -> SqliteStore {
-    let conn = Connection::open(path).unwrap();
+    let mut conn = Connection::open(path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=OFF; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)").unwrap();
     let state = Arc::new(RevisionState {
         active_revision: AtomicI64::new(0),
         poisoned: AtomicBool::new(false),
     });
-    register_revision_context(&conn, &state).unwrap();
+    register_revision_context(&mut conn, &state).unwrap();
     let ownership_state = Arc::new(ownership::OwnershipState::default());
     ownership::register_context(&conn, &ownership_state).unwrap();
     let preparation_state = Arc::new(document_preparation::PreparationState::default());
@@ -144,13 +144,17 @@ fn late_metadata_ddl_failure_and_commit_veto_restore_old_schema_and_clear_scope(
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mind.db");
         let old = old_store(&path, 12);
-        let conn = old.connection().unwrap();
+        let mut conn = old.connection().unwrap();
         let before = revision(&conn);
         if failure == "late_ddl" {
             conn.execute_batch("CREATE TABLE asset_ownership_history(sentinel TEXT)")
                 .unwrap();
         } else {
-            conn.commit_hook(Some(|| true)).unwrap();
+            conn.guard
+                .as_mut()
+                .unwrap()
+                .commit_hook(Some(|| true))
+                .unwrap();
         }
         let error = run_migrations(&conn, &old.revision_state).unwrap_err();
         assert!(

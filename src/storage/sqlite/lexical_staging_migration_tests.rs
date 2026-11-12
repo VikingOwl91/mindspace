@@ -172,14 +172,18 @@ fn late_fifteen_failure_and_commit_veto_preserve_fourteen_exactly() {
         let db = d.path().join("mind.db");
         let old = old_store(&db, 14);
         old.create_space("preserve", "metadata").unwrap();
-        let c = old.connection().unwrap();
+        let mut c = old.connection().unwrap();
         if failure == "late_ddl" {
             c.execute_batch("CREATE TABLE doc_stage_receipts(sentinel TEXT); INSERT INTO doc_stage_receipts VALUES('preserve')").unwrap();
         }
         let r = revision(&c);
         let before = legacy_snapshot(&c);
         if failure == "commit_veto" {
-            c.commit_hook(Some(|| true)).unwrap();
+            c.guard
+                .as_mut()
+                .unwrap()
+                .commit_hook(Some(|| true))
+                .unwrap();
         }
         let e = run_migrations(&c, &old.revision_state).unwrap_err();
         assert!(!matches!(e, Error::CommitOutcomeUnknown { .. }), "{e}");

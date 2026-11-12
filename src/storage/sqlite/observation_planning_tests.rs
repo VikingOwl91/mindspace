@@ -6,7 +6,7 @@ use crate::core::{AssertionEmbedding, SessionDraft};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -174,14 +174,21 @@ fn assert_integrity(store: &SqliteStore) {
         0
     );
 }
-fn clear_authorizer(c: &Connection) {
+fn clear_authorizer(c: &mut Connection) {
     c.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
 }
-struct AuthorizerReset<'a>(&'a Connection);
-impl Drop for AuthorizerReset<'_> {
+// These fixtures retain no Statement across arming. Install before borrowing a
+// transaction, then arm at the original fault boundary and flush idle cached
+// statements. This is not a replacement for reauthorizing active Statements.
+fn arm_authorizer(c: &Connection, armed: &AtomicBool) {
+    armed.store(true, AtomicOrdering::SeqCst);
+    c.flush_prepared_statement_cache();
+}
+struct AuthorizerReset(Arc<AtomicBool>);
+impl Drop for AuthorizerReset {
     fn drop(&mut self) {
-        clear_authorizer(self.0);
+        self.0.store(false, AtomicOrdering::SeqCst);
     }
 }
 
@@ -195,21 +202,40 @@ fn planner_accepts_no_mutation_sql_after_the_existing_tentative_m6_revision() {
         100,
     );
     let before = ledger(&w.store);
-    let c = w.store.connection().unwrap();
+    let mut c = w.store.connection().unwrap();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&writes);
+    let armed = Arc::new(AtomicBool::new(false));
+    let active = Arc::clone(&armed);
+    c.guard
+        .as_mut()
+        .unwrap()
+        .authorizer(Some(move |ctx: AuthContext<'_>| {
+            if !active.load(AtomicOrdering::SeqCst) {
+                return Authorization::Allow;
+            }
+            match ctx.action {
+                AuthAction::Insert { .. }
+                | AuthAction::Update { .. }
+                | AuthAction::Delete { .. } => {
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }
+        }))
+        .unwrap();
+    let reset = AuthorizerReset(Arc::clone(&armed));
     let tx = begin_write(&c, &w.store.revision_state).unwrap();
     let changes = c.total_changes();
     let rows = dump(&c, false);
-    let writes = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&writes);
-    c.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
-        AuthAction::Insert { .. } | AuthAction::Update { .. } | AuthAction::Delete { .. } => {
-            observed.fetch_add(1, AtomicOrdering::SeqCst);
-            Authorization::Deny
-        }
-        _ => Authorization::Allow,
-    }))
-    .unwrap();
-    let reset = AuthorizerReset(&c);
+    const FORBIDDEN: &str = "UPDATE logical_sources SET state=state WHERE 0";
+    // Prewarm an idle statement while disabled, then prove arming invalidates it.
+    drop(c.prepare_cached(FORBIDDEN).unwrap());
+    arm_authorizer(&c, &armed);
+    assert!(c.prepare_cached(FORBIDDEN).is_err());
+    assert!(writes.load(AtomicOrdering::SeqCst) > 0);
+    writes.store(0, AtomicOrdering::SeqCst);
     let plan = plan_file_observation(
         &tx,
         w.observation(
@@ -231,6 +257,7 @@ fn planner_accepts_no_mutation_sql_after_the_existing_tentative_m6_revision() {
     drop(plan);
     drop(reset);
     drop(tx);
+    clear_authorizer(c.guard.as_mut().unwrap());
     drop(c);
     assert_eq!(ledger(&w.store), before);
     assert_integrity(&w.store);
@@ -346,11 +373,19 @@ fn a_failed_hash_read_aborts_instead_of_becoming_missing_evidence() {
     let rows = dump(&w.store.connection().unwrap(), true);
     let hit = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&hit);
-    let result = with_hook(
-        move |stage, c| {
-            if stage == "before_plan" {
-                let count = Arc::clone(&count);
-                c.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+    let armed = Arc::new(AtomicBool::new(false));
+    let active = Arc::clone(&armed);
+    let reset = AuthorizerReset(Arc::clone(&armed));
+    {
+        let mut c = w.store.connection().unwrap();
+        c.guard
+            .as_mut()
+            .unwrap()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if !active.load(AtomicOrdering::SeqCst) {
+                    return Authorization::Allow;
+                }
+                match ctx.action {
                     AuthAction::Read {
                         table_name: "sources",
                         column_name: "content_hash",
@@ -359,8 +394,14 @@ fn a_failed_hash_read_aborts_instead_of_becoming_missing_evidence() {
                         Authorization::Deny
                     }
                     _ => Authorization::Allow,
-                }))
-                .map_err(dberr)?;
+                }
+            }))
+            .unwrap();
+    }
+    let result = with_hook(
+        move |stage, c| {
+            if stage == "before_plan" {
+                arm_authorizer(c, &armed);
             }
             Ok(())
         },
@@ -373,9 +414,10 @@ fn a_failed_hash_read_aborts_instead_of_becoming_missing_evidence() {
             ))
         },
     );
+    drop(reset);
     {
-        let c = w.store.connection().unwrap();
-        clear_authorizer(&c);
+        let mut c = w.store.connection().unwrap();
+        clear_authorizer(c.guard.as_mut().unwrap());
         assert!(c.is_autocommit());
     }
     assert!(matches!(result, Err(Error::Storage(_))), "{result:?}");
@@ -393,25 +435,36 @@ fn move_classification_reuses_the_first_fallible_hash_observation() {
         &[w.notes],
         100,
     );
-    let c = w.store.connection().unwrap();
-    let tx = begin_write(&c, &w.store.revision_state).unwrap();
+    let mut c = w.store.connection().unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&reads);
-    c.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
-        AuthAction::Read {
-            table_name: "sources",
-            column_name: "content_hash",
-        } => {
-            if count.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
-                Authorization::Allow
-            } else {
-                Authorization::Deny
+    let armed = Arc::new(AtomicBool::new(false));
+    let active = Arc::clone(&armed);
+    c.guard
+        .as_mut()
+        .unwrap()
+        .authorizer(Some(move |ctx: AuthContext<'_>| {
+            if !active.load(AtomicOrdering::SeqCst) {
+                return Authorization::Allow;
             }
-        }
-        _ => Authorization::Allow,
-    }))
-    .unwrap();
-    let reset = AuthorizerReset(&c);
+            match ctx.action {
+                AuthAction::Read {
+                    table_name: "sources",
+                    column_name: "content_hash",
+                } => {
+                    if count.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                        Authorization::Allow
+                    } else {
+                        Authorization::Deny
+                    }
+                }
+                _ => Authorization::Allow,
+            }
+        }))
+        .unwrap();
+    let reset = AuthorizerReset(Arc::clone(&armed));
+    let tx = begin_write(&c, &w.store.revision_state).unwrap();
+    arm_authorizer(&c, &armed);
     let plan = plan_file_observation(
         &tx,
         w.observation(
@@ -430,6 +483,7 @@ fn move_classification_reuses_the_first_fallible_hash_observation() {
     drop(reset);
     let result = apply_file_observation(plan).unwrap();
     tx.commit().unwrap();
+    clear_authorizer(c.guard.as_mut().unwrap());
     drop(c);
     assert!(matches!(
         result.files[0].outcome,
@@ -763,22 +817,25 @@ fn a_queued_receiver_classifies_after_the_prior_writer_commits() {
     let queued = w.writer();
     let (entered_tx, entered_rx) = mpsc::channel();
     {
-        let c = queued.connection().unwrap();
+        let mut c = queued.connection().unwrap();
         let mut signalled = false;
-        c.authorizer(Some(move |ctx: AuthContext<'_>| {
-            if matches!(
-                ctx.action,
-                AuthAction::Transaction {
-                    operation: TransactionOperation::Begin
+        c.guard
+            .as_mut()
+            .unwrap()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Begin
+                    }
+                ) && !signalled
+                {
+                    signalled = true;
+                    entered_tx.send(()).unwrap();
                 }
-            ) && !signalled
-            {
-                signalled = true;
-                entered_tx.send(()).unwrap();
-            }
-            Authorization::Allow
-        }))
-        .unwrap();
+                Authorization::Allow
+            }))
+            .unwrap();
     }
     let queued_input = w.observation(
         IngestScope::File,
@@ -875,8 +932,12 @@ fn a_connection_local_commit_veto_rolls_back_the_planned_receiver() {
     let before = ledger(&w.store);
     let rows = dump(&w.store.connection().unwrap(), true);
     {
-        let c = w.store.connection().unwrap();
-        c.commit_hook(Some(|| true)).unwrap();
+        let mut c = w.store.connection().unwrap();
+        c.guard
+            .as_mut()
+            .unwrap()
+            .commit_hook(Some(|| true))
+            .unwrap();
     }
     let result = w.store.record_observation(w.observation(
         IngestScope::Directory,
@@ -885,8 +946,8 @@ fn a_connection_local_commit_veto_rolls_back_the_planned_receiver() {
         100,
     ));
     {
-        let c = w.store.connection().unwrap();
-        register_revision_context(&c, &w.store.revision_state).unwrap();
+        let mut c = w.store.connection().unwrap();
+        register_revision_context(c.guard.as_mut().unwrap(), &w.store.revision_state).unwrap();
         assert!(c.is_autocommit());
     }
     assert!(

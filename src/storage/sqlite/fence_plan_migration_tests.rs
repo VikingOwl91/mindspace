@@ -295,12 +295,16 @@ fn late_seventeen_failure_and_commit_veto_leave_sixteen_and_legacy_writable() {
         let db = d.path().join("mind.db");
         let old = old_store(&db, 16);
         old.create_space("legacy", "").unwrap();
-        let c = old.connection().unwrap();
+        let mut c = old.connection().unwrap();
         let r = revision(&c);
         if fault == "late_ddl" {
             c.execute_batch("CREATE TABLE asset_fence_plan_receipts(sentinel TEXT); INSERT INTO asset_fence_plan_receipts VALUES('preserve')").unwrap();
         } else {
-            c.commit_hook(Some(|| true)).unwrap();
+            c.guard
+                .as_mut()
+                .unwrap()
+                .commit_hook(Some(|| true))
+                .unwrap();
         }
         let rows = ordinary_rows(&c);
         let e = run_migrations(&c, &old.revision_state).unwrap_err();
@@ -322,7 +326,11 @@ fn late_seventeen_failure_and_commit_veto_leave_sixteen_and_legacy_writable() {
             .unwrap(),
             0
         );
-        c.commit_hook(None::<fn() -> bool>).unwrap();
+        c.guard
+            .as_mut()
+            .unwrap()
+            .commit_hook(None::<fn() -> bool>)
+            .unwrap();
         drop(c);
         old.create_space("after-failed-migration", "").unwrap();
     }

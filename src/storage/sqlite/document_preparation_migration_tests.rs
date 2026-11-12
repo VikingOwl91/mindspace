@@ -158,14 +158,18 @@ fn late_fourteen_ddl_failure_or_veto_leaves_thirteen_exact_and_scope_cleared() {
         let path = dir.path().join("mind.db");
         let old = old_store(&path, 13);
         old.create_space("preserve", "old").unwrap();
-        let c = old.connection().unwrap();
+        let mut c = old.connection().unwrap();
         if mode == "late_ddl" {
             c.execute_batch("CREATE TABLE document_preparation_receipts(sentinel TEXT); INSERT INTO document_preparation_receipts VALUES('preserve')").unwrap();
         }
         let r = revision(&c);
         let before = snapshot(&c);
         if mode == "commit_veto" {
-            c.commit_hook(Some(|| true)).unwrap();
+            c.guard
+                .as_mut()
+                .unwrap()
+                .commit_hook(Some(|| true))
+                .unwrap();
         }
         let error = run_migrations(&c, &old.revision_state).unwrap_err();
         assert!(

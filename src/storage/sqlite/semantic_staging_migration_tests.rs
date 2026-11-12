@@ -204,14 +204,18 @@ fn late_sixteen_ddl_and_commit_veto_preserve_fifteen() {
         let db = d.path().join("mind.db");
         let old = old_store(&db, 15);
         old.create_space("preserve", "").unwrap();
-        let c = old.connection().unwrap();
+        let mut c = old.connection().unwrap();
         if failure == "late_ddl" {
             c.execute_batch("CREATE TABLE doc_semantic_stage_receipts(sentinel TEXT); INSERT INTO doc_semantic_stage_receipts VALUES('preserve')").unwrap();
         }
         let r = revision(&c);
         let before = old_rows(&c);
         if failure == "veto" {
-            c.commit_hook(Some(|| true)).unwrap();
+            c.guard
+                .as_mut()
+                .unwrap()
+                .commit_hook(Some(|| true))
+                .unwrap();
         }
         let e = run_migrations(&c, &old.revision_state).unwrap_err();
         assert!(!matches!(e, Error::CommitOutcomeUnknown { .. }), "{e}");

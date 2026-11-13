@@ -2,9 +2,13 @@
 
 `mind setup` registers Mindspace as an MCP server with **Claude Code**, **Codex CLI** or **OpenCode**.
 
-*MCP (Model Context Protocol) is the standard way a coding agent talks to local tools. After setup the agent can store
-and search memories and look up code definitions through Mindspace. Mindspace keeps everything in one local database
-file on your machine; setup sends nothing to any network service.*
+For Alpha installation, first follow the [source-install guide](source-install.md)
+and verify the seven RC.5 release assets. Public main contains older code; these
+setup instructions describe the qualified Alpha archive. The release is being
+prepared as a draft. Keep the installed executable at its stable absolute path.
+Native client registration/readback was qualified with Codex CLI 0.166.0; this does
+not certify client interactive screens or a model-driven session. OpenCode remains
+preview-only. Setup sends nothing to a network service.
 
 ## The short path: zero-permission setup (the default)
 

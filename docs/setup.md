@@ -2,9 +2,9 @@
 
 `mind setup` registers Mindspace as an MCP server with **Claude Code**, **Codex CLI** or **OpenCode**.
 
-For the unreleased `0.1.0-alpha.1` candidate, first follow the [source-install and operator guide](source-install.md). Anonymous source delivery is still gated; use only an explicitly supplied reviewed source tree. Keep the installed executable at its stable absolute path. A package version does not mean a public release or maintained release branch exists.
+For the unreleased `0.1.0-alpha.1` candidate, first follow the [source-install and operator guide](source-install.md). Use only the authorized curated archive and verify its external provenance/checksum/signature sidecars as described there; no anonymous endpoint is asserted. Keep the installed executable at its stable absolute path. A package version does not mean a public release or maintained release branch exists.
 
-The [installation qualification](releases/v0.1.0-alpha.1-install-qualification.md) records real Codex CLI0.166.0 registration/readback/undo with fresh configuration. It does not certify an interactive UI or model-driven agent session; OpenCode remains preview-only below.
+Historical installation qualification recorded real Codex CLI 0.166.0 registration/readback/undo with fresh configuration; this has not been newly run against the curated archive. It does not certify an interactive UI or model-driven agent session; OpenCode remains preview-only below.
 
 *MCP (Model Context Protocol) is the standard way a coding agent talks to local tools. After setup the agent can store
 and search memories and look up code definitions through Mindspace. Mindspace keeps everything in one local database

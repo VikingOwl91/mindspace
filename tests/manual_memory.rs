@@ -466,3 +466,68 @@ fn migration_seven_adds_embedding_tables_to_phase_one_database() {
         .unwrap();
     assert!(index);
 }
+
+#[test]
+fn oversized_manual_fields_are_rejected_without_writes() {
+    let db = TestDb::new();
+    let store = db.open();
+    let space = store.create_space("bounds", "").unwrap();
+    let too_large = "x".repeat(1024 * 1024 + 1);
+    for (subject, content) in [
+        (Some("valid"), too_large.as_str()),
+        (Some(too_large.as_str()), "valid"),
+    ] {
+        let error = store
+            .record_manual_write(draft(subject, content, &[space.id]))
+            .unwrap_err();
+        assert!(error.to_string().contains("1048576"), "{error}");
+    }
+    let conn = Connection::open(&db.path).unwrap();
+    for table in ["memories", "assertions", "evidence", "ingest_sessions"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}
+
+#[test]
+fn manual_memory_limit_is_inclusive_and_counts_utf8_bytes() {
+    use mindspace::core::MAX_MANUAL_MEMORY_BYTES as MAX;
+    let db = TestDb::new();
+    let store = db.open();
+    let space = store.create_space("bounds", "").unwrap();
+    // A derived subject can be the entire first line; both limits are equal.
+    let boundary = "é".repeat(MAX / 2);
+    for length in [MAX - 1, MAX] {
+        let content = format!("{}x", "é".repeat((length - 1) / 2));
+        let content = if length == MAX {
+            boundary.clone()
+        } else {
+            content
+        };
+        assert_eq!(content.len(), length);
+        let report = store
+            .record_manual_write(draft(None, &content, &[space.id]))
+            .unwrap();
+        assert_eq!(report.subject, content);
+        let detail = store.get_memory_detail(report.memory_id).unwrap().unwrap();
+        assert_eq!(detail.assertion.content, content);
+    }
+    let conn = Connection::open(&db.path).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap();
+    for (subject, content) in [
+        (Some("ok"), format!("{boundary}x")),
+        (Some(format!("{boundary}x").as_str()), "ok".to_string()),
+    ] {
+        assert!(store
+            .record_manual_write(draft(subject, &content, &[space.id]))
+            .is_err());
+    }
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+}

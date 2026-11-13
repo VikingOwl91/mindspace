@@ -1,5 +1,10 @@
 # Mindspace reference
 
+Archive note: dated layout trees and design/status snapshots in this reference
+are historical. The supplied `source-archive-manifest.json` sidecar records this
+curated payload's actual members and source provenance. Excluded review reports
+and source Git history are not included in this archive.
+
 Detailed design principles, command reference, MCP notes and implementation status.
 
 For the current unreleased `0.1.0-alpha.1` candidate, use the [source-install and operator guide](source-install.md). Its source-access, build-variant, installation and recovery instructions take precedence over historical setup steps below. No public release/tag or anonymous download is implied; the explicitly labeled v0.5.0 snapshot is retained as history.
@@ -523,3 +528,15 @@ for the timestamp gate, freshness tradeoff and release measurements.
 Explicitly deferred: AI extraction, sync, authentication, HTTP or hosted
 operation, PostgreSQL implementation, GUI/TUI. MCP is local stdio only. See
 `docs/decisions.md` for the reasoning behind each choice.
+
+MCP request lines are limited to 8 MiB of wire bytes, including any LF/CRLF. An
+oversized line closes the stdio transport before JSON parsing; reconnect with a
+smaller request. Manual-memory `content` and `subject` are each limited to 1 MiB
+of decoded UTF-8 bytes. Oversized fields return a tool error without writing;
+the session remains usable. JSON escaping contributes to the independent wire
+limit, so a request with individually valid fields can still exceed it. Existing
+records remain readable. Updates retaining an oversized legacy subject must
+supply a smaller subject. These are per-input bounds, not aggregate disk quotas.
+
+`mind ownership` is hidden, unsupported private development administration.
+Its staging commands do not provide supported Alpha document publication.

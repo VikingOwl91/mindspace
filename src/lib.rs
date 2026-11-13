@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod core;
+mod display;
 pub mod doctor;
 pub mod embeddings;
 #[cfg(unix)]

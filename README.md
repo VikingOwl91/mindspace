@@ -12,7 +12,7 @@ Git repositories (Rust code is parsed into definitions), answers "where is X
 defined?" and "what did we decide about Y?", and can tell you where each
 answer came from.
 
-**Status: unreleased `0.1.0-alpha.1` review candidate.** No public tag or release is asserted. Earlier0.x numbers, including0.5.0 and tags `v0.2.0`/`v0.3.0`, were internal milestones. The initial Legacy/Git profile is source-only Linux without embedding models. Canonical document publication and document-complete Alpha remain blocked; PDF extraction is incomplete. Command-line/JSON shapes and schema can change. Read [Known limits](#known-limits) and the [source-install/operator guide](docs/source-install.md) before using existing data.
+**Status: unreleased `0.1.0-alpha.1` review candidate.** No public tag or release is asserted. Earlier 0.x numbers, including 0.5.0 and tags `v0.2.0`/`v0.3.0`, were internal milestones. The initial Legacy/Git profile is source-only Linux without embedding models. Canonical document publication and document-complete Alpha remain blocked; PDF extraction is incomplete. Command-line/JSON shapes and schema can change. Read [Known limits](#known-limits) and the [source-install/operator guide](docs/source-install.md) before using existing data.
 
 - **Local.** One binary (`mind`), one SQLite database. No remote server or
   account is required. The optional model installer explicitly downloads pinned
@@ -68,26 +68,30 @@ always works and is the default.
 
 ## Install
 
-**Public source delivery is still blocked.** The repository address is
-`https://github.com/VikingOwl91/mindspace.git`, but anonymous acquisition requested
-credentials in the clean-user check. No release-download URL, public tag or
-credentials are supplied here. The frozen local RC.3 source archive has qualified
-build and provenance evidence, but no public delivery endpoint is available.
-Obtain and authenticate that exact reviewed archive before building; otherwise stop.
-See the [release-preparation decision](docs/releases/v0.1.0-alpha.1-release-preparation.md)
-for recipient verification, remaining reporting/hosting gates and artifact identity.
+Obtain the matching source archive, `source-archive-manifest.json`,
+`SHA256SUMS` and detached signatures for both the archive and manifest through
+the authorized handoff. Verify the actual signatures with an independently
+trusted signer and verify the checksums before use; **STOP** if anything is
+missing, uncertain or mismatched. The verified signed manifest identifies the
+archive by `archive.filename` and SHA-256, and records its signed source commit
+in `baseline.commit`. Every payload file is read from that commit, including documentation,
+licensing inputs and the archive assembler. Package identity alone does not
+authenticate these bytes.
 
-Use the [source-install/operator guide](docs/source-install.md) for the full
-validated local-candidate path, stable version-specific installation/PATH,
-configuration, MCP, Git, recovery and uninstall instructions.
+No public release, tag or anonymous download endpoint is asserted. The repository
+address `https://github.com/VikingOwl91/mindspace.git` is informational; obtain the
+authorized archive and its provenance through the agreed handoff. No model weights
+are included. The [source-install/operator guide](docs/source-install.md) covers
+verification, stable installation/PATH, configuration, MCP, Git, recovery and
+uninstall.
 
-Requirements: pinned Rust/Cargo1.98.1, Git, a C compiler and development headers.
+Requirements: pinned Rust/Cargo 1.98.1, Git, a C compiler and development headers.
 The recommended no-embeddings profile needs no weights. The alternative default
 build also requires a **C++ compiler** (`g++` on Debian) and libstdc++ at runtime.
 SQLite/FTS5 is bundled; a system SQLite server/CLI is not required. Linux is the
 qualified platform; MCP repository tools require effective Landlock ABI3+.
 
-From the authorized candidate tree:
+From the verified, extracted source tree:
 
 ```sh
 cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed
@@ -201,27 +205,31 @@ Rules that matter:
   enforced, canary verified)`. If the sandbox cannot be established, the
   repository tools switch themselves off and say why.
 
-Historical client evidence: a project-level `.mcp.json` with this content was picked up
-by Claude Code 2.1.319 (headless) as a connected project server and answered a
-tool call. The same configuration (loaded with `--mcp-config`) was exercised with a real Claude Code 2.1.319 client in headless mode by
-[`scripts/mcp-e2e-claude.py`](scripts/mcp-e2e-claude.py): tool discovery,
-ingestion, symbol questions checked against the source, refusal of paths
-outside the roots, restart, re-ingest, repository changes and crash recovery
-(40/40 checks, report in
-[`docs/reviews/mind-21-mcp-e2e.md`](docs/reviews/mind-21-mcp-e2e.md)). `mind setup` is tested against the real Claude Code 2.1.319 and Codex CLI 0.167.0 in throw-away configuration
-directories (registration, read-back, refusal of an existing entry, foreign entries). Not
-verified: the interactive UI of the clients, and OpenCode registration (preview only). A Codex and an OpenCode example are
-in [`docs/reference.md`](docs/reference.md).
-
-The clean-user qualification additionally exercised Codex0.166.0 native
-registration/readback/undo with fresh configuration, not a client UI or
-model-driven agent session. Keep the installed executable path stable.
+Historical client qualification used Claude Code 2.1.319 for project-level MCP
+configuration, discovery, ingestion, source-checked symbol questions, root refusals,
+restart and crash recovery. The retained
+[`scripts/mcp-e2e-claude.py`](scripts/mcp-e2e-claude.py) exercises that kind of flow.
+Separate historical setup checks used Claude Code 2.1.319 and Codex CLI 0.167.0 in
+throw-away configuration directories. Clean-user qualification used Codex 0.166.0
+for native registration/readback/undo. These are historical observations, not tests
+newly run against this curated archive. Interactive client UIs and model-driven
+agent sessions were not certified; OpenCode registration remains preview-only.
+Codex and OpenCode examples are in [`docs/reference.md`](docs/reference.md).
+Keep the installed executable path stable.
 
 Typical agent use: `repo_outline` (see what is there), `repo_ingest` with
 `paths` for the parts you need, `code_search` for definitions,
 `memory_search` for documents and decisions.
 
 ## Known limits
+
+Human-readable ingest/search/recall output replaces terminal controls and bidi
+overrides with `?`; stored data and JSON remain unchanged. Manual memories are
+limited to 1 MiB per content/subject field; MCP wire lines to 8 MiB including
+delimiters. See [the reference](docs/reference.md) for error and encoding details.
+Private `mind ownership` staging commands are unsupported and hidden from public
+help. Document publication remains blocked.
+
 
 Please read these; they are the difference between a surprise and a plan.
 
@@ -236,7 +244,7 @@ Please read these; they are the difference between a surprise and a plan.
   (default 30 s) is a deadline for the *preparation* of an ingest, **not** an
   end-to-end timeout. Once the database write starts it always runs to its
   end, so a call can far exceed the limit; the result then says
-  `over_limit: true` and is complete. Observed ([report](docs/reviews/mind-21-mcp-e2e.md)): ingesting `llama.cpp`
+  `over_limit: true` and is complete. In a historical qualification, ingesting `llama.cpp`
   (3,003 files, 220 documents, 629 MB `.git`) took 96 to 102 s, and the Claude
   Code client waited for it. There is no progress report, and a client with a short
   tool timeout may give up. Use `repo_outline` and `paths` to ingest a part.
@@ -244,7 +252,7 @@ Please read these; they are the difference between a surprise and a plan.
   one atomic transaction in the qualified failure controls; do not rely on the
   older partial-tree warning. An error can be `CommitOutcomeUnknown`, and a
   process-kill check is not power-loss certification. Preserve state and use the
-  [offline recovery procedure](docs/releases/v0.1.0-alpha.1-recovery-qualification.md);
+  [offline recovery procedure](docs/offline-recovery.md);
   never delete WAL/SHM or copy only live MAIN as a repair.
 - **Re-ingesting a changed repository re-derives all its documents** (they are
   bound to the commit), which costs time on big repos.
@@ -418,7 +426,7 @@ scripts/bench-baseline.sh               # benchmarks
   list, MCP details, search modes, Codex/OpenCode configuration.
 - [`docs/architecture.md`](docs/architecture.md), [`docs/memory-model.md`](docs/memory-model.md)
 - [`docs/decisions.md`](docs/decisions.md): decision log (ADR-001 to ADR-029)
-- [`docs/reviews/`](docs/reviews/): architecture review and the MCP end-to-end report
+- [Offline recovery](docs/offline-recovery.md): cooperative offline contract and exact recipe
 - [`SECURITY.md`](SECURITY.md) (how to report a vulnerability, scope) and
   [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Roadmap: there is no public roadmap file yet; the "planned" rows of the
@@ -426,4 +434,6 @@ scripts/bench-baseline.sh               # benchmarks
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE).
+MIT, see [`LICENSE`](LICENSE). Retained third-party fixture notices are in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); the included Apache 2.0 text is
+[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt). No model weights are included.

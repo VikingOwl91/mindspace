@@ -245,6 +245,7 @@ pub enum Command {
     },
     /// Trusted local legacy enrollment administration (no MCP route or search changes).
     #[cfg(unix)]
+    #[command(hide = true)]
     Ownership {
         #[command(subcommand)]
         command: ownership::OwnershipCommand,

@@ -3,7 +3,7 @@ fn main() {
     match mindspace::cli::run(&cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("error: {e}");
+            mindspace::cli::render::error(&e);
             std::process::exit(1);
         }
     }

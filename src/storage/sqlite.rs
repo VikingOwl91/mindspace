@@ -2722,6 +2722,7 @@ impl Store for SqliteStore {
     }
 
     fn record_manual_write(&self, draft: ManualMemoryDraft) -> Result<ManualMemoryReport> {
+        crate::core::validate_manual_text(&draft.content, draft.subject.as_deref())?;
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
         let at = Ts::now();

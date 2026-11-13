@@ -1,0 +1,13 @@
+{
+  "fixture_bytes": 711396,
+  "fixture_sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+  "fixture_equals_pinned_upstream_tokenizer": true,
+  "pinned_nomic_vocab_equals_pinned_google_bert_vocab": true,
+  "fixture_token_id_map_equals_pinned_nomic_vocab": true,
+  "vocabulary_size": 30522,
+  "fixture_attribution_metadata_fields": [],
+  "vocabulary_includes_ordinary_words_copyright_and_notice": true,
+  "nomic_revision": "e9b6763023c676ca8431644204f50c2b100d9aab",
+  "google_bert_hf_revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+  "google_research_bert_revision": "eedf5716ce1268e56f0a50264a88cafad334ac61"
+}

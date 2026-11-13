@@ -7,11 +7,21 @@ use crate::core::{
     MemorySummary, ObservationReport, SourceEventKind, Space,
 };
 
+// Apply only at human-readable sinks; JSON and stored strings stay lossless.
+fn display(value: &str) -> String {
+    crate::display::sanitize_display(value, usize::MAX)
+}
+
 fn json<T: serde::Serialize + ?Sized>(value: &T) {
     println!(
         "{}",
         serde_json::to_string_pretty(value).expect("engine structs serialize")
     );
+}
+
+/// Errors can include names and diagnostics from untrusted ingested files.
+pub fn error(error: &crate::core::Error) {
+    eprintln!("error: {}", display(&error.to_string()));
 }
 
 pub fn repo_info(info: &crate::ingest::repo_info::RepoInfo, as_json: bool) {
@@ -228,7 +238,9 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
     };
     println!(
         "session {} root {} ({})",
-        report.session_id, report.root, scope
+        report.session_id,
+        display(&report.root),
+        scope
     );
     for file in &report.files {
         let outcome = match &file.outcome {
@@ -236,21 +248,23 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
             crate::core::FileOutcome::Changed => "changed".to_string(),
             crate::core::FileOutcome::Created => "created".to_string(),
             crate::core::FileOutcome::Continued { from_location } => match from_location {
-                Some(from) => format!("continued from {from}"),
+                Some(from) => format!("continued from {}", display(from)),
                 None => "continued".to_string(),
             },
         };
         println!(
             "  {} logical {} {}",
-            file.location, file.logical_id, outcome
+            display(&file.location),
+            file.logical_id,
+            outcome
         );
         for action in &file.actions {
             println!(
                 "    memory {} \"{}\" {} [{}]",
                 action.memory_id,
-                action.subject,
-                action_label(&action.action),
-                action.spaces.join(", ")
+                display(&action.subject),
+                display(&action_label(&action.action)),
+                display(&action.spaces.join(", "))
             );
         }
     }
@@ -262,13 +276,13 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
             } => println!(
                 "  moved: logical {} {} -> {}",
                 event.logical_id,
-                from_location.as_deref().unwrap_or("?"),
-                to_location
+                display(from_location.as_deref().unwrap_or("?")),
+                display(to_location)
             ),
             SourceEventKind::Disappeared { from_location } => println!(
                 "  disappeared: logical {} (last seen {})",
                 event.logical_id,
-                from_location.as_deref().unwrap_or("?")
+                display(from_location.as_deref().unwrap_or("?"))
             ),
         }
     }
@@ -284,7 +298,9 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
     }
     println!(
         "session {} repository {} ({})",
-        report.session_id, report.repository_id, report.repository_path
+        report.session_id,
+        report.repository_id,
+        display(&report.repository_path)
     );
     println!(
         "refs: {} observed, {} added, {} changed, {} removed",
@@ -312,26 +328,26 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
             crate::core::GitRefEventKind::Created => {
                 println!(
                     "  ref created: {} -> {}",
-                    event.ref_name,
+                    display(&event.ref_name),
                     event.to_oid.as_deref().unwrap_or("?")
                 )
             }
             crate::core::GitRefEventKind::FastForward => println!(
                 "  ref fast-forward: {} {} -> {}",
-                event.ref_name,
+                display(&event.ref_name),
                 event.from_oid.as_deref().unwrap_or("?"),
                 event.to_oid.as_deref().unwrap_or("?")
             ),
             crate::core::GitRefEventKind::NonFastForward => println!(
                 "  ref non-fast-forward: {} {} -> {}",
-                event.ref_name,
+                display(&event.ref_name),
                 event.from_oid.as_deref().unwrap_or("?"),
                 event.to_oid.as_deref().unwrap_or("?")
             ),
             crate::core::GitRefEventKind::Deleted => {
                 println!(
                     "  ref deleted: {} (last at {})",
-                    event.ref_name,
+                    display(&event.ref_name),
                     event.from_oid.as_deref().unwrap_or("?")
                 )
             }
@@ -342,14 +358,19 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
             crate::core::GitFileOutcome::New => "new",
             crate::core::GitFileOutcome::Unchanged => "unchanged",
         };
-        println!("  {} @ {} ({})", file.path, file.commit_oid, outcome);
+        println!(
+            "  {} @ {} ({})",
+            display(&file.path),
+            file.commit_oid,
+            outcome
+        );
         for action in &file.actions {
             println!(
                 "    memory {} \"{}\" {} [{}]",
                 action.memory_id,
-                action.subject,
-                action_label(&action.action),
-                action.spaces.join(", ")
+                display(&action.subject),
+                display(&action_label(&action.action)),
+                display(&action.spaces.join(", "))
             );
         }
     }
@@ -406,14 +427,20 @@ pub fn search_hits(hits: &[crate::core::SearchHit], as_json: bool) {
         return;
     }
     for (i, hit) in hits.iter().enumerate() {
-        println!("{}. [{}] {} ({})", i + 1, hit.score, hit.subject, hit.state);
-        println!("   {}", hit.snippet.replace('\n', " "));
+        println!(
+            "{}. [{}] {} ({})",
+            i + 1,
+            hit.score,
+            display(&hit.subject),
+            hit.state
+        );
+        println!("   {}", display(&hit.snippet.replace('\n', " ")));
         let spaces = hit
             .spaces
             .iter()
             .map(|s| match &s.via {
-                Some(via) => format!("{} (via {})", s.name, via),
-                None => s.name.clone(),
+                Some(via) => format!("{} (via {})", display(&s.name), display(via)),
+                None => display(&s.name),
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -421,7 +448,11 @@ pub fn search_hits(hits: &[crate::core::SearchHit], as_json: bool) {
             "   spaces: {}",
             if spaces.is_empty() { "-" } else { &spaces }
         );
-        println!("   source: {} {}", hit.source_title, hit.source_location);
+        println!(
+            "   source: {} {}",
+            display(&hit.source_title),
+            display(&hit.source_location)
+        );
         println!("   memory: {}", hit.memory_id);
     }
 }
@@ -443,14 +474,18 @@ pub fn search_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) 
             index + 1,
             result.score_kind.as_str(),
             hit.score,
-            hit.subject,
+            display(&hit.subject),
             hit.state
         );
-        println!("   {}", hit.snippet.replace('\n', " "));
+        println!("   {}", display(&hit.snippet.replace('\n', " ")));
         println!("   score provenance: {}", render_score_provenance(result));
         let spaces = render_spaces(hit);
         println!("   spaces: {spaces}");
-        println!("   source: {} {}", hit.source_title, hit.source_location);
+        println!(
+            "   source: {} {}",
+            display(&hit.source_title),
+            display(&hit.source_location)
+        );
         println!("   memory: {}", hit.memory_id);
     }
 }
@@ -466,21 +501,29 @@ pub fn recall_hits(hits: &[crate::core::SearchHit], as_json: bool) {
         return;
     };
 
-    println!("answer: {}", answer.subject);
+    println!("answer: {}", display(&answer.subject));
     for line in answer.content.lines() {
-        println!("  {line}");
+        println!("  {}", display(line));
     }
-    println!("source: {} {}", answer.source_title, answer.source_location);
+    println!(
+        "source: {} {}",
+        display(&answer.source_title),
+        display(&answer.source_location)
+    );
     println!("spaces: {}", render_spaces(answer));
     println!("memory: {}", answer.memory_id);
 
     if hits.len() > 1 {
         println!("related:");
         for (index, hit) in hits.iter().enumerate().skip(1) {
-            println!("{}. {}", index + 1, hit.subject);
-            println!("   {}", hit.snippet.replace('\n', " "));
+            println!("{}. {}", index + 1, display(&hit.subject));
+            println!("   {}", display(&hit.snippet.replace('\n', " ")));
             println!("   spaces: {}", render_spaces(hit));
-            println!("   source: {} {}", hit.source_title, hit.source_location);
+            println!(
+                "   source: {} {}",
+                display(&hit.source_title),
+                display(&hit.source_location)
+            );
             println!("   memory: {}", hit.memory_id);
         }
     }
@@ -497,9 +540,9 @@ pub fn recall_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) 
         return;
     };
 
-    println!("answer: {}", answer.hit.subject);
+    println!("answer: {}", display(&answer.hit.subject));
     for line in answer.hit.content.lines() {
-        println!("  {line}");
+        println!("  {}", display(line));
     }
     println!(
         "score: [{} {:.6}]",
@@ -509,7 +552,8 @@ pub fn recall_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) 
     println!("score provenance: {}", render_score_provenance(answer));
     println!(
         "source: {} {}",
-        answer.hit.source_title, answer.hit.source_location
+        display(&answer.hit.source_title),
+        display(&answer.hit.source_location)
     );
     println!("spaces: {}", render_spaces(&answer.hit));
     println!("memory: {}", answer.hit.memory_id);
@@ -517,8 +561,8 @@ pub fn recall_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) 
     if outcome.hits.len() > 1 {
         println!("related:");
         for (index, result) in outcome.hits.iter().enumerate().skip(1) {
-            println!("{}. {}", index + 1, result.hit.subject);
-            println!("   {}", result.hit.snippet.replace('\n', " "));
+            println!("{}. {}", index + 1, display(&result.hit.subject));
+            println!("   {}", display(&result.hit.snippet.replace('\n', " ")));
             println!(
                 "   score: [{} {:.6}] ({})",
                 result.score_kind.as_str(),
@@ -528,7 +572,8 @@ pub fn recall_outcome(outcome: &crate::retrieval::SearchOutcome, as_json: bool) 
             println!("   spaces: {}", render_spaces(&result.hit));
             println!(
                 "   source: {} {}",
-                result.hit.source_title, result.hit.source_location
+                display(&result.hit.source_title),
+                display(&result.hit.source_location)
             );
             println!("   memory: {}", result.hit.memory_id);
         }
@@ -542,7 +587,7 @@ fn print_retrieval_summary(outcome: &crate::retrieval::SearchOutcome) {
         outcome.effective.as_str()
     );
     if let Some(fallback) = &outcome.fallback {
-        println!("fallback: {fallback}");
+        println!("fallback: {}", display(&fallback.to_string()));
     }
     println!(
         "candidates: lexical {}, semantic {}",
@@ -579,8 +624,8 @@ fn render_spaces(hit: &crate::core::SearchHit) -> String {
         .spaces
         .iter()
         .map(|space| match &space.via {
-            Some(via) => format!("{} (via {})", space.name, via),
-            None => space.name.clone(),
+            Some(via) => format!("{} (via {})", display(&space.name), display(via)),
+            None => display(&space.name),
         })
         .collect::<Vec<_>>()
         .join(", ");

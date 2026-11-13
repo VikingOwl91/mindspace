@@ -540,6 +540,14 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             return Err(format!("missing required argument '{key}'"));
         }
     }
+    if matches!(name, "memory_create" | "memory_update") {
+        // Before trimming, cloning, resolving spaces/IDs or touching storage.
+        crate::core::validate_manual_text(
+            obj.get("content").and_then(Value::as_str).unwrap_or(""),
+            obj.get("subject").and_then(Value::as_str),
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if let Some(value) = obj.get("depth") {
         if !value.as_u64().is_some_and(|d| d <= 4) {
             return Err("argument 'depth' must be an integer from 0 to 4".to_string());

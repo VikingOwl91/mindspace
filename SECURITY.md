@@ -21,9 +21,7 @@ Keep vulnerability details private until that route is published and verified.
 
 Before public distribution, the operator must publish the exact **Security >
 Report a vulnerability** link and verify it from an external GitHub account.
-This requires GitHub sign-in; it is not anonymous reporting. See the
-[release-preparation decision](docs/releases/v0.1.0-alpha.1-release-preparation.md).
-GitHub documents [availability and access](https://docs.github.com/en/code-security/concepts/vulnerability-reporting-and-management/repository-security-advisories).
+This requires GitHub sign-in; it is not anonymous reporting. GitHub documents [availability and access](https://docs.github.com/en/code-security/concepts/vulnerability-reporting-and-management/repository-security-advisories).
 
 Please include: the version or commit, your Linux kernel and distribution, how you started `mind mcp`
 (flags, allowed roots), and a reproduction. Use temporary directories and your own repositories only.

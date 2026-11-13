@@ -616,6 +616,21 @@ pub struct Memory {
     pub retire_reason: Option<String>,
 }
 
+/// Fixed UTF-8 byte limit for each manual-memory content and subject field.
+/// Ingested file/blob limits are enforced separately by ingestion.
+pub const MAX_MANUAL_MEMORY_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn validate_manual_text(content: &str, subject: Option<&str>) -> Result<()> {
+    for (field, value) in [("content", content), ("subject", subject.unwrap_or(""))] {
+        if value.len() > MAX_MANUAL_MEMORY_BYTES {
+            return Err(Error::Storage(format!(
+                "manual memory {field} exceeds {MAX_MANUAL_MEMORY_BYTES} UTF-8 bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// An explicit memory write. Its source and evidence are created by the
 /// storage layer with a manual provenance marker, never as a document.
 #[derive(Debug, Clone, PartialEq)]

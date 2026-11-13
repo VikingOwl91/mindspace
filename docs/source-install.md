@@ -1,14 +1,33 @@
 # Source installation and operator guide
 
-This guide describes the **unreleased `0.1.0-alpha.1` Legacy/Git candidate**. No public tag or release is asserted. The initial profile uses Linux, local private SQLite storage, lexical retrieval, explicit memories and committed Git content. Canonical document publication/search and document-complete Alpha remain blocked by R01–R17; PDF extraction is incomplete. No Knowledge Graph or Multi-Store capability is included.
+This guide describes the **unreleased `0.1.0-alpha.1` Legacy/Git candidate**. No public tag or release is asserted. The initial profile uses Linux, local private SQLite storage, lexical retrieval, explicit memories and committed Git content. Canonical document publication/search and document-complete Alpha remain blocked; PDF extraction is incomplete. No Knowledge Graph or Multi-Store capability is included.
 
-## 1. Obtain an authorized source tree
+## 1. Obtain and verify the source archive
 
-**Anonymous source acquisition is currently blocked.** Authenticated repository metadata confirms that `VikingOwl91/mindspace` is private; anonymous repository and vulnerability-form requests return HTTP404. No public release-download URL is asserted. The [install qualification](releases/v0.1.0-alpha.1-install-qualification.md) used a local bundle, not a successful anonymous download.
+Obtain the matching archive, `source-archive-manifest.json`, `SHA256SUMS` and
+actual detached signatures for both the archive and manifest through the
+authorized local handoff. Before building, verify the supplied signatures with
+an independently trusted signer and verify the archive and manifest checksums.
+If any item is missing, its identity is uncertain or verification fails,
+**STOP**. Only then use the verified manifest's `archive.filename` to identify
+the archive and `baseline.commit` for its signed source provenance. No archive
+filename, hash or source commit is fixed in this guide.
 
-For the frozen local RC.3 handoff, obtain the exact source archive, manifest, SHA256SUMS, both detached signatures and recipient `VERIFY.txt` described in the [release-preparation decision](releases/v0.1.0-alpha.1-release-preparation.md). Authenticate the publisher independently, verify signatures and hashes, then extract into a new directory. If the source, verification key or provenance cannot be authenticated, **STOP**.
+The curated archive contains no `.git` history or model weights. Its manifest
+identifies every selected file and hash; all payload files, including
+documentation and licensing inputs, come directly from its signed source commit. Keep the original
+archive and sidecars unchanged. Extract into a fresh controlled directory, set
+`SRC` to its absolute path and compare the extracted files with that manifest.
+Package identity alone does not authenticate any source bytes.
 
-RC.3 identifies signed source commit `d2cf762b66276b5f4ac91a02b03ed4ae1e4dd3bb` plus the signed manifest's declared documentation overlays and additions. The archive is not a byte-for-byte Git checkout and does not require private Git history. Its top-level directory is `mindspace-0.1.0-alpha.1`; set `SRC` to that absolute extracted path. `cargo pkgid` displays package identity; it does not authenticate the source. The manifest is authoritative for the exact payload; the current developer HEAD is not its source identity.
+No public release, tag or anonymous acquisition endpoint is asserted. The
+repository address `https://github.com/VikingOwl91/mindspace.git` is informational;
+the prior anonymous check requested credentials. Do not invent credentials or a
+release-download URL. If the authorized archive and verifiable provenance have
+not been supplied, **STOP here**. Historical installation checks used exact local
+source inputs, not a successful anonymous download, and do not newly qualify this
+curated archive. `cargo pkgid` displays package identity; it does not authenticate
+the source.
 
 <!-- identity-install: source-local -->
 ```sh
@@ -28,7 +47,7 @@ The qualified clean userspace is Debian13/trixie, x86_64, with the pinned Rust/C
 | Recommended no-embeddings Alpha | Rust/Cargo1.98.1, Git, C compiler and C development headers | GNU loader/libc, libm, libgcc_s; Git for repository operations. No embedding weights or C++ runtime required by the built application. |
 | Default build, optional embeddings capability | The same prerequisites **plus a C++ compiler** (`g++` on Debian) | Also libstdc++; real semantic retrieval needs separately installed pinned model assets. It is outside the initial qualified model-free support profile. |
 
-SQLite/FTS5 and Tree-sitter are compiled from source; a system SQLite CLI/server is not required by Mindspace. The actual default-build failure without `c++` is preserved in the qualification report. An independent C-only noembed build passed.
+SQLite/FTS5 and Tree-sitter are compiled from source; a system SQLite CLI/server is not required by Mindspace. Historical installation qualification observed a default-build failure without `c++` and a successful independent C-only noembed build. These observations are not a new build of this archive.
 
 On Debian, the package sets used inside the clean environment were `git gcc libc6-dev ca-certificates`, adding `g++` for the default profile. Install packages using your system's normal administration process; no host `sudo` command is prescribed here. Python3 is needed only for the optional manual MCP example and offline recovery recipe; strace/binutils are qualification tools, not basic Mindspace runtime dependencies.
 
@@ -211,7 +230,7 @@ Git support is SHA-1 and Rust structural extraction. `--history` interprets sele
 
 **Recovery engine boundary.** Python recovery uses the system SQLite independently of Mindspace's bundled engine. This remediated candidate links SQLite3.54.1, but the qualified Python runtime used SQLite3.46.1; the Rust dependency update does not patch that runtime, and Cargo advisory checks do not cover it. Use this procedure only for your trusted private Mindspace database and retained own validated backups. **STOP before opening** any externally supplied, less-trusted or uncertain-origin database, WAL or bundle. Hashes establish consistency, not authenticity. Such inputs require separately patched and qualified tooling and are outside this recovery profile. Qualification does not establish malicious-file resistance or system-library security clearance.
 
-Use the accepted [offline recovery runbook and exact recipe](releases/v0.1.0-alpha.1-recovery-qualification.md#6-validated-operator-runbook). There is no native Mindspace backup/restore command. The supported contract is cooperative offline operation: stop and account for every CLI/MCP/library reader/writer and prevent restarts. An unobservable potentially relevant process is a STOP; a process-name search or missing receipt is not writer exclusion.
+Use the [offline recovery runbook and exact recipe](offline-recovery.md#operator-runbook). There is no native Mindspace backup/restore command. The supported contract is cooperative offline operation: stop and account for every CLI/MCP/library reader/writer and prevent restarts. An unobservable potentially relevant process is a STOP; a process-name search or missing receipt is not writer exclusion.
 
 Before a new binary first opens existing data, preserve the exact old binary and a validated pre-upgrade backup. Ordinary reads can migrate. Never copy only live MAIN when acknowledged state may be in WAL; never delete WAL/SHM as cleanup. Restore to a fresh separate directory, validate integrity/FK/schema/logical contents and known retrieval/provenance, and keep the original backup immutable. Do not open the backup file with Mindspace.
 
@@ -220,7 +239,7 @@ The following extracts the already accepted recipe and backs up **only the fresh
 <!-- identity-install: backup-extract -->
 ```sh
 export RECOVERY_WORK="$(mktemp -d "$HOME/mindspace-recovery.XXXXXXXX")"
-python3 - "$SRC/docs/releases/v0.1.0-alpha.1-recovery-qualification.md" "$RECOVERY_WORK/offline-recipe.py" <<'PYRECIPE'
+python3 - "$SRC/docs/offline-recovery.md" "$RECOVERY_WORK/offline-recipe.py" <<'PYRECIPE'
 import os, sys
 from pathlib import Path
 text = Path(sys.argv[1]).read_text()
@@ -248,13 +267,13 @@ python3 "$RECOVERY_WORK/offline-recipe.py" restore "$RECOVERY_WORK/backup-1" "$R
 "$DEMO_RECOVERY_BIN" --db "$RECOVERY_WORK/restored-1/database.sqlite" search AlphaManualToken --space demo --json
 ```
 
-A valid snapshot omits later writes. If clients accepted post-backup writes, **STOP automatic rollback and preserve both states** for a recovery decision. Errors/interruption/lost acknowledgment may leave a private partial or complete output: retain it, revalidate before use, and retry in another new directory. Do not overwrite existing backups or candidates. No hot-backup, arbitrary historical upgrade, schema downgrade, publication recovery or power-loss guarantee is made. The actual historical qualification is the exact private schema16 development origin documented in the recovery report.
+A valid snapshot omits later writes. If clients accepted post-backup writes, **STOP automatic rollback and preserve both states** for a recovery decision. Errors/interruption/lost acknowledgment may leave a private partial or complete output: retain it, revalidate before use, and retry in another new directory. Do not overwrite existing backups or candidates. No hot-backup, arbitrary historical upgrade, schema downgrade, publication recovery or power-loss guarantee is made. The historical qualification covers the exact private schema16 development origin summarized in the [recovery runbook](offline-recovery.md#historical-qualification-and-limits); it does not qualify arbitrary old databases.
 
 ## 11. Limits, troubleshooting and uninstall
 
 | Symptom / limit | Action |
 | --- | --- |
-| Source clone requests credentials | Stop. Anonymous acquisition is unqualified/blocked; obtain an authorized reviewed tree without inventing credentials or a release URL. |
+| Source handoff is missing or verification fails | Stop. Obtain the authorized archive and verifiable sidecars; no anonymous endpoint or public release URL is asserted. |
 | `c++` missing | Use the noembed profile or install the additional C++ prerequisites for the default profile. Do not change the lockfile to bypass the build failure. |
 | Version is still0.5.0 | Stop; you are building an older tree or using a different executable. Check source provenance, chosen BUILD_BIN and first `mind` on PATH. |
 | Database missing | Initialize a new selected path only. If an existing path/data was expected, stop and investigate before recreating anything. |
@@ -285,4 +304,4 @@ test "$("$MIND_BIN" --version)" = 'mind 0.1.0-alpha.1'
 rm -- "$MIND_BIN"
 ```
 
-The command examples are candidate-local procedures qualified on disposable state. Source acquisition/public delivery remains provisional. Native registration/readback does not certify a client UI or a model-driven agent session. Current dependency/advisory gates, the mandatory security profile and exact release-candidate review still precede any public release.
+The command examples were qualified historically on disposable candidate-local state, not newly run against this curated archive. Local source handoff remains subject to verification; no public delivery is asserted. Native registration/readback does not certify a client UI or a model-driven agent session. Current dependency/advisory gates, the mandatory security profile and exact release-candidate review still precede any public release.

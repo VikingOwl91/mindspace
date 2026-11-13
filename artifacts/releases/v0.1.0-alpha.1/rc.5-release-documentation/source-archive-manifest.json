@@ -1,0 +1,1850 @@
+{
+  "allowlist_sha256": "5d06308882e17fcb3879f7fbc442b6ad08d7b93d391a9b17ad091069a837c89e",
+  "archive": {
+    "bytes": 1384547,
+    "filename": "mindspace-0.1.0-alpha.1-rc.5-source.tar.gz",
+    "sha256": "b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0",
+    "uncompressed_tar_bytes": 5806080,
+    "uncompressed_tar_sha256": "8e971e12628b9aeac69ba574932d02f281f92e3a742f59bbffe13c1cb99513d6"
+  },
+  "assembler_sha256": "a8814244ad7ea1a27b59567cd58829b95b0edc1b13095b9099c0fc9cdfa56c98",
+  "baseline": {
+    "commit": "a027d94680392648b6277dc2fd9bc20906114b91",
+    "tree": "3cc15658d9c840522cbff102b44f6d004d5506bf"
+  },
+  "candidate": "rc.5-release-documentation",
+  "format": "mindspace-source-archive-v2",
+  "members": [
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1",
+      "type": "directory"
+    },
+    {
+      "bytes": 31,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/.gitignore",
+      "sha256": "ec4ccc5bc03b6b8661ad11a16f631efc4161d046669bb27d673a1eb0e77e88e7",
+      "type": "file"
+    },
+    {
+      "bytes": 4775,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/CONTRIBUTING.md",
+      "sha256": "4f7fab8b7d365c1ef98fa785d1bfaa6902b3cb49f6d83ee1864c05bbf72fb532",
+      "type": "file"
+    },
+    {
+      "bytes": 66799,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/Cargo.lock",
+      "sha256": "232a4ac4a2033e9982f220b786a11a778cffe4333488eedcf6c05cc224700d15",
+      "type": "file"
+    },
+    {
+      "bytes": 2075,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/Cargo.toml",
+      "sha256": "fe177633a946d76aa50b80da2ed5da6837e238bb5d925b06aa1f7a5d95ef0bc4",
+      "type": "file"
+    },
+    {
+      "bytes": 1068,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/LICENSE",
+      "sha256": "abc613955fe70890f1c389648b7a6c494fc1248a316fe32d772ae3f986f93270",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/LICENSES",
+      "type": "directory"
+    },
+    {
+      "bytes": 11358,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/LICENSES/Apache-2.0.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "type": "file"
+    },
+    {
+      "bytes": 10690,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/README.md",
+      "sha256": "c430a65a00f6f4b95e90dc43c7321915c416028afb45296c85512067e62d45e4",
+      "type": "file"
+    },
+    {
+      "bytes": 3841,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/SECURITY.md",
+      "sha256": "7d1f3fe2ceabe004acd6518e86ca0d0ab2ada523fc0f74fa3827eb178df8312b",
+      "type": "file"
+    },
+    {
+      "bytes": 2382,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/THIRD_PARTY_NOTICES.md",
+      "sha256": "3871fd6a6830d17ad6ddb529cc074632e82b6e4e579b2eae8277fb9c08a0fd5a",
+      "type": "file"
+    },
+    {
+      "bytes": 1192,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/deny.toml",
+      "sha256": "a23611fed60d801f921f83095cec8cc6ec3a9d02b24cfcd60c5fa73375d11762",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/docs",
+      "type": "directory"
+    },
+    {
+      "bytes": 20996,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/adr-030-jit-authorization.md",
+      "sha256": "935816a6a0b0811696d1b2a2787e0d7b93b7f859fdcffd81359d9d23cab28301",
+      "type": "file"
+    },
+    {
+      "bytes": 8219,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/adr-m6-temporal-recording.md",
+      "sha256": "6b233e1179c6b87aa3c8310670c8b419acf98ca0929bd4d397121183b064fdca",
+      "type": "file"
+    },
+    {
+      "bytes": 22280,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/architecture.md",
+      "sha256": "42c97246757c586dafb62fe97a80d041f4841158fbf920983b7e4e4e9cbd35e4",
+      "type": "file"
+    },
+    {
+      "bytes": 69534,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/decisions.md",
+      "sha256": "173b49dfb0c77be9206d690eec9e18c20c047225acab590b4a85a741b4c94910",
+      "type": "file"
+    },
+    {
+      "bytes": 8929,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/doctor.md",
+      "sha256": "7f9278a978c6b1c469618c24145452cd9d0dbcfa682f69ede96db7086cacde0c",
+      "type": "file"
+    },
+    {
+      "bytes": 8173,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/grants.md",
+      "sha256": "3cb90e8cdb4836bc5f616353c1470839b8d13af07ed59049f79344d18d8fe7ac",
+      "type": "file"
+    },
+    {
+      "bytes": 37013,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/memory-model.md",
+      "sha256": "7e43a47d93fe830928934b49b79e1903336acef22d8b260951b28ec76a10915c",
+      "type": "file"
+    },
+    {
+      "bytes": 23615,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/offline-recovery.md",
+      "sha256": "5c861baab180b0a0d6c2c53683d01c47d7dc7aab84b3e49d6b63d35096b7879d",
+      "type": "file"
+    },
+    {
+      "bytes": 31365,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/reference.md",
+      "sha256": "b39feac86e18430eacaea80384ff989f39e23336ed9925517e566b7613726abb",
+      "type": "file"
+    },
+    {
+      "bytes": 4560,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/release-notes.md",
+      "sha256": "e4bab99914f9c2bea3b04b9ae032f7efee51638a45bf731fbc0639327a01b84b",
+      "type": "file"
+    },
+    {
+      "bytes": 14561,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/retrieval-performance.md",
+      "sha256": "0e2b416717e1b6c772c84e4248313ee6eb318e3e9bca6c0e1e2014ec56bf027c",
+      "type": "file"
+    },
+    {
+      "bytes": 5667,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/sandbox-capabilities.md",
+      "sha256": "d1ba3eb141d4e55881ca83e3863c236402de0a57ba8c5e2b844f1fd0f63d2983",
+      "type": "file"
+    },
+    {
+      "bytes": 10179,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/sandbox-seccomp.md",
+      "sha256": "ada30c3a38c718ac5de78ba12b6a19f39cd3642c8592d7b106dafd96532a19a5",
+      "type": "file"
+    },
+    {
+      "bytes": 10668,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/setup.md",
+      "sha256": "549c469e3d2576152476dbb76ccf3a2c36d498434cc9f89abfd3df61a3f52051",
+      "type": "file"
+    },
+    {
+      "bytes": 25832,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/docs/source-install.md",
+      "sha256": "583adae67fb13bc8973ac367a3f205009d1fa3abbd8959b042254998c0b64290",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/examples",
+      "type": "directory"
+    },
+    {
+      "bytes": 387,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/examples/example.md",
+      "sha256": "4ac7277b0ac20bf16d3c17b97bc5c10f235e93f400c23e920586dd38e6b17ed9",
+      "type": "file"
+    },
+    {
+      "bytes": 2621,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/examples/landlock_fd_probe.rs",
+      "sha256": "0a21da885836334a7f2b3aae39747d0db85c8fed7f73fb667ca95a46613ba09d",
+      "type": "file"
+    },
+    {
+      "bytes": 2043,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/examples/parse_probe.rs",
+      "sha256": "fab1885c703e7a32a05ba2ce01b4b318880d79e72001e007c1e89b912e8312a4",
+      "type": "file"
+    },
+    {
+      "bytes": 7652,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/examples/stream_bench.rs",
+      "sha256": "0e9ac60f9e694de4d8a1276f43c7b60704eece4ccb9eba57c69984c5885e8274",
+      "type": "file"
+    },
+    {
+      "bytes": 4709,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/examples/worker_probe.rs",
+      "sha256": "3ae3e87330357d25c3ce37e61cb5ecf25bb9f9bf1024692fc7a1a2204ca792f2",
+      "type": "file"
+    },
+    {
+      "bytes": 4675,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/examples/worker_run.rs",
+      "sha256": "5c8f65d81d16594ff85752b2c1db4ca51735633f818dfdf4e835a9545cd5fea6",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/migrations",
+      "type": "directory"
+    },
+    {
+      "bytes": 3991,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0001_init.sql",
+      "sha256": "9384ac1fa7d2b86c0a2a221d3807094a16740bd0ff6b83d100326e62048dbed2",
+      "type": "file"
+    },
+    {
+      "bytes": 4249,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0002_source_lifecycle.sql",
+      "sha256": "42efc24c91d26f62d4a168e77d898dd07a9c641e7e8993dbcd510468e76ec4bf",
+      "type": "file"
+    },
+    {
+      "bytes": 6039,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0003_git_ingest.sql",
+      "sha256": "24b9f75b1be5e5bf27949460f9fb1c6494a0e2bb08ab102a7c178d052555ae51",
+      "type": "file"
+    },
+    {
+      "bytes": 1809,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0004_code_structure.sql",
+      "sha256": "60b1a212d209240df339bad63c3eb170c85154a9276240415ebb4a02747726a8",
+      "type": "file"
+    },
+    {
+      "bytes": 1277,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0005_code_relationships.sql",
+      "sha256": "f67b7f2f8a8d35afbb1958cf3df2d1c66c936901ec0f11fcd86a6e2fa21663fb",
+      "type": "file"
+    },
+    {
+      "bytes": 125,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0006_manual_writes.sql",
+      "sha256": "d0a8a54edcd90c33e1711fc4cfe1c84ecab05f8a1fa9d61b127b621833aa518a",
+      "type": "file"
+    },
+    {
+      "bytes": 1637,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0007_embeddings.sql",
+      "sha256": "1245340ab703985190df3cccb831536633e7ea4af8c9c03d7a1b86389be37daa",
+      "type": "file"
+    },
+    {
+      "bytes": 3678,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0008_temporal_recording.sql",
+      "sha256": "e266d58fb7db386bb8cc03054f76d4b12895cba8436f956445cbd449ea3f6c30",
+      "type": "file"
+    },
+    {
+      "bytes": 2744,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0009_scopes_and_views.sql",
+      "sha256": "325d268ae12abb2420c0ce06e651a6169aefcde0dd334873d7d1d648789207e7",
+      "type": "file"
+    },
+    {
+      "bytes": 6749,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0010_documents.sql",
+      "sha256": "ad4e3e6a5c70cc8633e3fbee92434e8a8fbff85a7eb4aaabada5c8752e12cf68",
+      "type": "file"
+    },
+    {
+      "bytes": 2918,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0011_doc_code_blocks.sql",
+      "sha256": "cafbc80bf186381274e14c0de3e7b304afd388378b3c5493020bc55cc670de25",
+      "type": "file"
+    },
+    {
+      "bytes": 2275,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0012_doc_chunks.sql",
+      "sha256": "394fbebdee1bbacdebe08cd35a87a49a99a04f3bb318d60dc88e312dabb3a6c6",
+      "type": "file"
+    },
+    {
+      "bytes": 8956,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0013_legacy_ownership.sql",
+      "sha256": "1f93d71fd5cd7a4ad816f0ae5ac0e20f26877ae9f121a0214c70f78b8679e5b8",
+      "type": "file"
+    },
+    {
+      "bytes": 14464,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0014_document_preparation.sql",
+      "sha256": "de0fc31e3a0f7adde63fd2e84f788c37e6a4a98f9c363136648d02ac8017e21c",
+      "type": "file"
+    },
+    {
+      "bytes": 19186,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0015_lexical_staging.sql",
+      "sha256": "cf1475b50cad6029dc4d215a462b65c4562ed36817697caef501b00a241fc022",
+      "type": "file"
+    },
+    {
+      "bytes": 13343,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0016_semantic_staging.sql",
+      "sha256": "ccd233263dc4af4336a162edafb38aca775202f84f4597b5a6ee53605d80bec7",
+      "type": "file"
+    },
+    {
+      "bytes": 10221,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/migrations/0017_passive_fence_plans.sql",
+      "sha256": "d9829723fc0b258b4a99693f030520d0e0f6018c03d14c2488f813f8fcd64796",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/release",
+      "type": "directory"
+    },
+    {
+      "bytes": 6114,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/release/source-files.txt",
+      "sha256": "5d06308882e17fcb3879f7fbc442b6ad08d7b93d391a9b17ad091069a837c89e",
+      "type": "file"
+    },
+    {
+      "bytes": 66,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/rust-toolchain.toml",
+      "sha256": "a7a23801522d469e93021507fc88e9f5651056fce0e6aa22b3d3157c5f3dc6fe",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts",
+      "type": "directory"
+    },
+    {
+      "bytes": 7903,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/assemble-source-archive.py",
+      "sha256": "a8814244ad7ea1a27b59567cd58829b95b0edc1b13095b9099c0fc9cdfa56c98",
+      "type": "file"
+    },
+    {
+      "bytes": 8612,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/bench-baseline.sh",
+      "sha256": "e802f8a0e83fb173f060b1e95ae6409009c19549079271bcb2e2af0915bc1311",
+      "type": "file"
+    },
+    {
+      "bytes": 1773,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/check-doc-links.py",
+      "sha256": "521f91f92bb0daee9f72abd2a929a64bb492e06a5cb0d1cadc64e9ff52c37287",
+      "type": "file"
+    },
+    {
+      "bytes": 3397,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/check-sandbox-enforced.py",
+      "sha256": "63fd85688d934a3bec70e5c94ea8e859b312007d0b6148326fcf3a75bd906d63",
+      "type": "file"
+    },
+    {
+      "bytes": 3495,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/scripts/check_seccomp_bpf.py",
+      "sha256": "6287a7ac83019623bb298d8750ca6526e1f9e309690494f1a45a7bd1991d0289",
+      "type": "file"
+    },
+    {
+      "bytes": 18307,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/mcp-e2e-claude.py",
+      "sha256": "4c64430378b84330555bd1e620761152ea8861237ed36842c7c9fa197289f803",
+      "type": "file"
+    },
+    {
+      "bytes": 39515,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/scripts/qualify-alpha-recovery.py",
+      "sha256": "5d0cf6599d16ca82c795f3e541b3273e265dfb377f73c5aec79efd43488f8f6c",
+      "type": "file"
+    },
+    {
+      "bytes": 1640,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/security-profile.sh",
+      "sha256": "0d51fd69980ad38c48bdd74e8eab93dd0f36dde693e481dda79c760fe0bbd6a7",
+      "type": "file"
+    },
+    {
+      "bytes": 6613,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/scripts/test-source-archive.py",
+      "sha256": "545e25ab8fb944a2b02fa966935f7dc3c7f3828efb3562ae30118e00f7480638",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src",
+      "type": "directory"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/cli",
+      "type": "directory"
+    },
+    {
+      "bytes": 12534,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/cli/grant.rs",
+      "sha256": "4d527eecdb60b09741d0baa755f09ce9085cfb952309ba400a9e52900d794137",
+      "type": "file"
+    },
+    {
+      "bytes": 62670,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/cli/mod.rs",
+      "sha256": "e9cc53d96aa8ebec752ae4550ef5b45c5fecc05a30121a87cfdf9e174a822be4",
+      "type": "file"
+    },
+    {
+      "bytes": 36641,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/cli/ownership.rs",
+      "sha256": "77040f6f23cfd89140e9540e5aee6223c54bc281236b0e6f4b26a3f445004886",
+      "type": "file"
+    },
+    {
+      "bytes": 25898,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/cli/render.rs",
+      "sha256": "e5afc2d512003ecca488c1dd9167b2a201104cde1b2d42331db57cbadf7bb288",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/core",
+      "type": "directory"
+    },
+    {
+      "bytes": 38242,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/core/document.rs",
+      "sha256": "98eac4ac8734340a51f7358179f9d1665e9949b7860c0ab577be4ca97af2a456",
+      "type": "file"
+    },
+    {
+      "bytes": 6398,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/core/error.rs",
+      "sha256": "c5be472b71b17b68b467944c32d71a48b6dc318323db6afb549a15ac1644b5f7",
+      "type": "file"
+    },
+    {
+      "bytes": 55931,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/core/mod.rs",
+      "sha256": "e2cb322059772c3cd35231a0b08e5387205744197155b2621eef87b8c30c390b",
+      "type": "file"
+    },
+    {
+      "bytes": 691,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/display.rs",
+      "sha256": "929a5140097b3012b4e8c6f1dcb0b057ca4626434c940be72ffc6255fbc099c2",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/doctor",
+      "type": "directory"
+    },
+    {
+      "bytes": 32713,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/doctor/approval.rs",
+      "sha256": "1f5081f8dfb785ae92a0118b038fd4f042e4cf2162849ebc8c6695273f6ff20b",
+      "type": "file"
+    },
+    {
+      "bytes": 29155,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/doctor/capabilities.rs",
+      "sha256": "8704c25ddd62ef3eed642c878ee7d8c76f7dd325cfd209ac3e984f56bc932472",
+      "type": "file"
+    },
+    {
+      "bytes": 31626,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/doctor/mod.rs",
+      "sha256": "d16d7a8c023802abcf176e43159e686d6f0699b03d9a8eeb1a3db7a84dbf8019",
+      "type": "file"
+    },
+    {
+      "bytes": 17419,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/doctor/selftest.rs",
+      "sha256": "326b3e3342a3d5cf2be4f6446465a5fc32f22418d6a58c48a4eec27f9a6fca43",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings",
+      "type": "directory"
+    },
+    {
+      "bytes": 5554,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/budget.rs",
+      "sha256": "0bfc74b738fe118d5cecd25ed8dadd3361519ddbd2fa4d28d3bb6fec9997b521",
+      "type": "file"
+    },
+    {
+      "bytes": 19406,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/manager.rs",
+      "sha256": "9e6af16d2116756d91a7a2481361a5be75a0401240e040655f4085be4fbb7455",
+      "type": "file"
+    },
+    {
+      "bytes": 3470,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/manifest.rs",
+      "sha256": "35f2430b90faafb6dbe3d333f23c02699afa1e4bb326d7eb950e3b8d19383b8e",
+      "type": "file"
+    },
+    {
+      "bytes": 1259,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/mod.rs",
+      "sha256": "9bdd044fb97c120bd50776a14f0087c4ba7538b7229d6b289285728c23bcab82",
+      "type": "file"
+    },
+    {
+      "bytes": 10026,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/runtime.rs",
+      "sha256": "3df505b071f8112bc8bc81108d01155d873270356c96d12a8252b67226ac53f4",
+      "type": "file"
+    },
+    {
+      "bytes": 12509,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/strict.rs",
+      "sha256": "9501857fcea69223d1e6ead60dbb3315928fd448320cf2dcdf2cb98133a9b57a",
+      "type": "file"
+    },
+    {
+      "bytes": 12974,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/strict_contract.rs",
+      "sha256": "54802f12589ee56e1b7e60b4c978c5376452164615e3a9b892b457a8671c2a1f",
+      "type": "file"
+    },
+    {
+      "bytes": 3929,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/strict_contract_tests.rs",
+      "sha256": "3bb998664c1c79a353d82e627e4eb0cbbca7c75b54cb94c4b41a00ac64481433",
+      "type": "file"
+    },
+    {
+      "bytes": 14227,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/embeddings/strict_tests.rs",
+      "sha256": "916d87adf7f745fc36140c3f2b446c041eccea8612b588158bb3875f526b29c4",
+      "type": "file"
+    },
+    {
+      "bytes": 71549,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/grants.rs",
+      "sha256": "d4dec86528d1dfdb903a27c8aeac75623c4677f16d614f5f1c7a130aaf2255f0",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/indexing",
+      "type": "directory"
+    },
+    {
+      "bytes": 5510,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/indexing/mod.rs",
+      "sha256": "66019976c45613e3f835729e12aef2edc7e2b9caa090384ca7ae3a00e418c281",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest",
+      "type": "directory"
+    },
+    {
+      "bytes": 48990,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/code.rs",
+      "sha256": "f8f49770488506f7ebcbc243c14d6758483ecdce351c47857f4a3def015d15b9",
+      "type": "file"
+    },
+    {
+      "bytes": 20705,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/confined.rs",
+      "sha256": "d0be18e8a5315d0c980c8ab3c2b9d678df262856faf139c1110c8e150ff8b7c8",
+      "type": "file"
+    },
+    {
+      "bytes": 38583,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/confined_git.rs",
+      "sha256": "cfef04060e06c7fbc613e574701bbf34c8d28dcf9e11d56617af4dfe1f188861",
+      "type": "file"
+    },
+    {
+      "bytes": 3303,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/deadline.rs",
+      "sha256": "923dc22ed42bd1edc6063b4b2d93461fb2935b8d84495409e365af3ac63f3d2a",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/document",
+      "type": "directory"
+    },
+    {
+      "bytes": 6449,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/document/chunk.rs",
+      "sha256": "e736274ebabadde6bb7afa4b2e4e2cf2cfb22af814431c45336040a5d9278fc5",
+      "type": "file"
+    },
+    {
+      "bytes": 11287,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/document/detect.rs",
+      "sha256": "c1ed870e5e3aab43cace917a9425e07dfa05cce24e94c2649511625415f85085",
+      "type": "file"
+    },
+    {
+      "bytes": 11978,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/document/mod.rs",
+      "sha256": "5e29ceefc3407d52e5e71d9368804ee9ecf052de640faa2ceb12303a31f0543f",
+      "type": "file"
+    },
+    {
+      "bytes": 11306,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/document/structure.rs",
+      "sha256": "f97c3efc4996ed602cc5acaa24d113465eacaeb9b783cea318425543dd6abf47",
+      "type": "file"
+    },
+    {
+      "bytes": 16184,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/extract.rs",
+      "sha256": "f68b58fdb74a82cd7e4d5ec4f80ffeb78b2eca0944a3d4d988f3ffe7cfcd3cb0",
+      "type": "file"
+    },
+    {
+      "bytes": 52636,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/git.rs",
+      "sha256": "2740ff4aced901abc35b2a3a88c8047c05c1f24fc84686dbdf7d33c57b1c8003",
+      "type": "file"
+    },
+    {
+      "bytes": 25194,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/gitverify.rs",
+      "sha256": "e73af0938911f97a4cb0c829857eb0553568efc35ed3035fc1903acd3831a298",
+      "type": "file"
+    },
+    {
+      "bytes": 11760,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/markdown.rs",
+      "sha256": "f66e3f06e6a915c1835bed56121c798a572443d995c62bef02fbf9533121c1db",
+      "type": "file"
+    },
+    {
+      "bytes": 44359,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/mod.rs",
+      "sha256": "8c0bd76aa10e5f5712a03c87226743d1322e212c9f90381dd8884e08fb35cd03",
+      "type": "file"
+    },
+    {
+      "bytes": 8416,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/outline.rs",
+      "sha256": "8118caf106e41b48eaa547ec0ef6ef4d4ddda5b2044ea04d0b9e3ed92952f066",
+      "type": "file"
+    },
+    {
+      "bytes": 6652,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/release.rs",
+      "sha256": "b1f5315680a419749629cc9e6d142b4e04bcc72ff44b57aa4d7b7cd1a9d858b0",
+      "type": "file"
+    },
+    {
+      "bytes": 7764,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/remote.rs",
+      "sha256": "b9c69726d4e091335f206ae7e7ae9aeaa2145ba9915d24c2ff72d827162fe61a",
+      "type": "file"
+    },
+    {
+      "bytes": 4660,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/repo_info.rs",
+      "sha256": "efae812f935ff24caeaa0d95cf1b999e0e0ed56c6ee377c72fc71f563cec5c40",
+      "type": "file"
+    },
+    {
+      "bytes": 106674,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/ingest/stream.rs",
+      "sha256": "0775ba7b420481dc7ca4ad5e1a61e6ed2592dc0df27486e57294011a0f4af97c",
+      "type": "file"
+    },
+    {
+      "bytes": 2963,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/lib.rs",
+      "sha256": "f2058db6b937446ffed1ce1dae5fa3c2d700ae370994262ac74c52c818b10665",
+      "type": "file"
+    },
+    {
+      "bytes": 255,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/main.rs",
+      "sha256": "3a808bf03863dfeb11d22c923deb90885a2349412f42807efb5302c0b853e7a1",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp",
+      "type": "directory"
+    },
+    {
+      "bytes": 23067,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp/isolated.rs",
+      "sha256": "3d5c72df2922cab20d101c94237499236268014c47c1042fb52480701484cd79",
+      "type": "file"
+    },
+    {
+      "bytes": 17997,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp/isolated_git.rs",
+      "sha256": "d813d5c016e5e9b1171e03682431e2ddaf8d2f7061d1a19e3d000b9d508c5a30",
+      "type": "file"
+    },
+    {
+      "bytes": 271,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp/mod.rs",
+      "sha256": "c2aad6a1137e32ad84e3ae99c82477ef3a564e1be3a5a16596c21b62e7efbcc0",
+      "type": "file"
+    },
+    {
+      "bytes": 17636,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp/protocol.rs",
+      "sha256": "486a7dc68dedef60a407605e5f93083f454dc0be3c351cefd456612539d080b8",
+      "type": "file"
+    },
+    {
+      "bytes": 26951,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp/repo_tools.rs",
+      "sha256": "45c975a4548f328659814cb52d5013ccaa13b9a23499d835863e4800875f7c2c",
+      "type": "file"
+    },
+    {
+      "bytes": 32756,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/mcp/tools.rs",
+      "sha256": "1c761e60ed9b8e41ceb8b041af4404564ad775f4658a836157f98a0463fcf5a6",
+      "type": "file"
+    },
+    {
+      "bytes": 2852,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/pathenv.rs",
+      "sha256": "ecda4e8e5157a3e325534e722f34ad2ab913642ea44a5c241d3bf790c4f2e2e2",
+      "type": "file"
+    },
+    {
+      "bytes": 10090,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/paths.rs",
+      "sha256": "705cf1e2782bad8275f16712f02c31a23f1a89849e842eba4182de3e272fe7c1",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval",
+      "type": "directory"
+    },
+    {
+      "bytes": 6430,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval/fusion.rs",
+      "sha256": "3144c83547f7561748e4e7227af89225a3aad4bf10fbc8cb02743b3715b8a269",
+      "type": "file"
+    },
+    {
+      "bytes": 39836,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval/mod.rs",
+      "sha256": "0237e6149e6da776c255ede6bd3a2733ff68e1fbf6bcb7ec04496e6e26e4fdfd",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval/semantic",
+      "type": "directory"
+    },
+    {
+      "bytes": 13760,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval/semantic.rs",
+      "sha256": "1377235e2822fd750caf3b4c7d671299fc9c8bce4f35e85ea6ea01b298c27ad7",
+      "type": "file"
+    },
+    {
+      "bytes": 11507,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval/semantic/cache.rs",
+      "sha256": "3f1106a15031b5d14ed7ef6d9f492788f61148741eeec43df96eb864b8c6b9ba",
+      "type": "file"
+    },
+    {
+      "bytes": 29400,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/retrieval/semantic/cache_tests.rs",
+      "sha256": "0051d67f15f9dabb45294ef0943ae1ec533100f02c53a0369b1cb0fef5d29ac7",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/sandbox",
+      "type": "directory"
+    },
+    {
+      "bytes": 72944,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/sandbox/mod.rs",
+      "sha256": "aa3f63b61a3d8b01bb1b077a7263c27f2701a278140cfb6456220ea5e5a26b1b",
+      "type": "file"
+    },
+    {
+      "bytes": 25629,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/sandbox/seccomp.rs",
+      "sha256": "5af43460f4f7aa6e1bfcf6c68f01c79b51d574180b8ab996b18803004a211d11",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/setup",
+      "type": "directory"
+    },
+    {
+      "bytes": 17859,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/setup/client.rs",
+      "sha256": "e605ec9fba83605d660454f4f5d28525366c27cadc49e1a00b0cef86932bb55b",
+      "type": "file"
+    },
+    {
+      "bytes": 2523,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/setup/exec.rs",
+      "sha256": "49508329b90a4314b26ae5a8f6fc774fb09be87f4be11f07ff0c26e26a757e1f",
+      "type": "file"
+    },
+    {
+      "bytes": 21407,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/setup/mod.rs",
+      "sha256": "e35838b8975cab71ed5550a418f8f9ec49e35af11939f82915dce7529784177c",
+      "type": "file"
+    },
+    {
+      "bytes": 13170,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/setup/roots.rs",
+      "sha256": "799162e550f8430154d22f2fa491cbaceef8c1866a520699902620000792ace3",
+      "type": "file"
+    },
+    {
+      "bytes": 3691,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/setup/text.rs",
+      "sha256": "1d6b8dc26cb5dcf47fcf49a7fee353e7194b77548ecf70364da6e17dda662bfc",
+      "type": "file"
+    },
+    {
+      "bytes": 5773,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/setup/wizard.rs",
+      "sha256": "d0be7ea17d0cd626c847e4f14f0289d505a46a9a729dae48fb82f195639b5e75",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/storage",
+      "type": "directory"
+    },
+    {
+      "bytes": 14380,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/mod.rs",
+      "sha256": "d667b3707520df0e2dfb8ca54b4156c06e72e5e4bc600111ab98a673d1e049a7",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite",
+      "type": "directory"
+    },
+    {
+      "bytes": 213264,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite.rs",
+      "sha256": "5ed2c89795672739fe189babcf14bcc0c9ede22e3681440a0bcdd9ca7757c866",
+      "type": "file"
+    },
+    {
+      "bytes": 37977,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/document_preparation.rs",
+      "sha256": "c6a863244ec6b9863a5b9b790b6f78da61bbe3a70e153b7cabd07b26d55971cc",
+      "type": "file"
+    },
+    {
+      "bytes": 10578,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/document_preparation_migration_tests.rs",
+      "sha256": "3a546137f823513bff88751f39afc1a5c83125fd7eba3a9e0a8be6a982be9c7f",
+      "type": "file"
+    },
+    {
+      "bytes": 18179,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/document_preparation_tests.rs",
+      "sha256": "c81f3f6adf1080a50d5a1334638191ad6fbb64bc0a652be8a70889df0b08da0d",
+      "type": "file"
+    },
+    {
+      "bytes": 30158,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/documents.rs",
+      "sha256": "c797d9db8b608825d34347131ab5e68015b00e3ef16df6dd90a830dfde6777b3",
+      "type": "file"
+    },
+    {
+      "bytes": 16822,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/fence_plan_migration_tests.rs",
+      "sha256": "7a8741a80aae6f1666b4738e901d88789c0839bf9338044da2d7aeb1e463a422",
+      "type": "file"
+    },
+    {
+      "bytes": 51315,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/fence_plans.rs",
+      "sha256": "089b09156ad9f3e38b06541c4706238c10a8c57cd48f959f54405ef746db7d73",
+      "type": "file"
+    },
+    {
+      "bytes": 12412,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/files.rs",
+      "sha256": "3cdcc80aa370e56befa7181e5d93cce4231dae62e190662c6faf7434991f014e",
+      "type": "file"
+    },
+    {
+      "bytes": 18451,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/lexical_input.rs",
+      "sha256": "a69f10702162475234b1441bc9d436aa77697787b09fae54208d0924646667a1",
+      "type": "file"
+    },
+    {
+      "bytes": 21894,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/lexical_input_tests.rs",
+      "sha256": "583cf1724ceb58ec63b7368d0c989aadf10a42a62a564cc28dfaff65766e504d",
+      "type": "file"
+    },
+    {
+      "bytes": 30944,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/lexical_staging.rs",
+      "sha256": "53dc09ae09c0d551570de91fb05d14b9df8a893ae6d76faa3f09c1900e33b0c7",
+      "type": "file"
+    },
+    {
+      "bytes": 12588,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/lexical_staging_migration_tests.rs",
+      "sha256": "c3feb9a11ab1d9488f6f17340ce389a2ee9ce68c62f8c5af60e6f6dce2608f6c",
+      "type": "file"
+    },
+    {
+      "bytes": 14197,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/lexical_staging_tests.rs",
+      "sha256": "50926922dbc84859b030b52eb9b2cfe97d804c9c15303a150ff6672a09a4a096",
+      "type": "file"
+    },
+    {
+      "bytes": 37053,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/observation_planning_tests.rs",
+      "sha256": "b5aeb5624744b1b8ca44641cc44f391d0211ce426bfcefab90a2f592552f6840",
+      "type": "file"
+    },
+    {
+      "bytes": 31402,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/ownership.rs",
+      "sha256": "63c6a69bf30bfb6c1a1041048fda449def55383d762de2a43bce1bb93446d1c9",
+      "type": "file"
+    },
+    {
+      "bytes": 10346,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/ownership_migration_tests.rs",
+      "sha256": "48b84e7e6086f4731d452b88630ebab075d643f9fa704134e1bf32226069b654",
+      "type": "file"
+    },
+    {
+      "bytes": 18544,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/ownership_tests.rs",
+      "sha256": "16a97e6fe7a41258ab3dad1a93af540abae5af23d4e49a25bc006458e0cef481",
+      "type": "file"
+    },
+    {
+      "bytes": 19831,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/read_session.rs",
+      "sha256": "1f051b6d4fd8b31245712837e5de60ee563477d0b10a0c50722bbaac100ba8d5",
+      "type": "file"
+    },
+    {
+      "bytes": 26700,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/read_session_tests.rs",
+      "sha256": "0093c283649190dbbdef80178934f4ed71255fd62c70daf797e3c763caa22e29",
+      "type": "file"
+    },
+    {
+      "bytes": 11685,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/semantic_input.rs",
+      "sha256": "879b758fcdf54b79592d357fe342e7ab369135ed5c0b200331b27fdb7c6bc314",
+      "type": "file"
+    },
+    {
+      "bytes": 15972,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/semantic_input_tests.rs",
+      "sha256": "f62090d250daf39222590f5c175dc087e65f9639cdba122c8f82d6364370794d",
+      "type": "file"
+    },
+    {
+      "bytes": 35413,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/semantic_staging.rs",
+      "sha256": "c8e565d99156fd1f493314b72f6e54c69eb1155c4f48c7fdea016c67c406a151",
+      "type": "file"
+    },
+    {
+      "bytes": 13748,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/semantic_staging_migration_tests.rs",
+      "sha256": "c48ccb66c80cdb97a7ab222ca9b69a052e779faec70e2b9be14516678b52d869",
+      "type": "file"
+    },
+    {
+      "bytes": 23329,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/semantic_staging_tests.rs",
+      "sha256": "1b9f5186d957053da80a0df1f83cc47b8b55d23356bde6ef299f36625cfd82a8",
+      "type": "file"
+    },
+    {
+      "bytes": 18388,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/storage/sqlite/settings_tests.rs",
+      "sha256": "8cafb19937842718f468a51d0b37dbf074813c0148b55de3c8fd83a2d17b03a8",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/src/worker",
+      "type": "directory"
+    },
+    {
+      "bytes": 78888,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/broker.rs",
+      "sha256": "a70d80555953e4bd3c1dff4637e60be47dfc9c2ef50ccf98bda01abdfd60652e",
+      "type": "file"
+    },
+    {
+      "bytes": 45328,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/client.rs",
+      "sha256": "6edd7e76e7afbf771078a9d6d586d1a63bdc2fd6bc53833a194b9961d860523b",
+      "type": "file"
+    },
+    {
+      "bytes": 28002,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/context.rs",
+      "sha256": "5b2f1c746d111e20c27c34ccec060c9997d9952959ffa1b6ad295de2865fe059",
+      "type": "file"
+    },
+    {
+      "bytes": 16713,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/gate.rs",
+      "sha256": "ef5b5f75f31dfb8c7da02d05dcde7738e38340a0e05b80989edfa1e3744990fd",
+      "type": "file"
+    },
+    {
+      "bytes": 10423,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/git_probe.rs",
+      "sha256": "fdc0c442c8f4265cdff456eb47cb5548f17f550545c189c5ca7d886ad79d0010",
+      "type": "file"
+    },
+    {
+      "bytes": 2833,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/mod.rs",
+      "sha256": "d2d8c87227dfedc9d8b5dd48d54a573e8e132f379715e1317cb48224832b7c4b",
+      "type": "file"
+    },
+    {
+      "bytes": 20982,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/src/worker/run.rs",
+      "sha256": "adfeb54606322cc14d5e6524e098370cf8bb359f47e5cb31e30fed6df91cb4ef",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests",
+      "type": "directory"
+    },
+    {
+      "bytes": 18855,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/agent_e2e.rs",
+      "sha256": "c27fa3244de3d5bfd37366f3d778079c9f9db8a87775e2a4029e70046d226fe6",
+      "type": "file"
+    },
+    {
+      "bytes": 31538,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/broker.rs",
+      "sha256": "d903a5a7b037daca735b116842cdfad397f52b9368811dcc87333475805b57ca",
+      "type": "file"
+    },
+    {
+      "bytes": 40982,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/broker_mcp.rs",
+      "sha256": "bf4b95258dbc85fb047819801bff262ea784d5390340d8cb6c9ef9cd8bb3f660",
+      "type": "file"
+    },
+    {
+      "bytes": 29272,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/cli.rs",
+      "sha256": "513f1d2eaf5b09ad7af5daee9f9c46adcf904259fde47246ce5213abc86ba8e6",
+      "type": "file"
+    },
+    {
+      "bytes": 16620,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/code_classification.rs",
+      "sha256": "2edc1d6e0c5d907ec738e8d15f67f44157b6903225429c7e0f00d45bf10363cf",
+      "type": "file"
+    },
+    {
+      "bytes": 11554,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/code_readers_agree.rs",
+      "sha256": "dee7e755e89bf748a5a45604ec7c5e558795eed5d10cbc63333ce4adb50be597",
+      "type": "file"
+    },
+    {
+      "bytes": 9835,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/code_search.rs",
+      "sha256": "a03cbb8f6e485cac464bdd98d56dfb9dafb772a2cf86a1a33677c47cdf07fa21",
+      "type": "file"
+    },
+    {
+      "bytes": 2270,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/code_structure.rs",
+      "sha256": "6f80d9f9bbe04dd5e2b92a6d9b9d4a308aba3e52fe9d2538e1fb2053a8d5a63d",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/common",
+      "type": "directory"
+    },
+    {
+      "bytes": 6345,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/common/mod.rs",
+      "sha256": "6d23d0123b5a74b2fb328e5f88033c301fc39ca46c305839febec051586246ea",
+      "type": "file"
+    },
+    {
+      "bytes": 37815,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/context_exchange.rs",
+      "sha256": "36d5b0902ede78e5513c05495472d75fc13b3b7137e9a75d7ef5997e2e68c448",
+      "type": "file"
+    },
+    {
+      "bytes": 50076,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/doctor.rs",
+      "sha256": "5c42bcc369ee9515b1c2e9e8d5e7481d590bc9820ae4b67ccf8cc9d31921e48f",
+      "type": "file"
+    },
+    {
+      "bytes": 7667,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/document_chunking.rs",
+      "sha256": "b0f4e92a16b36006092915c72c0ec216482fe7b76b0fb715e1062b107b52dc24",
+      "type": "file"
+    },
+    {
+      "bytes": 24954,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/document_chunks.rs",
+      "sha256": "157d8c1c9e3b4be2a42fb2d3fcdaaa0715970318dcd721c2d4bde6e3f3248cb9",
+      "type": "file"
+    },
+    {
+      "bytes": 72350,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/document_ingest.rs",
+      "sha256": "7a6e40f1662692b57347152905fca332860abc2c962a3a6d9e8acb4dda142ffb",
+      "type": "file"
+    },
+    {
+      "bytes": 64663,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/document_model.rs",
+      "sha256": "f2c8527775e9ebcfe625bfdfc50fa5ec799949eca0fadbcbd58dac3ee57d7813",
+      "type": "file"
+    },
+    {
+      "bytes": 34923,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/document_preparation_admin.rs",
+      "sha256": "ebffc6604fd44b52cd0cf32164eb233ad86dd8ece8a39fab5f0f80b5dd3371a0",
+      "type": "file"
+    },
+    {
+      "bytes": 37379,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/embeddings.rs",
+      "sha256": "3d8017bcb2e9330c75e87d3a0c8e8c02af6ec62ba1cf90500344595f0696992e",
+      "type": "file"
+    },
+    {
+      "bytes": 22218,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/extraction_split.rs",
+      "sha256": "4020823903d0bc05b08eaa42c759b771cab7d6bdeb646163f3c2201b994c13f8",
+      "type": "file"
+    },
+    {
+      "bytes": 30063,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/extraction_worker.rs",
+      "sha256": "5bafc696f99e8dc39f62a072b3e260672f6b0aaf96b9ffcc44f32913ade82822",
+      "type": "file"
+    },
+    {
+      "bytes": 14115,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/extractor_version.rs",
+      "sha256": "825d810889eb00f37f10f3849821e0664291f7b4a71a50e203c64f5bab22a7cf",
+      "type": "file"
+    },
+    {
+      "bytes": 48839,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/fence_plan_admin.rs",
+      "sha256": "7a4656433cfa91ee7aaf0a1e8c694d01e5abbcc048a90324cc09d534fcb7d811",
+      "type": "file"
+    },
+    {
+      "bytes": 24620,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/fence_plan_compatibility.rs",
+      "sha256": "76f213d5e3ea46acb33ebaab50c7eac7c3eeda4607df9c0ba794d3014e1aee4a",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/fixtures",
+      "type": "directory"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/fixtures/code",
+      "type": "directory"
+    },
+    {
+      "bytes": 96,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/fixtures/code/recovered_foreign_mod_in_impl.rs",
+      "sha256": "e4430bbb89125420727c18ef23bf179b499202a584c259a2f6ef1d5943a7d4c2",
+      "type": "file"
+    },
+    {
+      "bytes": 711396,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/fixtures/nomic-tokenizer.json",
+      "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+      "type": "file"
+    },
+    {
+      "bytes": 12536,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/frontend_spawn_gate.rs",
+      "sha256": "e4618dcb6b0a4f170c2be43c4874c656633aafb88813193d04c5016fd3d9951b",
+      "type": "file"
+    },
+    {
+      "bytes": 42248,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_broker.rs",
+      "sha256": "bf033640102c8ce85a653319d1c611fca91cf996ab4be9babdb334c785dfdcc9",
+      "type": "file"
+    },
+    {
+      "bytes": 19599,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_broker_mcp.rs",
+      "sha256": "2e0330965c1db2b5a3607182ec97a61012895387352706ee4f9ac39b4c507f26",
+      "type": "file"
+    },
+    {
+      "bytes": 41063,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_confined.rs",
+      "sha256": "589995a75ab476cf588ef2e021c4c6ed2f2935ca6ae6eb098b0a8a10c75a7b8a",
+      "type": "file"
+    },
+    {
+      "bytes": 16272,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_context.rs",
+      "sha256": "00f9ae2380676103368fd37ba04dcd3497272d779c7d3ca7d1934e36309422d0",
+      "type": "file"
+    },
+    {
+      "bytes": 20748,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_hardening.rs",
+      "sha256": "a28ddc461f8574fbb4c58e988ae9090ab6047ad675b1b80cb1e2827bee4df6e7",
+      "type": "file"
+    },
+    {
+      "bytes": 56426,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_ingest.rs",
+      "sha256": "a936b1331c12506f5eff3ac07cf80b43a3d06f9c0b077ae97d6796061c7783ba",
+      "type": "file"
+    },
+    {
+      "bytes": 5535,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_object_format.rs",
+      "sha256": "ab4cd84a0f031800fb275754e6f4b1ed99c2104e3f83ac4c132cae1edfc3152a",
+      "type": "file"
+    },
+    {
+      "bytes": 18165,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_persist_atomicity.rs",
+      "sha256": "9aa8fd1e41982c2e39d20101564796b108eeea8974e89071088600c1ce5b665b",
+      "type": "file"
+    },
+    {
+      "bytes": 11581,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_trust.rs",
+      "sha256": "a4f03aa44e5e9d3cfa2ae9b730ef3eb7b206211992eaf6f928d78bd6d5c7aec5",
+      "type": "file"
+    },
+    {
+      "bytes": 48322,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/git_verified.rs",
+      "sha256": "d1353d2fe2932131e4383c438fd7e6793b698e94e6bcf4d1df739af96bc6c5f7",
+      "type": "file"
+    },
+    {
+      "bytes": 35143,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/grants.rs",
+      "sha256": "179acb7a5aed1a54f8f98e1522323441e3ab53dd351354534122b499cb791be1",
+      "type": "file"
+    },
+    {
+      "bytes": 21142,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/indexing.rs",
+      "sha256": "6b842477caf763bc138953f2344428df01e50e8cef880efb836715b1a43cd6ce",
+      "type": "file"
+    },
+    {
+      "bytes": 40347,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/ingest_confinement.rs",
+      "sha256": "1e509446035c328c4892e79249d263b1ca4c953c164bffe807c3657ef8ba7824",
+      "type": "file"
+    },
+    {
+      "bytes": 30629,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/invariants.rs",
+      "sha256": "9b9d3bc5ad0ad8bac135ee8bf27600926f8e63cc4526d59acdc43cfb006586ed",
+      "type": "file"
+    },
+    {
+      "bytes": 58733,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/lexical_staging_admin.rs",
+      "sha256": "43fba560911ad4be29643a49b20d19be4da569cfb8295db6bbb5b12c5f47cdc5",
+      "type": "file"
+    },
+    {
+      "bytes": 21259,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/lifecycle.rs",
+      "sha256": "fb40c9130890f1dea286e9208f10f28789668459529729a4ef427a5bd64a991e",
+      "type": "file"
+    },
+    {
+      "bytes": 32896,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/m6_temporal.rs",
+      "sha256": "567bdc1155b54eb7cfa9a512fcb78c934e706bb0a96c5fe558d4ad752cd9f67a",
+      "type": "file"
+    },
+    {
+      "bytes": 17501,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/manual_memory.rs",
+      "sha256": "e480b188759f7c1b3d5eaacc62cb56b5fb34df680e4b1095c21024a135c46d21",
+      "type": "file"
+    },
+    {
+      "bytes": 25240,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/mcp.rs",
+      "sha256": "a2d1de336fe7e98de9d77ea8e04fa6f5121fd410cba3b13f6af33ea0ee92e159",
+      "type": "file"
+    },
+    {
+      "bytes": 16651,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/mcp_allowlist_modes.rs",
+      "sha256": "160cf2fd96830699fee7c678f6467c12ee41ca1f13e7210c9492c988d8285182",
+      "type": "file"
+    },
+    {
+      "bytes": 41243,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/mcp_git_isolated.rs",
+      "sha256": "f3aceb7aede7d0a42d3ac955cfb2c07192073617b35e07597c43e6db01027290",
+      "type": "file"
+    },
+    {
+      "bytes": 18084,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/mcp_ingest_timeout.rs",
+      "sha256": "814fe742a4fb7a805067e64bc0b2d076d5ed2364284f058c14817c7b0d855f9c",
+      "type": "file"
+    },
+    {
+      "bytes": 72153,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/mcp_isolated.rs",
+      "sha256": "da9b8420f2cd0d4092937162ce9f76cdaa66265cd719cc2354078b2b71925c8b",
+      "type": "file"
+    },
+    {
+      "bytes": 9287,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/mcp_repo_tools.rs",
+      "sha256": "b83e6aead71200badbf13b9bf7fb5c29aeb3b2386a8cafe5d678f43a2bc9d61a",
+      "type": "file"
+    },
+    {
+      "bytes": 8551,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/models.rs",
+      "sha256": "cdf32ec0536583cdeb36b34143d3ce445c93798fbb8cf6558a67b8fa34872840",
+      "type": "file"
+    },
+    {
+      "bytes": 25317,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/old_client_adversarial.rs",
+      "sha256": "c4dfa9c3e326934398033ce72ac551a3e3d38262a528252b38473e61516eb845",
+      "type": "file"
+    },
+    {
+      "bytes": 41988,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/ownership_admin.rs",
+      "sha256": "5d9b6bbe9fbffd39bc3a492ce45a1627c2f6acb750f83f6beb09c621968d9e71",
+      "type": "file"
+    },
+    {
+      "bytes": 3579,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/parser_safety.rs",
+      "sha256": "0425d748d09775713e57a77ac3b7011088d875961f5d6338559d1d01486e8e58",
+      "type": "file"
+    },
+    {
+      "bytes": 6588,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/paths.rs",
+      "sha256": "a10b41206194b29c95bd0e6fe807ebdbda83a91024231bc45568ef7f2f2bd6c8",
+      "type": "file"
+    },
+    {
+      "bytes": 9686,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/persist_atomicity.rs",
+      "sha256": "99006f9fa6b54dbc45145d7948fab5386f5f5a90cf38b554c8a0745c7bc7aaa3",
+      "type": "file"
+    },
+    {
+      "bytes": 16960,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/placeholder_provenance.rs",
+      "sha256": "b9b824116e5d405cd5fa6fd6e1980a6f1295aee0fbed23f98e25fa951347217a",
+      "type": "file"
+    },
+    {
+      "bytes": 17670,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/private_sqlite.rs",
+      "sha256": "40c7f8a0a5d77bc262def322190fe3d223474288818d1b2ccee5c84b901d6131",
+      "type": "file"
+    },
+    {
+      "bytes": 49087,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/record_stream.rs",
+      "sha256": "d60376d5c22c4df9ce7a3d24732c0aeab83c3807d31a025aea906e93208be75d",
+      "type": "file"
+    },
+    {
+      "bytes": 10122,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/repo_info.rs",
+      "sha256": "bb23c26fd9278695c066d820545afa8d42360b2f472e8def43e84b69e63c24f1",
+      "type": "file"
+    },
+    {
+      "bytes": 62278,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/retrieval.rs",
+      "sha256": "d7ab18b70b09ed9d6d09c1ecf0c60291b2765f08faaef088f2d646092b2d1916",
+      "type": "file"
+    },
+    {
+      "bytes": 14231,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/sandbox_failure_modes.rs",
+      "sha256": "351b3fa8482ee9c54b3a23fc7c0e6f0d1714dee83af01b0fd70bca95d52482f0",
+      "type": "file"
+    },
+    {
+      "bytes": 5323,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/scan_select.rs",
+      "sha256": "ca2f9d887d05a589a736afb98f3d2879aad67ced4de8e0328d599a502d94490b",
+      "type": "file"
+    },
+    {
+      "bytes": 12167,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/scopes.rs",
+      "sha256": "fb5089b12014abe09794665611e4c0bc2d1332823d5ba9ad47319731d3482b39",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/scripts",
+      "type": "directory"
+    },
+    {
+      "bytes": 3703,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/scripts/systemd_git_containment.sh",
+      "sha256": "e2b1c9af58c5430ee7a229e25d18393beee9519dd275cad7141c7bf96166e48b",
+      "type": "file"
+    },
+    {
+      "bytes": 3490,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/scripts/systemd_git_mcp.sh",
+      "sha256": "187cab3bc992833f727b8f5be85317405f2552e11610a86f33a3f712498fddd1",
+      "type": "file"
+    },
+    {
+      "bytes": 2980,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/scripts/systemd_unit_containment.sh",
+      "sha256": "ccb0eb0717d7b08e2ab3dbccd09443374cc6193bf92fc4cd206d79268ad53141",
+      "type": "file"
+    },
+    {
+      "bytes": 30415,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/seccomp_compat.rs",
+      "sha256": "7b3a8fcd5208c4bcd5406f74b2f296074d5a555cd9aba7c61df0c874ef81b7da",
+      "type": "file"
+    },
+    {
+      "bytes": 34247,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/seccomp_isolation.rs",
+      "sha256": "2221529f30e5e6c23df5b9612836edf11d54b49caa4fdf645b6c151632b1c1c3",
+      "type": "file"
+    },
+    {
+      "bytes": 60842,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/semantic_staging_admin.rs",
+      "sha256": "304e4ca294b0e8bfc88a3230c15148920391fa55af0d44e5feacea555ffe094d",
+      "type": "file"
+    },
+    {
+      "bytes": 66005,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/setup.rs",
+      "sha256": "11adda77a36867a52999edbfae87dc8dde15df39cbea579be117fff44d4176e9",
+      "type": "file"
+    },
+    {
+      "bytes": 14852,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/signal_isolation.rs",
+      "sha256": "d19ce883b13fd96363c3da9248d16f8fb92cf279a3f7f4bf6d85f17f6b3ef8f0",
+      "type": "file"
+    },
+    {
+      "bytes": 22646,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/sqlite_adversarial.rs",
+      "sha256": "ce6c0db01d6f1bdca6115ec76d2ef45ff6ccce131e70404cbfe083691aa0bda8",
+      "type": "file"
+    },
+    {
+      "bytes": 891,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/sqlite_security.rs",
+      "sha256": "4113dd2f43c4cbeba04323c0bec78511e60ed9c97594c6c5498e3082025cad06",
+      "type": "file"
+    },
+    {
+      "bytes": 6043,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/stream_gate.rs",
+      "sha256": "d65ae16dc4f9f2e9ffb72e4fe4f3116698618f13f445983f8fa5dcca37bc8b83",
+      "type": "file"
+    },
+    {
+      "bytes": 20115,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/structural_policy.rs",
+      "sha256": "d9597c0b5fbf3de79a6b83fbde31f5e2d6a7ebc92970d66f6b58823ec6bee073",
+      "type": "file"
+    },
+    {
+      "bytes": 0,
+      "mode": "0755",
+      "path": "mindspace-0.1.0-alpha.1/tests/support",
+      "type": "directory"
+    },
+    {
+      "bytes": 10541,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/support/adversarial_common.rs",
+      "sha256": "f51d3fd2bffc398102661099d48e94aed461d82f4ac765e29764cdeedbb34b63",
+      "type": "file"
+    },
+    {
+      "bytes": 9725,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/support/schema_fixture.rs",
+      "sha256": "1fa1987db29cad22680df93bcd4ed788661fe3a46fa4bcfdde7e1795aaafd49e",
+      "type": "file"
+    },
+    {
+      "bytes": 5591,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tests/token_budget.rs",
+      "sha256": "fcf15a3fc9d3f2adc0e3d65879bf37ade7c2638a1a9807d136518235e657fbdd",
+      "type": "file"
+    },
+    {
+      "bytes": 646,
+      "mode": "0644",
+      "path": "mindspace-0.1.0-alpha.1/tokenizer-provenance.json",
+      "sha256": "c31ad30c990816f033ac22ae5391a7d702a7cf9030f1bc95f6b338c3406fc0a4",
+      "type": "file"
+    }
+  ],
+  "normalization": {
+    "format": "ustar",
+    "gid": 0,
+    "gzip_filename": "",
+    "gzip_level": 9,
+    "gzip_mtime": 0,
+    "tar_mtime_epoch": 1794538594,
+    "uid": 0
+  },
+  "publication": "local qualification only; publication not authorized",
+  "source": "Every member is an exact regular Git blob from baseline.commit; no overlays.",
+  "version": "0.1.0-alpha.1"
+}

@@ -276,7 +276,7 @@ inspect_existing() { # PREFIX EXPECTED_VERSION; never execute a binary with a mi
     # Never follow a linked bin directory to perform this inspection.
     for directory in "$iprefix" "$iprefix/bin"; do
         if [ "$directory" != "$iprefix" ]; then
-            [ -d "$directory" ] && [ ! -L "$directory" ] || continue
+            if [ ! -d "$directory" ] || [ -L "$directory" ]; then continue; fi
         fi
         for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
             [ -e "$entry" ] || [ -L "$entry" ] || continue

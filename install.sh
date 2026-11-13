@@ -160,7 +160,7 @@ case "${HOME:-}" in
     /*) ;;
     *) die "HOME must be set to an absolute path." ;;
 esac
-[ -d "$HOME" ] && [ -w "$HOME" ] || die "HOME ($HOME) is not a writable directory."
+if ! [ -d "$HOME" ] || ! [ -w "$HOME" ]; then die "HOME ($HOME) is not a writable directory."; fi
 PREFIX=$HOME/.local/lib/mindspace/$VERSION
 
 # Never overwrite or reuse an existing install. Check before any download.
@@ -176,7 +176,7 @@ fi
 # parent directory of the build, and anybody who can write one of them (for example /tmp/.cargo on a
 # shared machine) could make the build run their code. Refuse to build below such a directory.
 TMP_BASE=${TMPDIR:-/tmp}
-[ -d "$TMP_BASE" ] && [ -w "$TMP_BASE" ] || die "temporary directory $TMP_BASE is not writable (set TMPDIR)."
+if ! [ -d "$TMP_BASE" ] || ! [ -w "$TMP_BASE" ]; then die "temporary directory $TMP_BASE is not writable (set TMPDIR)."; fi
 TMP_BASE=$(cd "$TMP_BASE" && pwd -P) || die "cannot resolve the temporary directory $TMP_BASE."
 if [ "$VERIFY_ONLY" != 1 ]; then
     d=$TMP_BASE
@@ -300,7 +300,9 @@ sha_of() { sha256sum "$1" | awk '{print $1}'; }
 while read -r want_sum want_size name; do
     dest=$WORK/assets/$name
     if [ -n "$ASSETS_DIR" ]; then
-        [ -f "$ASSETS_DIR/$name" ] && [ ! -L "$ASSETS_DIR/$name" ] || die "$ASSETS_DIR/$name is missing (or is a link). All seven assets are required."
+        if ! [ -f "$ASSETS_DIR/$name" ] || [ -L "$ASSETS_DIR/$name" ]; then
+            die "$ASSETS_DIR/$name is missing (or is a link). All seven assets are required."
+        fi
         cp -- "$ASSETS_DIR/$name" "$dest"
     else
         say "  downloading $name"
@@ -382,7 +384,7 @@ if grep -qv '^[-d]$' "$WORK/types"; then
 fi
 tar -xzf "$WORK/assets/$ARCHIVE" -C "$WORK/src" --no-same-owner --no-same-permissions || die "extraction failed."
 SRC=$WORK/src/$TOPDIR
-[ -f "$SRC/Cargo.toml" ] && [ -f "$SRC/Cargo.lock" ] || die "the archive does not look like the Mindspace source."
+if ! [ -f "$SRC/Cargo.toml" ] || ! [ -f "$SRC/Cargo.lock" ]; then die "the archive does not look like the Mindspace source."; fi
 grep -q "^version = \"$VERSION\"" "$SRC/Cargo.toml" || die "the archive's version is not $VERSION."
 grep -q "^channel = \"$RUST_VERSION\"" "$SRC/rust-toolchain.toml" || die "the archive pins a different Rust toolchain than $RUST_VERSION."
 say "Unpacked to a private temporary directory."

@@ -1,5 +1,12 @@
 # Source installation and operator guide
 
+**New here?** Use the [install guide](install.md): `sh install.sh` does the verification and build
+below for you. This page is the operator reference: manual signature verification (section 1), build
+requirements (2 and 3), configuration and data locations (5), a complete demo and the MCP manual
+example (6 to 9), backup, restore and upgrade STOP rules (10), and limits, troubleshooting and
+uninstall (11). The command blocks on this page are POSIX `sh`, not Fish syntax: run them in `sh`
+or bash, or save a block to a file and run it with `sh`.
+
 This guide covers the **v0.1.0-alpha.1 Legacy/Git Public Alpha profile**: local
 Linux x86_64 SQLite storage, lexical retrieval, explicit memories, legacy
 Markdown/text and committed Git content. Canonical document/PDF ingestion and M8
@@ -9,7 +16,9 @@ Use the explicitly attached RC.5 archive from the
 [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). Public main and GitHub-generated source archives are
 older code; the release tag points to the older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`.
 These instructions are adapted from the qualified RC.5 documentation. The archive
-retains its original preparation-status wording and unchanged signed bytes.
+retains its original preparation-status wording and unchanged signed bytes. That wording
+("unpublished", "candidate", "no public reporting destination") is historical; the current
+statements are in this repository's documentation.
 
 ## 1. Obtain and verify the source archive
 

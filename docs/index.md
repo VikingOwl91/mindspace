@@ -1,7 +1,7 @@
 # Alpha documentation
 
-Start with the [README](../README.md), then [verify and install the RC.5 source
-archive](source-install.md) from the
+Start with the [README](../README.md), then the [install guide](install.md): `sh install.sh` verifies
+and builds the RC.5 source archive from the
 [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
 Public main contains an older implementation plus these documentation updates.
 The release tag points to the older hosting commit
@@ -10,7 +10,8 @@ do not identify or contain the qualified RC.5 implementation. The former
 `v0.2.0` and `v0.3.0` pre-alpha releases and their tags have been removed;
 `v0.1.0-alpha.1` is the only published release.
 
-- [Installation, verification and uninstall](source-install.md)
+- [Install guide: the installer, the trust decision, troubleshooting](install.md)
+- [Operator reference: manual verification, build requirements, backup and recovery, uninstall](source-install.md)
 - [CLI, configuration and manual MCP examples](reference.md)
 - [Client setup and undo](setup.md)
 - [Release notes and excluded capabilities](release-notes.md)
@@ -20,7 +21,7 @@ do not identify or contain the qualified RC.5 implementation. The former
 - [MIT license](../LICENSE) and [archive third-party notices](../THIRD_PARTY_NOTICES.md)
 
 The README has a short quickstart against your own repository. The install
-guide (sections 6 to 9) includes the complete temporary Git-repository demo and a
+operator reference (sections 6 to 9) includes the complete temporary Git-repository demo and a
 standalone Python/stdio MCP memory example, so an AI account is not required. Execute examples against the verified archive build, not a build
 of older public main.
 

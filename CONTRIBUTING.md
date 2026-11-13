@@ -3,7 +3,7 @@
 Public main has older implementation code than the qualified RC.5 Alpha archive.
 For the first independently qualified public Alpha baseline, use the
 [official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
-and the [install guide](docs/source-install.md). A clone or generated source ZIP is older code; its
+and the [install guide](docs/install.md). A clone or generated source ZIP is older code; its
 builds/tests are not RC.5 qualification. Contributor instructions below describe
 that public implementation. Report vulnerabilities through the [private channel](SECURITY.md).
 
@@ -20,6 +20,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo deny check advisories licenses bans sources     # config: deny.toml (no ignored advisories)
 cargo audit
 python3 scripts/check-doc-links.py                    # relative links and anchors in the Markdown files
+sh tests/scripts/install_sh_test.sh                   # release installer, no build; needs network (--with-build also builds)
+shellcheck -s sh install.sh                           # POSIX shell lint of the installer
 ```
 
 Linux is the only tested platform.

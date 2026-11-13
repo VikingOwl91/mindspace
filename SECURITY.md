@@ -16,7 +16,7 @@ reports the same version. The supported profile is Linux x86_64, built from
 source without embeddings.
 Install the Alpha from the
 [official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
-using the [source-install guide](docs/source-install.md). The named release asset
+using the [install guide](docs/install.md). The named release asset
 is the authoritative source. The release tag and GitHub's generated "Source code"
 archives contain older code.
 
@@ -56,6 +56,7 @@ valuable:
 - writing into a root marked `:ro`;
 - the sandbox reporting `enforced` when it is not;
 - running code from a repository (hooks, configuration, Git helpers);
+- a flaw in `install.sh` that lets a modified, unsigned or wrongly signed release be built or installed;
 - data from outside the roots ending up in the database or in a tool result.
 
 ## Out of scope

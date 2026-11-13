@@ -58,6 +58,13 @@ detached signatures under the pinned signer and both strict checksum checks. A
 bundled public key or checksum alone does not authenticate the publisher. The
 instructions explain independent publisher/domain trust and WKD key retrieval.
 
+The `install.sh` script on public `main` automates these checks, builds the verified
+archive with Rust 1.98.1 and installs one binary; see the [install guide](install.md).
+It pins the same hashes and the same key fingerprint, and it asks you to confirm
+that fingerprint. The manual steps in `VERIFY.txt` and the
+[operator reference](source-install.md#1-obtain-and-verify-the-source-archive) remain
+valid.
+
 The signed manifest binds these archive bytes and its 235 source files to source
 commit `a027d94680392648b6277dc2fd9bc20906114b91`, tree
 `3cc15658d9c840522cbff102b44f6d004d5506bf`. Local qualification was recorded at

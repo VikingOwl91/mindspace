@@ -1424,8 +1424,11 @@ mod tests {
         assert_eq!(g.path, std::fs::canonicalize(&repo).unwrap());
         let res = resolve_for_start(&store, &pol, now());
         assert_eq!(res.roots.len(), 1);
-        // replace the approved directory by another one at the same path
-        std::fs::remove_dir(&repo).unwrap();
+        // replace the approved directory by another one at the same path. The
+        // old one is moved aside, not removed: a freed inode number can be
+        // reused at once (ext4), which would make the new directory look
+        // identical by device/inode.
+        std::fs::rename(&repo, t.path().join("approved-moved")).unwrap();
         std::fs::create_dir(&repo).unwrap();
         let res = resolve_for_start(&store, &pol, now());
         assert!(res.roots.is_empty());

@@ -48,7 +48,8 @@ sh install.sh
 Rust 1.98.1 and installs one binary at
 `~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind`. It asks you to confirm the
 publisher's key fingerprint, never uses `sudo`, never edits your shell or agent
-configuration, and never touches an existing database or install. It needs
+configuration, and never touches an existing database. It is safe to run again: an
+intact install is reported as already up to date and left alone. It needs
 `curl`, `gpg`, a C compiler and Rust 1.98.1
 (`rustup toolchain install 1.98.1 --profile minimal`), and it downloads the locked
 Cargo dependencies into a temporary directory. Run it as `sh install.sh` from Fish

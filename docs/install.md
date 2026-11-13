@@ -9,7 +9,7 @@ manual procedure and the operator reference, see the [source-install guide](sour
 
 - **Linux on x86_64.** Other systems are not qualified.
 - **Tools:** `curl`, `gpg` (GnuPG with `--assert-signer` support; the installer checks), `tar`, `gzip`,
-  `sha256sum`, and a C compiler with C headers (`gcc` or `cc`). Install Git too: ingesting a
+  `sha256sum`, `timeout`, `flock` (util-linux), and a C compiler with C headers (`gcc` or `cc`). Install Git too: ingesting a
   repository needs it.
 - **Rust 1.98.1.** With [rustup](https://rustup.rs): `rustup toolchain install 1.98.1 --profile minimal`.
   The installer checks for it and never installs it for you. It does not use `stable`, and it does not
@@ -62,6 +62,52 @@ What the installer then checks, and stops on any failure:
 The pinned hashes are what binds the installer to exactly these bytes; the signatures show that the
 publisher you confirmed signed them.
 
+## Running it again
+
+You can run the installer as often as you like.
+
+| What it finds | What it does |
+| --- | --- |
+| Nothing | Installs. |
+| An intact install of this version (the binary runs, reports `mind 0.1.0-alpha.1` and matches its install record) | Says `Already up to date`, changes nothing, exits 0. It needs no Rust, no network and no fingerprint. |
+| An install of this version without an install record (made by an earlier installer or by hand) | Checks its layout and reported version; says `Already up to date`, changes nothing, exits 0. It explicitly warns that build authenticity cannot be re-established offline; use `--reinstall` for a freshly verified build. |
+| A directory that is not a valid install (missing or non-executable binary, a binary that reports another version or no longer matches its record, a symbolic link, a file) | Stops with exit 1 and tells you what is wrong. A directory that merely exists is never taken as proof of an install. |
+| A validated older version, with this version absent | Stops with exit 1 and explains `--upgrade`. With that option, installs beside the old version, preserving it. |
+| A newer version installed beside this one | Stops with exit 1 unless the intact install of this version is already there. `--allow-older` installs this version beside the newer one. |
+
+`--reinstall` replaces an existing install of this version, only on request. The replacement is built,
+copied into a private staging directory on the installation filesystem, and checked first. Only then
+is the old directory moved to `~/.local/lib/mindspace/previous/` (kept, not deleted) and the new one put in its place. If anything fails after the move, the old install is moved
+back if its original path is still free; otherwise its backup path is printed for recovery.
+Concurrent installer publication is serialized using a lock on the installation directory. Protected
+prefix content is rechecked after staging. The lock does not coordinate arbitrary same-user programs.
+If interrupted after replacement, the complete new prefix and previous backup are retained; retrying
+validates the new prefix. There is no separate automatic activation step. Catchable signals
+trigger cleanup; SIGKILL or power loss can leave a staging directory or a backup under `previous/`,
+which should be inspected before retrying. Databases, agent configuration and MCP registrations are
+never touched, so a registration made with `mind setup` keeps pointing at the same path. Unexpected files inside a prefix, including
+databases or configuration, block replacement even with `--reinstall`: inspect and back up those files
+first. Linked parent directories are refused. Symlinked files and non-regular receipts are invalid.
+
+Versions are installed side by side, each in `~/.local/lib/mindspace/<version>/`. The installer
+never changes your `PATH` or switches between them, and it never installs an older version over a newer
+one on its own: which `mind` runs is decided by your `PATH`. `--upgrade` stages the requested version
+side by side; it does not activate it. Existing MCP registrations continue to use their original
+versioned binary. Switching PATH or a registration is a separate explicit user action. Prerelease
+ordering follows semantic versioning, so `0.1.0-alpha.2` is newer than `0.1.0-alpha.1`, `0.1.0-alpha.10` is newer than
+`0.1.0-alpha.2`, and `0.1.0` is newer than any `0.1.0-` prerelease.
+
+The `install-record` file in the install directory lists the version, the SHA-256 of the installed
+binary, the archive SHA-256, the source commit and the publisher fingerprint. It catches accidental
+damage or a half-finished copy. It does not protect against someone who can already write to your home
+directory. A receipt is parsed as data, never executed. Recorded binaries are hashed before their
+version command is run; legacy binaries have no receipt to check first. Other version prefixes are
+validated too, and incomplete or invalid ones stop the operation with their path and a reason.
+
+This installer selects only the pinned RC.5 release, version `0.1.0-alpha.1`. `--upgrade` can install
+that version beside a validated older version; it does not discover newer releases. No newer release
+or automatic activation is provided by this option.
+
 ## Optional: check the installer itself
 
 The hashes and the key fingerprint that the installer pins are in `install.sh`, which comes from the
@@ -95,8 +141,8 @@ would read it and it could make the build run someone else's code (set `TMPDIR` 
 directory if `/tmp` or a parent has one).
 
 It never uses `sudo`, never edits shell startup files, never touches Codex or Claude Code
-configuration, never opens or migrates any Mindspace database, and never overwrites an existing
-install: if the versioned directory exists it stops and leaves it alone.
+configuration, never opens or migrates any Mindspace database, and never replaces an existing
+install unless you ask with `--reinstall`.
 
 ## After installing
 
@@ -136,6 +182,9 @@ on your `PATH` means an older binary shadows this one.
 | `--verify-only` | Download and authenticate the release, then stop. Nothing is built or installed. |
 | `--assets-dir DIR` | Use seven assets you downloaded yourself. They are verified exactly like downloaded ones. |
 | `--key-file FILE` | Use a public key file you obtained independently instead of the publisher's domain. |
+| `--upgrade` | Install this version beside validated older versions; preserve binaries and existing registrations. Activation is separate. |
+| `--reinstall` | Replace an existing install of this version, after a successful build. The old one is kept in `~/.local/lib/mindspace/previous/`. |
+| `--allow-older` | Install this version although a newer one is already installed (side by side). |
 | `--keep-work` | Keep the temporary directory for inspection. |
 
 ## If it stops
@@ -146,7 +195,10 @@ on your `PATH` means an older binary shadows this one.
 | `Cargo would read ... while building here` | Set `TMPDIR` to a private directory (mode 700) that has no `.cargo/config.toml` in it or above it, and run it again. |
 | `missing required tools` | Install the named tools with your package manager and run it again. |
 | `Rust 1.98.1 is not installed`, `this Alpha builds with Rust 1.98.1 exactly` | `rustup toolchain install 1.98.1 --profile minimal` (without rustup, `rustc` and `cargo` must both be 1.98.1). |
-| `An installation already exists` | The installer left it untouched. Move or remove that directory yourself to reinstall. |
+| `Already up to date` | Nothing to do. The install is intact. |
+| `it has no install record` | The install runs but cannot be checked. Run `sh install.sh --reinstall` for a verified build. |
+| `is not a valid installation` | The reason is printed. Nothing was changed. `sh install.sh --reinstall` stages a fresh build and preserves the old prefix under `previous/`. Unexpected data must be inspected and backed up first. |
+| `a newer version is already installed` | Update your checkout (`git pull`) for the current installer, or pass `--allow-older`. |
 | `does not match its pinned SHA-256`, `signature check failed`, `invalid, expired, revoked` | Do not use the files. Retry on a different network; if it persists, report it privately (see [SECURITY.md](../SECURITY.md)). |
 | `could not fetch the publisher key` | Retry, or obtain the public key independently and pass `--key-file`. |
 | `the build failed` | The last lines of the build log are printed. Nothing was installed. |
@@ -160,11 +212,12 @@ To authenticate the release without the installer, follow the
 ## Uninstall
 
 ```sh
-rm -- ~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind
+rm -f -- ~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind ~/.local/lib/mindspace/0.1.0-alpha.1/install-record
 rmdir ~/.local/lib/mindspace/0.1.0-alpha.1/bin ~/.local/lib/mindspace/0.1.0-alpha.1
 ```
 
-Databases live elsewhere and are not removed. See the
+Installs replaced by `--reinstall` are in `~/.local/lib/mindspace/previous/`; delete them when you no longer
+want them. Databases live elsewhere and are not removed. See the
 [uninstall and troubleshooting](source-install.md#11-limits-troubleshooting-and-uninstall) reference for
 registrations made with `mind setup`.
 
@@ -175,3 +228,23 @@ the release is "unpublished" or a "candidate", and that there is no public repor
 wording is historical. They cannot be edited without invalidating the signatures. Current
 instructions are the ones in this repository, and vulnerabilities are reported through
 [GitHub private vulnerability reporting](../SECURITY.md#reporting-a-vulnerability).
+
+## Installer regression checks
+
+Run the offline prefix-validation and publication tests with:
+
+```sh
+sh tests/scripts/install_lifecycle_test.sh
+sh tests/scripts/install_publish_test.sh
+```
+
+The publication suite uses a fixture executable and the actual installer helpers and publication
+code; it exercises filesystem changes, rollback, signals and locks. It does not authenticate or build
+a release. It requires Python 3 to extract those sections for testing. The lifecycle suite does not
+need a Rust toolchain. Both run in disposable temporary HOME directories.
+
+`sh tests/scripts/install_sh_test.sh` verifies the real published signatures, integrity refusals and
+other preflight behavior without compiling. Add `--with-build` for real RC.5 builds, installation,
+repeat installation, reinstall, injected staging/publication failures and build interruption. That
+run needs the tools and network described above. Synthetic version-transition tests do not prove
+compatibility with a future unpublished release or a database migration.

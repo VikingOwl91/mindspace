@@ -90,6 +90,12 @@ jobs:
         run: |
           shellcheck -s sh -S warning install.sh
           shellcheck -s sh -S warning tests/scripts/install_sh_test.sh
+          shellcheck -s sh -S warning tests/scripts/install_lifecycle_test.sh
+          shellcheck -s sh -S warning tests/scripts/install_publish_test.sh
+      - name: Installer lifecycle tests (offline)
+        run: sh tests/scripts/install_lifecycle_test.sh
+      - name: Installer publication tests (offline fixtures)
+        run: sh tests/scripts/install_publish_test.sh
       - name: Installer tests (no build)
         run: sh tests/scripts/install_sh_test.sh
 

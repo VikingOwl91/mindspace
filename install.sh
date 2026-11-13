@@ -10,13 +10,14 @@
 # temporary directory and installs one binary under
 #   $HOME/.local/lib/mindspace/0.1.0-alpha.1/bin/mind
 # What it never does: use sudo, edit shell startup files, touch an agent configuration or an existing
-# database, overwrite an existing install, or fall back to an unverified download.
+# database, replace an existing install without --reinstall, or fall back to an unverified download.
 #
 # Usage:  sh install.sh [--trust-fingerprint FPR] [--verify-only] [--assets-dir DIR]
-#                       [--key-file FILE] [--keep-work] [--help]
+#                       [--key-file FILE] [--upgrade] [--reinstall] [--allow-older] [--keep-work] [--help]
 
 set -eu
 umask 077
+export LC_ALL=C
 
 VERSION=0.1.0-alpha.1
 TAG=v$VERSION
@@ -45,7 +46,8 @@ bcba2140c52fb84befaedba8ae1dfd8b1aa2fb121149a2d6bba5e4736e88879b 680 mindspace-r
 
 WORK=
 PREFIX=
-CREATED_PREFIX=0
+STAGED=
+BACKUP_HOLDER=
 INSTALL_OK=0
 BUILD_PID=
 KEEP_WORK=0
@@ -53,6 +55,14 @@ VERIFY_ONLY=0
 ASSETS_DIR=
 KEY_FILE=
 TRUST_FPR=
+UPGRADE=0
+REINSTALL=0
+ALLOW_OLDER=0
+MOVED_OLD=0
+BACKUP=
+STATE=none
+REASON=
+REPAIRABLE=1
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -73,8 +83,18 @@ Options:
                            downloading them. They are verified exactly like downloaded ones.
   --key-file FILE          Use this public key file, which you obtained independently, instead of
                            fetching the publisher key from the publisher's domain.
+  --upgrade                Install pinned RC.5 beside validated older versions; no discovery or activation.
+  --reinstall              Replace an existing installation of this version. Nothing is replaced
+                           until a fresh build has succeeded; the old one is moved to
+                           ~/.local/lib/mindspace/previous/, not deleted. Failure before replacement
+                           restores it if the original path remains free.
+  --allow-older            Install this version although a newer one is already installed. It is
+                           installed beside the newer one; your PATH decides which one runs.
   --keep-work              Keep the temporary working directory (for inspection) when finished.
   -h, --help               Show this text.
+
+Run twice, it does nothing the second time: an installation that is present and intact is reported
+as "Already up to date" and left untouched.
 
 The installer needs: curl, gpg (GnuPG with --assert-signer), tar, gzip, sha256sum, a C compiler and
 Rust 1.98.1. See docs/install.md in the repository for the trust decision and troubleshooting.
@@ -101,11 +121,18 @@ cleanup() {
     if [ -n "$WORK" ] && [ -d "$WORK/gnupg" ] && command -v gpgconf >/dev/null 2>&1; then
         gpgconf --homedir "$WORK/gnupg" --kill all >/dev/null 2>&1 || true
     fi
-    if [ "$CREATED_PREFIX" = 1 ] && [ "$INSTALL_OK" != 1 ] && [ -n "$PREFIX" ]; then
-        rm -f "$PREFIX/bin/mind" "$PREFIX/bin/mind.new" 2>/dev/null || true
-        rmdir "$PREFIX/bin" 2>/dev/null || true
-        rmdir "$PREFIX" 2>/dev/null || true
+    if [ -n "$STAGED" ] && [ -d "$STAGED" ]; then
+        rm -f "$STAGED/bin/mind" "$STAGED/install-record" 2>/dev/null || true
+        rmdir "$STAGED/bin" "$STAGED" 2>/dev/null || true
     fi
+    if [ "$MOVED_OLD" = 1 ] && [ "$INSTALL_OK" != 1 ] && [ -n "$BACKUP" ] && { [ -e "$BACKUP" ] || [ -L "$BACKUP" ]; }; then
+        if ! [ -e "$PREFIX" ] && ! [ -L "$PREFIX" ] && mv -T -- "$BACKUP" "$PREFIX" 2>/dev/null; then
+            say "The previous installation was restored at $PREFIX." >&2
+        else
+            say "The previous installation is kept at $BACKUP. Inspect it before restoring it to $PREFIX." >&2
+        fi
+    fi
+    [ -z "$BACKUP_HOLDER" ] || rmdir "$BACKUP_HOLDER" 2>/dev/null || true
     if [ -n "$WORK" ] && [ -d "$WORK" ]; then
         if [ "$KEEP_WORK" = 1 ]; then
             say "Working directory kept: $WORK"
@@ -144,6 +171,9 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         --verify-only) VERIFY_ONLY=1; shift ;;
+        --upgrade) UPGRADE=1; shift ;;
+        --reinstall) REINSTALL=1; shift ;;
+        --allow-older) ALLOW_OLDER=1; shift ;;
         --keep-work) KEEP_WORK=1; shift ;;
         -h | --help) usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
@@ -161,16 +191,209 @@ case "${HOME:-}" in
     *) die "HOME must be set to an absolute path." ;;
 esac
 if ! [ -d "$HOME" ] || ! [ -w "$HOME" ]; then die "HOME ($HOME) is not a writable directory."; fi
-PREFIX=$HOME/.local/lib/mindspace/$VERSION
+INSTALL_ROOT=$HOME/.local/lib/mindspace
+PREFIX=$INSTALL_ROOT/$VERSION
 
-# Never overwrite or reuse an existing install. Check before any download.
-if [ "$VERIFY_ONLY" != 1 ] && { [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; }; then
-    say "An installation already exists at:"
-    say "  $PREFIX"
-    say "It was left untouched. To reinstall, move or remove that directory yourself first. Your"
-    say "databases are stored elsewhere and are never touched by this installer."
-    exit 1
+MISSING=
+need_cmd() { command -v "$1" >/dev/null 2>&1 || MISSING="$MISSING $1"; }
+for c in sha256sum awk grep tr cut mv date timeout; do need_cmd "$c"; done
+if [ -n "$MISSING" ]; then
+    die "missing required tools:$MISSING. Install them with your system's package manager, then run this again."
 fi
+
+# ---------------------------------------------------------------- 1b. an existing installation
+# Compare two versions (MAJOR.MINOR.PATCH with an optional -prerelease, as in semantic versioning).
+# Prints -1, 0 or 1. A prerelease is lower than the release; numeric identifiers compare as numbers.
+ver_cmp() {
+    awk -v a="$1" -v b="$2" '
+    # Compare unbounded decimal strings without floating point rounding.
+    function numcmp(a, b) {
+        sub(/^0+/, "", a); sub(/^0+/, "", b)
+        if (length(a) != length(b)) return length(a) < length(b) ? -1 : 1
+        return "x" a == "x" b ? 0 : ("x" a < "x" b ? -1 : 1)
+    }
+    function parse(v, o,   i, core) {
+        sub(/\+.*/, "", v)
+        i = index(v, "-")
+        o["has"] = i ? 1 : 0; o["pre"] = i ? substr(v, i + 1) : ""
+        split(i ? substr(v, 1, i - 1) : v, core, ".")
+        o[1] = core[1]; o[2] = core[2]; o[3] = core[3]
+    }
+    function cmp(a, b,   x, y, i, c, n, pa, pb, na, nb, ia, ib, ra, rb) {
+        parse(a, x); parse(b, y)
+        for (i = 1; i <= 3; i++) {c = numcmp(x[i], y[i]); if (c) return c}
+        if (!x["has"] && !y["has"]) return 0
+        if (!x["has"]) return 1
+        if (!y["has"]) return -1
+        na = split(x["pre"], pa, "."); nb = split(y["pre"], pb, ".")
+        n = na < nb ? na : nb
+        for (i = 1; i <= n; i++) {
+            ia = pa[i]; ib = pb[i]
+            ra = (ia ~ /^[0-9]+$/); rb = (ib ~ /^[0-9]+$/)
+            if (ra && rb) {c = numcmp(ia, ib); if (c) return c}
+            else if (ra) return -1
+            else if (rb) return 1
+            else if ("x" ia != "x" ib) return "x" ia < "x" ib ? -1 : 1
+        }
+        return na == nb ? 0 : (na < nb ? -1 : 1)
+    }
+    BEGIN {print cmp(a, b)}'
+}
+
+# Version names are SemVer, including hyphenated prerelease identifiers and build metadata.
+is_version() {
+    printf '%s\n' "$1" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' || return 1
+    printf '%s\n' "$1" | awk '
+        {sub(/\+.*/, ""); sub(/^[^-]*-?/, ""); n=split($0, a, ".")
+         for (i=1; i<=n; i++) if (a[i] ~ /^0[0-9]+$/) exit 1}'
+}
+
+check_install_parents() {
+    for parent in "$HOME/.local" "$HOME/.local/lib" "$INSTALL_ROOT"; do
+        [ ! -L "$parent" ] || die "$parent is a symbolic link. Inspect this installation path before proceeding; nothing was replaced."
+        if [ -e "$parent" ] && [ ! -d "$parent" ]; then
+            die "$parent is not a directory. Inspect this installation path before proceeding."
+        fi
+    done
+}
+
+# Sets STATE to none, valid (intact, with an install record), legacy (runs and reports the right
+# version but has no record) or invalid, and REASON for invalid. A directory that merely exists is
+# never treated as an installation. The record is a consistency check against accidental damage; it
+# is not protection against someone who can already write to your home directory.
+inspect_existing() { # PREFIX EXPECTED_VERSION; never execute a binary with a mismatching receipt.
+    iprefix=$1
+    expected=$2
+    STATE=none
+    REASON=
+    REPAIRABLE=1
+    if ! [ -e "$iprefix" ] && ! [ -L "$iprefix" ]; then return 0; fi
+    STATE=invalid
+    if [ -L "$iprefix" ]; then REASON="it is a symbolic link"; return 0; fi
+    if ! [ -d "$iprefix" ]; then REASON="it is not a directory"; return 0; fi
+    ibin=$iprefix/bin/mind
+    # Check for data before any repairable layout/binary failure returns.
+    # Never follow a linked bin directory to perform this inspection.
+    for directory in "$iprefix" "$iprefix/bin"; do
+        if [ "$directory" != "$iprefix" ]; then
+            [ -d "$directory" ] && [ ! -L "$directory" ] || continue
+        fi
+        for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            case "$entry" in
+                "$ibin" | "$iprefix/install-record")
+                    if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+                        REASON="unexpected directory $entry; inspect and back up its contents before repair"
+                        REPAIRABLE=0
+                        return 0
+                    fi
+                    continue ;;
+                "$iprefix/bin") continue ;;
+            esac
+            REASON="unexpected entry $entry; inspect and back up your data before repairing this prefix"
+            REPAIRABLE=0
+            return 0
+        done
+    done
+    if [ -L "$iprefix/bin" ] || ! [ -d "$iprefix/bin" ]; then
+        REASON="bin is not a real directory; bin/mind is missing or is not a regular file"; return 0
+    fi
+    if [ -L "$ibin" ] || ! [ -f "$ibin" ]; then REASON="bin/mind is missing or is not a regular file"; return 0; fi
+    if ! [ -x "$ibin" ]; then REASON="bin/mind is not executable"; return 0; fi
+    irec=$iprefix/install-record
+    if [ -L "$irec" ]; then REASON="install-record is a symbolic link"; return 0; fi
+    has_record=0
+    if [ -e "$irec" ]; then
+        if ! [ -f "$irec" ]; then REASON="install-record is not a regular file"; return 0; fi
+        # Read as data, never source a receipt; reject duplicates, missing and unknown fields.
+        if ! awk '
+            NR == 1 {if ($0 != "mindspace-install-record 1") bad=1; next}
+            {i=index($0, "="); k=substr($0, 1, i-1); v=substr($0, i+1)
+             if (!i || !length(v) || index(v, "=") || seen[k]++) bad=1
+             if (k == "installed_at" && v !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/) bad=1
+             if (k !~ /^(version|archive_sha256|binary_sha256|source_commit|publisher_fingerprint|installed_at)$/) bad=1}
+            END {if (NR != 7) bad=1; exit bad ? 1 : 0}' "$irec"; then
+            REASON="install-record has an unknown format"; return 0
+        fi
+        rv=$(awk -F= '$1 == "version" {print $2}' "$irec")
+        ra=$(awk -F= '$1 == "archive_sha256" {print $2}' "$irec")
+        rb=$(awk -F= '$1 == "binary_sha256" {print $2}' "$irec")
+        rf=$(awk -F= '$1 == "publisher_fingerprint" {print $2}' "$irec")
+        rc=$(awk -F= '$1 == "source_commit" {print $2}' "$irec")
+        if [ "$rv" != "$expected" ] || [ "$rf" != "$FPR" ] ||
+            { [ "$expected" = "$VERSION" ] && { [ "$ra" != "$ARCHIVE_SHA" ] || [ "$rc" != "$MANIFEST_COMMIT" ]; }; }; then
+            REASON="install-record describes a different version or build"; return 0
+        fi
+        if ! printf '%s\n' "$ra" | grep -Eq '^[0-9a-f]{64}$' ||
+            ! printf '%s\n' "$rc" | grep -Eq '^[0-9a-f]{40}$'; then
+            REASON="install-record has an unknown format"; return 0
+        fi
+        if [ "$rb" != "$(sha256sum "$ibin" | awk '{print $1}')" ]; then
+            REASON="bin/mind no longer matches its install record (modified or damaged)"; return 0
+        fi
+        has_record=1
+    fi
+    igot=$(timeout -k 1 10 "$ibin" --version 2>/dev/null) || igot=
+    if [ "$igot" != "mind $expected" ]; then
+        REASON="bin/mind does not run, or reports '${igot:-nothing}' instead of 'mind $expected'"
+        return 0
+    fi
+    STATE=legacy
+    [ "$has_record" = 0 ] || STATE=valid
+}
+
+check_existing() {
+    check_install_parents
+    inspect_existing "$PREFIX" "$VERSION"
+    if [ "$REINSTALL" != 1 ]; then
+        case "$STATE" in
+            valid | legacy)
+                say "Already up to date: mind $VERSION runs at $PREFIX/bin/mind. Nothing was changed."
+                if [ "$STATE" = legacy ]; then
+                    say "It has no install record: legacy validation checks its layout and reported version only."
+                    say "Its build authenticity cannot be re-established offline. For a freshly verified build, run: sh install.sh --reinstall"
+                else
+                    say "It matches its install record (a local consistency check, not independent authentication)."
+                fi
+                exit 0
+                ;;
+            invalid)
+                say "$PREFIX is not a valid installation: $REASON." >&2
+                say "Nothing was replaced. Inspect and back up this prefix first." >&2
+                say "For a prefix containing only installer files, run: sh install.sh --reinstall" >&2
+                say "The previous installation is kept under $INSTALL_ROOT/previous/, not deleted." >&2
+                exit 1
+                ;;
+        esac
+    fi
+    NEWER=
+    OLDER=
+    # Validate sibling installations too; names alone cannot authorize a version transition.
+    for d in "$INSTALL_ROOT"/*; do
+        [ -e "$d" ] || [ -L "$d" ] || continue
+        n=${d##*/}
+        is_version "$n" || continue
+        [ "$n" = "$VERSION" ] && continue
+        inspect_existing "$d" "$n"
+        [ "$STATE" != invalid ] || die "$d is not a valid installation: $REASON. Inspect and back up that prefix before retrying; nothing was replaced."
+        if [ "$(ver_cmp "$n" "$VERSION")" = 1 ]; then NEWER="$NEWER $n"; else OLDER="$OLDER $n"; fi
+    done
+    inspect_existing "$PREFIX" "$VERSION"
+    [ "$REPAIRABLE" = 1 ] || die "$PREFIX is not a valid installation: $REASON. Nothing was replaced."
+    [ -z "$NEWER" ] || say "Newer versions installed:$NEWER"
+    [ -z "$OLDER" ] || say "Older versions installed:$OLDER"
+    if [ -n "$NEWER" ] && [ "$ALLOW_OLDER" != 1 ]; then
+        die "a newer version is already installed ($NEWER). Nothing was replaced. Obtain the current installer, or use --allow-older to install $VERSION beside it; PATH and MCP registrations remain unchanged."
+    fi
+    if [ -n "$OLDER" ] && [ "$UPGRADE" != 1 ] && [ "$STATE" = none ]; then
+        die "an older installation exists ($OLDER). Run sh install.sh --upgrade to install $VERSION beside it. Previous binaries, PATH and MCP registrations are preserved."
+    fi
+    if [ "$REINSTALL" = 1 ] && [ "$STATE" != none ]; then
+        say "--reinstall: after staging and verification the existing installation is moved to $INSTALL_ROOT/previous/, not deleted."
+    fi
+}
+
+if [ "$VERIFY_ONLY" != 1 ]; then check_existing; fi
 
 # A relative TMPDIR would break the build; resolve it. Cargo reads a .cargo/config.toml from every
 # parent directory of the build, and anybody who can write one of them (for example /tmp/.cargo on a
@@ -193,11 +416,10 @@ if [ "$VERIFY_ONLY" != 1 ]; then
 fi
 
 MISSING=
-need_cmd() { command -v "$1" >/dev/null 2>&1 || MISSING="$MISSING $1"; }
-for c in sha256sum tar gzip gpg awk grep sed tr cmp cut cp mv mktemp install df wc; do need_cmd "$c"; done
+for c in tar gzip gpg sed cmp cp mktemp install df wc; do need_cmd "$c"; done
 [ -n "$ASSETS_DIR" ] || need_cmd curl
 if [ "$VERIFY_ONLY" != 1 ]; then
-    for c in setsid env tail sleep; do need_cmd "$c"; done
+    for c in setsid env tail sleep flock; do need_cmd "$c"; done
     if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
         MISSING="$MISSING cc(C-compiler)"
     fi
@@ -430,15 +652,51 @@ say "Built: $GOT_VERSION"
 # ---------------------------------------------------------------- 7. install
 step "Installing"
 
-(umask 022 && mkdir -p "$HOME/.local/lib/mindspace") || die "cannot create $HOME/.local/lib/mindspace."
-mkdir -m 700 "$PREFIX" 2>/dev/null || die "$PREFIX appeared meanwhile; it was left untouched."
-CREATED_PREFIX=1
-mkdir -m 700 "$PREFIX/bin"
-install -m 0755 "$BIN" "$PREFIX/bin/mind.new"
-mv "$PREFIX/bin/mind.new" "$PREFIX/bin/mind"
-[ "$("$PREFIX/bin/mind" --version 2>/dev/null)" = "mind $VERSION" ] || die "the installed binary does not report 'mind $VERSION'."
-INSTALLED_SHA=$(sha_of "$PREFIX/bin/mind")
+# Lock the real directory inode, avoiding a lock file on the read-only repeat path.
+check_install_parents
+(umask 022 && mkdir -p "$INSTALL_ROOT") || die "cannot create $INSTALL_ROOT."
+exec 9<"$INSTALL_ROOT"
+flock -n 9 || die "another installer is publishing into $INSTALL_ROOT. Let it finish, then retry."
+# Repeat all checks under the publication lock: an install may have appeared during the build.
+check_existing
+STAGED=$(mktemp -d "$INSTALL_ROOT/.install.XXXXXX") || die "cannot stage the installation."
+mkdir -m 700 "$STAGED/bin"
+install -m 0755 "$BIN" "$STAGED/bin/mind" || die "cannot stage the binary; the previous installation is untouched."
+[ "$("$STAGED/bin/mind" --version 2>/dev/null)" = "mind $VERSION" ] || die "the staged binary does not report 'mind $VERSION'."
+INSTALLED_SHA=$(sha_of "$STAGED/bin/mind")
+[ "$INSTALLED_SHA" = "$(sha_of "$BIN")" ] || die "the staged binary differs from the verified build."
+{
+    printf 'mindspace-install-record 1\n'
+    printf 'version=%s\n' "$VERSION"
+    printf 'binary_sha256=%s\n' "$INSTALLED_SHA"
+    printf 'archive_sha256=%s\n' "$ARCHIVE_SHA"
+    printf 'source_commit=%s\n' "$MANIFEST_COMMIT"
+    printf 'publisher_fingerprint=%s\n' "$FPR"
+    printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"$STAGED/install-record" || die "cannot write the install record."
+chmod 600 "$STAGED/install-record"
+# Staging can take time: refuse to move data added to the existing prefix meanwhile.
+if [ "$REINSTALL" = 1 ]; then check_existing; fi
+if [ "$REINSTALL" = 1 ] && [ "$STATE" != none ]; then
+    BACKUP_DIR=$INSTALL_ROOT/previous
+    if [ -L "$BACKUP_DIR" ] || { [ -e "$BACKUP_DIR" ] && [ ! -d "$BACKUP_DIR" ]; }; then
+        die "$BACKUP_DIR is not a real directory. Inspect it before retrying; nothing was replaced."
+    fi
+    if [ ! -d "$BACKUP_DIR" ]; then mkdir -m 700 "$BACKUP_DIR"; fi
+    BACKUP_HOLDER=$(mktemp -d "$BACKUP_DIR/$VERSION.XXXXXX") || die "cannot reserve a backup directory."
+    BACKUP=$BACKUP_HOLDER/install
+    # Set intent first so cleanup handles a signal delivered immediately after the rename.
+    MOVED_OLD=1
+    mv -T -- "$PREFIX" "$BACKUP" || die "cannot move the existing installation aside."
+    say "The previous installation is kept at $BACKUP."
+fi
+if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then die "$PREFIX appeared meanwhile; it was left untouched."; fi
+# -T prevents nesting a replacement inside an unexpectedly created destination directory.
+mv -T --no-clobber "$STAGED" "$PREFIX" || die "cannot publish the staged installation."
+[ ! -d "$STAGED" ] || die "$PREFIX appeared meanwhile; it was left untouched."
 INSTALL_OK=1
+STAGED=
+flock -u 9
 
 cat <<EOF
 
@@ -449,7 +707,8 @@ Installed and verified.
   sha256   $INSTALLED_SHA
 
 Nothing else was changed: no PATH entry, no shell startup file, no agent configuration, no database.
-
+${BACKUP:+The previous installation is kept at $BACKUP.
+}
 Next steps
   1. Try it without changing your shell (works in sh, bash, zsh and fish):
        $PREFIX/bin/mind --version
@@ -462,6 +721,6 @@ Next steps
        $PREFIX/bin/mind setup codex
        $PREFIX/bin/mind setup claude-code
 
-To remove it later: rm -- "$PREFIX/bin/mind" && rmdir "$PREFIX/bin" "$PREFIX"
+To remove it later: rm -- "$PREFIX/bin/mind" "$PREFIX/install-record" && rmdir "$PREFIX/bin" "$PREFIX"
 Your databases live elsewhere and are not removed.
 EOF

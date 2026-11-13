@@ -46,7 +46,7 @@ with_path() { TEST_PATH=$1; shift; "$@"; TEST_PATH=; }
 expect() { # NAME WANT_RC PATTERN
     if [ "$RC" = "$2" ] && printf '%s' "$OUT" | grep -q -- "$3"; then pass "$1"; else fail "$1 (rc=$RC, wanted $2 and /$3/)" "$(printf '%s' "$OUT" | tail -n 6)"; fi
 }
-tree_of() { (cd "$1" && find . | sort); }
+tree_of() { (cd "$1" && find . -printf '%p %y %m %s %T@ %l\n' | sort; find . -type f -exec sha256sum {} + | sort); }
 no_leftovers() { # NAME: the installer's temp dir is gone
     left=0
     for d in "$T/tmp-$HN"/mindspace-install.*; do [ -e "$d" ] && left=1; done
@@ -86,11 +86,13 @@ expect "unsupported architecture is refused" 1 "x86_64 only"
 # A PATH without gpg / without a Rust toolchain.
 mkshim() { # DIR omitted-tool...
     d=$1; shift; mkdir -p "$d"
-    for tool in sh uname setsid pgrep sha256sum tar gzip gpg awk grep sed tr cmp mktemp install df wc curl cc gcc cut mv cp mkdir rmdir rm chmod cat head tail env dirname sleep cargo rustc rustup; do
+    for tool in sh date timeout flock uname setsid pgrep sha256sum tar gzip gpg awk grep sed tr cmp mktemp install df wc curl cc gcc cut mv cp mkdir rmdir rm chmod cat head tail env dirname sleep cargo rustc rustup; do
         skip=0
         for o in "$@"; do [ "$o" = "$tool" ] && skip=1; done
         [ "$skip" = 1 ] && continue
-        p=$(command -v "$tool" 2>/dev/null) && [ -x "$p" ] && ln -sf "$p" "$d/$tool"
+        p=$(command -v "$tool" 2>/dev/null) && [ -x "$p" ] || continue
+        p=$(cd "$(dirname "$p")" && pwd)/${p##*/}
+        ln -sf "$p" "$d/$tool"
     done
 }
 HN=dep; new_home dep
@@ -102,14 +104,117 @@ with_path "$T/shim-norust" run_inst --trust-fingerprint "$FPR"
 expect "missing Rust is reported before any download" 1 "missing required tools:.*cargo"
 
 # --------------------------------------------------------------------------- existing installation
-HN=exist; new_home exist
-mkdir -p "$H/.local/lib/mindspace/0.1.0-alpha.1/bin"
-printf 'precious' >"$H/.local/lib/mindspace/0.1.0-alpha.1/bin/mind"
+# Re-running the installer must be safe: an intact install is reported and left alone, a damaged or
+# unexpected one is never trusted or replaced silently, and other versions are never downgraded.
+CUR=0.1.0-alpha.1
+PIN_ARCHIVE=b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0
+expect_out() { # NAME PATTERN: the output contains PATTERN (exit code not checked)
+    if printf '%s' "$OUT" | grep -q -- "$2"; then pass "$1"; else fail "$1 (no /$2/ in the output)" "$(printf '%s' "$OUT" | tail -n 6)"; fi
+}
+expect_not_out() { # NAME PATTERN
+    if printf '%s' "$OUT" | grep -q -- "$2"; then fail "$1 (found /$2/)" "$(printf '%s' "$OUT" | tail -n 6)"; else pass "$1"; fi
+}
+case_home() { HN=$1; new_home "$1"; }
+mk_prefix() { # HOMEDIR VERSION REPORTED-VERSION RECORD(ok|none|stale|other): a fake installed binary
+    pd=$1/.local/lib/mindspace/$2
+    mkdir -p "$pd/bin"
+    printf '#!/bin/sh\necho "mind %s"\n' "$3" >"$pd/bin/mind"
+    chmod 755 "$pd/bin/mind"
+    case "$4" in
+        none) ;;
+        *)
+            sum=$(sha256sum "$pd/bin/mind" | awk '{print $1}')
+            if [ "$4" = stale ]; then sum=0000000000000000000000000000000000000000000000000000000000000000; fi
+            ver=$2
+            if [ "$4" = other ]; then ver=0.0.1; fi
+            printf 'mindspace-install-record 1\nversion=%s\nbinary_sha256=%s\narchive_sha256=%s\nsource_commit=a027d94680392648b6277dc2fd9bc20906114b91\npublisher_fingerprint=%s\ninstalled_at=2026-11-13T12:00:00Z\n' "$ver" "$sum" "$PIN_ARCHIVE" "$FPR" >"$pd/install-record"
+            ;;
+    esac
+}
+untouched() { # NAME: HOME looks exactly as it did in $before
+    if [ "$before" = "$(tree_of "$H")" ]; then pass "$1: nothing was changed"; else fail "$1: HOME was modified"; fi
+}
+inst_state() { # NAME RECORD REPORTED WANT_RC PATTERN
+    case_home "$1"; mk_prefix "$H" "$CUR" "$3" "$2"
+    before=$(tree_of "$H"); content=$(cat "$H/.local/lib/mindspace/$CUR/bin/mind")
+    run_inst --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist"
+    expect "$1" "$4" "$5"
+    [ "$content" = "$(cat "$H/.local/lib/mindspace/$CUR/bin/mind")" ] || fail "$1: the binary changed"
+    untouched "$1"
+    no_leftovers "$1"
+}
+inst_state "intact install is reported as already up to date" ok "$CUR" 0 "Already up to date"
+inst_state "install without a record is reported, not trusted" none "$CUR" 0 "no install record"
+inst_state "binary that no longer matches its record is invalid" stale "$CUR" 1 "no longer matches"
+inst_state "record of another version is invalid" other "$CUR" 1 "different version or build"
+inst_state "binary reporting another version is invalid" none 9.9.9 1 "reports '"
+
+case_home idem; mk_prefix "$H" "$CUR" "$CUR" ok
 before=$(tree_of "$H")
+run_inst --trust-fingerprint "$FPR"; expect "running twice: first run is already up to date" 0 "Already up to date"
+run_inst --trust-fingerprint "$FPR"; expect "running twice: second run is already up to date" 0 "Already up to date"
+untouched "repeated runs"
+case_home notools; mk_prefix "$H" "$CUR" "$CUR" ok
+with_path "$T/shim-norust" run_inst
+expect "an intact install needs no Rust, no network and no fingerprint" 0 "Already up to date"
+
+case_home inv_exec; mk_prefix "$H" "$CUR" "$CUR" none; chmod 644 "$H/.local/lib/mindspace/$CUR/bin/mind"
+before=$(tree_of "$H"); run_inst --trust-fingerprint "$FPR"; expect "non-executable binary is invalid" 1 "not executable"; untouched "non-executable binary"
+case_home inv_nobin; mkdir -p "$H/.local/lib/mindspace/$CUR"
+before=$(tree_of "$H"); run_inst --trust-fingerprint "$FPR"; expect "an empty directory is not an installation" 1 "missing or is not a regular file"; untouched "empty directory"
+case_home inv_link; mkdir -p "$H/real" "$H/.local/lib/mindspace"; ln -s "$H/real" "$H/.local/lib/mindspace/$CUR"
+before=$(tree_of "$H"); run_inst --trust-fingerprint "$FPR"; expect "a symlinked prefix is invalid" 1 "symbolic link"; untouched "symlinked prefix"
+case_home inv_file; mkdir -p "$H/.local/lib/mindspace"; printf x >"$H/.local/lib/mindspace/$CUR"
+before=$(tree_of "$H"); run_inst --trust-fingerprint "$FPR"; expect "a file in place of the prefix is invalid" 1 "not a directory"; untouched "file in place of the prefix"
+case_home inv_binlink; mk_prefix "$H" "$CUR" "$CUR" none; mv "$H/.local/lib/mindspace/$CUR/bin/mind" "$H/realbin"; ln -s "$H/realbin" "$H/.local/lib/mindspace/$CUR/bin/mind"
+before=$(tree_of "$H"); run_inst --trust-fingerprint "$FPR"; expect "a symlinked binary is invalid" 1 "regular file"; untouched "symlinked binary"
+case_home inv_hint; mk_prefix "$H" "$CUR" 9.9.9 none
+before=$(tree_of "$H"); run_inst --trust-fingerprint "$FPR"
+expect "an invalid install gets recovery guidance" 1 "sh install.sh --reinstall"
+expect_out "the guidance says nothing is deleted" "not deleted"
+
+# --reinstall is explicit, and the old install stays in place until a build has succeeded.
+case_home re; mk_prefix "$H" "$CUR" 9.9.9 none
+before=$(tree_of "$H")
+run_inst --reinstall --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist"
+expect_out "--reinstall says what it will do" "moved to"
+untouched "--reinstall before any build"
+
+# Versions installed beside this one: never downgrade silently, and understand prerelease ordering.
+trans() { # NAME OTHER-VERSION older|newer
+    case_home "$1"; mk_prefix "$H" "$2" "$2" ok
+    before=$(tree_of "$H")
+    run_inst --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist"
+    if [ "$3" = newer ]; then
+        expect "$2 is newer than $CUR: the installer refuses to go back" 1 "a newer version is already installed"
+        run_inst --allow-older --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist"
+        expect_out "$2: --allow-older is accepted" "Newer versions installed: $2"
+        expect_not_out "$2: --allow-older is not refused" "a newer version is already installed"
+    else
+        expect_out "$2 is older than $CUR: noted, not an obstacle" "Older versions installed: $2"
+        expect_not_out "$2: an older version does not block" "a newer version is already installed"
+    fi
+    untouched "$2 beside $CUR"
+}
+trans tv1 0.0.9 older
+trans tv2 0.1.0-alpha.0 older
+trans tv3 0.1.0-alpha older
+trans tv4 0.1.0-alpha.2 newer
+trans tv5 0.1.0-alpha.10 newer
+trans tv6 0.1.0-beta.1 newer
+trans tv7 0.1.0 newer
+trans tv8 0.2.0 newer
+trans tv9 1.0.0 newer
+case_home tv_ignored
+mkdir -p "$H/.local/lib/mindspace/previous/9.9.9-1" "$H/.local/lib/mindspace/0.9.9.bak/bin" "$H/.local/lib/mindspace/2.0.0"
+printf x >"$H/.local/lib/mindspace/0.9.9.bak/bin/mind"
 run_inst --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist"
-expect "existing prefix is refused before any download" 1 "already exists"
-if [ "$(cat "$H/.local/lib/mindspace/0.1.0-alpha.1/bin/mind")" = precious ] && [ "$before" = "$(tree_of "$H")" ]; then pass "existing install is untouched"; else fail "existing install was modified"; fi
-no_leftovers "existing prefix"
+expect_not_out "backups and odd names never authorize a transition" "a newer version is already installed"
+expect "a bare version directory is invalid" 1 "not a valid installation"
+case_home tv_current_newer; mk_prefix "$H" "$CUR" "$CUR" ok; mk_prefix "$H" 0.2.0 0.2.0 ok
+run_inst --trust-fingerprint "$FPR"
+expect "an intact install stays up to date even when a newer one exists" 0 "Already up to date"
+expect_not_out "a no-op needs no version transition" "STOP:"
 
 # --------------------------------------------------------------------------- trust decision
 HN=trust; new_home trust
@@ -267,23 +372,28 @@ if [ "$WITH_BUILD" = 1 ]; then
     db_before=$(sha256sum "$H/.local/share/mindspace/mind.db" | awk '{print $1}')
     run_inst --trust-fingerprint "$FPR"
     expect "fresh install succeeds" 0 "Installed and verified"
-    BIN=$H/.local/lib/mindspace/0.1.0-alpha.1/bin/mind
+    PFX=$H/.local/lib/mindspace/$CUR
+    BIN=$PFX/bin/mind
     [ "$("$BIN" --version 2>/dev/null)" = "mind 0.1.0-alpha.1" ] && pass "installed binary reports mind 0.1.0-alpha.1" || fail "installed binary version"
-    [ "$(stat -c %a "$BIN")" = 755 ] && [ "$(stat -c %a "$H/.local/lib/mindspace/0.1.0-alpha.1")" = 700 ] && pass "install modes are 0755 binary, 0700 prefix" || fail "install modes"
+    [ "$(stat -c %a "$BIN")" = 755 ] && [ "$(stat -c %a "$PFX")" = 700 ] && pass "install modes are 0755 binary, 0700 prefix" || fail "install modes"
+    bin_sha=$(sha256sum "$BIN" | awk '{print $1}')
+    if [ "$(stat -c %a "$PFX/install-record")" = 600 ] && grep -qx "version=$CUR" "$PFX/install-record" &&
+        grep -qx "binary_sha256=$bin_sha" "$PFX/install-record" && grep -qx "archive_sha256=$PIN_ARCHIVE" "$PFX/install-record"; then
+        pass "the install record describes the installed binary"
+    else fail "install record"; fi
     [ "$(sha256sum "$H/.local/share/mindspace/mind.db" | awk '{print $1}')" = "$db_before" ] && pass "existing database is byte-identical" || fail "existing database changed"
     extra=$(cd "$H" && find . -mindepth 1 | while IFS= read -r f; do
         case "$f" in
-            ./.local | ./.local/lib | ./.local/lib/mindspace | ./.local/lib/mindspace/0.1.0-alpha.1 | ./.local/lib/mindspace/0.1.0-alpha.1/bin | ./.local/lib/mindspace/0.1.0-alpha.1/bin/mind) ;;
+            ./.local | ./.local/lib | ./.local/lib/mindspace | ./.local/lib/mindspace/0.1.0-alpha.1 | ./.local/lib/mindspace/0.1.0-alpha.1/bin | ./.local/lib/mindspace/0.1.0-alpha.1/bin/mind | ./.local/lib/mindspace/0.1.0-alpha.1/install-record) ;;
             ./.local/share | ./.local/share/mindspace | ./.local/share/mindspace/mind.db) ;;
             *) printf '%s\n' "$f" ;;
         esac
     done)
     [ -z "$extra" ] && pass "only the versioned prefix was created in HOME" || fail "unexpected files in HOME" "$extra"
     no_leftovers "fresh install"
-    bin_before=$(sha256sum "$BIN" | awk '{print $1}')
     run_inst --trust-fingerprint "$FPR"
-    expect "second run is refused, not overwritten" 1 "already exists"
-    [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$bin_before" ] && pass "binary unchanged by the second run" || fail "binary changed by the second run"
+    expect "second run: already up to date, exit 0" 0 "Already up to date"
+    [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$bin_sha" ] && pass "binary unchanged by the second run" || fail "binary changed by the second run"
 
     # CLI quickstart with a fresh database, using absolute paths and --db (shell neutral)
     QDB=$H/mindspace-quickstart/mind.db
@@ -297,16 +407,72 @@ if [ "$WITH_BUILD" = 1 ]; then
     cfg_before=$(tree_of "$H")
     HOME=$H CODEX_HOME=$H/.codex "$BIN" --db "$QDB" setup codex >"$T/setup.out" 2>&1
     if grep -qi 'preview' "$T/setup.out" && [ "$cfg_before" = "$(tree_of "$H")" ]; then pass "mind setup codex previews and changes nothing"; else fail "mind setup codex preview" "$(tail -n 5 "$T/setup.out")"; fi
+    qdb_before=$(sha256sum "$QDB" | awk '{print $1}')
+    printf 'sentinel codex MCP registration\n' >"$H/.codex/config.toml"
+    mkdir -p "$H/.config/mindspace"
+    printf 'sentinel application configuration\n' >"$H/.config/mindspace/config.toml"
+    config_before=$(tree_of "$H/.config/mindspace"; tree_of "$H/.codex")
 
-    # Fish: the documented entry point is `sh install.sh` even from a Fish session.
+    # An install made without a record (an earlier installer) is reported, never silently replaced.
+    rm "$PFX/install-record"
+    run_inst --trust-fingerprint "$FPR"
+    expect "an install without a record is reported and left alone" 0 "no install record"
+    [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$bin_sha" ] && pass "binary unchanged without a record" || fail "binary changed without a record"
+
+    # Explicit reinstall, started from a Fish session when Fish is available.
     if command -v fish >/dev/null 2>&1; then
-        HN=fish; new_home fish
-        OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-fish" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            fish -c "sh '$INSTALL' --trust-fingerprint $FPR" </dev/null 2>&1); RC=$?
-        expect "installer runs from a fish session" 0 "Installed and verified"
+        OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-b1" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            fish -c "sh '$INSTALL' --reinstall --trust-fingerprint $FPR" </dev/null 2>&1); RC=$?
+    else
+        run_inst --reinstall --trust-fingerprint "$FPR"
     fi
+    expect "--reinstall replaces the install (from a fish session when available)" 0 "Installed and verified"
+    prevs=$(ls "$H/.local/lib/mindspace/previous" 2>/dev/null | wc -l | tr -d ' ')
+    prev=$(ls -d "$H/.local/lib/mindspace/previous"/* 2>/dev/null | head -n1)
+    if [ "$prevs" = 1 ] && [ "$(sha256sum "$prev/install/bin/mind" | awk '{print $1}')" = "$bin_sha" ]; then pass "the previous binary was kept, byte for byte"; else fail "previous installation not kept" "$prevs entries in previous/"; fi
+    [ -f "$PFX/install-record" ] && pass "the new install has a record" || fail "the new install has no record"
+    [ "$(sha256sum "$H/.local/share/mindspace/mind.db" | awk '{print $1}')" = "$db_before" ] && [ "$(sha256sum "$QDB" | awk '{print $1}')" = "$qdb_before" ] && pass "databases are byte-identical after the reinstall" || fail "a database changed during the reinstall"
+    [ "$config_before" = "$(tree_of "$H/.config/mindspace"; tree_of "$H/.codex")" ] && pass "configuration and MCP registrations are byte-identical" || fail "configuration or MCP registration changed"
+    no_leftovers "reinstall"
+    run_inst --trust-fingerprint "$FPR"
+    expect "after the reinstall it is up to date again" 0 "Already up to date"
+    new_sha=$(sha256sum "$BIN" | awk '{print $1}')
 
-    # Interrupted install: stop it while it builds.
+    # A reinstall that fails after the old install was moved aside puts the old one back.
+    mkdir -p "$T/shim-install"
+    printf '#!/bin/sh\nexit 1\n' >"$T/shim-install/install"; chmod +x "$T/shim-install/install"
+    with_path "$T/shim-install:$PATH" run_inst --reinstall --trust-fingerprint "$FPR"
+    expect "a staging failure leaves the current install untouched" 1 "cannot stage the binary"
+    [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$new_sha" ] && pass "staging failure preserved the binary" || fail "staging failure changed the binary"
+
+    mkdir -p "$T/shim-publish"
+    REAL_MV=$(command -v mv)
+    cat >"$T/shim-publish/mv" <<EOF
+#!/bin/sh
+case "\${3:-}" in */.install.*) exit 1 ;; esac
+exec "$REAL_MV" "\$@"
+EOF
+    chmod +x "$T/shim-publish/mv"
+    with_path "$T/shim-publish:$PATH" run_inst --reinstall --trust-fingerprint "$FPR"
+    expect "a publication failure restores the old install" 1 "restored"
+    if [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$new_sha" ] && [ -f "$PFX/install-record" ]; then pass "the previous installation was restored intact"; else fail "the previous installation was not restored"; fi
+    [ "$(ls "$H/.local/lib/mindspace/previous" | wc -l | tr -d ' ')" = 1 ] && pass "no stray backup was left" || fail "stray backup left behind"
+    no_leftovers "failed reinstall"
+
+    # Interrupted reinstall: the existing install is untouched.
+    env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-b1" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+        sh "$INSTALL" --reinstall --trust-fingerprint "$FPR" >"$T/int.out" 2>&1 </dev/null &
+    ipid=$!
+    i=0
+    while [ $i -lt 120 ] && ! ls "$T/tmp-b1"/mindspace-install.*/build.log >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done
+    sleep 3
+    kill -TERM "$ipid" 2>/dev/null
+    wait "$ipid" 2>/dev/null
+    sleep 2
+    no_leftovers "interrupted reinstall"
+    if [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$new_sha" ] && [ "$(ls "$H/.local/lib/mindspace/previous" | wc -l | tr -d ' ')" = 1 ]; then pass "an interrupted reinstall leaves the existing install untouched"; else fail "interrupted reinstall changed the install"; fi
+
+    # Interrupted first install: nothing is left.
     HN=int; new_home int
     env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-int" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
         sh "$INSTALL" --trust-fingerprint "$FPR" >"$T/int.out" 2>&1 </dev/null &

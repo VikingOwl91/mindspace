@@ -209,6 +209,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Create explicit memories (the CLI counterpart of the MCP memory tools)
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Retire an active memory (it stays inspectable)
     Retire {
         id: String,
@@ -368,6 +373,27 @@ pub enum SpaceCommand {
     Link {
         from: String,
         to: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryCommand {
+    /// Create an explicit memory with manual provenance
+    ///
+    /// The memory is stored exactly as you give it. Repeating the same subject and
+    /// content creates nothing new; it only adds the spaces that are missing. Use `-`
+    /// as CONTENT to read it from standard input.
+    Create {
+        /// The text to remember, or `-` to read it from standard input
+        content: String,
+        /// Space to store the memory in (repeatable; at least one)
+        #[arg(long = "space", required = true)]
+        spaces: Vec<String>,
+        /// Subject of the memory (default: the first non-empty line of the content)
+        #[arg(long)]
+        subject: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -704,6 +730,38 @@ pub fn execute(cli: &Cli) -> Result<()> {
             let conflicts = store.list_conflicts()?;
             render::conflicts(&conflicts, *json);
         }
+        Command::Memory { command } => match command {
+            MemoryCommand::Create {
+                content,
+                spaces,
+                subject,
+                json,
+            } => {
+                let content = if content == "-" {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                        .map_err(|e| Error::Storage(format!("cannot read standard input: {e}")))?;
+                    buf
+                } else {
+                    content.clone()
+                };
+                if content.trim().is_empty() {
+                    return Err(Error::EmptyContent);
+                }
+                let store = open(cli)?;
+                let spaces = spaces
+                    .iter()
+                    .map(|name| store.get_space(name).map(|space| space.id))
+                    .collect::<Result<Vec<_>>>()?;
+                let report = store.record_manual_write(crate::core::ManualMemoryDraft {
+                    subject: subject.clone(),
+                    content,
+                    spaces,
+                    supersedes: None,
+                })?;
+                render::memory_created(&report, *json);
+            }
+        },
         Command::Retire { id, reason } => {
             let store = open(cli)?;
             let memory_id = resolve_memory_id(&store, id)?;

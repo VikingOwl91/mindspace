@@ -15,11 +15,27 @@ impl Mind {
     }
 
     fn run(&self, args: &[&str]) -> (String, String, bool) {
-        let out = Command::new(env!("CARGO_BIN_EXE_mind"))
+        self.run_with_stdin(args, "")
+    }
+
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> (String, String, bool) {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mind"))
             .env("MINDSPACE_DB", self.db.path().join("mind.db"))
             .args(args)
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("run mind");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait for mind");
         (
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -777,4 +793,106 @@ fn ingest_error_from_an_untrusted_filename_is_terminal_safe() {
         assert!(err.contains("Grüße 日本語 🦉"));
         assert!(err.contains("not valid UTF-8"));
     }
+}
+
+fn memory_fixture() -> Mind {
+    let mind = Mind::new();
+    for args in [
+        &["init"][..],
+        &["space", "create", "coding"][..],
+        &["space", "create", "personal"][..],
+    ] {
+        let (_, stderr, ok) = mind.run(args);
+        assert!(ok, "{args:?} failed: {stderr}");
+    }
+    mind
+}
+
+#[test]
+fn memory_create_stores_an_explicit_memory_that_search_finds() {
+    let mind = memory_fixture();
+    let (out, err, ok) = mind.run(&[
+        "memory",
+        "create",
+        "Use a bounded cache for the parser.",
+        "--space",
+        "coding",
+    ]);
+    assert!(ok, "memory create failed: {err}");
+    assert!(out.contains("created"), "{out}");
+    let (out, _, ok) = mind.run(&["search", "bounded", "--space", "coding"]);
+    assert!(ok);
+    assert!(out.contains("bounded cache"), "{out}");
+    let (out, _, _) = mind.run(&["search", "bounded", "--space", "personal"]);
+    assert!(!out.contains("bounded cache"), "wrong space leaked: {out}");
+}
+
+#[test]
+fn memory_create_derives_the_subject_from_the_first_line_unless_given() {
+    let mind = memory_fixture();
+    let (out, err, ok) = mind.run(&[
+        "memory",
+        "create",
+        "Cache policy\nBounded.",
+        "--space",
+        "coding",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).expect("json report");
+    assert_eq!(report["subject"], "Cache policy");
+    assert!(report["memory_id"].is_string());
+    let (out, err, ok) = mind.run(&[
+        "memory",
+        "create",
+        "Other body",
+        "--space",
+        "coding",
+        "--subject",
+        "Explicit",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["subject"], "Explicit");
+}
+
+#[test]
+fn memory_create_is_idempotent_and_adds_new_spaces() {
+    let mind = memory_fixture();
+    let args = |space| ["memory", "create", "Same note", "--space", space, "--json"];
+    let (first, err, ok) = mind.run(&args("coding"));
+    assert!(ok, "{err}");
+    let (second, err, ok) = mind.run(&args("coding"));
+    assert!(ok, "{err}");
+    let (third, err, ok) = mind.run(&args("personal"));
+    assert!(ok, "{err}");
+    let id = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["memory_id"].clone();
+    assert_eq!(id(&first), id(&second), "repeat created a second memory");
+    assert_eq!(id(&first), id(&third), "new space created a second memory");
+    let spaces = serde_json::from_str::<serde_json::Value>(&third).unwrap()["spaces"].clone();
+    assert!(spaces.to_string().contains("personal"), "{spaces}");
+}
+
+#[test]
+fn memory_create_reads_the_content_from_stdin_with_a_dash() {
+    let mind = memory_fixture();
+    let (_, err, ok) = mind.run_with_stdin(
+        &["memory", "create", "-", "--space", "coding"],
+        "Piped decision\nWe pipe notes in.\n",
+    );
+    assert!(ok, "{err}");
+    let (out, _, _) = mind.run(&["search", "pipe", "--space", "coding"]);
+    assert!(out.contains("Piped decision"), "{out}");
+}
+
+#[test]
+fn memory_create_refuses_unknown_spaces_empty_content_and_a_missing_space() {
+    let mind = memory_fixture();
+    let (_, err, ok) = mind.run(&["memory", "create", "x", "--space", "nope"]);
+    assert!(!ok && !err.is_empty(), "unknown space accepted");
+    let (_, err, ok) = mind.run(&["memory", "create", "   ", "--space", "coding"]);
+    assert!(!ok && !err.is_empty(), "blank content accepted");
+    let (_, err, ok) = mind.run(&["memory", "create", "x"]);
+    assert!(!ok && err.contains("--space"), "{err}");
 }

@@ -807,6 +807,20 @@ pub fn conflicts(groups: &[ConflictGroup], as_json: bool) {
     }
 }
 
+pub fn memory_created(report: &crate::core::ManualMemoryReport, as_json: bool) {
+    if as_json {
+        json(report);
+        return;
+    }
+    println!(
+        "memory {} {}: \"{}\" [{}]",
+        report.memory_id,
+        super::action_label(&report.action),
+        display(&report.subject),
+        report.spaces.join(", ")
+    );
+}
+
 pub fn retired(memory: &Memory) {
     println!(
         "memory {} retired at {}",

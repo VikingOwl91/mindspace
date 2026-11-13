@@ -158,7 +158,7 @@ New admitted private database directories use0700; new MAIN/WAL/SHM files use060
 
 ## 7. Store and retrieve a memory
 
-The CLI can ingest existing legacy Markdown/text and retrieve/inspect its memories. Explicit manual creation/update/retirement is provided by MCP/library interfaces; there is no `mind memory create` CLI command.
+The CLI can ingest existing legacy Markdown/text and retrieve/inspect its memories. Explicit manual creation/update/retirement is provided by MCP/library interfaces; the RC.5 archive has no `mind memory create` CLI command (current `main` has one).
 
 <!-- identity-install: legacy-memory -->
 ```sh

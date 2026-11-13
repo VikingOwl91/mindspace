@@ -34,7 +34,10 @@ Use `mind ingest /path/to/note.md --space demo` for an existing legacy text or
 Markdown file. Git ingestion reads committed objects, not dirty/untracked files.
 `--history` selects ref tips, not every ancestor's file content. Serialize ingests
 while changing HEAD. `mind inspect <memory-id> --json` inspects a returned memory.
-There is no CLI memory-create command; create/update/retire use MCP. The install
+Create a memory on the command line with
+`mind memory create "text" --space demo` (`--subject` sets the subject, `-` reads the text from
+standard input, repeating it only adds missing spaces). The signed RC.5 archive has no such
+command; there, create/update/retire use MCP. The install
 guide includes a standalone Python/stdio MCP example. Use the verified binary's
 `--help` and subcommand help for full syntax. These examples are retained docs,
 not a new runtime qualification.

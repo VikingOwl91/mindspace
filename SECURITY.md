@@ -9,7 +9,7 @@ archive and the older repository implementation.
 | --- | --- |
 | `0.1.0-alpha.1` / RC.5 source archive | Current Alpha prerelease; best-effort reports accepted. |
 | Public `main` | Older pre-alpha implementation; reports accepted, but it is not the RC.5 Alpha source. |
-| Historical `v0.2.0`, `v0.3.0` and other development snapshots | No maintained release line or backport commitment. |
+| Earlier development snapshots, including the removed `v0.2.0` and `v0.3.0` releases | No maintained release line or backport commitment. Those releases and tags are no longer published. |
 
 There is no stable release, LTS branch or guaranteed response time. Qualification
 applies to exact source/archive bytes, not every binary with the same version.

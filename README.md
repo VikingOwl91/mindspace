@@ -16,7 +16,7 @@ GitHub prerelease.** Download it from the
 [official release page](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
 The supported profile is Linux x86_64 without embedding models.
 **v0.1.0-alpha.1 establishes the first independently qualified public Alpha
-baseline.**
+baseline** and is the only published release.
 
 ## Which source is the Alpha
 
@@ -28,7 +28,7 @@ older code, not the qualified Alpha.**
 | Release asset `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` | The qualified RC.5 Alpha source. This is the authoritative distribution; verify and build this. |
 | Public `main` (clone, Download ZIP) | An older implementation plus these documentation updates. Not RC.5. |
 | Tag `v0.1.0-alpha.1` and its generated "Source code" ZIP/tar.gz | The older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`. The tag anchors the release page and does not identify the RC.5 source tree. |
-| Releases `v0.2.0` and `v0.3.0` | Historical pre-alpha development snapshots. |
+| Former `v0.2.0` and `v0.3.0` releases | Removed. These pre-alpha snapshots and their tags are no longer published; their commits remain in the history of `main`. |
 
 The broader RC.5 Git history is not published. The older crate 0.5.0 number is
 not this Alpha's version. See the [release notes](docs/release-notes.md).

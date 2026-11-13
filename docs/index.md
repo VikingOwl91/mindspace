@@ -6,8 +6,9 @@ archive](source-install.md) from the
 Public main contains an older implementation plus these documentation updates.
 The release tag points to the older hosting commit
 `92f68ff646ec9b06ba21df2fb7879dfbc1281838`; the tag and generated source downloads
-do not identify or contain the qualified RC.5 implementation. Releases `v0.2.0`
-and `v0.3.0` are historical pre-alpha development snapshots.
+do not identify or contain the qualified RC.5 implementation. The former
+`v0.2.0` and `v0.3.0` pre-alpha releases and their tags have been removed;
+`v0.1.0-alpha.1` is the only published release.
 
 - [Installation, verification and uninstall](source-install.md)
 - [CLI, configuration and manual MCP examples](reference.md)

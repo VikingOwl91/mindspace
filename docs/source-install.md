@@ -55,7 +55,7 @@ cd "$SRC"
 cargo pkgid --locked
 ```
 
-Historical internal versions (`0.5.0`, tags `v0.2.0`/`v0.3.0`) are not the public Alpha identity. Package version alignment does not downgrade database schema17 or change MCP protocol versions.
+Historical internal versions (`0.5.0`, the removed tags `v0.2.0`/`v0.3.0`) are not the public Alpha identity. Package version alignment does not downgrade database schema17 or change MCP protocol versions.
 
 ## 2. Install prerequisites
 

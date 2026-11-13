@@ -1,8 +1,8 @@
 # v0.1.0-alpha.1 release notes
 
 **v0.1.0-alpha.1 establishes the first independently qualified public Alpha
-baseline.** Earlier v0.2.0 and v0.3.0 releases are historical pre-alpha development
-snapshots.
+baseline** and is the only published release. The earlier v0.2.0 and v0.3.0
+pre-alpha releases and their tags have been removed.
 
 It is published as a GitHub prerelease, not a stable release.
 
@@ -10,8 +10,8 @@ It is published as a GitHub prerelease, not a stable release.
 sidecars from the [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). This uploaded archive is the authoritative,
 qualified Alpha source distribution.** Verify it before extracting or building.
 
-The repository's `main` implementation and historical
-`v0.2.0`/`v0.3.0` tags describe older development milestones. The
+The repository's `main` implementation represents older development milestones,
+including the commits the former `v0.2.0`/`v0.3.0` tags pointed to. The
 `v0.1.0-alpha.1` tag points to the older public commit
 `92f68ff646ec9b06ba21df2fb7879dfbc1281838` solely to anchor the release page; it
 does not identify the RC.5 source tree.

@@ -1,0 +1,892 @@
+{
+  "baseline_commit": "559539ee74974cd97eb8dd88210203f00b012101",
+  "source": {
+    "commit": "5670b752c36e454d4a18f7d1c128ae9fb6f8f114",
+    "tree": "0ff41b11479c6ff697e6381d4894b80fd86937a6",
+    "signer": "0E6699CB48F3941AE28CA88D509F78007F62D5EA",
+    "files": 26,
+    "clean_tracked_worktree_and_index": true
+  },
+  "archive": {
+    "source_commit": "5670b752c36e454d4a18f7d1c128ae9fb6f8f114",
+    "source_tree": "0ff41b11479c6ff697e6381d4894b80fd86937a6",
+    "archive_sha256": "7c43b3f273f060134e1d468abfa2247005a1ab8992b150fb885f3d958cde9846",
+    "manifest_sha256": "8e47b25f3c3a8e0ae34d19aeb91117a415e84d7498dcee12f1e6632407944d65",
+    "archive_bytes": 1387559,
+    "regular_files": 234,
+    "directories": 29,
+    "two_clean_git_checkouts_byte_identical": true,
+    "independent_extracted_repack_byte_identical": true,
+    "all_payload_files_exact_source_blobs": true,
+    "normalized_inventory_verified": true,
+    "doc_links_checked": 17,
+    "python": "3.14.10",
+    "zlib": "1.4",
+    "source_view": "/home/cnachtigall/git/projects/mindspace/target/fable-archive-qualification/extracted/mindspace-0.1.0-alpha.1",
+    "output": "/home/cnachtigall/git/projects/mindspace-wt/m8-s3d2/artifacts/releases/v0.1.0-alpha.1/rc.4-fable-remediation",
+    "all_original_members_unchanged_after_builds_and_guide_checks": true
+  },
+  "signatures": {
+    "status": {
+      "mindspace-0.1.0-alpha.1-rc.4-source.tar.gz": "VALIDSIG pinned signer",
+      "tampered-mindspace-0.1.0-alpha.1-rc.4-source.tar.gz": "rejected exit 1",
+      "source-archive-manifest.json": "VALIDSIG pinned signer",
+      "tampered-source-archive-manifest.json": "rejected exit 1",
+      "wrong-asserted-signer": "rejected exit 1"
+    },
+    "signer": "0E6699CB48F3941AE28CA88D509F78007F62D5EA",
+    "exact_recipient_commands_passed": true,
+    "live_independent_WKD_key_retrieval_passed": true,
+    "files": {
+      "SHA256SUMS": "94f8de6697196788176a85495f97b153d99e23b0c2093548a3c182d36797cab7",
+      "VERIFY.txt": "c9756db1a99f5f0345e5cb69a26d5261660c1a7f469fbe4014fa98a756ee8f7d",
+      "mindspace-0.1.0-alpha.1-rc.4-source.tar.gz": "7c43b3f273f060134e1d468abfa2247005a1ab8992b150fb885f3d958cde9846",
+      "mindspace-0.1.0-alpha.1-rc.4-source.tar.gz.asc": "eb35f1349fe12264f3eecf35e3e8feff7c38cd2b712034df8d9f99be7f9d974e",
+      "mindspace-release-signing-key.asc": "bcba2140c52fb84befaedba8ae1dfd8b1aa2fb121149a2d6bba5e4736e88879b",
+      "source-archive-manifest.json": "8e47b25f3c3a8e0ae34d19aeb91117a415e84d7498dcee12f1e6632407944d65",
+      "source-archive-manifest.json.asc": "0db96d646d44327185a27b3f9603b9fc39722b6165c42914d7599d7f6010f191"
+    },
+    "keyring": "/home/cnachtigall/git/projects/mindspace/target/fable-runtime/tmp/recipient-9s4mshx4/tmp.GmEr3nxxkr"
+  },
+  "full_regression": {
+    "log_sha256": "4c343517986e8ca03f7402448d1f3c85149132f391f1a361bcb7b76a7c38a4a4",
+    "targets": [
+      {
+        "target": "Running unittests src/lib.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mindspace-4680005d3a47dd3d)",
+        "passed": 365,
+        "failed": 0,
+        "ignored": 5,
+        "filtered": 0
+      },
+      {
+        "target": "Running unittests src/main.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mind-60ae2bfdde4d4159)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/agent_e2e.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/agent_e2e-b9c29ff00684b9c6)",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/broker.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/broker-6300028fd2fdce36)",
+        "passed": 14,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/broker_mcp.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/broker_mcp-29b64d3c115cf08d)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/cli.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/cli-5946d88f32ce554c)",
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/code_classification.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/code_classification-5a9fb3b15e8c29c3)",
+        "passed": 17,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/code_readers_agree.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/code_readers_agree-288da9496ac4bd16)",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/code_search.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/code_search-e2be71747aa729d3)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/code_structure.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/code_structure-54bef0d68784b6a8)",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/context_exchange.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/context_exchange-2c0bf4b4293a7a50)",
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/doctor.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/doctor-867b40d9136225bb)",
+        "passed": 37,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/document_chunking.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/document_chunking-78012a391b8c9d14)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/document_chunks.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/document_chunks-e9334cb7b1cf1378)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/document_ingest.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/document_ingest-6efa9614aa933527)",
+        "passed": 30,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/document_model.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/document_model-5aaf1f777338baea)",
+        "passed": 28,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/document_preparation_admin.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/document_preparation_admin-5b2bc452b0e02528)",
+        "passed": 23,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/embeddings.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/embeddings-a92c10b9a8532f3b)",
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/extraction_split.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/extraction_split-455d5f6818ad31f3)",
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/extraction_worker.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/extraction_worker-615180f46b472dbb)",
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/extractor_version.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/extractor_version-da154c0b77be85be)",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/fence_plan_admin.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/fence_plan_admin-82a6435bf7a0d9d8)",
+        "passed": 26,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/fence_plan_compatibility.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/fence_plan_compatibility-bb874ca5df4a1a11)",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 4,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/frontend_spawn_gate.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/frontend_spawn_gate-814b948ed641094e)",
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_broker.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_broker-f93f109c66ec09cc)",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_broker_mcp.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_broker_mcp-0fb769e8aedba8ca)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_confined.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_confined-e1ef971e8e2a6e14)",
+        "passed": 18,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_context.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_context-4e39c0a465300577)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_hardening.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_hardening-d310cd41a6909188)",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_ingest.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_ingest-de1b541cb10f0f48)",
+        "passed": 39,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_object_format.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_object_format-f4976f0b402ba901)",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_persist_atomicity.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_persist_atomicity-eb3bfe82e20033a1)",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_trust.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_trust-a117d2a7600922f0)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/git_verified.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/git_verified-78bfbb3d60ad2005)",
+        "passed": 25,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/grants.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/grants-a4dde8c8bfaceb3d)",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/indexing.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/indexing-81866ba50cda2ee7)",
+        "passed": 22,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/ingest_confinement.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/ingest_confinement-9ab00b0edd5a2676)",
+        "passed": 26,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/invariants.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/invariants-28061873d5d191ad)",
+        "passed": 25,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/lexical_staging_admin.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/lexical_staging_admin-f9b2685b84ee3f86)",
+        "passed": 26,
+        "failed": 0,
+        "ignored": 2,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/lifecycle.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/lifecycle-54e0b95111e788b3)",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/m6_temporal.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/m6_temporal-df2f1e6044bb7557)",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/manual_memory.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/manual_memory-38cc47252e927acc)",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/mcp.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mcp-9bfe16e0f7d77249)",
+        "passed": 11,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/mcp_allowlist_modes.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mcp_allowlist_modes-cb55800d2d42afea)",
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/mcp_git_isolated.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mcp_git_isolated-a407fc514f6c759e)",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/mcp_ingest_timeout.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mcp_ingest_timeout-6b88c5bc745d8c76)",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/mcp_isolated.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mcp_isolated-9023844493058b60)",
+        "passed": 28,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/mcp_repo_tools.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/mcp_repo_tools-9cd80a8960eaeb39)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/models.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/models-d5c44aaaa748b93f)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/old_client_adversarial.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/old_client_adversarial-6be018164e185ba2)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 6,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/ownership_admin.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/ownership_admin-660070d4df54d943)",
+        "passed": 26,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/parser_safety.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/parser_safety-2f1d57abab7d5848)",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/paths.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/paths-339063a5d6a78623)",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/persist_atomicity.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/persist_atomicity-42224ceb312fe517)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/placeholder_provenance.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/placeholder_provenance-6c1f652cf2b430d1)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/private_sqlite.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/private_sqlite-a79f50b67b3dc52b)",
+        "passed": 11,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/record_stream.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/record_stream-1e3c440600371ae5)",
+        "passed": 26,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/repo_info.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/repo_info-837b8f913c384d14)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/retrieval.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/retrieval-93337c93e1a0a4e6)",
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/sandbox_failure_modes.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/sandbox_failure_modes-4ed1a86e2635c39f)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/scan_select.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/scan_select-2f21c9757215b183)",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/scopes.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/scopes-6c48d9ecd834dc43)",
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/seccomp_compat.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/seccomp_compat-d4e1d81d985b670a)",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/seccomp_isolation.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/seccomp_isolation-1dfdc893b8bee616)",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/semantic_staging_admin.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/semantic_staging_admin-bd0788a38a0fadc2)",
+        "passed": 24,
+        "failed": 0,
+        "ignored": 2,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/setup.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/setup-e7296809e8b30cc8)",
+        "passed": 53,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/signal_isolation.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/signal_isolation-178382e6f743e322)",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/sqlite_adversarial.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/sqlite_adversarial-eaa5ef2eed964211)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 6,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/sqlite_security.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/sqlite_security-b6481dbe4c673204)",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/stream_gate.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/stream_gate-ab88740e8cc4f001)",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/structural_policy.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/structural_policy-c309f60e4df0e435)",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "target": "Running tests/token_budget.rs (/home/cnachtigall/git/projects/mindspace/target/fable-remediation/debug/deps/token_budget-abd0b0eaf572feeb)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "target": "Doc-tests mindspace",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "totals": {
+      "passed": 1338,
+      "failed": 0,
+      "ignored": 35,
+      "filtered": 0
+    },
+    "optional_skips": [
+      "skipped: set MINDSPACE_E2E_REPO=<repo dir> to run against a real repository",
+      "SKIPPED: no watchdog appeared",
+      "SKIPPED: no watchdog appeared"
+    ]
+  },
+  "checks": {
+    "eligible-full-regression": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "--no-fail-fast",
+        "--",
+        "--nocapture"
+      ],
+      "start_utc": "2026-11-13T01:31:02.351390+00:00",
+      "end_utc": "2026-11-13T01:41:04.902677+00:00",
+      "exit_code": 0,
+      "log_sha256": "4c343517986e8ca03f7402448d1f3c85149132f391f1a361bcb7b76a7c38a4a4",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--offline",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "start_utc": "2026-11-13T01:34:08.522870+00:00",
+      "end_utc": "2026-11-13T01:35:05.332273+00:00",
+      "exit_code": 0,
+      "log_sha256": "e4f9708bc8022c03f805b4b3e0741784969b24411258a9c8337cb0e3350ee8f4",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "audit-complete": {
+      "command": [
+        "cargo",
+        "audit",
+        "--json"
+      ],
+      "start_utc": "2026-11-13T01:20:45.341630+00:00",
+      "end_utc": "2026-11-13T01:20:46.720562+00:00",
+      "exit_code": 0,
+      "log_sha256": "ba95e079a0f2ace3f81b0e210cbadf7c614afc7695183c4edb578a1484a90d2f",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "deny-complete": {
+      "command": [
+        "cargo",
+        "deny",
+        "--locked",
+        "check",
+        "advisories",
+        "licenses",
+        "bans",
+        "sources"
+      ],
+      "start_utc": "2026-11-13T01:20:46.258104+00:00",
+      "end_utc": "2026-11-13T01:20:47.242575+00:00",
+      "exit_code": 0,
+      "log_sha256": "985944cede9673228162cfcf8cba1618068b31fa2518b083dc5e01cb105e32ce",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "security-profile": {
+      "command": [
+        "bash",
+        "scripts/security-profile.sh"
+      ],
+      "start_utc": "2026-11-13T01:45:19.110917+00:00",
+      "end_utc": "2026-11-13T01:50:56.901770+00:00",
+      "exit_code": 0,
+      "log_sha256": "0cb3eef29cbdea9c07eaf64e5ec389d266cad046511b8f9240ad83f784ac84bd",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "ordinary-noembed": {
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--no-default-features",
+        "--bin",
+        "mind",
+        "--target-dir",
+        "/home/cnachtigall/git/projects/mindspace/target/fable-ordinary-noembed"
+      ],
+      "start_utc": "2026-11-13T01:38:24.631846+00:00",
+      "end_utc": "2026-11-13T01:40:47.039468+00:00",
+      "exit_code": 0,
+      "log_sha256": "7c27a7d0214da63e17b2fff67439f6c5a07c2ac72aea0591e89c35e129018271",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "ordinary-default": {
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--bin",
+        "mind",
+        "--target-dir",
+        "/home/cnachtigall/git/projects/mindspace/target/fable-ordinary-default"
+      ],
+      "start_utc": "2026-11-13T01:38:25.082802+00:00",
+      "end_utc": "2026-11-13T01:43:27.870529+00:00",
+      "exit_code": 0,
+      "log_sha256": "b8bf973df1a34e77f9e3a49754810c57fc7bd60d4e66df4e36b16f2f5dca51dc",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "extracted-noembed": {
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--no-default-features",
+        "--bin",
+        "mind",
+        "--target-dir",
+        "/home/cnachtigall/git/projects/mindspace/target/fable-ordinary-noembed"
+      ],
+      "start_utc": "2026-11-13T01:52:17.447583+00:00",
+      "end_utc": "2026-11-13T01:52:59.467150+00:00",
+      "exit_code": 0,
+      "log_sha256": "56482e4a8ed367e6ef6d2b826907078f75c9f6daa66345e34c7ba62d23d0f36b",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "extracted-default": {
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--bin",
+        "mind",
+        "--target-dir",
+        "/home/cnachtigall/git/projects/mindspace/target/fable-ordinary-default"
+      ],
+      "start_utc": "2026-11-13T01:52:18.070952+00:00",
+      "end_utc": "2026-11-13T01:53:06.055746+00:00",
+      "exit_code": 0,
+      "log_sha256": "73d4c43f9f8746822e2245856d91f891ea2f2b224d96dfaf26dbffdb0e3dd692",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "release-audit-final": {
+      "command": [
+        "cargo",
+        "audit",
+        "--json"
+      ],
+      "start_utc": "2026-11-13T02:10:48.621441+00:00",
+      "end_utc": "2026-11-13T02:10:49.956193+00:00",
+      "exit_code": 0,
+      "log_sha256": "ba95e079a0f2ace3f81b0e210cbadf7c614afc7695183c4edb578a1484a90d2f",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    },
+    "release-deny-final": {
+      "command": [
+        "cargo",
+        "deny",
+        "--locked",
+        "check",
+        "advisories",
+        "licenses",
+        "bans",
+        "sources"
+      ],
+      "start_utc": "2026-11-13T02:10:49.397650+00:00",
+      "end_utc": "2026-11-13T02:10:50.453559+00:00",
+      "exit_code": 0,
+      "log_sha256": "df11b48d4aed9e7d57f33938848f8d5f785b9fcc23743f5d3e1f70c1d9cde46f",
+      "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+    }
+  },
+  "ordinary_archive_smokes": {
+    "noembed": {
+      "profile": "noembed",
+      "binary_sha256": "f31ed69104c910f30d2e090067901454a637e63e3ef714c386ab7881395bfd26",
+      "checks": [
+        "version-public-help-private-admin",
+        "private-db-creation",
+        "sanitized-file-ingest",
+        "sanitized-git-ingest",
+        "all-search-recall-variants-safe-json-exact",
+        "ingest-error-safe",
+        "15-tool-contract-and-dormant-document-surface",
+        "manual-boundary-errors-no-lookup-session-survives",
+        "inclusive-wire-LF-CRLF-EOF-and-overflow",
+        "ordinary-features-no-spawn-gate"
+      ],
+      "groups": 10,
+      "features": [
+        "[]"
+      ],
+      "fixture": "/home/cnachtigall/git/projects/mindspace/target/fable-runtime/tmp/ordinary-noembed-hvydkmsa",
+      "status": "PASS"
+    },
+    "default": {
+      "profile": "default",
+      "binary_sha256": "e1638694a8a1689a05872d26e0b9c00245b52ea889749b88daec79ffa3372387",
+      "checks": [
+        "version-public-help-private-admin",
+        "private-db-creation",
+        "sanitized-file-ingest",
+        "sanitized-git-ingest",
+        "all-search-recall-variants-safe-json-exact",
+        "ingest-error-safe",
+        "15-tool-contract-and-dormant-document-surface",
+        "manual-boundary-errors-no-lookup-session-survives",
+        "inclusive-wire-LF-CRLF-EOF-and-overflow",
+        "ordinary-features-no-spawn-gate"
+      ],
+      "groups": 10,
+      "features": [
+        "[\"default\", \"embeddings\"]"
+      ],
+      "fixture": "/home/cnachtigall/git/projects/mindspace/target/fable-runtime/tmp/ordinary-default-tvm_q_qj",
+      "status": "PASS"
+    }
+  },
+  "operator_guide_non_recovery": {
+    "noembed": {
+      "status": "PASS",
+      "groups": 11,
+      "completed": [
+        "install",
+        "readme-quickstart",
+        "initialize",
+        "legacy-memory",
+        "mcp-manual",
+        "mcp-codex",
+        "git-sample",
+        "git-change",
+        "backup-extract",
+        "mcp-codex-undo",
+        "uninstall"
+      ],
+      "backup_restore_executed": false,
+      "backup_restore_limitation": "Full guide attempts stopped at the unchanged quiescence guard; these independent fresh fixtures exclude that group and do not bypass it.",
+      "fixture": "/home/cnachtigall/git/projects/mindspace/target/fable-guide/supported-guide-noembed-_6w3mmxf",
+      "binary_sha256": "f31ed69104c910f30d2e090067901454a637e63e3ef714c386ab7881395bfd26",
+      "guide_sha256": "8b42aff37613751acb3e0a5bc6ba5c64983aaf5b1b583390927fe44569069e15",
+      "log_sha256": "87e0c135688c6cb13b37436a0f506220a92f936a312b22b79b67d04239f0649b",
+      "codex_version": "0.167.2",
+      "uninstall_retained_identical_logical_database": true
+    },
+    "default": {
+      "status": "PASS",
+      "groups": 11,
+      "completed": [
+        "install",
+        "readme-quickstart",
+        "initialize",
+        "legacy-memory",
+        "mcp-manual",
+        "mcp-codex",
+        "git-sample",
+        "git-change",
+        "backup-extract",
+        "mcp-codex-undo",
+        "uninstall"
+      ],
+      "backup_restore_executed": false,
+      "backup_restore_limitation": "Full guide attempts stopped at the unchanged quiescence guard; these independent fresh fixtures exclude that group and do not bypass it.",
+      "fixture": "/home/cnachtigall/git/projects/mindspace/target/fable-guide/supported-guide-default-s9eczmox",
+      "binary_sha256": "e1638694a8a1689a05872d26e0b9c00245b52ea889749b88daec79ffa3372387",
+      "guide_sha256": "8b42aff37613751acb3e0a5bc6ba5c64983aaf5b1b583390927fe44569069e15",
+      "log_sha256": "1afc18729c544601ab8838227a9ad4568708e9499ed54585b0d8a21be9a40b8a",
+      "codex_version": "0.167.2",
+      "uninstall_retained_identical_logical_database": true
+    }
+  },
+  "independent_delta_review": {
+    "verdict": "ACCEPT",
+    "scope": "F01-F04 plus bounded sole-finding correction recheck",
+    "corrected_finding": "Git replacement refs could change payload for same source provenance",
+    "recheck": {
+      "source_commit": "071b7f0f06c89ebdcb42ec6154e531082d271350",
+      "source_tree": "41ad9a76d32d607f8487671f6fcec09290940146",
+      "identical_clone_outputs": {
+        "mindspace-0.1.0-alpha.1-rc.4-source.tar.gz": "88ab778aca9d19901a89dc5f3af0c68dfcca64a453c6c7e3f94847f6dfcb7e5f",
+        "source-archive-manifest.json": "1d9b792d6543392b77434f4aeb557cd0ff9086a3a67cf4af1712872e2deb460c",
+        "SHA256SUMS": "895665e52ef9ff29f1467ebde6ef2ae4fd20d7ac9388fe78174e2b841679af4d"
+      },
+      "replacement_cases": [
+        "blob-ref",
+        "blob-tree-refs",
+        "blob-tree-commit-refs"
+      ],
+      "suite_stdout": "",
+      "suite_stderr": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.262s\n\nOK\n"
+    }
+  },
+  "security_profile_passes": 120,
+  "rustsec_head": "af7b3ec33460b8e2de8d422e16d628518891a519",
+  "recovery_fresh_rerun": {
+    "result": "STOP at unchanged quiescence guard; not a fresh successful backup/restore qualification",
+    "error": "RuntimeError: STOP: unclassified unobservable process: {\"pid\": 3779, \"starttime\": \"3347\"}",
+    "pid_namespace_probe": "private user/PID namespace possible; a PID namespace preserving ownership mapping refused Operation not permitted; no check bypassed",
+    "recovery_recipe_bytes_unchanged_from_rc3": true
+  },
+  "preservation": {
+    "untouched_baseline_files": 325,
+    "all_content_inode_mtime_mode_unchanged": true,
+    "historical_artifact_files": 22
+  },
+  "publication": "NOT_AUTHORIZED; no push, tag, upload, release or visibility change",
+  "raw_evidence_root": "/home/cnachtigall/git/projects/mindspace/target/fable-evidence",
+  "final_advisory_check_utc": "2026-11-13T02:10:50.453559+00:00"
+}

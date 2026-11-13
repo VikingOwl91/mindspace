@@ -112,7 +112,9 @@ EOF2
 cat >"$T/late-empty/mv" <<EOF2
 #!/bin/sh
 case "\$*" in *'/.install.'*) mkdir -p "\$HOME/.local/lib/mindspace/$CUR" ;; esac
-exec "$REAL_MV" "\$@"
+"$REAL_MV" "\$@" || exit \$?
+# Some coreutils versions return nonzero when --no-clobber skips a rename.
+[ ! -d "\${3:-}" ] || exit 1
 EOF2
 chmod 755 "$T/signal-publish/mv" "$T/late-data/install" "$T/late-empty/mv"
 RE=1; TEST_PATH=$T/signal-publish:$PATH; run

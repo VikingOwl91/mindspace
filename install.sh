@@ -692,7 +692,13 @@ if [ "$REINSTALL" = 1 ] && [ "$STATE" != none ]; then
 fi
 if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then die "$PREFIX appeared meanwhile; it was left untouched."; fi
 # -T prevents nesting a replacement inside an unexpectedly created destination directory.
-mv -T --no-clobber "$STAGED" "$PREFIX" || die "cannot publish the staged installation."
+if ! mv -T --no-clobber "$STAGED" "$PREFIX"; then
+    # Coreutils versions differ on the exit status of a skipped no-clobber rename.
+    if [ -d "$STAGED" ] && { [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; }; then
+        die "$PREFIX appeared meanwhile; it was left untouched."
+    fi
+    die "cannot publish the staged installation."
+fi
 [ ! -d "$STAGED" ] || die "$PREFIX appeared meanwhile; it was left untouched."
 INSTALL_OK=1
 STAGED=

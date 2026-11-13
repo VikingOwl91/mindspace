@@ -13,8 +13,8 @@ Markdown/text and committed Git content. Canonical document/PDF ingestion and M8
 publication are not supported. Embedding inference is outside the qualified profile.
 
 Use the explicitly attached RC.5 archive from the
-[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). Public main and GitHub-generated source archives are
-older code; the release tag points to the older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`.
+[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). GitHub-generated source archives are
+older code, public main is the Alpha source plus later changes, and the release tag points to the older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`.
 These instructions are adapted from the qualified RC.5 documentation. The archive
 retains its original preparation-status wording and unchanged signed bytes. That wording
 ("unpublished", "candidate", "no public reporting destination") is historical; the current
@@ -53,8 +53,8 @@ placeholders above. Stop on any missing, uncertain or mismatched item before
 building or opening data. The manifest inventories every payload file and hash;
 RC.5 files are exact blobs from its signed source commit, with no overlays.
 There is no Git history or model weight bundle. `cargo pkgid` below displays
-package identity only; it does not authenticate the source. The public source repository is an older implementation; cloning it does not
-obtain the Alpha source. The signed manifest links the archive to its private
+package identity only; it does not authenticate the source. Cloning the public repository does not
+obtain the qualified archive. The signed manifest links the archive to its private
 source commit without publishing that Git history.
 
 <!-- identity-install: source-local -->

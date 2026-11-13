@@ -3,7 +3,7 @@
 Start with the [README](../README.md), then the [install guide](install.md): `sh install.sh` verifies
 and builds the RC.5 source archive from the
 [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
-Public main contains an older implementation plus these documentation updates.
+Public main contains the Alpha source, later changes and these documentation updates.
 The release tag points to the older hosting commit
 `92f68ff646ec9b06ba21df2fb7879dfbc1281838`; the tag and generated source downloads
 do not identify or contain the qualified RC.5 implementation. The former
@@ -22,8 +22,8 @@ do not identify or contain the qualified RC.5 implementation. The former
 
 The README has a short quickstart against your own repository. The install
 operator reference (sections 6 to 9) includes the complete temporary Git-repository demo and a
-standalone Python/stdio MCP memory example, so an AI account is not required. Execute examples against the verified archive build, not a build
-of older public main.
+standalone Python/stdio MCP memory example, so an AI account is not required. Execute examples against the verified archive build; a build of public
+main can differ.
 
 The supported profile is Linux x86_64 without embedding models: explicit memories,
 legacy Markdown/text, committed Git content, lexical retrieval and Rust symbols.

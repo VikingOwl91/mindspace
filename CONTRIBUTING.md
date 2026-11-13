@@ -1,14 +1,13 @@
 # Contributing
 
-Public main has older implementation code than the qualified RC.5 Alpha archive.
-For the first independently qualified public Alpha baseline, use the
+Public `main` contains the source of the qualified RC.5 Alpha archive (commit `a027d94`)
+plus later changes. Only the signed archive is the qualified Alpha: to run the Alpha, use the
 [official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
-and the [install guide](docs/install.md). A clone or generated source ZIP is older code; its
-builds/tests are not RC.5 qualification. Contributor instructions below describe
-that public implementation. Report vulnerabilities through the [private channel](SECURITY.md).
+and the [install guide](docs/install.md). A clone or generated source ZIP is not that qualification,
+even where the code matches. Report vulnerabilities through the [private channel](SECURITY.md).
 
 
-Thanks for your interest. The implementation on public main is pre-alpha; please open an issue before starting larger work.
+Thanks for your interest. Mindspace is an Alpha; please open an issue before starting larger work.
 
 ## Build and test
 
@@ -34,7 +33,7 @@ Linux is the only tested platform.
 | Minimum supported (MSRV) | 1.96 | `rust-version` in `Cargo.toml`, checked by the `msrv` CI job |
 | Qualified Alpha source archive | 1.98.1, frozen | `rust-toolchain.toml` inside the RC.5 archive |
 
-Public `main` is not the qualified Alpha, and changing its toolchain does not
+Changing the toolchain of `main` does not
 change the published RC.5 archive, which is built with 1.98.1 as described in the
 [install guide](docs/source-install.md). The `msrv` job runs a locked check of all
 targets with default features, a check of the library and `mind` binary without

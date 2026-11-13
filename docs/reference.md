@@ -2,7 +2,8 @@
 
 These examples are selected/adapted from the qualified RC.5 README, reference
 and install guide. First [verify and install the RC.5 archive](source-install.md).
-Public main, the hosting tag and generated source downloads contain older code.
+The hosting tag and generated source downloads contain older code; public main contains the
+Alpha source plus later changes.
 
 ## Database configuration
 

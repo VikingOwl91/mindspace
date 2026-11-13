@@ -16,8 +16,8 @@ including the commits the former `v0.2.0`/`v0.3.0` tags pointed to. The
 `92f68ff646ec9b06ba21df2fb7879dfbc1281838` solely to anchor the release page; it
 does not identify the RC.5 source tree.
 **GitHub's generated “Source code (zip)” and “Source code (tar.gz)” downloads,
-the tag tree and a repository clone contain older source, not RC.5.
-Public main now includes the Alpha documentation alongside its older implementation.**
+and the tag tree contain older source, not RC.5.
+Public main includes the RC.5 source baseline (`a027d94`) and the Alpha documentation.**
 Historical version numbers do not identify this Alpha or imply a database downgrade.
 
 ## What is included

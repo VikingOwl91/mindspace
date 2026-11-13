@@ -7,7 +7,7 @@ Security reports are welcome. Please report privately, as described below.
 | Version / source | Reports |
 | --- | --- |
 | `v0.1.0-alpha.1` (the RC.5 source archive attached to the release) | Accepted, best effort. This is the current Alpha. |
-| Public `main` | Accepted, best effort. It contains an older implementation, not the Alpha source. |
+| Public `main` | Accepted, best effort. It contains the Alpha source plus later changes, but is not the qualified archive. |
 | Earlier development snapshots | Not maintained; no backports. |
 
 There is no stable release, no LTS branch and no guaranteed response time.
@@ -18,7 +18,7 @@ Install the Alpha from the
 [official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
 using the [install guide](docs/install.md). The named release asset
 is the authoritative source. The release tag and GitHub's generated "Source code"
-archives contain older code.
+archives point to the older hosting commit and are not the Alpha.
 
 ## Reporting a vulnerability
 
@@ -83,5 +83,5 @@ The sandbox and its limits are documented separately:
 - [Architecture: security boundaries](docs/architecture.md#security-boundaries)
 - [Limits](docs/reference.md#limits-and-security)
 
-These pages describe the qualified Alpha archive. Public `main` contains older
-code and may not implement every protection described there.
+These pages describe the qualified Alpha archive. Public `main` contains the same source plus
+later changes, so details can differ.

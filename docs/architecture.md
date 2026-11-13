@@ -1,8 +1,8 @@
 # Alpha architecture
 
 This overview describes the qualified RC.5 archive, using the architecture,
-README and operator guides included in it. Public main has older implementation
-code; this documentation update does not replace that source.
+README and operator guides included in it. Public main contains that source plus later
+changes.
 
 ## Local engine
 

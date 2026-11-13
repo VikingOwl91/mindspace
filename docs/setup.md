@@ -4,8 +4,8 @@
 
 For Alpha installation, first follow the [source-install guide](source-install.md)
 and verify the seven RC.5 release assets. Public main contains older code; these
-setup instructions describe the qualified Alpha archive. The release is being
-prepared as a draft. Keep the installed executable at its stable absolute path.
+setup instructions describe the qualified Alpha archive. Keep the installed
+executable at its stable absolute path.
 Native client registration/readback was qualified with Codex CLI 0.166.0; this does
 not certify client interactive screens or a model-driven session. OpenCode remains
 preview-only. Setup sends nothing to a network service.

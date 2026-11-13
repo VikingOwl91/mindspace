@@ -3,7 +3,6 @@
 These examples are selected/adapted from the qualified RC.5 README, reference
 and install guide. First [verify and install the RC.5 archive](source-install.md).
 Public main, the hosting tag and generated source downloads contain older code.
-The Alpha release is being prepared as a draft and is not yet published.
 
 ## Database configuration
 

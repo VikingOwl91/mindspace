@@ -4,21 +4,19 @@
 baseline.** Earlier v0.2.0 and v0.3.0 releases are historical pre-alpha development
 snapshots.
 
-**Draft Prerelease: not published.** The tag name and pinned hosting target are
-reserved in this draft; no published tag is asserted. These instructions apply
-to the attached assets available to authorized draft readers and to their future
-public availability after separate publication authorization.
+It is published as a GitHub prerelease, not a stable release.
 
 **Download `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` and its six verification
-sidecars from the [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1) when published. This uploaded archive is the qualified Alpha
-source distribution.** Verify it before extracting or building.
+sidecars from the [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). This uploaded archive is the authoritative,
+qualified Alpha source distribution.** Verify it before extracting or building.
 
 The repository's `main` implementation and historical
 `v0.2.0`/`v0.3.0` tags describe older development milestones. The
-`v0.1.0-alpha.1` draft has its hosting target pinned to approved older commit
-`92f68ff646ec9b06ba21df2fb7879dfbc1281838` solely to anchor this release page.
+`v0.1.0-alpha.1` tag points to the older public commit
+`92f68ff646ec9b06ba21df2fb7879dfbc1281838` solely to anchor the release page; it
+does not identify the RC.5 source tree.
 **GitHub's generated “Source code (zip)” and “Source code (tar.gz)” downloads,
-a future tag tree and a repository clone contain older source, not RC.5.
+the tag tree and a repository clone contain older source, not RC.5.
 Public main now includes the Alpha documentation alongside its older implementation.**
 Historical version numbers do not identify this Alpha or imply a database downgrade.
 
@@ -84,9 +82,11 @@ requests or discussions. Include the exact archive/version, environment, startup
 flags and a reproduction using your own temporary data. Handling is best effort,
 with no guaranteed response time or maintained Alpha release branch implied.
 
-The frozen RC.5 archive documents and `VERIFY.txt` record the preparation date,
-when publication and a reporting destination were still pending. This release
-page supplies the subsequent delivery and reporting information. The archive,
+The frozen RC.5 archive documents, `VERIFY.txt` and the signed manifest record the
+preparation state, when publication and a reporting destination were still
+pending. The manifest's `publication` field therefore still reads
+`local qualification only; publication not authorized`. The release
+page and these notes supply the subsequent delivery and reporting information. The archive,
 manifest, verification instructions and signatures retain their qualified bytes.
 
 See the [source-install guide](source-install.md), [documentation index](index.md)

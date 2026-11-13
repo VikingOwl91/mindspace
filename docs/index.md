@@ -1,11 +1,13 @@
 # Alpha documentation
 
 Start with the [README](../README.md), then [verify and install the RC.5 source
-archive](source-install.md). The official Alpha release is being prepared as a
-draft and is not yet published. Public main contains an older implementation
-plus these documentation updates. The hosting target remains the older commit
-`92f68ff646ec9b06ba21df2fb7879dfbc1281838`; its tag and generated source downloads
-do not identify or contain the qualified RC.5 implementation.
+archive](source-install.md) from the
+[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
+Public main contains an older implementation plus these documentation updates.
+The release tag points to the older hosting commit
+`92f68ff646ec9b06ba21df2fb7879dfbc1281838`; the tag and generated source downloads
+do not identify or contain the qualified RC.5 implementation. Releases `v0.2.0`
+and `v0.3.0` are historical pre-alpha development snapshots.
 
 - [Installation, verification and uninstall](source-install.md)
 - [CLI, configuration and manual MCP examples](reference.md)

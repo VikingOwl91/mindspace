@@ -6,9 +6,8 @@ Markdown/text and committed Git content. Canonical document/PDF ingestion and M8
 publication are not supported. Embedding inference is outside the qualified profile.
 
 Use the explicitly attached RC.5 archive from the
-[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1) when published. The release is currently
-being prepared as a draft. Public main and GitHub-generated source archives are
-older code; the hosting target remains `92f68ff646ec9b06ba21df2fb7879dfbc1281838`.
+[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). Public main and GitHub-generated source archives are
+older code; the release tag points to the older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`.
 These instructions are adapted from the qualified RC.5 documentation. The archive
 retains its original preparation-status wording and unchanged signed bytes.
 
@@ -16,8 +15,8 @@ retains its original preparation-status wording and unchanged signed bytes.
 
 Obtain the complete matching delivery packet: the source `.tar.gz`,
 `source-archive-manifest.json`, `SHA256SUMS`, detached `.asc` signatures for both
-archive and manifest, `VERIFY.txt`, and the convenience public key. Download only the seven named assets from the official release page when published;
-a draft is not an anonymous download endpoint.
+archive and manifest, `VERIFY.txt`, and the convenience public key. Download only the seven named assets from the official release page;
+GitHub's generated "Source code" archives are not part of the packet.
 
 1. Authenticate the publisher through an independently trusted contact/domain.
    The pinned primary fingerprint is
@@ -293,7 +292,7 @@ A valid snapshot omits later writes. If clients accepted post-backup writes, **S
 
 | Symptom / limit | Action |
 | --- | --- |
-| Source handoff is missing or verification fails | Stop. Obtain all seven matching RC.5 assets from the official release when published; do not substitute the generated source archive. |
+| Source handoff is missing or verification fails | Stop. Obtain all seven matching RC.5 assets from the official release; do not substitute the generated source archive. |
 | `c++` missing | Use the noembed profile or install the additional C++ prerequisites for the default profile. Do not change the lockfile to bypass the build failure. |
 | Version is still0.5.0 | Stop; you are building an older tree or using a different executable. Check source provenance, chosen BUILD_BIN and first `mind` on PATH. |
 | Database missing | Initialize a new selected path only. If an existing path/data was expected, stop and investigate before recreating anything. |

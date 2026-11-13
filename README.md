@@ -1,7 +1,9 @@
 # Mindspace
 
-Local memory and code search for AI coding agents, stored in SQLite and available
-through a command-line tool or [MCP](https://modelcontextprotocol.io).
+Mindspace is a local-first persistent memory and code search tool for AI coding
+agents. It is written in Rust, stores its data in a local SQLite database, and is
+used through the `mind` command-line tool or as a stdio
+[MCP](https://modelcontextprotocol.io) (Model Context Protocol) server.
 
 Mindspace keeps explicit decisions, notes and committed Git content across agent
 sessions. Search results retain their source and history. Rust definitions can be
@@ -9,20 +11,27 @@ found by symbol and file, with commit provenance. Parsing and lexical search nee
 Mindspace does not automatically record conversations; an agent must explicitly
 write a memory or ingest a source.
 
-**v0.1.0-alpha.1 is a source-only Legacy/Git Public Alpha candidate (RC.5).**
-Its [official GitHub release page](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1) is being prepared as a draft;
-the Alpha assets are not publicly downloadable until a separate publication GO.
+**v0.1.0-alpha.1 is a source-only Legacy/Git Public Alpha (RC.5), published as a
+GitHub prerelease.** Download it from the
+[official release page](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
 The supported profile is Linux x86_64 without embedding models.
+**v0.1.0-alpha.1 establishes the first independently qualified public Alpha
+baseline.**
 
-The explicitly attached `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` is the
-authoritative Alpha source. Public `main` contains an older implementation plus
-these documentation updates. The release hosting target remains the older public
-commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`; the hosting tag does not identify
-the RC.5 source tree. **A clone, Download ZIP, and GitHub-generated source ZIP/tar
-archives contain older code, not the qualified Alpha.** The broader RC.5 Git
-history is not published. Earlier `v0.2.0` and `v0.3.0` releases are historical pre-alpha development
-snapshots. **v0.1.0-alpha.1 establishes the first independently qualified public
-Alpha baseline.** The older crate 0.5.0 number is not this Alpha's version. See the [release notes](docs/release-notes.md).
+## Which source is the Alpha
+
+**A clone, Download ZIP, and GitHub-generated source ZIP/tar archives contain
+older code, not the qualified Alpha.**
+
+| Source | What it contains |
+| --- | --- |
+| Release asset `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` | The qualified RC.5 Alpha source. This is the authoritative distribution; verify and build this. |
+| Public `main` (clone, Download ZIP) | An older implementation plus these documentation updates. Not RC.5. |
+| Tag `v0.1.0-alpha.1` and its generated "Source code" ZIP/tar.gz | The older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`. The tag anchors the release page and does not identify the RC.5 source tree. |
+| Releases `v0.2.0` and `v0.3.0` | Historical pre-alpha development snapshots. |
+
+The broader RC.5 Git history is not published. The older crate 0.5.0 number is
+not this Alpha's version. See the [release notes](docs/release-notes.md).
 
 ## What this Alpha includes
 
@@ -42,11 +51,10 @@ release profile.
 
 ## Install
 
-When published, download all seven RC.5 assets from the
+Download all seven RC.5 assets from the
 [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1): the named source archive, manifest,
 `SHA256SUMS`, detached signatures for archive and manifest, `VERIFY.txt` and public
-key. While it is a draft, visitors without repository write access cannot download
-it. Authenticate the publisher independently, then follow `VERIFY.txt` to verify
+key. Authenticate the publisher independently, then follow `VERIFY.txt` to verify
 both signatures and the exact checksums **before extracting or building**.
 A bundled public key or a checksum alone does not authenticate the publisher.
 

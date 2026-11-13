@@ -3,13 +3,12 @@
 Public main has older implementation code than the qualified RC.5 Alpha archive.
 For the first independently qualified public Alpha baseline, use the
 [official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
-when published and the [install guide](docs/source-install.md). The release is
-being prepared as a draft. A clone or generated source ZIP is older code; its
+and the [install guide](docs/source-install.md). A clone or generated source ZIP is older code; its
 builds/tests are not RC.5 qualification. Contributor instructions below describe
 that public implementation. Report vulnerabilities through the [private channel](SECURITY.md).
 
 
-Thanks for your interest. Mindspace is pre-alpha; please open an issue before starting larger work.
+Thanks for your interest. The implementation on public main is pre-alpha; please open an issue before starting larger work.
 
 ## Build and test
 

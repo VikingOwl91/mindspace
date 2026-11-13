@@ -7,13 +7,13 @@ archive and the older repository implementation.
 
 | Version / source | Security-report scope |
 | --- | --- |
-| `0.1.0-alpha.1` / RC.5 source archive | Current Alpha candidate; best-effort reports accepted. Release is being prepared as a draft, not yet published. |
+| `0.1.0-alpha.1` / RC.5 source archive | Current Alpha prerelease; best-effort reports accepted. |
 | Public `main` | Older pre-alpha implementation; reports accepted, but it is not the RC.5 Alpha source. |
 | Historical `v0.2.0`, `v0.3.0` and other development snapshots | No maintained release line or backport commitment. |
 
 There is no stable release, LTS branch or guaranteed response time. Qualification
 applies to exact source/archive bytes, not every binary with the same version.
-Install from the [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1) when published, using the
+Install from the [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1), using the
 [source-install guide](docs/source-install.md). The named RC.5 asset is authoritative;
 the hosting tag and GitHub-generated source archives contain older code. RC.5's
 broader Git history is not public.

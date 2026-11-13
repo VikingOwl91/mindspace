@@ -73,6 +73,26 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+  installer:
+    name: Release installer
+    # install.sh authenticates and installs the released Alpha, not this checkout. These checks run it
+    # against the real release assets without building: refusals, signature and checksum failures,
+    # and that nothing is written outside what it should create.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          shellcheck -s sh install.sh
+          shellcheck -s sh -S warning tests/scripts/install_sh_test.sh
+      - name: Installer tests (no build)
+        run: sh tests/scripts/install_sh_test.sh
+
   msrv:
     name: Minimum supported Rust
     # The rust-version in Cargo.toml is the single source of truth. This job builds with exactly

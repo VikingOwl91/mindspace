@@ -14,7 +14,7 @@ ALLOWLIST = 'release/source-files.txt'
 ASSEMBLER = 'scripts/assemble-source-archive.py'
 VERSION = '0.1.0-alpha.1'
 PREFIX = 'mindspace-' + VERSION
-FILENAME = PREFIX + '-rc.4-source.tar.gz'
+FILENAME = PREFIX + '-rc.5-source.tar.gz'
 
 
 def sha(data):
@@ -143,7 +143,7 @@ def main():
     payload = {name: blob(name) for name in names}
     archive, raw, members = archive_bytes(payload, epoch)
     manifest = dict(
-        format='mindspace-source-archive-v2', version=VERSION, candidate='rc.4-fable-remediation',
+        format='mindspace-source-archive-v2', version=VERSION, candidate='rc.5-release-documentation',
         publication='local qualification only; publication not authorized',
         baseline=dict(commit=commit, tree=tree),
         archive=dict(filename=FILENAME, bytes=len(archive), sha256=sha(archive),

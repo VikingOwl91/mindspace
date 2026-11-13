@@ -6,10 +6,10 @@ legacy Markdown/text and committed Git content. **Canonical document/PDF ingesti
 and M8 document publication are not part of this Alpha.** Private staging is not
 a supported ingestion route. Embedding inference is outside the model-free profile.
 
-The revised checkout README, this guide and [release notes](release-notes.md)
-postdate frozen RC.4. Public delivery needs a new reviewed archive containing
-these documents. RC.4's archive/signatures remain unchanged; do not mistake the
-current checkout documentation for its original payload.
+The local RC.5 source candidate includes the finalized README, this guide and
+[release notes](release-notes.md). RC.4 retains its earlier documentation and
+unchanged archive/signatures. Use the manifest and verification instructions
+from the same candidate; public delivery is not yet authorized.
 
 ## 1. Obtain and verify the source archive
 
@@ -42,7 +42,7 @@ The exact recipient procedure, including fresh-directory extraction, is in
 `VERIFY.txt`; it supplies actual filenames and hash pins rather than the path
 placeholders above. Stop on any missing, uncertain or mismatched item before
 building or opening data. The manifest inventories every payload file and hash;
-RC.4 files are exact blobs from its signed source commit, with no overlays.
+RC.5 files are exact blobs from its signed source commit, with no overlays.
 There is no Git history or model weight bundle. `cargo pkgid` below displays
 package identity only; it does not authenticate the source. The source repository
 address is informational, not a promised public clone/download route.

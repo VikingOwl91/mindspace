@@ -11,9 +11,9 @@ write a memory or ingest a source.
 
 **v0.1.0-alpha.1 is being prepared as a source-only Legacy/Git Public Alpha. It
 has not been published.** The supported profile is Linux x86_64 without embedding
-models. These checkout documents were revised after the frozen RC.4 archive;
-a new reviewed archive must include them before public delivery. See the
-[release notes](docs/release-notes.md).
+models. The local RC.5 source candidate includes these finalized documents;
+RC.4 remains frozen as the previous candidate. Public delivery is not yet
+authorized. See the [release notes](docs/release-notes.md).
 
 ## What this Alpha includes
 

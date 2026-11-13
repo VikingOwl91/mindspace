@@ -17,6 +17,7 @@ docs/grants.md
 docs/memory-model.md
 docs/offline-recovery.md
 docs/reference.md
+docs/release-notes.md
 docs/retrieval-performance.md
 docs/sandbox-capabilities.md
 docs/sandbox-seccomp.md

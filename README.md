@@ -75,9 +75,48 @@ export PATH="$HOME/.local/lib/mindspace/0.1.0-alpha.1/bin:$PATH"
 fish_add_path ~/.local/lib/mindspace/0.1.0-alpha.1/bin
 ```
 
+### Build from a checkout
+
+The installer above is the qualified path for the Alpha. To work on Mindspace, or to
+build the current `main`, build from a checkout instead:
+
+```sh
+git clone https://github.com/VikingOwl91/mindspace
+cd mindspace
+cargo build --release          # produces target/release/mind
+target/release/mind --version  # mind 0.1.0-alpha.1
+```
+
+You need Linux, Git, a C compiler and **Rust 1.96 or newer** (`rust-version` in
+`Cargo.toml`; CI builds with exactly 1.96.0). The repository also contains a
+`rust-toolchain.toml` that pins Rust 1.100.0 for development and CI. If you use
+rustup, it installs that version for you. To build with another toolchain,
+name it explicitly:
+
+```sh
+rustup toolchain install 1.96.0 --profile minimal
+cargo +1.96.0 build --release
+```
+
+The installer is separate. It builds the signed RC.5 archive, which is frozen at
+Rust 1.98.1 and says so when it runs. A checkout build is not that qualified
+archive, even where the code is the same.
+
+## Your database and a try-out database
+
+Mindspace keeps everything in one SQLite file. Which file a command uses is decided
+in this order: `--db <path>`, then the `MINDSPACE_DB` environment variable, then the
+default `$XDG_DATA_HOME/mindspace/mind.db` (`~/.local/share/mindspace/mind.db` if
+`XDG_DATA_HOME` is not set).
+
+- **Your database** is the default one. Commands without `--db` use it, and
+  `mind setup` registers it for your agent. Create it once with `mind init`.
+- **A try-out database** is a separate file you can throw away. Use it to learn the
+  commands, always with an explicit `--db`. Nothing in it carries over to your own database.
+
 ## Quickstart
 
-This indexes a Git repository you already have and searches it. No AI model or
+This indexes a Git repository and searches it in a throwaway database. No AI model or
 agent account is needed. The commands work in bash, zsh and Fish.
 
 **Before you start**
@@ -87,18 +126,16 @@ agent account is needed. The commands work in bash, zsh and Fish.
 - Ingesting a Git repository writes one small marker file,
   `.git/mindspace-repository-id`, into that repository. Tracked files and the
   working tree are not changed.
-- The path `~/mindspace-quickstart/mind.db` below is a new database. If you
-  already have a Mindspace database, read [offline recovery](docs/offline-recovery.md)
-  before opening it with a new binary.
 
 ```sh
-mind --db ~/mindspace-quickstart/mind.db init
-mind --db ~/mindspace-quickstart/mind.db space create myproject
-mind --db ~/mindspace-quickstart/mind.db ingest /path/to/your/repository --space myproject
-mind --db ~/mindspace-quickstart/mind.db search retry --space myproject
+mind --db ~/mindspace-tryout/mind.db init
+mind --db ~/mindspace-tryout/mind.db space create myproject
+mind --db ~/mindspace-tryout/mind.db ingest /path/to/your/repository --space myproject
+mind --db ~/mindspace-tryout/mind.db search retry --space myproject
 ```
 
-Replace the repository path and the search word with your own.
+Replace the repository path and the search word with your own. When you are done,
+remove the try-out database with `rm -r ~/mindspace-tryout`.
 
 **What to expect**
 
@@ -111,11 +148,25 @@ Replace the repository path and the search word with your own.
   nothing matches, it prints `no results`.
 
 If the repository contains Rust, look up a definition by name with
-`mind --db ~/mindspace-quickstart/mind.db symbols parse_config --space myproject`.
+`mind --db ~/mindspace-tryout/mind.db symbols parse_config --space myproject`.
 To index a single note instead, pass a Markdown or text file to `mind ingest`.
 For a complete walk-through with a throwaway repository, re-ingestion after a
 commit and creating a memory over MCP, see sections 6 to 9 of the
 [source-install guide](docs/source-install.md#6-initialize-a-private-demo-database).
+
+## Use it for real
+
+Leave out `--db` to work in your own database:
+
+```sh
+mind init                              # creates your database and prints its path
+mind space create myproject
+mind ingest /path/to/your/repository --space myproject
+mind search retry --space myproject
+```
+
+Use this database for the agent too (next section), so the command line and the
+agent see the same memories.
 
 ## Connect Claude Code or Codex
 
@@ -123,8 +174,8 @@ commit and creating a memory over MCP, see sections 6 to 9 of the
 shows a preview first and changes the client's configuration only with `--apply`:
 
 ```sh
-mind setup codex --db ~/mindspace-quickstart/mind.db            # preview, changes nothing
-mind setup codex --db ~/mindspace-quickstart/mind.db --apply    # register
+mind setup codex            # preview, changes nothing
+mind setup codex --apply    # register
 ```
 
 Use `claude-code` instead of `codex` for Claude Code. OpenCode is preview-only.
@@ -132,10 +183,10 @@ Existing entries are refused rather than overwritten, the change is read back fr
 the client, and a backup of its configuration is kept. See
 [setup and undo](docs/setup.md).
 
-Setup registers the database selected when you run it: `--db`, then
-`MINDSPACE_DB`, otherwise the default `$XDG_DATA_HOME/mindspace/mind.db`. Check
-the `database` line in the preview. Use the same database for the command line
-and the agent.
+Setup registers the database selected when you run it, in the order described
+under [Your database and a try-out database](#your-database-and-a-try-out-database).
+Check the `database` line in the preview: it must be your own database, not a
+try-out one.
 
 Registration starts with no repository access: memory tools work and repository
 tools refuse. To share a repository, undo the registration and run setup again
@@ -154,12 +205,12 @@ outside any shared repository. For manual configuration, see the
 ## Security and provenance
 
 The installer builds only the signed RC.5 source archive attached to the release.
-Other sources contain older code:
+Other sources differ from the signed archive:
 
 | Source | What it contains |
 | --- | --- |
 | Release asset `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` | The qualified Alpha source (RC.5). The installer verifies and builds this. |
-| Public `main` (clone, Download ZIP) | An older implementation plus the current documentation and `install.sh`. |
+| Public `main` (clone, Download ZIP) | The Alpha source baseline (`a027d94`) plus later changes, the current documentation and `install.sh`. Not signed, not the qualified archive. |
 | Tag `v0.1.0-alpha.1` and its generated "Source code" ZIP/tar.gz | The older commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`, which only anchors the release page. |
 
 Archive SHA-256: `b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0`.

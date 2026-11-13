@@ -185,7 +185,7 @@ mind --version
 `SKIP`, and read the indented lines under a `WARN` or `FAIL` only:
 
 ```sh
-mind --db ~/mindspace-quickstart/mind.db doctor | grep -E '^(PASS|WARN|FAIL|SKIP)'
+mind doctor | grep -E '^(PASS|WARN|FAIL|SKIP)'
 ```
 
 The `sandbox` line matters only for the MCP repository tools. A `WARN` about a different `mind` earlier

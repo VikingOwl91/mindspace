@@ -170,6 +170,14 @@ fn child_entry() {
     if mode.is_empty() {
         return;
     }
+    // Some modes are killed by SIGSYS on purpose. Without this limit the kernel writes a
+    // core file into the working directory for each of them.
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit only reads the struct passed to it.
+    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
     // the harness prints "test child_entry ... " without a newline
     println!();
     let allowed = std::path::PathBuf::from(env("M72C_ALLOWED"));

@@ -3,6 +3,7 @@ pub mod code;
 pub mod confined;
 pub mod confined_git;
 pub mod deadline;
+pub mod document;
 pub mod extract;
 pub mod git;
 pub mod gitverify;

@@ -1,0 +1,95 @@
+Mindspace 0.1.0-alpha.1 / RC.4 candidate recipient verification
+
+Preparation only: no public release or download endpoint is asserted. Obtain all
+seven delivery files together through an authorized handoff. This instruction
+file and the convenience key are not independent trust anchors.
+
+1. Authenticate the publisher BEFORE trusting this file's fingerprint or URLs.
+   The expected publisher is Christian Nachtigall, GitHub VikingOwl91, with
+   signing identity christian@nachtigall.dev. Independently recognize that
+   identity/domain (for example from your prior trusted contact or record).
+   If you learned everything only from the download, STOP and confirm through
+   an independently trusted channel. HTTPS/WKD then authenticates the key as
+   published by that domain; it does not prove the publisher's legal identity.
+
+   Full primary signing-key fingerprint (compare all 40 hex characters):
+   0E6699CB48F3941AE28CA88D509F78007F62D5EA
+
+   The independent domain channel is HTTPS OpenPGP Web Key Directory (WKD):
+   https://openpgpkey.nachtigall.dev/.well-known/openpgpkey/nachtigall.dev/hu/rckmfa7rw857sf15hkixzhxx4681turz?l=christian
+   Direct WKD alternative, if independently trusted:
+   https://nachtigall.dev/.well-known/openpgpkey/hu/rckmfa7rw857sf15hkixzhxx4681turz?l=christian
+   https://github.com/VikingOwl91.gpg is a corroborating public channel, not a
+   separate trust anchor from GitHub-hosted release assets. A keyserver lookup
+   or the enclosed mindspace-release-signing-key.asc alone authenticates nobody.
+
+2. Use trusted local curl, SHA-256 and GnuPG tools. The commands below were
+   checked with curl 8.23.0, GNU sha256sum 9.12 and GnuPG 2.4.9 on Linux.
+   GnuPG must support --assert-signer; if unsupported, STOP rather than remove
+   that check. Run in a dedicated shell in the downloaded package directory.
+   set -eu makes any failed command a STOP. Keep the new keyring for inspection;
+   no existing user keyring or owner-trust settings are modified.
+
+```sh
+set -eu
+VERIFY_HOME="$(mktemp -d)"
+FPR=0E6699CB48F3941AE28CA88D509F78007F62D5EA
+curl --connect-timeout 10 --max-time 30 --fail --silent --show-error --proto '=https' --tlsv1.2   'https://openpgpkey.nachtigall.dev/.well-known/openpgpkey/nachtigall.dev/hu/rckmfa7rw857sf15hkixzhxx4681turz?l=christian'   --output "$VERIFY_HOME/publisher-key"
+gpg --no-options --homedir "$VERIFY_HOME" --batch --no-auto-key-retrieve   --import "$VERIFY_HOME/publisher-key"
+test "$(gpg --no-options --homedir "$VERIFY_HOME" --batch --with-colons   --fingerprint "$FPR" | awk -F: '$1 == "fpr" {print $10; exit}')" = "$FPR"
+for FILE in mindspace-0.1.0-alpha.1-rc.4-source.tar.gz source-archive-manifest.json; do
+  gpg --no-options --homedir "$VERIFY_HOME" --batch --no-auto-key-retrieve     --assert-signer "$FPR" --status-fd 1 --verify "$FILE.asc" "$FILE"     > "$VERIFY_HOME/$FILE.status"
+  if grep -Eq '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|KEYEXPIRED|SIGEXPIRED|KEYREVOKED|NO_PUBKEY|FAILURE|ERROR)( |$)' "$VERIFY_HOME/$FILE.status"; then
+    printf '%s\n' 'STOP: signature/key is invalid, expired, revoked or unavailable.' >&2
+    exit 1
+  fi
+done
+printf '%s\n'   '7c43b3f273f060134e1d468abfa2247005a1ab8992b150fb885f3d958cde9846  mindspace-0.1.0-alpha.1-rc.4-source.tar.gz'   '8e47b25f3c3a8e0ae34d19aeb91117a415e84d7498dcee12f1e6632407944d65  source-archive-manifest.json'   > "$VERIFY_HOME/expected-SHA256SUMS"
+cmp "$VERIFY_HOME/expected-SHA256SUMS" SHA256SUMS
+sha256sum --check --strict SHA256SUMS
+```
+
+Require both pinned-signer verifications and both checksum checks to succeed.
+A GnuPG "unknown" owner-trust warning is expected in a fresh keyring: identity
+trust comes from step 1, not marking a key "ultimate". STOP on any missing file,
+network/TLS error, fingerprint mismatch, expired/revoked key, signature failure,
+checksum mismatch or ambiguous result. Do not build or run unverified sources.
+
+3. The signed manifest records version 0.1.0-alpha.1, candidate rc.4, source
+   commit 5670b752c36e454d4a18f7d1c128ae9fb6f8f114; every payload file is an exact Git blob, with no overlays.
+   It is authoritative for payload provenance; signatures are not release approval.
+   After verification, extract only into a NEW empty directory:
+
+```sh
+EXTRACT_ROOT="$(mktemp -d)"
+tar -xzf mindspace-0.1.0-alpha.1-rc.4-source.tar.gz -C "$EXTRACT_ROOT"
+SRC="$EXTRACT_ROOT/mindspace-0.1.0-alpha.1"
+```
+
+   Read $SRC/docs/source-install.md before building, installing or opening data.
+   RC.4 was requalified on the eligible Linux host; a new Debian rootfs run is
+   not claimed. See the local signed release evidence for exact coverage.
+   Historical clean-rootfs environment: Debian13 x86_64, Rust/Cargo1.98.1, Git, gcc, libc6-dev,
+   ca-certificates; add g++ for the default build. Recommended model-free build:
+   cargo build --locked --release --no-default-features --bin mind
+   The guide covers PATH, CLI/MCP, Git ingestion, permissions and uninstall.
+   $SRC/docs/offline-recovery.md covers trusted-own-data offline backup/restore;
+   stop all clients/connections first. Its Python/system SQLite is separately
+   supplied, not the patched bundled engine; do not open untrusted DB/WAL pairs.
+
+   License/notice material is inside the authenticated archive: LICENSE,
+   LICENSES/Apache-2.0.txt, THIRD_PARTY_NOTICES.md, tokenizer-provenance.json.
+   No dependency source, binaries or model weights are bundled. Binary/vendor
+   redistribution requires its own license inventory. Document-complete Alpha,
+   canonical M8 publication and PDF extraction are not supported Alpha features.
+
+   No public vulnerability-reporting destination is established yet. Keep
+   sensitive reports private; do not use public issues/PRs/discussions. A working,
+   monitored route must be published and verified before any public delivery.
+
+Reconstruction from a clean checkout of the exact source commit:
+python3 scripts/assemble-source-archive.py --repo . --ref 5670b752c36e454d4a18f7d1c128ae9fb6f8f114 --output /tmp/mindspace-rc4-rebuild
+The output directory must not exist. The authenticated archive includes the
+assembler and explicit release/source-files.txt; no historical archive or
+private overlay is required. Detached signatures have signing timestamps and
+are not claimed byte-reproducible.

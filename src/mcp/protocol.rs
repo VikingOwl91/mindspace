@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 use serde_json::{json, Map, Value};
 
@@ -8,6 +8,10 @@ use crate::storage::Store;
 
 use super::repo_tools::McpConfig;
 use super::tools;
+
+/// Maximum wire bytes in one request line, including LF/CRLF when present.
+/// Independent of decoded manual-memory field bounds. Overflow closes stdio.
+pub const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[MCP_PROTOCOL_VERSION];
@@ -43,11 +47,19 @@ fn serve_with_io<R: BufRead, W: Write>(
     let mut line = Vec::new();
     loop {
         line.clear();
-        let bytes_read = reader
+        // Read at most one byte beyond the limit. Do not parse or drain an
+        // unbounded attacker-controlled line, even if it has no delimiter.
+        let bytes_read = (&mut *reader)
+            .take(MAX_REQUEST_LINE_BYTES as u64 + 1)
             .read_until(b'\n', &mut line)
             .map_err(|e| Error::McpTransport {
                 detail: format!("cannot read stdin: {e}"),
             })?;
+        if bytes_read > MAX_REQUEST_LINE_BYTES {
+            return Err(Error::McpTransport {
+                detail: format!("request line exceeds {MAX_REQUEST_LINE_BYTES} bytes"),
+            });
+        }
         if bytes_read == 0 {
             writer.flush().map_err(|e| Error::McpTransport {
                 detail: format!("cannot flush stdout: {e}"),
@@ -330,6 +342,48 @@ mod tests {
         let mut output = Vec::new();
         serve_with_io(&store, &McpConfig::none(), &mut reader, &mut output).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn request_line_limit_counts_wire_bytes_and_stops_before_parsing() {
+        let ping = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        for ending in [b"\n".as_slice(), b"\r\n".as_slice(), b"".as_slice()] {
+            let mut valid = ping.to_vec();
+            valid.resize(MAX_REQUEST_LINE_BYTES - ending.len(), b' ');
+            valid.extend_from_slice(ending);
+            let store = SqliteStore::open_in_memory().unwrap();
+            let mut output = Vec::new();
+            serve_with_io(
+                &store,
+                &McpConfig::none(),
+                &mut Cursor::new(&valid),
+                &mut output,
+            )
+            .unwrap();
+            let response: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(response["result"], json!({}));
+            assert_eq!(response["id"], 1);
+            // One byte over the boundary, including delimiter, must not execute ping.
+            valid.insert(ping.len(), b' ');
+            let mut reader = Cursor::new(&valid);
+            output.clear();
+            let error =
+                serve_with_io(&store, &McpConfig::none(), &mut reader, &mut output).unwrap_err();
+            assert!(matches!(error, Error::McpTransport { .. }));
+            assert!(output.is_empty());
+            assert_eq!(reader.position(), MAX_REQUEST_LINE_BYTES as u64 + 1);
+        }
+        // Unterminated oversized invalid input, followed by a valid request: never
+        // parse or drain the first line and never execute the second request.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut input = vec![0xff; MAX_REQUEST_LINE_BYTES * 2];
+        input.push(b'\n');
+        input.extend_from_slice(ping);
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        assert!(serve_with_io(&store, &McpConfig::none(), &mut reader, &mut output).is_err());
+        assert_eq!(reader.position(), MAX_REQUEST_LINE_BYTES as u64 + 1);
+        assert!(output.is_empty());
     }
 
     fn initialize_message(id: Value, version: &str) -> String {

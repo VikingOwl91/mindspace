@@ -366,23 +366,23 @@ fn call_tool(
         }
         "memory_get" => {
             let requested_id = string(obj, "id")?;
-            let id = resolve_memory_id(store, requested_id)?;
-            let detail = store
-                .get_memory_detail(id)?
-                .ok_or_else(|| Error::MemoryNotFound {
-                    prefix: requested_id.to_string(),
-                })?;
+            let detail = crate::memory_detail_for_prefix(store, requested_id)?;
             serde_json::to_value(detail).map_err(|e| Error::Storage(e.to_string()))
         }
         "memory_search" => {
-            let spaces = match obj.get("spaces") {
-                Some(_) => Some(resolve_spaces(store, string_array(obj, "spaces")?)?),
+            let space_names = match obj.get("spaces") {
+                Some(_) => Some(
+                    string_array(obj, "spaces")?
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                ),
                 None => None,
             };
             let at = optional_string(obj, "at")?.map(Ts::parse).transpose()?;
             let query = SearchQuery {
                 text: string(obj, "query")?.to_string(),
-                space_ids: spaces,
+                space_ids: None,
                 limit: optional_u32(obj, "limit")?.unwrap_or(20),
                 at,
                 include_superseded: optional_bool(obj, "include_superseded")?.unwrap_or(false),
@@ -390,12 +390,13 @@ fn call_tool(
             };
             match optional_string(obj, "mode")? {
                 None => {
-                    let hits = retrieval::search(store, query)?;
+                    let hits = retrieval::search_named(store, query, space_names.as_deref())?;
                     Ok(json!({ "hits": hits }))
                 }
                 Some(value) => {
                     let mode = retrieval::SearchMode::from_str(value).map_err(Error::Storage)?;
-                    let outcome = semantic.search(store, query, mode)?;
+                    let outcome =
+                        semantic.search_named(store, query, mode, space_names.as_deref())?;
                     serde_json::to_value(outcome).map_err(|e| Error::Storage(e.to_string()))
                 }
             }
@@ -538,6 +539,14 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
         if !obj.contains_key(*key) {
             return Err(format!("missing required argument '{key}'"));
         }
+    }
+    if matches!(name, "memory_create" | "memory_update") {
+        // Before trimming, cloning, resolving spaces/IDs or touching storage.
+        crate::core::validate_manual_text(
+            obj.get("content").and_then(Value::as_str).unwrap_or(""),
+            obj.get("subject").and_then(Value::as_str),
+        )
+        .map_err(|error| error.to_string())?;
     }
     if let Some(value) = obj.get("depth") {
         if !value.as_u64().is_some_and(|d| d <= 4) {

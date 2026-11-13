@@ -2,6 +2,9 @@
 //! remotes are stored credential-free, and the 0009 migration sits on top of
 //! the M6 baseline without re-running it.
 
+#[path = "support/schema_fixture.rs"]
+mod schema_fixture;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -292,12 +295,28 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
     let m = Mind::new(&["alpha"]);
     let before: (i64, i64) = {
         let conn = Connection::open(m.db()).unwrap();
+        schema_fixture::remove_empty_ownership_metadata(&conn);
         // Simulate a database created by the M6 commit: no 0009 objects yet.
         for t in ["scope_spaces", "scopes", "repository_remotes", "git_views"] {
             conn.execute_batch(&format!("DROP TABLE {t};")).unwrap();
         }
-        conn.execute("DELETE FROM schema_migrations WHERE version = 9", [])
+        // the document tables of migration 10 go with it: the database predates both
+        for t in [
+            "doc_chunks",
+            "doc_chunk_sets",
+            "doc_nodes",
+            "doc_extractions",
+            "doc_blobs",
+        ] {
+            conn.execute_batch(&format!("DROP TABLE {t};")).unwrap();
+        }
+        conn.execute_batch("DROP INDEX uq_logical_documents_location;")
             .unwrap();
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12)",
+            [],
+        )
+        .unwrap();
         (
             conn.query_row("SELECT COUNT(*) FROM m6_revisions", [], |r| r.get(0))
                 .unwrap(),
@@ -306,7 +325,7 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
         )
     };
 
-    // Opening applies only migration 9.
+    // Opening applies 9 through 17, including five metadata R; M6 baseline is not repeated.
     let (_, err, ok) = m.run(&["space", "list"]);
     assert!(ok, "{err}");
     let conn = Connection::open(m.db()).unwrap();
@@ -315,7 +334,7 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 17);
     for t in ["scopes", "scope_spaces", "repository_remotes", "git_views"] {
         let n: i64 = conn
             .query_row(
@@ -326,8 +345,12 @@ fn migration_nine_upgrades_a_v8_database_without_repeating_the_m6_baseline() {
             .unwrap();
         assert_eq!(n, 1, "{t} missing");
     }
-    // Baseline and coverage were not recreated; the open itself was not a
-    // knowledge write, so no revision was allocated for the migration.
+    // Original baseline and public query coverage remain unchanged. Schemas 13/14/15/16/17 record
+    // one metadata availability revision each, without a knowledge mutation.
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM m6_revisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, before.0 + 5);
     let after: (i64, i64) = (
         conn.query_row(
             "SELECT COUNT(*) FROM m6_revisions WHERE kind = 'baseline'",

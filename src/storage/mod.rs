@@ -3,12 +3,14 @@ pub mod sqlite;
 use uuid::Uuid;
 
 use crate::core::{
-    AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation,
+    Anchor, AssertionEmbedding, CodeDerivation, CodeHit, CodeLanguage, CodeObservation,
     CodeObservationReport, CodeParserIdentity, CodeResolutionReport, CodeSearchQuery,
-    ConflictGroup, EmbeddingIndexStatus, GitObservation, GitObservationReport, GitRefObservation,
-    IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory, MemoryDetail, MemorySummary,
-    ObservationReport, Result, SearchHitRaw, SearchQuery, SourceLifecycle, Space, SpaceLink,
-    TemporalDimension, TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
+    ConflictGroup, DocumentExtractionDraft, DocumentExtractionInfo, DocumentExtractionReport,
+    EmbeddingIndexStatus, EmbeddingSettings, GitObservation, GitObservationReport,
+    GitRefObservation, IngestObservation, ManualMemoryDraft, ManualMemoryReport, Memory,
+    MemoryDetail, MemorySummary, ObservationReport, Result, SearchHitRaw, SearchQuery,
+    SourceLifecycle, Space, SpaceLink, StoredCitation, TemporalDimension,
+    TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
 
 /// The relationship resolutions that belong to one Git ingestion: run for each commit after the
@@ -20,11 +22,44 @@ pub struct GitResolutionPlan<'a> {
     pub version: &'a str,
 }
 
+/// Read-only database dependencies of one legacy memory retrieval response.
+///
+/// The returned session retains one connection and snapshot until `finish` or
+/// drop. It exposes no mutation or nested-session operation. Collect owned data,
+/// finish the session, then render or perform external model work.
+pub trait MemoryRead {
+    fn get_space(&self, name: &str) -> Result<Space>;
+    fn list_spaces(&self) -> Result<Vec<Space>>;
+    fn list_spaces_with_counts(&self) -> Result<Vec<(Space, u64)>>;
+    fn list_space_links(&self) -> Result<Vec<SpaceLink>>;
+    fn embedding_index_status(&self, derivation_key: &str) -> Result<EmbeddingIndexStatus>;
+    fn read_embedding_settings(&self) -> Result<EmbeddingSettings>;
+    fn search_vectors(
+        &self,
+        query_vector: &[f32],
+        query: &SearchQuery,
+        derivation_key: &str,
+    ) -> Result<Vec<SearchHitRaw>>;
+    fn get_memory_detail(&self, id: Uuid) -> Result<Option<MemoryDetail>>;
+    fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>>;
+    fn list_replaced_by(&self, id: Uuid) -> Result<Vec<MemorySummary>>;
+    fn memory_id_prefix_matches(&self, prefix: &str) -> Result<Vec<Uuid>>;
+    fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHitRaw>>;
+    fn list_conflicts(&self) -> Result<Vec<ConflictGroup>>;
+    /// End the read transaction and report cleanup failures. Early errors and
+    /// unwinding also clean up through Drop; an unusable connection is discarded.
+    fn finish(self: Box<Self>) -> Result<()>;
+}
+
 /// The storage boundary. Methods correspond to use cases, not tables, and
 /// traffic exclusively in `core` types. Each state-changing method owns its
 /// transaction; a future PostgreSQL backend would implement this trait
 /// without exposing transaction handles to callers.
 pub trait Store {
+    /// Retain one read-only snapshot for complete memory response collection.
+    /// This must not be implemented as independently executed Store getters.
+    fn read_session(&self) -> Result<Box<dyn MemoryRead + '_>>;
+
     fn temporal_history_capabilities(&self) -> Result<TemporalHistoryCapabilities>;
     fn require_temporal_coverage(
         &self,
@@ -51,6 +86,36 @@ pub trait Store {
     /// changed logical sources, exactly as specified in
     /// docs/memory-model.md section 6.
     fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport>;
+    // -- documents (M8 S1) --------------------------------------------------
+
+    /// Atomically records one document extraction: the document (a logical source of kind
+    /// `document`, one per location), its revision (the canonical text), the extraction keyed by the
+    /// original-bytes hash and the extractor identity, its structure nodes and, only if the draft
+    /// asks for it, the original bytes. All or nothing, in one recording revision; an identical
+    /// repeat changes nothing and consumes no revision. It never touches memories, assertions,
+    /// evidence or the file lifecycle.
+    fn record_document_extraction(
+        &self,
+        draft: DocumentExtractionDraft,
+    ) -> Result<DocumentExtractionReport>;
+    /// Explicit document chunking. Validates the actual tokenizer budget before one atomic
+    /// extraction + chunk-set write; never creates assertions or memories.
+    #[cfg(feature = "embeddings")]
+    fn record_chunked_document(
+        &self,
+        draft: DocumentExtractionDraft,
+        budget: &crate::embeddings::budget::TokenBudget,
+    ) -> Result<DocumentExtractionReport>;
+    /// The stored side of a citation: `None` when no extraction with the anchor's identity exists
+    /// (wrong revision, other extractor, unknown document). An anchor that names more than the stored
+    /// extraction supports is an error, never a downgrade.
+    fn resolve_document_anchor(&self, anchor: &Anchor) -> Result<Option<StoredCitation>>;
+    /// Every extraction of one document, oldest first.
+    fn list_document_extractions(&self, logical_id: Uuid) -> Result<Vec<DocumentExtractionInfo>>;
+    /// Erases retained original bytes. The extractions, their text and their anchors stay; their
+    /// citations simply stop reporting `bytes_resolved`. `false`: nothing was retained.
+    fn erase_document_bytes(&self, source_bytes_hash: &str) -> Result<bool>;
+
     /// The logical identity and lifecycle journal of one source.
     fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>>;
 
@@ -156,6 +221,10 @@ pub trait Store {
     /// Returns the number of rows removed.
     fn clear_embeddings(&self, derivation_key: &str) -> Result<usize>;
 
+    /// Read enablement and model together from one storage snapshot.
+    /// Missing keys remain optional; storage errors must not become missing values.
+    fn read_embedding_settings(&self) -> Result<EmbeddingSettings>;
+
     /// Read a database-level setting.
     fn get_meta(&self, key: &str) -> Result<Option<String>>;
     /// Write a database-level setting.
@@ -192,4 +261,19 @@ pub trait Store {
     // -- lifecycle -----------------------------------------------------------
 
     fn retire_memory(&self, id: Uuid, reason: Option<String>, at: Ts) -> Result<Memory>;
+}
+
+/// One immutable, revision-bound document chunk. `context` names structure nodes only; it is
+/// never copied into the cited source range. Retrieval projection is deliberately deferred.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredDocumentChunk {
+    pub id: String,
+    pub extraction_id: crate::core::Uuid,
+    pub version: String,
+    pub budget_identity: String,
+    pub start: u64,
+    pub end: u64,
+    pub tokens: usize,
+    pub context: Vec<Vec<u32>>,
+    pub anchor: crate::core::Anchor,
 }

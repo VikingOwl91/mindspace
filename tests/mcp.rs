@@ -682,3 +682,77 @@ fn uninitialized_database_fails_on_stderr_without_protocol_stdout() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("mind init"));
 }
+
+#[test]
+fn oversized_manual_fields_are_tool_errors_before_store_lookups() {
+    let (_dir, path) = database();
+    let mut process = McpProcess::spawn(&path);
+    let too_large = "x".repeat(1024 * 1024 + 1);
+    for field in ["content", "subject"] {
+        for name in ["memory_create", "memory_update"] {
+            let mut args = json!({"content":"ok", "subject":"ok", "spaces":["missing"]});
+            if name == "memory_update" {
+                args["id"] = json!("00000000-0000-0000-0000-000000000000");
+            }
+            args[field] = json!(too_large);
+            let response = process.call(100, name, args);
+            let error = tool_error_text(&response);
+            assert!(
+                error.contains(field) && error.contains("1048576"),
+                "{error}"
+            );
+        }
+    }
+    assert!(process.shutdown().success());
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn manual_memory_boundaries_preserve_json_and_update_contracts() {
+    use mindspace::core::MAX_MANUAL_MEMORY_BYTES as MAX;
+    let (_dir, path) = database();
+    let mut process = McpProcess::spawn(&path);
+    let boundary = "é".repeat(MAX / 2);
+    let created = success_content(&process.call(
+        101,
+        "memory_create",
+        json!({
+            "content": boundary, "subject":boundary, "spaces":["coding"]
+        }),
+    ));
+    let id = created["memory_id"].as_str().unwrap();
+    let updated = success_content(&process.call(
+        102,
+        "memory_update",
+        json!({
+            "id":id, "content": format!("{}x", "é".repeat((MAX-2)/2))
+        }),
+    ));
+    assert_eq!(updated["subject"], boundary);
+    let new_id = updated["memory_id"].as_str().unwrap();
+    for field in ["content", "subject"] {
+        let mut args = json!({"id":new_id, "content":"unchanged on rejection"});
+        args[field] = json!(format!("{boundary}x"));
+        assert!(tool_error_text(&process.call(103, "memory_update", args)).contains("1048576"));
+    }
+    let current = success_content(&process.call(104, "memory_get", json!({"id":new_id})));
+    assert_eq!(current["memory"]["state"], "active");
+    assert_eq!(current["assertion"]["subject"], boundary);
+    // Escaped ASCII controls count as decoded bytes, not the longer wire encoding.
+    let controls = format!("marker{}", "\u{1b}".repeat(MAX - 6));
+    let escaped = success_content(&process.call(
+        105,
+        "memory_create",
+        json!({
+            "subject":"Escaped boundary", "content": controls, "spaces":["coding"]
+        }),
+    ));
+    let got = success_content(&process.call(106, "memory_get", json!({"id":escaped["memory_id"]})));
+    assert_eq!(got["assertion"]["content"], controls);
+    assert!(process.shutdown().success());
+}

@@ -8,7 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::{readiness, resolve_ready, ModelLookup, Readiness, ReadyModel, RuntimeFactory};
 use super::{FallbackReason, SemanticCapability};
 use crate::core::{Error, Result, SearchQuery};
-use crate::retrieval::{search_with_mode, RetrievalOptions, SearchMode, SearchOutcome};
+use crate::retrieval::{
+    collect_prepared, concurrent_profile_change, prepare_plan, RetrievalOptions, SearchMode,
+    SearchOutcome,
+};
 use crate::storage::Store;
 
 #[derive(Default)]
@@ -105,17 +108,16 @@ fn qualified(model: &ReadyModel) -> bool {
 mod tests;
 
 impl SemanticCache {
-    pub(crate) fn search(
+    pub(crate) fn search_named(
         &mut self,
         store: &dyn Store,
         query: SearchQuery,
         mode: SearchMode,
+        names: Option<&[String]>,
     ) -> Result<SearchOutcome> {
         let base = match super::manager::data_dir() {
             Ok(base) => base,
             Err(e) => {
-                // No usable data directory: no model can be found. Same early
-                // checks as `search_with`, and the old source is evicted.
                 self.entry = None;
                 if query.text.trim().is_empty() {
                     return Err(Error::EmptyQuery);
@@ -127,19 +129,29 @@ impl SemanticCache {
                         detail: e.to_string(),
                     }
                 };
-                return search_with_mode(
+                let plan = prepare_plan(
+                    mode,
+                    &SemanticCapability::Unavailable(reason),
+                    &query.text,
+                    query.limit,
+                )?;
+                return collect_prepared(
                     store,
                     query,
                     mode,
-                    &SemanticCapability::Unavailable(reason),
+                    plan,
                     RetrievalOptions::default(),
-                );
+                    names,
+                    None,
+                )?
+                .ok_or_else(concurrent_profile_change);
             }
         };
-        self.search_with(
+        self.search_with_named(
             store,
             query,
             mode,
+            names,
             &base,
             super::manifest::find_model,
             &super::candle_runtime,
@@ -148,6 +160,7 @@ impl SemanticCache {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn search_with(
         &mut self,
@@ -160,90 +173,169 @@ impl SemanticCache {
         clock: &dyn Fn() -> SystemTime,
         qualify: &dyn Fn(&ReadyModel) -> bool,
     ) -> Result<SearchOutcome> {
+        self.search_with_named(
+            store, query, mode, None, base, lookup, factory, clock, qualify,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_named(
+        &mut self,
+        store: &dyn Store,
+        query: SearchQuery,
+        mode: SearchMode,
+        names: Option<&[String]>,
+        base: &Path,
+        lookup: ModelLookup,
+        factory: RuntimeFactory<'_>,
+        clock: &dyn Fn() -> SystemTime,
+        qualify: &dyn Fn(&ReadyModel) -> bool,
+    ) -> Result<SearchOutcome> {
         if query.text.trim().is_empty() {
             return Err(Error::EmptyQuery);
         }
         if mode == SearchMode::Lexical {
-            return search_with_mode(
+            let plan = prepare_plan(
+                mode,
+                &SemanticCapability::Unavailable(FallbackReason::EmbeddingsDisabled),
+                &query.text,
+                query.limit,
+            )?;
+            return collect_prepared(
                 store,
                 query,
                 mode,
-                &SemanticCapability::Unavailable(FallbackReason::EmbeddingsDisabled),
+                plan,
                 RetrievalOptions::default(),
-            );
+                names,
+                None,
+            )?
+            .ok_or_else(concurrent_profile_change);
         }
 
-        // Taking ownership first makes every early error evict the old source.
-        let previous = self.entry.take();
-        let now = clock();
-        let clock_forward = self.last_observed.is_none_or(|last| now >= last);
-        self.last_observed = Some(now);
-        let model = match readiness(store, base, lookup)? {
-            Readiness::Ready(model) => model,
-            Readiness::Unavailable(reason) => {
-                return search_with_mode(
+        // Every early error evicts the old source. Only authenticated runtime
+        // assets can be retained; settings and coverage are always read afresh.
+        let mut previous = self.entry.take();
+        let mut forced_asset_failure = None;
+        for attempt in 0..=1 {
+            let now = clock();
+            let clock_forward = self.last_observed.is_none_or(|last| now >= last);
+            self.last_observed = Some(now);
+            let (profile, readiness) = readiness(store, base, lookup)?;
+            let model = match readiness {
+                Readiness::Ready(model) if forced_asset_failure.is_none() => Some(model),
+                Readiness::Ready(_) => None,
+                Readiness::Unavailable(reason) => {
+                    let reason = forced_asset_failure.take().unwrap_or(reason);
+                    let plan = prepare_plan(
+                        mode,
+                        &SemanticCapability::Unavailable(reason),
+                        &query.text,
+                        query.limit,
+                    )?;
+                    if let Some(result) = collect_prepared(
+                        store,
+                        query.clone(),
+                        mode,
+                        plan,
+                        RetrievalOptions::default(),
+                        names,
+                        Some(&profile),
+                    )? {
+                        return Ok(result);
+                    }
+                    if attempt == 1 {
+                        return Err(concurrent_profile_change());
+                    }
+                    previous = None;
+                    continue;
+                }
+            };
+            let Some(model) = model else {
+                let reason = forced_asset_failure.take().expect("forced fallback exists");
+                let plan = prepare_plan(
+                    mode,
+                    &SemanticCapability::Unavailable(reason),
+                    &query.text,
+                    query.limit,
+                )?;
+                return collect_prepared(
                     store,
                     query,
                     mode,
-                    &SemanticCapability::Unavailable(reason),
+                    plan,
                     RetrievalOptions::default(),
-                );
-            }
-        };
-        // Sample the clock before metadata and hashing. A newly written file
-        // must be verified again after the timestamp-resolution safety margin.
-        let before = Snapshot::read(base, &model).ok();
-        let eligible = clock_forward
-            && qualify(&model)
-            && before.as_ref().is_some_and(|stamp| stamp.quiescent(now));
-        let reused = eligible
-            && previous
-                .as_ref()
-                .is_some_and(|old| old.model == model && Some(&old.snapshot) == before.as_ref());
-        let capability = if reused {
-            previous.expect("reused entry exists").capability
-        } else {
-            // Drop the old weights before allocating their replacement.
-            drop(previous);
-            resolve_ready(&model, factory)?
-        };
-        let result = search_with_mode(
-            store,
-            query.clone(),
-            mode,
-            &capability,
-            RetrievalOptions::default(),
-        )?;
-        if !matches!(capability, SemanticCapability::Ready(_))
-            || matches!(
-                result.fallback,
-                Some(FallbackReason::QueryEmbeddingFailed { .. })
-            )
-        {
-            return Ok(result);
-        }
-
-        let after = Snapshot::read(base, &model).ok();
-        if before.is_some() && before != after {
-            // No semantic retry: Auto may run its ordinary lexical fallback.
-            return search_with_mode(
+                    names,
+                    Some(&profile),
+                )?
+                .ok_or_else(concurrent_profile_change);
+            };
+            let before = Snapshot::read(base, &model).ok();
+            let eligible = clock_forward
+                && qualify(&model)
+                && before.as_ref().is_some_and(|stamp| stamp.quiescent(now));
+            let reused = eligible
+                && previous.as_ref().is_some_and(|old| {
+                    old.model == model && Some(&old.snapshot) == before.as_ref()
+                });
+            let capability = if reused {
+                previous.take().expect("reused entry exists").capability
+            } else {
+                drop(previous.take());
+                resolve_ready(&model, factory)?
+            };
+            // No read transaction is retained during inference.
+            let plan = prepare_plan(mode, &capability, &query.text, query.limit)?;
+            let Some(result) = collect_prepared(
                 store,
-                query,
+                query.clone(),
                 mode,
-                &SemanticCapability::Unavailable(FallbackReason::ModelFilesInvalid {
+                plan,
+                RetrievalOptions::default(),
+                names,
+                Some(&profile),
+            )?
+            else {
+                if attempt == 1 {
+                    return Err(concurrent_profile_change());
+                }
+                continue;
+            };
+            if !matches!(capability, SemanticCapability::Ready(_))
+                || matches!(
+                    result.fallback,
+                    Some(FallbackReason::QueryEmbeddingFailed { .. })
+                )
+            {
+                return Ok(result);
+            }
+            let after = Snapshot::read(base, &model).ok();
+            if before.is_some() && before != after {
+                // Discard the whole response. A fresh lexical fallback (Auto)
+                // consumes the same single restart budget as a DB mismatch;
+                // strict modes retain their original explicit artifact error.
+                let reason = FallbackReason::ModelFilesInvalid {
                     model: model.entry.id.to_string(),
                     detail: "model artifacts changed during retrieval".to_string(),
-                }),
-                RetrievalOptions::default(),
-            );
+                };
+                if mode != SearchMode::Auto {
+                    return Err(crate::retrieval::unavailable(&reason));
+                }
+                if attempt == 1 {
+                    return Err(concurrent_profile_change());
+                }
+                forced_asset_failure = Some(reason);
+                continue;
+            }
+            if eligible && qualify(&model) && (query.limit > 0 || reused) {
+                self.entry = Some(Cached {
+                    model,
+                    snapshot: before.expect("eligible snapshot exists"),
+                    capability,
+                });
+            }
+            return Ok(result);
         }
-        if eligible && qualify(&model) && (query.limit > 0 || reused) {
-            self.entry = Some(Cached {
-                model,
-                snapshot: before.expect("eligible snapshot exists"),
-                capability,
-            });
-        }
-        Ok(result)
+        Err(concurrent_profile_change())
     }
 }

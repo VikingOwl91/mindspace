@@ -1,5 +1,7 @@
 #[cfg(unix)]
 pub mod grant;
+#[cfg(unix)]
+pub mod ownership;
 pub mod render;
 
 use std::path::PathBuf;
@@ -241,6 +243,13 @@ pub enum Command {
         #[command(subcommand)]
         command: grant::GrantCommand,
     },
+    /// Trusted local legacy enrollment administration (no MCP route or search changes).
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Ownership {
+        #[command(subcommand)]
+        command: ownership::OwnershipCommand,
+    },
     /// EXPERIMENT (M7.3b.2a): one confined extraction worker, started by a parent process
     /// that hands it a root directory descriptor and a channel. Not for users.
     #[cfg(unix)]
@@ -445,12 +454,22 @@ fn search_for_cli(
     store: &dyn Store,
     query: SearchQuery,
     mode: Option<retrieval::SearchMode>,
+    space_names: Option<&[String]>,
 ) -> Result<SearchResults> {
     match mode {
         Some(mode) => Ok(SearchResults::Mode(
-            retrieval::search_with_mode_resolving_capability(store, query, mode)?,
+            retrieval::search_with_mode_resolving_capability_named(
+                store,
+                query,
+                mode,
+                space_names,
+            )?,
         )),
-        None => Ok(SearchResults::Legacy(retrieval::search(store, query)?)),
+        None => Ok(SearchResults::Legacy(retrieval::search_named(
+            store,
+            query,
+            space_names,
+        )?)),
     }
 }
 
@@ -614,22 +633,20 @@ pub fn execute(cli: &Cli) -> Result<()> {
             mode,
         } => {
             let store = open(cli)?;
-            let space_ids = match space {
-                Some(name) => Some(vec![store.get_space(name)?.id]),
-                None => None,
-            };
+            let space_names = space.as_ref().map(|name| vec![name.clone()]);
             let at = at.as_deref().map(Ts::parse).transpose()?;
             let results = search_for_cli(
                 &store,
                 SearchQuery {
                     text: query.clone(),
-                    space_ids,
+                    space_ids: None,
                     limit: *limit,
                     at,
                     include_superseded: *include_superseded,
                     include_retired: *include_retired,
                 },
                 mode.map(Into::into),
+                space_names.as_deref(),
             )?;
             match results {
                 SearchResults::Legacy(hits) => render::search_hits(&hits, *json),
@@ -644,21 +661,19 @@ pub fn execute(cli: &Cli) -> Result<()> {
             mode,
         } => {
             let store = open(cli)?;
-            let space_ids = match space {
-                Some(name) => Some(vec![store.get_space(name)?.id]),
-                None => None,
-            };
+            let space_names = space.as_ref().map(|name| vec![name.clone()]);
             let results = search_for_cli(
                 &store,
                 SearchQuery {
                     text: query.clone(),
-                    space_ids,
+                    space_ids: None,
                     limit: *limit,
                     at: None,
                     include_superseded: false,
                     include_retired: false,
                 },
                 mode.map(Into::into),
+                space_names.as_deref(),
             )?;
             match results {
                 SearchResults::Legacy(hits) => render::recall_hits(&hits, *json),
@@ -667,18 +682,12 @@ pub fn execute(cli: &Cli) -> Result<()> {
         }
         Command::Inspect { id, json } => {
             let store = open(cli)?;
-            let memory_id = resolve_memory_id(&store, id)?;
-            let detail = store
-                .get_memory_detail(memory_id)?
-                .ok_or_else(|| Error::MemoryNotFound { prefix: id.clone() })?;
+            let detail = crate::memory_detail_for_prefix(&store, id)?;
             render::inspect(&detail, *json);
         }
         Command::Trace { id, json } => {
             let store = open(cli)?;
-            let memory_id = resolve_memory_id(&store, id)?;
-            let detail = store
-                .get_memory_detail(memory_id)?
-                .ok_or_else(|| Error::MemoryNotFound { prefix: id.clone() })?;
+            let detail = crate::memory_detail_for_prefix(&store, id)?;
             render::trace(&detail, *json);
         }
         Command::History { subject, json } => {
@@ -867,15 +876,15 @@ License: {}",
         Command::Index { command } => match command {
             IndexCommand::Run { batch_size, limit } => {
                 let store = open(cli)?;
-                if !crate::embeddings::manager::is_enabled(&store) {
+                let (enabled, selected) = crate::embeddings::manager::read_settings(&store)?;
+                if !enabled {
                     return Err(Error::Storage(
                         "embeddings disabled; run: mind embeddings enable".to_string(),
                     ));
                 }
-                let selected =
-                    crate::embeddings::manager::selected_model(&store).ok_or_else(|| {
-                        Error::Storage("no model selected; run: mind model use <id>".to_string())
-                    })?;
+                let selected = selected.ok_or_else(|| {
+                    Error::Storage("no model selected; run: mind model use <id>".to_string())
+                })?;
                 let entry = crate::embeddings::manifest::find_model(&selected)
                     .ok_or_else(|| Error::Storage(format!("unknown model: {selected}")))?;
                 if !crate::embeddings::manager::is_installed(entry) {
@@ -941,6 +950,8 @@ License: {}",
         },
         #[cfg(unix)]
         Command::Grant { command } => grant::run(cli, command)?,
+        #[cfg(unix)]
+        Command::Ownership { command } => ownership::run(cli, command)?,
         // handled at the top of `run`, before anything else happens
         #[cfg(unix)]
         Command::ExtractionWorker => unreachable!("the worker is started by `run`"),

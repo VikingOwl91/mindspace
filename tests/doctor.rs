@@ -362,13 +362,14 @@ fn an_incompatible_schema_is_reported_without_touching_the_file() {
         .contains("contiguous"));
 
     // Older than this binary: a warning; the doctor must NOT migrate it.
-    // The tables of migration 9 are removed as well, so that a migrating open
+    // The tables of migrations 9, 10 and 11 are removed as well, so that a migrating open
     // WOULD change the file (re-creating them): the unchanged hashes below prove
     // the doctor did not migrate.
     rusqlite_edit(
         &db,
         "INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0);
-         DELETE FROM schema_migrations WHERE version = 9;
+         DELETE FROM schema_migrations WHERE version >= 9;
+         DROP TABLE doc_chunks; DROP TABLE doc_chunk_sets; DROP TABLE doc_nodes; DROP TABLE doc_extractions; DROP TABLE doc_blobs; DROP INDEX uq_logical_documents_location;
          DROP TABLE git_views; DROP TABLE repository_remotes; DROP TABLE scope_spaces; DROP TABLE scopes;",
     );
     let before = files(db.parent().unwrap());

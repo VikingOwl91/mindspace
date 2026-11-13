@@ -11,19 +11,22 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use uuid::Uuid;
 
 use crate::core::{
-    cosine_similarity, decode_f32_le, encode_f32_le, sha256_hex, Assertion, AssertionDraft,
+    cosine_similarity, decode_f32_le, encode_f32_le, sha256_hex, Anchor, Assertion, AssertionDraft,
     AssertionEmbedding, AssertionKind, CodeDerivation, CodeEntity, CodeImport, CodeObservation,
-    CodeObservationReport, ConflictGroup, EmbeddingIndexStatus, Error, Evidence, EvidenceDraft,
-    EvidenceKind, FileObservation, FileOutcome, GitFileOutcome, GitFileReport, GitObservation,
-    GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation, IngestObservation,
-    IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft, ManualMemoryReport, Memory,
-    MemoryAction, MemoryActionKind, MemoryDetail, MemoryState, MemorySummary, ObservationReport,
-    ObservedFile, Result, SearchHitRaw, SearchQuery, Source, SourceEvent, SourceEventKind,
-    SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink, TemporalCoverage,
-    TemporalCoverageStatus, TemporalDimension, TemporalHistoryCapabilities, Ts,
-    UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
+    CodeObservationReport, ConflictGroup, DocumentExtractionDraft, DocumentExtractionInfo,
+    DocumentExtractionReport, EmbeddingIndexStatus, EmbeddingSettings, Error, Evidence,
+    EvidenceDraft, EvidenceKind, FileObservation, FileOutcome, GitFileOutcome, GitFileReport,
+    GitObservation, GitObservationReport, GitProvenance, GitRefEventRecord, GitRefObservation,
+    IngestObservation, IngestScope, LogicalKind, LogicalSource, ManualMemoryDraft,
+    ManualMemoryReport, Memory, MemoryAction, MemoryActionKind, MemoryDetail, MemoryState,
+    MemorySummary, ObservationReport, ObservedFile, Result, SearchHitRaw, SearchQuery, Source,
+    SourceEvent, SourceEventKind, SourceKind, SourceLifecycle, SourcePresence, Space, SpaceLink,
+    StoredCitation, TemporalCoverage, TemporalCoverageStatus, TemporalDimension,
+    TemporalHistoryCapabilities, Ts, UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
 };
 use crate::storage::Store;
+mod files;
+mod read_session;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../migrations/0001_init.sql")),
@@ -47,10 +50,36 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         include_str!("../../migrations/0009_scopes_and_views.sql"),
     ),
+    (10, include_str!("../../migrations/0010_documents.sql")),
+    (
+        11,
+        include_str!("../../migrations/0011_doc_code_blocks.sql"),
+    ),
+    (12, include_str!("../../migrations/0012_doc_chunks.sql")),
+    (
+        13,
+        include_str!("../../migrations/0013_legacy_ownership.sql"),
+    ),
+    (
+        14,
+        include_str!("../../migrations/0014_document_preparation.sql"),
+    ),
+    (
+        15,
+        include_str!("../../migrations/0015_lexical_staging.sql"),
+    ),
+    (
+        16,
+        include_str!("../../migrations/0016_semantic_staging.sql"),
+    ),
+    (
+        17,
+        include_str!("../../migrations/0017_passive_fence_plans.sql"),
+    ),
 ];
 
 const MANUAL_SOURCE_LOCATION: &str = "manual://writes";
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 /// The migration that creates the M6 baseline and installs the write fence.
 /// Those steps run exactly once, when this migration is applied, and not for
 /// whichever migration happens to be latest. Later migrations add tables
@@ -60,9 +89,23 @@ const FILE_PRODUCER_FAMILY: &str = "file:legacy";
 const GIT_PRODUCER_FAMILY: &str = "git:legacy";
 const MANUAL_PRODUCER_FAMILY: &str = "manual:write";
 
+pub(crate) mod document_preparation;
+mod documents;
+pub(crate) mod fence_plans;
+pub(crate) mod lexical_input;
+pub(crate) mod lexical_staging;
+pub(crate) mod ownership;
+pub(crate) mod semantic_input;
+pub(crate) mod semantic_staging;
+
 pub struct SqliteStore {
     conn: Mutex<Option<Connection>>,
     revision_state: Arc<RevisionState>,
+    ownership_state: Arc<ownership::OwnershipState>,
+    preparation_state: Arc<document_preparation::PreparationState>,
+    lexical_state: Arc<lexical_staging::LexicalState>,
+    semantic_state: Arc<semantic_staging::SemanticState>,
+    fence_plan_state: Arc<fence_plans::FencePlanState>,
     fts_integrity: AtomicBool,
 }
 
@@ -238,8 +281,9 @@ pub struct DatabaseInspection {
 ///  - no WAL file: the file is opened `immutable=1`. SQLite then creates no
 ///    `-wal`/`-shm` file (a plain read-only open of a WAL-mode database leaves
 ///    both behind) and there is no log to ignore;
-///  - WAL file present (a server may be writing): `mode=ro`, which reads the log
-///    and, because the files already exist, creates nothing new.
+///  - WAL file present (a server may be writing): `mode=ro`, which reads the log.
+///    SQLite may recreate missing SHM with MAIN's permissions; read-only is not
+///    a promise of no auxiliary filesystem activity.
 ///
 /// A writer that starts between the check and the open is not detected; the
 /// result is a snapshot.
@@ -332,17 +376,12 @@ fn read_inspection(abs: &Path, with_wal: bool) -> Result<DatabaseInspection> {
 
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| Error::Io {
-                    path: parent.display().to_string(),
-                    source: e,
-                })?;
-            }
-        }
-        let conn = Connection::open(path)
-            .map_err(|e| Error::Storage(format!("cannot open database {}: {e}", path.display())))?;
+        let conn = files::open(path, true)?;
         Self::init_conn(conn)
+    }
+
+    pub(crate) fn open_existing_file(path: &Path) -> Result<Self> {
+        Self::init_conn(files::open(path, false)?)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -361,15 +400,63 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(dberr)?;
         register_revision_context(&mut conn, &revision_state)?;
+        let ownership_state = Arc::new(ownership::OwnershipState::default());
+        ownership::register_context(&conn, &ownership_state)?;
+        let preparation_state = Arc::new(document_preparation::PreparationState::default());
+        document_preparation::register_context(&conn, &preparation_state)?;
+        let lexical_state = Arc::new(lexical_staging::LexicalState::default());
+        lexical_staging::register_context(&conn, &lexical_state)?;
+        let semantic_state = Arc::new(semantic_staging::SemanticState::default());
+        semantic_staging::register_context(&conn, &semantic_state)?;
+        let fence_plan_state = Arc::new(fence_plans::FencePlanState::default());
+        fence_plans::register_context(&conn, &fence_plan_state)?;
         reject_future_schema(&conn)?;
-        run_migrations(&conn)?;
+        run_migrations(&conn, &revision_state)?;
         validate_fence_inventory(&conn)?;
         let fts_integrity = verify_fts_counts(&conn).is_ok();
         Ok(Self {
             conn: Mutex::new(Some(conn)),
             revision_state,
+            ownership_state,
+            preparation_state,
+            lexical_state,
+            semantic_state,
+            fence_plan_state,
             fts_integrity: AtomicBool::new(fts_integrity),
         })
+    }
+
+    /// Inspect passive metadata with normal SQLite locking, without migrating.
+    #[cfg(unix)]
+    pub(crate) fn open_fence_plan_inspection(
+        ctx: &crate::cli::ownership::AdminContext,
+    ) -> Result<Self> {
+        let conn = ownership::open_admin_read_only(ctx, |conn| {
+            let version: i64 = conn
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                    r.get(0)
+                })
+                .map_err(dberr)?;
+            if version != CURRENT_SCHEMA_VERSION {
+                return Err(Error::Storage("passive reads require checkpointed initialized schema 17; perform a separate trusted upgrade/checkpoint; read commands never migrate or recover".into()));
+            }
+            validate_fence_inventory(conn)
+        })?;
+        let store = Self {
+            conn: Mutex::new(Some(conn)),
+            revision_state: Arc::new(RevisionState {
+                active_revision: AtomicI64::new(0),
+                poisoned: AtomicBool::new(false),
+            }),
+            ownership_state: Arc::new(ownership::OwnershipState::default()),
+            preparation_state: Arc::new(document_preparation::PreparationState::default()),
+            lexical_state: Arc::new(lexical_staging::LexicalState::default()),
+            semantic_state: Arc::new(semantic_staging::SemanticState::default()),
+            fence_plan_state: Arc::new(fence_plans::FencePlanState::default()),
+            fts_integrity: AtomicBool::new(true),
+        };
+        ctx.validate()?;
+        Ok(store)
     }
 
     fn connection(&self) -> Result<ConnectionGuard<'_>> {
@@ -883,12 +970,61 @@ fn validate_migration_prefix(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn run_migrations(conn: &Connection) -> Result<()> {
+/// A migration-owned revision scope. It never starts or commits a nested transaction.
+struct MigrationRevisionScope {
+    state: Arc<RevisionState>,
+}
+
+impl MigrationRevisionScope {
+    fn enter(conn: &Connection, state: &Arc<RevisionState>) -> Result<Self> {
+        if conn.is_autocommit() || state.poisoned.load(Ordering::SeqCst) {
+            return Err(Error::Storage(
+                "metadata migration requires a healthy owned transaction".into(),
+            ));
+        }
+        let previous: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(revision_id),0) FROM m6_revisions",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(dberr)?;
+        let revision = previous
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("recording revision space exhausted".into()))?;
+        state
+            .active_revision
+            .compare_exchange(0, revision, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| {
+                Error::Storage(
+                    "metadata migration cannot replace active write authorization".into(),
+                )
+            })?;
+        let scope = Self {
+            state: Arc::clone(state),
+        };
+        conn.execute(
+            "INSERT INTO m6_revisions(revision_id,recorded_at,kind) VALUES(?1,?2,'write')",
+            rusqlite::params![revision, Ts::now().0],
+        )
+        .map_err(dberr)?;
+        Ok(scope)
+    }
+}
+
+impl Drop for MigrationRevisionScope {
+    fn drop(&mut self) {
+        self.state.active_revision.store(0, Ordering::SeqCst);
+    }
+}
+
+fn run_migrations(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
     reject_future_schema(conn)?;
     validate_migration_prefix(conn)?;
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(dberr)?;
 
+    let metadata_committed = std::cell::Cell::new(false);
     let migration_result = (|| {
         let has_migration_table: bool = conn
             .query_row(
@@ -929,6 +1065,13 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 tx.commit().map_err(dberr)?;
                 continue;
             }
+            // Ownership metadata records its own birth in this already-owned transaction.
+            // Migration 8 must remain the sole installer of the original baseline/fences.
+            let metadata_scope = if matches!(*version, 13..=17) {
+                Some(MigrationRevisionScope::enter(&tx, state)?)
+            } else {
+                None
+            };
             tx.execute_batch(sql).map_err(dberr)?;
             if *version == M6_VERSION {
                 apply_m6_baseline(&tx)?;
@@ -942,7 +1085,47 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 install_m6_write_fence(&tx)?;
                 validate_fence_inventory(&tx)?;
             }
-            tx.commit().map_err(dberr)?;
+            if matches!(*version, 13..=17) {
+                let (table, key) = match *version {
+                    13 => ("asset_ownership_schema", "local-enroll@1"),
+                    14 => ("document_preparation_schema", "local-doc-prepare@1"),
+                    15 => ("lexical_staging_schema", "local-doc-stage-lexical@1"),
+                    16 => ("semantic_staging_schema", "local-doc-stage-semantic@1"),
+                    _ => ("fence_plan_schema", "local-fence-plan@1"),
+                };
+                tx.execute("INSERT INTO m6_row_availability(table_name,entity_key,revision_id) VALUES(?1,?2,m6_write_revision())", [table,key]).map_err(dberr)?;
+                let violations: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(dberr)?;
+                if violations != 0 {
+                    return Err(Error::Storage(
+                        "ownership metadata migration failed foreign_key_check".into(),
+                    ));
+                }
+                validate_fence_inventory(&tx)?;
+                // Test-only pause uses the existing SQLite COMMIT hook; absent in production.
+                #[cfg(feature = "spawn-gate")]
+                if *version == 17 {
+                    if let Some(prefix) =
+                        std::env::var_os("MINDSPACE_FENCE_PLAN_MIGRATION_GATE_PATH")
+                    {
+                        std::env::set_var("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", prefix);
+                        gate::PAUSE_IN_COMMIT.store(true, Ordering::SeqCst);
+                    }
+                }
+                WriteTransaction {
+                    tx: Some(tx),
+                    conn,
+                    revision_state: Arc::clone(state),
+                }
+                .commit()?;
+                metadata_committed.set(true);
+            } else {
+                tx.commit().map_err(dberr)?;
+            }
+            drop(metadata_scope);
         }
         validate_migration_prefix(conn)?;
         let current: i64 = conn
@@ -961,8 +1144,28 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     let restore_result = conn
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(dberr);
-    migration_result?;
-    restore_result?;
+    if let Err(error) = migration_result {
+        if metadata_committed.get() {
+            state.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::CommitOutcomeUnknown {
+                detail: format!(
+                    "ownership metadata committed but final verification failed: {error}"
+                ),
+            });
+        }
+        return Err(error);
+    }
+    if let Err(error) = restore_result {
+        if metadata_committed.get() {
+            state.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::CommitOutcomeUnknown {
+                detail: format!(
+                    "ownership metadata committed but connection restoration failed: {error}"
+                ),
+            });
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1506,6 +1709,142 @@ fn validate_fence_inventory(conn: &Connection) -> Result<()> {
     for row in rows {
         expected.remove(&row.map_err(dberr)?);
     }
+    let ownership_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=13)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if ownership_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='asset_ownership_schema' AND a.entity_key='local-enroll@1' AND r.kind='write'", [], |r| r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "ownership schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            ownership::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
+    }
+    let preparation_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if preparation_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='document_preparation_schema' AND a.entity_key='local-doc-prepare@1' AND r.kind='write'", [], |r| r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "document preparation schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            document_preparation::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
+    }
+    let lexical_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=15)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if lexical_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='lexical_staging_schema' AND a.entity_key='local-doc-stage-lexical@1' AND r.kind='write'", [], |r|r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "lexical staging schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            lexical_staging::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
+    }
+    let semantic_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=16)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if semantic_installed {
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='semantic_staging_schema' AND a.entity_key='local-doc-stage-semantic@1' AND r.kind='write'", [], |r|r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "semantic staging schema availability marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            semantic_staging::enforcement_names()
+                .into_iter()
+                .filter(|name| !installed.contains(name)),
+        );
+    }
+    let passive_installed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(dberr)?;
+    if passive_installed {
+        fence_plans::validate_schema(conn)?;
+        let marker: bool = conn.query_row("SELECT COUNT(*)=1 FROM m6_row_availability a JOIN m6_revisions r ON r.revision_id=a.revision_id WHERE a.table_name='fence_plan_schema' AND a.entity_key='local-fence-plan@1' AND r.kind='write'", [], |r|r.get(0)).map_err(dberr)?;
+        if !marker {
+            return Err(Error::Storage(
+                "passive fence schema marker is missing or invalid".into(),
+            ));
+        }
+        let installed: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger'")
+            .map_err(dberr)?
+            .query_map([], |r| r.get(0))
+            .map_err(dberr)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(dberr)?;
+        expected.extend(
+            fence_plans::enforcement_names()
+                .into_iter()
+                .filter(|n| !installed.contains(n)),
+        );
+    }
     if !expected.is_empty() {
         let mut missing: Vec<String> = expected.into_iter().collect();
         missing.sort_unstable();
@@ -1677,6 +2016,8 @@ fn load_summaries(
     for r in rows {
         out.push(r.map_err(dberr)?);
     }
+    #[cfg(test)]
+    read_session_tests::checkpoint("summary_enrichment");
     attach_space_names(conn, &mut out)?;
     Ok(out)
 }
@@ -1699,6 +2040,8 @@ fn space_names_by_memory(
     conn: &Connection,
     memory_ids: &[String],
 ) -> Result<BTreeMap<String, Vec<String>>> {
+    #[cfg(test)]
+    read_session_tests::checkpoint("search_enrichment");
     let placeholders = vec!["?"; memory_ids.len()].join(", ");
     let sql = format!(
         "SELECT ms.memory_id, s.name FROM memory_spaces ms \
@@ -1719,11 +2062,31 @@ fn space_names_by_memory(
     Ok(map)
 }
 
+/// One statement snapshot, also usable within an already-owned read transaction.
+fn read_embedding_settings_on(conn: &Connection) -> Result<EmbeddingSettings> {
+    conn.query_row(
+        "SELECT (SELECT value FROM mind_meta WHERE key = 'embedding.enabled'), \
+                (SELECT value FROM mind_meta WHERE key = 'embedding.model')",
+        [],
+        |row| {
+            Ok(EmbeddingSettings {
+                enabled: row.get(0)?,
+                model: row.get(1)?,
+            })
+        },
+    )
+    .map_err(dberr)
+}
+
 // ---------------------------------------------------------------------------
 // Store implementation
 // ---------------------------------------------------------------------------
 
 impl Store for SqliteStore {
+    fn read_session(&self) -> Result<Box<dyn crate::storage::MemoryRead + '_>> {
+        Ok(Box::new(read_session::SqliteMemoryRead::begin(self)?))
+    }
+
     fn temporal_history_capabilities(&self) -> Result<TemporalHistoryCapabilities> {
         let conn = self.connection()?;
         load_temporal_capabilities(&conn)
@@ -1776,75 +2139,31 @@ impl Store for SqliteStore {
     }
 
     fn get_space(&self, name: &str) -> Result<Space> {
-        let conn = self.connection()?;
-        conn.query_row(
-            "SELECT id, name, description, created_at FROM spaces WHERE name = ?1",
-            rusqlite::params![name],
-            row_space,
-        )
-        .optional()
-        .map_err(dberr)?
-        .ok_or_else(|| Error::SpaceNotFound {
-            name: name.to_string(),
-        })
+        let session = self.read_session()?;
+        let result = session.get_space(name)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn list_spaces(&self) -> Result<Vec<Space>> {
-        let conn = self.connection()?;
-        let mut stmt = conn
-            .prepare("SELECT id, name, description, created_at FROM spaces ORDER BY name")
-            .map_err(dberr)?;
-        let rows = stmt.query_map([], row_space).map_err(dberr)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(dberr)?);
-        }
-        Ok(out)
+        let session = self.read_session()?;
+        let result = session.list_spaces()?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn list_spaces_with_counts(&self) -> Result<Vec<(Space, u64)>> {
-        let conn = self.connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.id, s.name, s.description, s.created_at,
-                        (SELECT COUNT(*) FROM memory_spaces ms
-                         JOIN memories m ON m.id = ms.memory_id
-                         WHERE ms.space_id = s.id AND m.state = 'active') AS n
-                 FROM spaces s ORDER BY s.name",
-            )
-            .map_err(dberr)?;
-        let rows = stmt
-            .query_map([], |r| Ok((row_space(r)?, r.get::<_, i64>("n")? as u64)))
-            .map_err(dberr)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(dberr)?);
-        }
-        Ok(out)
+        let session = self.read_session()?;
+        let result = session.list_spaces_with_counts()?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn list_space_links(&self) -> Result<Vec<SpaceLink>> {
-        let conn = self.connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT from_space, to_space, created_at FROM space_links \
-                 ORDER BY created_at, from_space, to_space",
-            )
-            .map_err(dberr)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(SpaceLink {
-                    from_space: uuid_col(r, "from_space")?,
-                    to_space: uuid_col(r, "to_space")?,
-                    created_at: ts_col(r, "created_at")?,
-                })
-            })
-            .map_err(dberr)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(dberr)?);
-        }
-        Ok(out)
+        let session = self.read_session()?;
+        let result = session.list_space_links()?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn link_spaces(&self, from: Uuid, to: Uuid) -> Result<SpaceLink> {
@@ -1913,77 +2232,40 @@ impl Store for SqliteStore {
         tx.commit()?;
         Ok(report)
     }
+    fn record_document_extraction(
+        &self,
+        draft: DocumentExtractionDraft,
+    ) -> Result<DocumentExtractionReport> {
+        documents::record(self, draft)
+    }
+    #[cfg(feature = "embeddings")]
+    fn record_chunked_document(
+        &self,
+        draft: DocumentExtractionDraft,
+        budget: &crate::embeddings::budget::TokenBudget,
+    ) -> Result<DocumentExtractionReport> {
+        let plan = crate::ingest::document::chunk::chunk_document(&draft, budget)?;
+        documents::record_with_chunks(self, draft, Some(plan))
+    }
+    fn resolve_document_anchor(&self, anchor: &Anchor) -> Result<Option<StoredCitation>> {
+        documents::resolve(self, anchor)
+    }
+    fn list_document_extractions(&self, logical_id: Uuid) -> Result<Vec<DocumentExtractionInfo>> {
+        documents::list(self, logical_id)
+    }
+    fn erase_document_bytes(&self, source_bytes_hash: &str) -> Result<bool> {
+        documents::erase(self, source_bytes_hash)
+    }
     fn get_source_lifecycle(&self, logical_id: Uuid) -> Result<Option<SourceLifecycle>> {
         let conn = self.connection()?;
         load_source_lifecycle(&conn, logical_id)
     }
 
     fn get_memory_detail(&self, id: Uuid) -> Result<Option<MemoryDetail>> {
-        let conn = self.connection()?;
-        let memory = conn
-            .query_row(
-                "SELECT id, assertion_id, state, created_at, superseded_by, superseded_at, \
-                        retired_at, retire_reason \
-                 FROM memories WHERE id = ?1",
-                rusqlite::params![id.to_string()],
-                row_memory,
-            )
-            .optional()
-            .map_err(dberr)?;
-        let Some(memory) = memory else {
-            return Ok(None);
-        };
-        let assertion = load_assertion(&conn, memory.assertion_id)?;
-        let evidence = load_evidence(&conn, assertion.evidence_id)?;
-        let source = conn
-            .query_row(
-                "SELECT id, logical_id, kind, location, title, content, content_hash, \
-                        media_type, size_bytes, ingested_at \
-                 FROM sources WHERE id = ?1",
-                rusqlite::params![evidence.source_id.to_string()],
-                row_source,
-            )
-            .map_err(dberr)?;
-        let source_lifecycle = load_source_lifecycle(&conn, source.logical_id)?
-            .ok_or_else(|| Error::Storage("source without logical identity".to_string()))?;
-        let mut spaces_stmt = conn
-            .prepare(
-                "SELECT s.id, s.name, s.description, s.created_at \
-                 FROM memory_spaces ms JOIN spaces s ON s.id = ms.space_id \
-                 WHERE ms.memory_id = ?1 ORDER BY s.name",
-            )
-            .map_err(dberr)?;
-        let space_rows = spaces_stmt
-            .query_map(rusqlite::params![memory.id.to_string()], row_space)
-            .map_err(dberr)?;
-        let mut spaces = Vec::new();
-        for r in space_rows {
-            spaces.push(r.map_err(dberr)?);
-        }
-        let superseded_by = match memory.superseded_by {
-            Some(sb) => load_summaries(&conn, "", "m.id = ?", vec![Value::Text(sb.to_string())])?
-                .into_iter()
-                .next(),
-            None => None,
-        };
-        let supersedes = load_summaries(
-            &conn,
-            "",
-            "m.superseded_by = ?",
-            vec![Value::Text(memory.id.to_string())],
-        )?;
-        let git = load_git_provenance(&conn, &source.id)?;
-        Ok(Some(MemoryDetail {
-            memory,
-            assertion,
-            evidence,
-            source,
-            source_lifecycle,
-            spaces,
-            superseded_by,
-            supersedes,
-            git,
-        }))
+        let session = self.read_session()?;
+        let result = session.get_memory_detail(id)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn record_git_observation(
@@ -2440,6 +2722,7 @@ impl Store for SqliteStore {
     }
 
     fn record_manual_write(&self, draft: ManualMemoryDraft) -> Result<ManualMemoryReport> {
+        crate::core::validate_manual_text(&draft.content, draft.subject.as_deref())?;
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
         let at = Ts::now();
@@ -2696,22 +2979,10 @@ impl Store for SqliteStore {
     }
 
     fn embedding_index_status(&self, derivation_key: &str) -> Result<EmbeddingIndexStatus> {
-        let conn = self.connection()?;
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM assertions", [], |r| r.get(0))
-            .map_err(dberr)?;
-        let embedded: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assertion_embeddings WHERE derivation_key = ?1",
-                rusqlite::params![derivation_key],
-                |r| r.get(0),
-            )
-            .map_err(dberr)?;
-        Ok(EmbeddingIndexStatus {
-            derivation_key: derivation_key.to_string(),
-            total_assertions: total as u64,
-            embedded: embedded as u64,
-        })
+        let session = self.read_session()?;
+        let result = session.embedding_index_status(derivation_key)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn clear_embeddings(&self, derivation_key: &str) -> Result<usize> {
@@ -2725,6 +2996,13 @@ impl Store for SqliteStore {
             .map_err(dberr)?;
         tx.commit()?;
         Ok(n)
+    }
+
+    fn read_embedding_settings(&self) -> Result<EmbeddingSettings> {
+        let session = self.read_session()?;
+        let result = session.read_embedding_settings()?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -2757,269 +3035,45 @@ impl Store for SqliteStore {
         query: &SearchQuery,
         derivation_key: &str,
     ) -> Result<Vec<SearchHitRaw>> {
-        if query_vector.is_empty() {
-            return Err(Error::InvalidVector {
-                detail: "query vector is empty".to_string(),
-            });
-        }
-        for (i, v) in query_vector.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(Error::InvalidVector {
-                    detail: format!("non-finite value at index {i}: {v}"),
-                });
-            }
-        }
-        // Empty space list means "matches nothing", same as lexical search.
-        if let Some(ids) = &query.space_ids {
-            if ids.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
-        let dim = query_vector.len();
-        let mut params: Vec<Value> = Vec::new();
-        params.push(Value::Text(derivation_key.to_string()));
-        params.push(Value::Integer(dim as i64));
-        let filter_sql = build_search_filters(query, &mut params);
-        // All filter-qualified candidates are evaluated before ranking (F1).
-        // query.limit is applied only after ranking; no silent candidate cap.
-        let mut sql = String::from(
-            "SELECT m.id, a.id AS assertion_id, a.subject, a.content, ae.embedding, ae.dimension, \
-                    m.state, m.created_at, a.extraction, src.title, src.location \
-             FROM assertion_embeddings ae \
-             JOIN assertions a ON a.id = ae.assertion_id \
-             JOIN memories m ON m.assertion_id = a.id \
-             JOIN evidence e ON e.id = a.evidence_id \
-             JOIN sources src ON src.id = e.source_id \
-             WHERE ae.derivation_key = ?1 AND ae.dimension = ?2",
-        );
-        sql.push_str(&filter_sql);
-
-        // Fetch candidates (no ORDER BY in SQL; ranking happens in Rust).
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(&sql).map_err(dberr)?;
-        let rows = stmt
-            .query_map(params_from_iter(params), |r| {
-                let memory_id: String = r.get("id")?;
-                let assertion_id: String = r.get("assertion_id")?;
-                let embedding_bytes: Vec<u8> = r.get("embedding")?;
-                let stored_dim: i64 = r.get("dimension")?;
-                Ok((
-                    SearchHitRaw {
-                        memory_id: Uuid::parse_str(&memory_id).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
-                        })?,
-                        assertion_id: Uuid::parse_str(&assertion_id).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
-                        })?,
-                        subject: r.get("subject")?,
-                        content: r.get("content")?,
-                        snippet: String::new(),
-                        score: 0.0,
-                        state: enum_col(r, "state", MemoryState::parse)?,
-                        created_at: ts_col(r, "created_at")?,
-                        extraction: r.get("extraction")?,
-                        space_names: Vec::new(),
-                        source_title: r.get("title")?,
-                        source_location: r.get("location")?,
-                    },
-                    embedding_bytes,
-                    stored_dim,
-                ))
-            })
-            .map_err(dberr)?;
-
-        let mut candidates: Vec<(f64, SearchHitRaw)> = Vec::new();
-        for row in rows {
-            let (mut hit, bytes, stored_dim) = row.map_err(dberr)?;
-            // Dimension mismatch or malformed blob: exclude with no panic.
-            let stored = match decode_f32_le(&bytes, Some(stored_dim as usize)) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if stored.len() != dim {
-                continue;
-            }
-            let sim = cosine_similarity(&stored, query_vector);
-            // Deterministic content-window snippet for non-lexical hits.
-            hit.snippet = content_window(&hit.content);
-            hit.score = sim;
-            candidates.push((sim, hit));
-        }
-
-        // Deterministic ordering: score desc, then memory_id asc.
-        candidates.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.memory_id.cmp(&b.1.memory_id))
-        });
-        let mut hits: Vec<SearchHitRaw> = candidates
-            .into_iter()
-            .take(query.limit as usize)
-            .map(|(_, h)| h)
-            .collect();
-
-        // Fill space_names post-hoc, identical to lexical search.
-        let ids: Vec<String> = hits.iter().map(|h| h.memory_id.to_string()).collect();
-        let names = space_names_by_memory(&conn, &ids)?;
-        for h in &mut hits {
-            if let Some(ns) = names.get(&h.memory_id.to_string()) {
-                h.space_names = ns.clone();
-            }
-        }
-        // Assign rank is deferred to retrieval (M4); store returns raw hits.
-        Ok(hits)
+        let session = self.read_session()?;
+        let result = session.search_vectors(query_vector, query, derivation_key)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn list_memories_by_subject(&self, subject_normalized: &str) -> Result<Vec<MemorySummary>> {
-        let conn = self.connection()?;
-        load_summaries(
-            &conn,
-            "",
-            "a.subject_normalized = ?1",
-            vec![Value::Text(subject_normalized.to_string())],
-        )
+        let session = self.read_session()?;
+        let result = session.list_memories_by_subject(subject_normalized)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn list_replaced_by(&self, id: Uuid) -> Result<Vec<MemorySummary>> {
-        let conn = self.connection()?;
-        load_summaries(
-            &conn,
-            "",
-            "m.superseded_by = ?1",
-            vec![Value::Text(id.to_string())],
-        )
+        let session = self.read_session()?;
+        let result = session.list_replaced_by(id)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn memory_id_prefix_matches(&self, prefix: &str) -> Result<Vec<Uuid>> {
-        let conn = self.connection()?;
-        let lowered: String = prefix
-            .to_lowercase()
-            .chars()
-            .filter(|c| *c != '-')
-            .collect();
-        if lowered.is_empty() {
-            return Ok(Vec::new());
-        }
-        let pattern = format!("{lowered}%");
-        let mut stmt = conn
-            .prepare("SELECT id FROM memories WHERE REPLACE(id, '-', '') LIKE ?1 ORDER BY id")
-            .map_err(dberr)?;
-        let rows = stmt
-            .query_map(rusqlite::params![pattern], |r| r.get::<_, String>(0))
-            .map_err(dberr)?;
-        let mut out = Vec::new();
-        for r in rows {
-            let s = r.map_err(dberr)?;
-            if s.replace('-', "").starts_with(&lowered) {
-                out.push(
-                    Uuid::parse_str(&s)
-                        .map_err(|e| Error::Storage(format!("corrupt id '{s}': {e}")))?,
-                );
-            }
-        }
-        Ok(out)
+        let session = self.read_session()?;
+        let result = session.memory_id_prefix_matches(prefix)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHitRaw>> {
-        let conn = self.connection()?;
-        if !self.fts_integrity.load(Ordering::SeqCst) {
-            return Err(Error::FtsIndexInconsistent {
-                detail: "the last open-time integrity check failed; verify or rebuild the index"
-                    .to_string(),
-            });
-        }
-        let text = query.text.trim();
-        if text.is_empty() {
-            return Err(Error::EmptyQuery);
-        }
-        let mut sql = String::from(
-            "SELECT m.id, a.id AS assertion_id, a.subject, a.content, \
-                    snippet(assertion_fts, 2, '[', ']', '…', 12) AS snip, \
-                    bm25(assertion_fts) AS score, m.state, m.created_at, a.extraction, \
-                    src.title, src.location \
-             FROM assertion_fts \
-             JOIN assertions a ON a.id = assertion_fts.assertion_id \
-             JOIN memories m ON m.assertion_id = a.id \
-             JOIN evidence e ON e.id = a.evidence_id \
-             JOIN sources src ON src.id = e.source_id \
-             WHERE assertion_fts MATCH ?1",
-        );
-        let mut params: Vec<Value> = vec![Value::Text(text.to_string())];
-
-        // Empty space list means "matches nothing", same as before.
-        if let Some(ids) = &query.space_ids {
-            if ids.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
-
-        let filter_sql = build_search_filters(query, &mut params);
-        sql.push_str(&filter_sql);
-
-        // Deterministic tie-break: score ASC (bm25, best first), then memory id.
-        sql.push_str(&format!(
-            " ORDER BY score ASC, m.id ASC LIMIT ?{}",
-            params.len() + 1
-        ));
-        params.push(Value::Integer(i64::from(query.limit)));
-
-        // Deterministic two-step: try the text as an FTS5 match expression;
-        // on a syntax error retry it as a literal quoted phrase, so plain
-        // text containing punctuation ("O(1)") still searches.
-        let run = |match_text: &str| -> Result<Vec<SearchHitRaw>> {
-            let mut p = params.clone();
-            p[0] = Value::Text(match_text.to_string());
-            run_search_sql(&conn, &sql, p)
-        };
-        match run(text) {
-            Err(Error::QuerySyntax(_)) => run(&format!("\"{}\"", text.replace('"', "\"\""))),
-            other => other,
-        }
+        let session = self.read_session()?;
+        let result = session.search(query)?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn list_conflicts(&self) -> Result<Vec<ConflictGroup>> {
-        let conn = self.connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.id, s.name, a.subject_normalized \
-                 FROM memory_spaces ms \
-                 JOIN memories m ON m.id = ms.memory_id \
-                 JOIN assertions a ON a.id = m.assertion_id \
-                 JOIN spaces s ON s.id = ms.space_id \
-                 WHERE m.state = 'active' \
-                 GROUP BY s.id, a.subject_normalized \
-                 HAVING COUNT(*) > 1 \
-                 ORDER BY s.name, a.subject_normalized",
-            )
-            .map_err(dberr)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    uuid_col(r, "id")?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(dberr)?;
-        let mut groups = Vec::new();
-        for r in rows {
-            let (space_id, space_name, subject) = r.map_err(dberr)?;
-            let members = load_summaries(
-                &conn,
-                "JOIN memory_spaces fms ON fms.memory_id = m.id",
-                "m.state = 'active' AND fms.space_id = ? AND a.subject_normalized = ?",
-                vec![
-                    Value::Text(space_id.to_string()),
-                    Value::Text(subject.clone()),
-                ],
-            )?;
-            groups.push(ConflictGroup {
-                space_name,
-                subject,
-                members,
-            });
-        }
-        Ok(groups)
+        let session = self.read_session()?;
+        let result = session.list_conflicts()?;
+        session.finish()?;
+        Ok(result)
     }
 
     fn retire_memory(&self, id: Uuid, reason: Option<String>, at: Ts) -> Result<Memory> {
@@ -3220,6 +3274,18 @@ enum Plan {
     },
 }
 
+/// Captured file identity/lifecycle classification for one serialized operation.
+/// This is neither a persisted plan nor proof of physical file or alias identity.
+/// Application still performs ordinary version/knowledge reconciliation.
+struct FileObservationPlan<'conn> {
+    conn: &'conn Connection,
+    session: crate::core::SessionDraft,
+    files: Vec<ObservedFile>,
+    spaces: Vec<Uuid>,
+    classifications: Vec<Plan>,
+    residual_disappearances: BTreeMap<Uuid, String>,
+}
+
 /// What the engine believes about one logical source inside an ingest
 /// root: its expected location and the hash of its latest version.
 type KnownSource = (String, Option<String>);
@@ -3413,31 +3479,20 @@ fn record_code_observation_tx(
     Ok(report)
 }
 
-fn record_observation_tx(
-    conn: &Connection,
+/// Read the complete file classification before any ordinary mutation effects.
+/// The caller retains the existing serialized M6 transaction throughout planning
+/// and application; supplied roots/locations remain ordinary strings.
+fn plan_file_observation<'conn>(
+    conn: &'conn Connection,
     observation: IngestObservation,
-) -> Result<ObservationReport> {
+) -> Result<FileObservationPlan<'conn>> {
     let IngestObservation {
         session,
         mut files,
         spaces,
     } = observation;
-    let at = session.observed_at;
     let full = session.scope == IngestScope::Directory;
     let root = session.root.clone();
-
-    let session_id = Uuid::now_v7();
-    conn.execute(
-        "INSERT INTO ingest_sessions (id, root, scope, observed_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            session_id.to_string(),
-            session.root,
-            session.scope.as_str(),
-            at.0,
-        ],
-    )
-    .map_err(dberr)?;
-    upsert_scope(conn, None, Some(&session.root), &spaces, at)?;
 
     // Deterministic processing order.
     files.sort_by(|a, b| a.location.cmp(&b.location));
@@ -3596,7 +3651,9 @@ fn record_observation_tx(
             }
             let hash_of = |logical: &Uuid| -> Option<String> {
                 if gone.contains_key(logical) {
-                    latest_version_hash(conn, logical).ok().flatten()
+                    // This hash was read fallibly while capturing `present`.
+                    // A failed lookup must never become missing move evidence.
+                    present[logical].1.clone()
                 } else {
                     absent.get(logical).and_then(|(_, h)| h.clone())
                 }
@@ -3636,11 +3693,65 @@ fn record_observation_tx(
         }
     }
 
+    // Continued moves are already represented by their per-file classification.
+    // Only unmatched disappearances remain for application; partial observations
+    // never populate this map.
+    gone.retain(|logical, _| !matched.contains_key(logical));
+    Ok(FileObservationPlan {
+        conn,
+        session,
+        files,
+        spaces,
+        classifications: plans,
+        residual_disappearances: gone,
+    })
+}
+
+fn record_observation_tx(
+    conn: &Connection,
+    observation: IngestObservation,
+) -> Result<ObservationReport> {
+    #[cfg(test)]
+    observation_planning_tests::checkpoint("before_plan", conn)?;
+    let plan = plan_file_observation(conn, observation)?;
+    #[cfg(test)]
+    observation_planning_tests::checkpoint("after_plan", conn)?;
+    apply_file_observation(plan)
+}
+
+/// Apply captured file classifications; ordinary version/knowledge reconciliation remains here.
+fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationReport> {
+    let FileObservationPlan {
+        conn,
+        session,
+        files,
+        spaces,
+        classifications,
+        residual_disappearances,
+    } = plan;
+    let at = session.observed_at;
+    let root = session.root.clone();
+
+    // Preserve the original relative UUID allocation order: session first, then
+    // any new logical sources/versions created by the existing execution path.
+    let session_id = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO ingest_sessions (id, root, scope, observed_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            session_id.to_string(),
+            session.root,
+            session.scope.as_str(),
+            at.0,
+        ],
+    )
+    .map_err(dberr)?;
+    upsert_scope(conn, None, Some(&session.root), &spaces, at)?;
+
     // --- execution -----------------------------------------------------------
     let mut report_files: Vec<FileObservation> = Vec::new();
     let mut events: Vec<SourceEvent> = Vec::new();
 
-    for plan in plans {
+    for plan in classifications {
         match plan {
             Plan::Unchanged {
                 location,
@@ -3758,28 +3869,23 @@ fn record_observation_tx(
     // Disappearances: full observations only, scoped to the observed root.
     // This records absence; it does NOT retire derived memories
     // (disappearance is not falsehood).
-    if full {
-        for (logical, location) in &gone {
-            if matched.contains_key(logical) {
-                continue;
-            }
-            conn.execute(
-                "UPDATE logical_sources SET state = 'absent' WHERE id = ?1",
-                rusqlite::params![logical.to_string()],
-            )
-            .map_err(dberr)?;
-            let event = insert_source_event(
-                conn,
-                *logical,
-                SourceEventKind::Disappeared {
-                    from_location: Some(location.clone()),
-                },
-                None,
-                session_id,
-                at,
-            )?;
-            events.push(event);
-        }
+    for (logical, location) in &residual_disappearances {
+        conn.execute(
+            "UPDATE logical_sources SET state = 'absent' WHERE id = ?1",
+            rusqlite::params![logical.to_string()],
+        )
+        .map_err(dberr)?;
+        let event = insert_source_event(
+            conn,
+            *logical,
+            SourceEventKind::Disappeared {
+                from_location: Some(location.clone()),
+            },
+            None,
+            session_id,
+            at,
+        )?;
+        events.push(event);
     }
 
     Ok(ObservationReport {
@@ -3826,8 +3932,8 @@ fn absent_logical_at(conn: &Connection, location: &str) -> Result<Option<Uuid>> 
 
 fn logical_at(conn: &Connection, location: &str, state: &str) -> Result<Option<Uuid>> {
     let sql = format!(
-        "SELECT id FROM logical_sources WHERE current_location = ?1 AND state = '{state}' \
-         ORDER BY created_at DESC, id DESC LIMIT 1"
+        "SELECT id FROM logical_sources WHERE kind = 'file' AND current_location = ?1 \
+         AND state = '{state}' ORDER BY created_at DESC, id DESC LIMIT 1"
     );
     let id: Option<String> = conn
         .query_row(&sql, rusqlite::params![location], |r| r.get(0))
@@ -5452,3 +5558,45 @@ mod commit_failure_tests {
         ));
     }
 }
+
+impl SqliteStore {
+    /// Lists immutable chunk sets of this extraction, ordered by version, budget and source offset.
+    pub fn list_document_chunks(
+        &self,
+        extraction_id: Uuid,
+    ) -> Result<Vec<crate::storage::StoredDocumentChunk>> {
+        documents::list_chunks(self, extraction_id)
+    }
+}
+
+#[cfg(test)]
+#[path = "sqlite/ownership_migration_tests.rs"]
+mod ownership_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/document_preparation_migration_tests.rs"]
+mod document_preparation_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/lexical_staging_migration_tests.rs"]
+mod lexical_staging_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/semantic_staging_migration_tests.rs"]
+mod semantic_staging_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/fence_plan_migration_tests.rs"]
+mod fence_plan_migration_tests;
+
+#[cfg(test)]
+#[path = "sqlite/settings_tests.rs"]
+mod settings_tests;
+
+#[cfg(test)]
+#[path = "sqlite/read_session_tests.rs"]
+mod read_session_tests;
+
+#[cfg(test)]
+#[path = "sqlite/observation_planning_tests.rs"]
+mod observation_planning_tests;

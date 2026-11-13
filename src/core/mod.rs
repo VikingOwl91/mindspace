@@ -1,5 +1,12 @@
+pub mod document;
 pub mod error;
 
+pub use document::{
+    is_sha256_hex, params_hash, source_precision_claim, Anchor, AnchorPrecision, BBox,
+    CitationStatus, DocNodeDraft, DocumentExtractionDraft, DocumentExtractionInfo,
+    DocumentExtractionReport, DocumentRefusal, LiveObservation, NodeKind, Resolution,
+    RetainedBytes, StoredCitation, MAX_NODES,
+};
 pub use error::{Error, Result};
 
 use std::collections::BTreeMap;
@@ -265,6 +272,8 @@ pub enum SourceKind {
     /// A release derived from a tag ref (ADR-024); not a blob.
     GitTag,
     Manual,
+    /// A document (M8): its versions hold canonical extracted text. Outside the file lifecycle.
+    Document,
 }
 
 impl SourceKind {
@@ -274,6 +283,7 @@ impl SourceKind {
             SourceKind::GitBlob => "git_blob",
             SourceKind::GitTag => "git_tag",
             SourceKind::Manual => "manual",
+            SourceKind::Document => "document",
         }
     }
 
@@ -283,6 +293,7 @@ impl SourceKind {
             "git_blob" => Some(SourceKind::GitBlob),
             "git_tag" => Some(SourceKind::GitTag),
             "manual" => Some(SourceKind::Manual),
+            "document" => Some(SourceKind::Document),
             _ => None,
         }
     }
@@ -473,6 +484,8 @@ pub enum LogicalKind {
     File,
     GitPath,
     Manual,
+    /// A document (M8): outside the file lifecycle.
+    Document,
 }
 
 impl LogicalKind {
@@ -481,6 +494,7 @@ impl LogicalKind {
             LogicalKind::File => "file",
             LogicalKind::GitPath => "git_path",
             LogicalKind::Manual => "manual",
+            LogicalKind::Document => "document",
         }
     }
 
@@ -489,6 +503,7 @@ impl LogicalKind {
             "file" => Some(LogicalKind::File),
             "git_path" => Some(LogicalKind::GitPath),
             "manual" => Some(LogicalKind::Manual),
+            "document" => Some(LogicalKind::Document),
             _ => None,
         }
     }
@@ -601,6 +616,21 @@ pub struct Memory {
     pub retire_reason: Option<String>,
 }
 
+/// Fixed UTF-8 byte limit for each manual-memory content and subject field.
+/// Ingested file/blob limits are enforced separately by ingestion.
+pub const MAX_MANUAL_MEMORY_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn validate_manual_text(content: &str, subject: Option<&str>) -> Result<()> {
+    for (field, value) in [("content", content), ("subject", subject.unwrap_or(""))] {
+        if value.len() > MAX_MANUAL_MEMORY_BYTES {
+            return Err(Error::Storage(format!(
+                "manual memory {field} exceeds {MAX_MANUAL_MEMORY_BYTES} UTF-8 bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// An explicit memory write. Its source and evidence are created by the
 /// storage layer with a manual provenance marker, never as a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -644,6 +674,14 @@ pub struct UnembeddedAssertion {
     pub subject: String,
     pub content: String,
     pub created_at: Ts,
+}
+
+/// Related legacy embedding settings read from one coherent storage snapshot.
+/// Raw optional values preserve absence, empty strings and unknown identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingSettings {
+    pub enabled: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Coverage of one derivation key over the assertion population.

@@ -476,3 +476,305 @@ fn expected_unavailable_reason() -> &'static str {
         "feature_disabled"
     }
 }
+
+fn index_run_with_isolated_home(root: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_mind"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TMPDIR", root)
+        .arg("--db")
+        .arg(root.join("mind.db"))
+        .args(["index", "run"])
+        .output()
+        .expect("run isolated index command")
+}
+
+#[test]
+fn index_run_preserves_legitimate_settings_outcomes() {
+    use mindspace::storage::Store;
+
+    for (enabled, model, expected) in [
+        (None, None, "embeddings disabled"),
+        (
+            Some("TRUE"),
+            Some("synthetic-unknown"),
+            "embeddings disabled",
+        ),
+        (
+            Some("false"),
+            Some("synthetic-unknown"),
+            "embeddings disabled",
+        ),
+        (Some("true"), None, "no model selected"),
+        (Some("true"), Some(""), "unknown model:"),
+        (
+            Some("true"),
+            Some("synthetic-unknown"),
+            "unknown model: synthetic-unknown",
+        ),
+        (
+            Some("true"),
+            Some(mindspace::embeddings::manifest::NOMIC_V1_5.id),
+            "not installed",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mindspace::SqliteStore::open(&dir.path().join("mind.db")).unwrap();
+        if let Some(value) = enabled {
+            store.set_meta("embedding.enabled", value).unwrap();
+        }
+        if let Some(value) = model {
+            store.set_meta("embedding.model", value).unwrap();
+        }
+        drop(store);
+        let output = index_run_with_isolated_home(dir.path());
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "expected {expected:?}, got {stderr}"
+        );
+    }
+}
+
+#[test]
+fn index_run_propagates_settings_storage_errors_instead_of_disabled() {
+    use mindspace::storage::Store;
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("mind.db");
+    let store = mindspace::SqliteStore::open(&database).unwrap();
+    store.set_meta("embedding.enabled", "false").unwrap();
+    store
+        .set_meta("embedding.model", "SYNTHETIC_MODEL")
+        .unwrap();
+    drop(store);
+    // Deliberately malformed disposable schema: constructor inventory still
+    // exists, while decoding the required legacy settings query must fail.
+    let raw = rusqlite::Connection::open(&database).unwrap();
+    raw.execute_batch("ALTER TABLE mind_meta RENAME COLUMN value TO synthetic_unavailable")
+        .unwrap();
+    drop(raw);
+
+    let output = index_run_with_isolated_home(dir.path());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no such column"), "{stderr}");
+    assert!(stderr.contains("value"), "{stderr}");
+    assert!(!stderr.contains("embeddings disabled"), "{stderr}");
+    assert!(!stderr.contains("no model selected"), "{stderr}");
+}
+
+#[test]
+fn untrusted_text_is_terminal_safe_and_json_is_lossless() {
+    let mind = Mind::new();
+    assert!(mind.run(&["init"]).2);
+    let controls = "\u{1b}]0;title\u{7}\u{1b}[2J\u{1b}[31m\u{9b}31m\r\u{8}\u{7f}\u{202e}\u{2066}";
+    let heading_controls = controls.replace('\r', "");
+    let subject = format!("EscapeToken Grüße 日本語 🦉 {heading_controls}");
+    let space = format!("safe{controls}");
+    assert!(mind.run(&["space", "create", &space]).2);
+    let path = mind.db.path().join(format!("note{controls}.md"));
+    std::fs::write(
+        &path,
+        format!("# {subject}\n\nEscapeToken body {controls}\nSecond line.\n"),
+    )
+    .unwrap();
+    let path = path.to_str().unwrap();
+    let (out, err, ok) = mind.run(&["ingest", path, "--space", &space]);
+    assert!(ok, "{err}");
+    assert_terminal_safe(&out);
+    assert!(out.contains("Grüße 日本語 🦉"));
+    for command in ["search", "recall"] {
+        for mode in [None, Some("lexical"), Some("auto")] {
+            let mut args = vec![command, "EscapeToken", "--space", &space];
+            if let Some(mode) = mode {
+                args.extend(["--mode", mode]);
+            }
+            let (out, err, ok) = mind.run(&args);
+            assert!(ok, "{err}");
+            assert_terminal_safe(&out);
+            assert!(out.contains("Grüße 日本語 🦉"));
+            args.push("--json");
+            let (out, err, ok) = mind.run(&args);
+            assert!(ok, "{err}");
+            let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let hit = if mode.is_some() {
+                &json["hits"][0]["hit"]
+            } else {
+                &json[0]
+            };
+            assert_eq!(hit["subject"], subject);
+            assert!(hit["content"].as_str().unwrap().contains('\u{1b}'));
+            assert!(hit["source_location"].as_str().unwrap().contains(controls));
+            assert_eq!(hit["spaces"][0]["name"], space);
+        }
+    }
+    // JSON ingest reports retain raw data too.
+    let (out, err, ok) = mind.run(&["ingest", path, "--space", &space, "--json"]);
+    assert!(ok, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(report["root"].as_str().unwrap().contains(controls));
+}
+
+fn assert_terminal_safe(output: &str) {
+    assert!(
+        !output
+            .chars()
+            .any(|c| (c.is_control() && c != '\n' && c != '\t')
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)),
+        "unsafe output: {output:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn public_help_hides_internal_ownership_but_explicit_admin_help_works() {
+    let mind = Mind::new();
+    for args in [vec!["--help"], vec!["help"], vec!["help", "help"]] {
+        let (out, err, ok) = mind.run(&args);
+        assert!(ok, "{err}");
+        assert!(!out.contains("ownership"), "{out}");
+        assert!(!out.contains("stage-document"), "{out}");
+    }
+    let (out, err, ok) = mind.run(&["ownership", "--help"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("stage-document-lexical"));
+}
+
+#[test]
+fn git_ingest_output_sanitizes_untrusted_paths_and_subjects() {
+    let mind = Mind::new();
+    assert!(mind.run(&["init"]).2);
+    assert!(mind.run(&["space", "create", "coding"]).2);
+    let repo = mind.db.path().join("repo\u{1b}]0;git\u{7}");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&["init", "-q"]);
+    let name = "GitToken\u{1b}[2J.md";
+    std::fs::write(
+        repo.join(name),
+        "# GitToken Grüße 🦉 \u{1b}]0;title\u{7}\n\nGitToken \u{9b}31m body.\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "fixture",
+    ]);
+    git(&["branch", "branch\u{202e}"]);
+    let (out, err, ok) = mind.run(&["ingest", repo.to_str().unwrap(), "--space", "coding"]);
+    assert!(ok, "{err}");
+    assert_terminal_safe(&out);
+    assert!(out.contains("Grüße 🦉"));
+    for command in ["search", "recall"] {
+        let (out, err, ok) = mind.run(&[command, "GitToken", "--space", "coding"]);
+        assert!(ok, "{err}");
+        assert_terminal_safe(&out);
+        assert!(out.contains("Grüße 🦉"));
+    }
+}
+
+#[test]
+fn manual_controls_related_hits_and_inherited_spaces_are_safe_but_json_is_exact() {
+    use mindspace::storage::Store;
+    let mind = Mind::new();
+    assert!(mind.run(&["init"]).2);
+    let store = mindspace::SqliteStore::open(&mind.db.path().join("mind.db")).unwrap();
+    let controls = "\u{1b}]52;c;AAAA\u{7}\u{1b}[2J\u{9b}\u{8}\r\t\u{7f}\u{202e}\u{2069}";
+    let source = store
+        .create_space(&format!("source{controls}"), "")
+        .unwrap();
+    let via = store.create_space(&format!("via{controls}"), "").unwrap();
+    store.link_spaces(via.id, source.id).unwrap();
+    let subject = format!("ManualToken e\u{301} 日本語 🦉 {controls}");
+    for suffix in ["one", "two"] {
+        store
+            .record_manual_write(mindspace::core::ManualMemoryDraft {
+                subject: Some(subject.clone()),
+                content: format!("ManualToken body {controls}\n{suffix}"),
+                spaces: vec![source.id],
+                supersedes: None,
+            })
+            .unwrap();
+    }
+    drop(store);
+    for command in ["search", "recall"] {
+        for mode in [None, Some("lexical"), Some("auto")] {
+            let mut args = vec![command, "ManualToken", "--space", &via.name];
+            if let Some(mode) = mode {
+                args.extend(["--mode", mode]);
+            }
+            let (out, err, ok) = mind.run(&args);
+            assert!(ok, "{err}");
+            assert_terminal_safe(&out);
+            assert!(out.contains("e\u{301} 日本語 🦉"));
+            assert!(out.contains("(via source"));
+            if command == "recall" {
+                assert!(out.contains("related:"));
+            }
+            args.push("--json");
+            let (out, err, ok) = mind.run(&args);
+            assert!(ok, "{err}");
+            let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let hits = if mode.is_some() {
+                &result["hits"]
+            } else {
+                &result
+            };
+            assert_eq!(hits.as_array().unwrap().len(), 2);
+            for value in hits.as_array().unwrap() {
+                let hit = if mode.is_some() { &value["hit"] } else { value };
+                assert_eq!(hit["subject"], subject);
+                assert!(hit["content"].as_str().unwrap().contains(controls));
+                assert_eq!(hit["spaces"][0]["via"], source.name);
+                assert_eq!(hit["spaces"][0]["name"], source.name);
+            }
+        }
+    }
+}
+
+#[test]
+fn ingest_error_from_an_untrusted_filename_is_terminal_safe() {
+    let mind = Mind::new();
+    assert!(mind.run(&["init"]).2);
+    assert!(mind.run(&["space", "create", "coding"]).2);
+    let directory = mind.db.path().join("untrusted");
+    std::fs::create_dir(&directory).unwrap();
+    let filename = "Grüße 日本語 🦉 \u{1b}]0;error\u{7}\u{202e}.txt";
+    std::fs::write(directory.join(filename), [0xff, 0xfe]).unwrap();
+    for json in [false, true] {
+        let mut args = vec!["ingest", directory.to_str().unwrap(), "--space", "coding"];
+        if json {
+            args.push("--json");
+        }
+        let (out, err, ok) = mind.run(&args);
+        assert!(!ok);
+        assert!(out.is_empty());
+        assert_terminal_safe(&err);
+        assert!(err.contains("Grüße 日本語 🦉"));
+        assert!(err.contains("not valid UTF-8"));
+    }
+}

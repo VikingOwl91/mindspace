@@ -262,6 +262,12 @@ pub fn remove_model(id: &str) -> Result<()> {
 
 // ---- persistence via mind_meta ----
 
+/// Coupled operational selection from one storage observation; never display fallback.
+pub(crate) fn read_settings(store: &dyn Store) -> Result<(bool, Option<String>)> {
+    let settings = store.read_embedding_settings()?;
+    Ok((settings.enabled.as_deref() == Some("true"), settings.model))
+}
+
 /// Fallible read of the enable flag. A storage failure is an error here, so it
 /// cannot look like "disabled". `is_enabled` swallows errors for display only.
 pub fn read_enabled(store: &dyn Store) -> Result<bool> {

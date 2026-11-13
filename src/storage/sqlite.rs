@@ -350,7 +350,7 @@ impl SqliteStore {
         Self::init_conn(conn)
     }
 
-    fn init_conn(conn: Connection) -> Result<Self> {
+    fn init_conn(mut conn: Connection) -> Result<Self> {
         let revision_state = Arc::new(RevisionState {
             active_revision: AtomicI64::new(0),
             poisoned: AtomicBool::new(false),
@@ -360,7 +360,7 @@ impl SqliteStore {
             .map_err(dberr)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(dberr)?;
-        register_revision_context(&conn, &revision_state)?;
+        register_revision_context(&mut conn, &revision_state)?;
         reject_future_schema(&conn)?;
         run_migrations(&conn)?;
         validate_fence_inventory(&conn)?;
@@ -643,7 +643,7 @@ fn dberr(e: rusqlite::Error) -> Error {
     Error::Storage(e.to_string())
 }
 
-fn register_revision_context(conn: &Connection, state: &Arc<RevisionState>) -> Result<()> {
+fn register_revision_context(conn: &mut Connection, state: &Arc<RevisionState>) -> Result<()> {
     let function_state = Arc::clone(state);
     conn.create_scalar_function(
         "m6_write_revision",

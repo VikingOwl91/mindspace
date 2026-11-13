@@ -1,0 +1,171 @@
+{
+  "source": {
+    "source_commit": "a027d94680392648b6277dc2fd9bc20906114b91",
+    "source_tree": "3cc15658d9c840522cbff102b44f6d004d5506bf",
+    "parent": "d02dfa0428002cfc00375f0587de63905ea7ea5b",
+    "signer": "0E6699CB48F3941AE28CA88D509F78007F62D5EA",
+    "files": [
+      "README.md",
+      "docs/source-install.md",
+      "docs/release-notes.md",
+      "release/source-files.txt",
+      "scripts/assemble-source-archive.py"
+    ]
+  },
+  "archive": {
+    "source_commit": "a027d94680392648b6277dc2fd9bc20906114b91",
+    "source_tree": "3cc15658d9c840522cbff102b44f6d004d5506bf",
+    "archive_sha256": "b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0",
+    "manifest_sha256": "903d8fd226593b74083bc8c0a11b7ffafc520eae06b5f054d0565ad1f5dae391",
+    "archive_bytes": 1384547,
+    "regular_files": 235,
+    "directories": 29,
+    "two_clean_git_checkouts_byte_identical": true,
+    "independent_extracted_repack_byte_identical": true,
+    "all_payload_files_exact_source_blobs": true,
+    "normalized_inventory_verified": true,
+    "doc_links_checked": 18,
+    "python": "3.14.10",
+    "zlib": "1.4",
+    "source_view": "/home/cnachtigall/git/projects/mindspace/target/rc5-qualification/extracted/mindspace-0.1.0-alpha.1",
+    "output": "/home/cnachtigall/git/projects/mindspace-wt/m8-s3d2/artifacts/releases/v0.1.0-alpha.1/rc.5-release-documentation"
+  },
+  "payload_delta": {
+    "added": [
+      "docs/release-notes.md"
+    ],
+    "removed": [],
+    "changed": [
+      "README.md",
+      "docs/source-install.md",
+      "release/source-files.txt",
+      "scripts/assemble-source-archive.py"
+    ],
+    "unchanged_rc4_members": 230,
+    "license_and_tokenizer_materials_unchanged": [
+      "LICENSE",
+      "LICENSES/Apache-2.0.txt",
+      "THIRD_PARTY_NOTICES.md",
+      "tokenizer-provenance.json",
+      "tests/fixtures/nomic-tokenizer.json"
+    ],
+    "all_changes_documentation_or_packaging_metadata": true
+  },
+  "signatures": {
+    "status": {
+      "mindspace-0.1.0-alpha.1-rc.5-source.tar.gz": "VALIDSIG pinned signer",
+      "tampered-mindspace-0.1.0-alpha.1-rc.5-source.tar.gz": "rejected exit 1",
+      "source-archive-manifest.json": "VALIDSIG pinned signer",
+      "tampered-source-archive-manifest.json": "rejected exit 1",
+      "wrong-asserted-signer": "rejected exit 1"
+    },
+    "signer": "0E6699CB48F3941AE28CA88D509F78007F62D5EA",
+    "exact_recipient_commands_passed": true,
+    "live_independent_WKD_key_retrieval_passed": true,
+    "files": {
+      "SHA256SUMS": "5fc56e89bed615a7755bfe4e28eb63bd3fe6e855f586bae6142c14754ecb06ef",
+      "VERIFY.txt": "86c667876ad6e91a7dce4341c44d4ea2207fdba7c3ad368d51f74dfdc2a46b84",
+      "mindspace-0.1.0-alpha.1-rc.5-source.tar.gz": "b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0",
+      "mindspace-0.1.0-alpha.1-rc.5-source.tar.gz.asc": "6604a649c6795249ebf168116418825db9bef08ef370b2a1884aee4df190b685",
+      "mindspace-release-signing-key.asc": "bcba2140c52fb84befaedba8ae1dfd8b1aa2fb121149a2d6bba5e4736e88879b",
+      "source-archive-manifest.json": "903d8fd226593b74083bc8c0a11b7ffafc520eae06b5f054d0565ad1f5dae391",
+      "source-archive-manifest.json.asc": "f2eda80092b572761e80f381128e75afee4b042a21af66d5a1064d9aabf52f2d"
+    },
+    "keyring": "/home/cnachtigall/git/projects/mindspace/target/fable-runtime/tmp/recipient-gc3hg6wu/tmp.zC2Yq4v37R",
+    "verify_prose_corrected_to_rc5_commands_unchanged": true
+  },
+  "runtime": {
+    "original_source_members_unchanged": 235,
+    "binary_sha256": "73bbabc1b7084d2a4dd8364a651e5140ab5223bb8823c481e1d1c62a9665d28b",
+    "ordinary_features": [
+      "[]"
+    ],
+    "spawn_gate_absent": true,
+    "python": "3.13.5",
+    "system_sqlite": "3.46.1",
+    "uid": 1001,
+    "guide_groups_passed": 12,
+    "install_and_readme_quickstart_executed": true,
+    "cli_git_memory_and_stdio_mcp_smoke": "PASS",
+    "isolated_demo_backup_restore": "PASS; trusted new demo only, not full historical migration/recovery suite",
+    "network": "none",
+    "host_mounts": false,
+    "container": "mindspace-rc5-6wbf7u1n",
+    "start_utc": "2026-11-13T03:05:15.114981+00:00",
+    "end_utc": "2026-11-13T03:05:17.587061+00:00",
+    "driver_log_sha256": "f700d1c399b907360f51480ccb515edbecbcd808c870e77fb8bcdad8b2057565"
+  },
+  "build": {
+    "command": "literal source-local + build-noembed blocks, podman exec --interactive",
+    "exit_code": 0,
+    "status": "PASS",
+    "start_utc": "2026-11-13T03:01:53.003749+00:00",
+    "end_utc": "2026-11-13T03:03:25.418634+00:00",
+    "container": "mindspace-rc5-6wbf7u1n",
+    "uid": 1001,
+    "network": "none",
+    "host_mounts": false,
+    "cache": "public Cargo registry only; no previous source/targets/credentials",
+    "log_sha256": "99e5ed7ddfb020942f63e361f600b97b7a9169e69fea5a28a672ca6988ce6a8e"
+  },
+  "advisory": {
+    "command": [
+      "cargo",
+      "audit",
+      "--json"
+    ],
+    "start_utc": "2026-11-13T03:01:00.729810+00:00",
+    "end_utc": "2026-11-13T03:01:02.075517+00:00",
+    "exit_code": 0,
+    "log_sha256": "ba95e079a0f2ace3f81b0e210cbadf7c614afc7695183c4edb578a1484a90d2f",
+    "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+  },
+  "dependency_policy": {
+    "command": [
+      "cargo",
+      "deny",
+      "--locked",
+      "check",
+      "advisories",
+      "licenses",
+      "bans",
+      "sources"
+    ],
+    "start_utc": "2026-11-13T03:01:00.327285+00:00",
+    "end_utc": "2026-11-13T03:01:01.122991+00:00",
+    "exit_code": 0,
+    "log_sha256": "9d2d6edb36457d37a33ecba76913a864fe48b5530219a2975a0d0a0a0db3f32a",
+    "environment": "fresh HOME/XDG/TMPDIR, global/system Git config disabled; public dependency cache reused; no client credentials"
+  },
+  "full_regression_and_fable_audit": "NOT RUN: exact application/test/migration/dependency bytes unchanged from RC.4",
+  "archive_python_unit_tests": "4 PASS; python3 -B scripts/test-source-archive.py",
+  "preserved_untouched_baseline_files": 357,
+  "independent_delta_review": {
+    "verdict": "ACCEPT",
+    "findings": 0,
+    "independently_checked": [
+      "source signature and five-file delta",
+      "235 exact Git blobs/allowlist",
+      "payload delta",
+      "assembly/repack byte identity",
+      "pinned signatures and negative controls",
+      "four archive tests and18-file doc links",
+      "357 baseline content/metadata records",
+      "build/runtime log and script hash bindings"
+    ],
+    "runtime_rerun_by_reviewer": false
+  },
+  "scanner_identity": {
+    "alpm_package": "gitleaks 8.30.1-1.1",
+    "version_cli": "version is set by build process",
+    "binary_sha256": "d9f926d6f6f99a17bfb38d57dec2733234b22a519e324217a86ab3b6c2c63c65"
+  },
+  "container_cleanup": {
+    "container": "mindspace-rc5-6wbf7u1n",
+    "id": "ff1a89eb723eb7a392cd80290d5e176a16b9ef7441066b899a24c644b3c27c82",
+    "status": "exited",
+    "filesystem_and_evidence_retained": true,
+    "previous_container_status_unchanged": "exited",
+    "stop_behavior": "Podman SIGTERM timed out after2seconds; SIGKILL ended the task-owned namespace/PID1 sleep. All qualification checks had completed; no graceful application-shutdown claim is made."
+  }
+}

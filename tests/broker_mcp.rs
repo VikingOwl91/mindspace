@@ -997,6 +997,16 @@ fn a_start_that_fails_after_the_fork_leaves_no_watchdog_broker_or_tree() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let before: Vec<PathBuf> = mindspace_cgroups();
+    // The same precondition as the other tests in this file: without cgroup v2 delegation the
+    // broker never forks, so there is no watchdog to observe. Skip with a message in that case.
+    let Some(probe) = Fe::start_unlocked(&w, &project, &[]) else {
+        return;
+    };
+    probe.finish();
+    let end = Instant::now() + Duration::from_secs(10);
+    while mindspace_cgroups().iter().any(|t| !before.contains(t)) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let mut c = w.mind(&["mcp", "--allow-root"]);
     c.arg(&project)
         .args(["--grants", "--broker"])

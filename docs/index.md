@@ -19,9 +19,9 @@ do not identify or contain the qualified RC.5 implementation. The former
 - [Security reports and supported versions](../SECURITY.md)
 - [MIT license](../LICENSE) and [archive third-party notices](../THIRD_PARTY_NOTICES.md)
 
-The README includes a complete temporary Git-repository quickstart. The install
-guide includes a standalone Python/stdio MCP memory example, so an AI account is
-not required. Execute examples against the verified archive build, not a build
+The README has a short quickstart against your own repository. The install
+guide (sections 6 to 9) includes the complete temporary Git-repository demo and a
+standalone Python/stdio MCP memory example, so an AI account is not required. Execute examples against the verified archive build, not a build
 of older public main.
 
 The supported profile is Linux x86_64 without embedding models: explicit memories,

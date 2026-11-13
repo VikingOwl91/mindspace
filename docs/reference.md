@@ -15,8 +15,10 @@ existing data with a new binary.
 
 ## CLI examples
 
-After the [README quickstart](../README.md#quickstart-no-ai-model-needed), these
-commands use its temporary database, repository and `demo` space:
+After the install guide's demo ([sections 6 to 9](source-install.md#6-initialize-a-private-demo-database)),
+these commands use its temporary database, repository and `demo` space. The
+[README quickstart](../README.md#quickstart) shows the core commands against
+your own repository.
 
 ```sh
 mind space list
@@ -89,8 +91,41 @@ The supported profile is Linux x86_64 without embedding models. MCP repository
 access requires effective Landlock ABI 3+ and a successful startup canary. CLI
 ingestion has no equivalent kernel-confinement promise. Do not treat
 `--insecure-no-sandbox` as an equivalent workaround. Read the
-[architecture](architecture.md), [README limits](../README.md#known-limits) and
+[architecture](architecture.md#security-boundaries),
+[sandbox capabilities](sandbox-capabilities.md) and
 [security policy](../SECURITY.md).
+
+Known limits of this Alpha:
+
+- Linux x86_64 is the qualified platform. MCP repository access needs effective
+  Landlock ABI 3+; other operating systems and arbitrary filesystems/containers
+  are not qualified by this release.
+- MCP is local unauthenticated stdio. Anyone who can access it can use its tools,
+  including writes. Spaces organize retrieval; they are not access controls.
+- Storage is not encrypted and source deletion is not secure erasure. New
+  admitted private DB/sidecar files use `0600`, new private directories `0700`;
+  existing permissive files are preserved rather than silently changed.
+- Manual content and subject fields each allow 1 MiB of decoded UTF-8. MCP lines
+  allow 8 MiB including delimiters. Oversized fields return tool errors;
+  oversized lines close the transport. No aggregate storage quota is promised.
+- Human-readable ingest/search/recall output replaces terminal controls and bidi
+  overrides with `?`. Stored values and JSON remain unchanged.
+- Rust is the only structurally parsed language. Recovered parses can be partial.
+  Git repositories must use SHA-1. `--history` selects ref tips, not every
+  ancestor's file content. Serialize ingests while changing HEAD.
+- Repeating an unchanged ingest reuses derived content; session/revision
+  journals can still grow.
+- Large ingests can take minutes. MCP preparation deadlines do not interrupt a
+  database commit. An uncertain commit result requires preserving state and
+  investigating; process-kill tests do not certify power-loss recovery.
+- Semantic/hybrid retrieval and real-model inference are outside this release
+  profile. Package, schema and protocol versions are separate; Alpha command and
+  schema compatibility can change.
+
+Confined MCP combines Landlock, descriptor-based path checks and hardened Git
+execution, including ignored user/system Git configuration and disabled hooks,
+fsmonitor and replace refs. Read access can disclose repository content to the
+connected agent; Mindspace's permissions do not restrict the agent's other tools.
 
 Canonical document/PDF ingestion, unfinished M8 publication and real-model
 inference are outside the qualified Alpha. There are no native `mind backup`

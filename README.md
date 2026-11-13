@@ -5,226 +5,195 @@ agents. It is written in Rust, stores its data in a local SQLite database, and i
 used through the `mind` command-line tool or as a stdio
 [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server.
 
-Mindspace keeps explicit decisions, notes and committed Git content across agent
-sessions. Search results retain their source and history. Rust definitions can be
-found by symbol and file, with commit provenance. Parsing and lexical search need no AI model.
-Mindspace does not automatically record conversations; an agent must explicitly
-write a memory or ingest a source.
+> **Status:** `v0.1.0-alpha.1` is a source-only public Alpha for Linux x86_64,
+> published as a GitHub prerelease. It is the only published release.
+> [Download it from the release page](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
 
-**v0.1.0-alpha.1 is a source-only Legacy/Git Public Alpha (RC.5), published as a
-GitHub prerelease.** Download it from the
-[official release page](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
-The supported profile is Linux x86_64 without embedding models.
-**v0.1.0-alpha.1 establishes the first independently qualified public Alpha
-baseline** and is the only published release.
+## Why use it
 
-## Which source is the Alpha
+- **Agents forget between sessions.** Mindspace keeps the decisions and notes an
+  agent or you explicitly store, so a later session can search them.
+- **Your data stays local.** One SQLite database on your machine. No account, no
+  hosted service and no required daemon.
+- **No AI model needed.** Parsing and lexical search are deterministic.
+- **Results keep their origin.** Each hit shows its source and, for Git content,
+  the commit. `mind inspect` shows the full evidence chain.
+- **Nothing is recorded automatically.** An agent must explicitly write a memory
+  or ingest a source.
 
-**A clone, Download ZIP, and GitHub-generated source ZIP/tar archives contain
-older code, not the qualified Alpha.**
+## Features in this Alpha
 
-| Source | What it contains |
-| --- | --- |
-| Release asset `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` | The qualified RC.5 Alpha source. This is the authoritative distribution; verify and build this. |
-| Public `main` (clone, Download ZIP) | An older implementation plus these documentation updates. Not RC.5. |
-| Tag `v0.1.0-alpha.1` and its generated "Source code" ZIP/tar.gz | The older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`. The tag anchors the release page and does not identify the RC.5 source tree. |
-| Former `v0.2.0` and `v0.3.0` releases | Removed. These pre-alpha snapshots and their tags are no longer published; their commits remain in the history of `main`. |
-
-The broader RC.5 Git history is not published. The older crate 0.5.0 number is
-not this Alpha's version. See the [release notes](docs/release-notes.md).
-
-## What this Alpha includes
-
-| Workflow | Interface |
+| You can | With |
 | --- | --- |
 | Create, update or retire an explicit memory | MCP `memory_create`, `memory_update`, `memory_retire` |
 | Ingest Markdown/text files and committed Git content | `mind ingest`; MCP `repo_ingest` for allowed repositories |
-| Search memories and inspect their evidence/history | `mind search`, `mind recall`, `mind inspect`; MCP memory tools |
-| Find Rust definitions with file/commit provenance | `mind symbols`; MCP `code_search` |
-| Organize retrieval by named spaces | CLI `mind space`; MCP space tools |
+| Search memories and inspect their evidence and history | `mind search`, `mind recall`, `mind inspect`; MCP memory tools |
+| Find Rust definitions with file and commit provenance | `mind symbols`; MCP `code_search` |
+| Group content into named spaces | `mind space`; MCP space tools |
 
-Legacy Markdown/text ingestion is included. **Canonical document/PDF ingestion
-and M8 document publication are not part of this Alpha.** Private `mind ownership`
-staging commands are unsupported and hidden from public help. Embedding-based
-search remains optional development capability outside this qualified model-free
-release profile.
+Not part of this Alpha: canonical document/PDF ingestion, M8 document
+publication, and embedding-based (semantic or hybrid) search. Rust is the only
+structurally parsed language. There is no CLI command to create a memory; that
+goes through MCP.
 
 ## Install
 
-Download all seven RC.5 assets from the
-[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1): the named source archive, manifest,
-`SHA256SUMS`, detached signatures for archive and manifest, `VERIFY.txt` and public
-key. Authenticate the publisher independently, then follow `VERIFY.txt` to verify
-both signatures and the exact checksums **before extracting or building**.
-A bundled public key or a checksum alone does not authenticate the publisher.
+The Alpha is distributed as a signed source archive attached to the
+[v0.1.0-alpha.1 release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
+**Do not build from a clone, Download ZIP or the "Source code" archives on the
+release page.** They contain older code:
+
+| Source | What it contains |
+| --- | --- |
+| Release asset `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` | The qualified Alpha source (RC.5). Verify and build this. |
+| Public `main` (clone, Download ZIP) | An older implementation plus the current documentation. |
+| Tag `v0.1.0-alpha.1` and its generated "Source code" ZIP/tar.gz | The older commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`, which only anchors the release page. |
+
+1. Download all seven assets from the release page.
+2. Authenticate the publisher's signing key through a channel you trust, then
+   follow `VERIFY.txt` to check both signatures and the checksums **before
+   extracting or building**. A key or checksum found next to the download does
+   not authenticate the publisher on its own.
+3. Build from the verified, extracted source tree. You need the pinned
+   Rust/Cargo 1.98.1, Git, a C compiler and C development headers.
+
+   ```sh
+   cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed
+   ./target/alpha-noembed/release/mind --version   # must report mind 0.1.0-alpha.1
+   ```
+
+4. Install the binary at a stable path and add it to your `PATH`, as described
+   in the [source-install guide](docs/source-install.md#4-install-into-a-new-stable-prefix).
 
 Archive SHA-256: `b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0`.
-Manifest SHA-256: `903d8fd226593b74083bc8c0a11b7ffafc520eae06b5f054d0565ad1f5dae391`.
-Signing fingerprint: `0E6699CB48F3941AE28CA88D509F78007F62D5EA`.
-The signed manifest identifies source commit
-`a027d94680392648b6277dc2fd9bc20906114b91`; it is a publisher provenance statement,
-not a claim that this source commit or its ancestry can be fetched from GitHub.
+Signing key fingerprint: `0E6699CB48F3941AE28CA88D509F78007F62D5EA`.
+The [release notes](docs/release-notes.md) have the full provenance details.
+No prebuilt package has been qualified.
 
-Build requirements are the pinned **Rust/Cargo 1.98.1**, Git, a C compiler and C
-development headers. SQLite/FTS5 and Tree-sitter are bundled. The recommended
-profile needs neither model weights nor a C++ compiler; the alternative default
-build also requires C++ and libstdc++.
+## Quickstart
 
-From the verified, extracted source tree:
+This indexes a Git repository you already have and searches it. No AI model or
+agent account is needed.
 
-```sh
-cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed
-./target/alpha-noembed/release/mind --version   # must report mind 0.1.0-alpha.1
-```
+**Before you start**
 
-Follow the [source-install guide](docs/source-install.md) to install that binary
-at a stable path and configure your shell. It also covers prerequisites, archive
-verification, MCP setup, recovery and uninstall. Do not install a test or
-`--all-targets` artifact. No prebuilt package has been qualified.
-
-## Quickstart (no AI model needed)
-
-After the guide's installation/PATH step, run this in a dedicated shell. It
-creates a fresh demo database and repository, without using your Git identity or
-an existing user database. The source archive itself needs no `.git` history.
+- `mind --version` prints `mind 0.1.0-alpha.1`.
+- Pick a repository you trust. Command-line ingestion is not sandboxed.
+- Ingesting a Git repository writes one small marker file,
+  `.git/mindspace-repository-id`, into that repository. Tracked files and the
+  working tree are not changed.
+- The example uses a new database. If you already have a Mindspace database,
+  read [offline recovery](docs/offline-recovery.md) before opening it with a
+  new binary.
 
 ```sh
-set -eu
-export DEMO_ROOT="$(mktemp -d "$HOME/mindspace-alpha-demo.XXXXXXXX")"
-export MINDSPACE_DB="$DEMO_ROOT/data/mind.db"
+export MINDSPACE_DB="$HOME/mindspace-quickstart/mind.db"
+
 mind init
-mind space create demo
-mkdir -m 700 "$DEMO_ROOT/repo"
-git -C "$DEMO_ROOT/repo" init -q -b main
-printf '# Decision\n\nAlphaGitToken records a committed decision.\n' > "$DEMO_ROOT/repo/decision.md"
-printf 'pub fn alpha_demo_symbol() {}\n' > "$DEMO_ROOT/repo/lib.rs"
-git -C "$DEMO_ROOT/repo" add .
-git -C "$DEMO_ROOT/repo" -c user.name='Mindspace Demo' -c user.email='demo@example.invalid' -c commit.gpgsign=false commit -qm initial
-mind ingest "$DEMO_ROOT/repo" --space demo
-mind ingest "$DEMO_ROOT/repo" --space demo
-mind symbols alpha_demo_symbol --space demo
-mind search AlphaGitToken --space demo --json
-mind recall AlphaGitToken --space demo
-mind space list
-mind doctor
+mind space create myproject
+mind ingest /path/to/your/repository --space myproject
+mind search "retry" --space myproject
 ```
 
-Git ingestion reads committed objects, not dirty or untracked files. Repeating an
-unchanged ingest reuses derived content; session/revision journals can still grow.
-For an existing Markdown/text file, use `mind ingest /path/to/note.md --space demo`.
-There is no CLI memory-create command: the guide includes a standalone Python/MCP
-example for explicit memory creation, without a coding-agent account.
+Replace the repository path and the search word with your own.
 
-## Configure CLI and MCP access
+**What to expect**
 
-Select the database with `--db`, then `MINDSPACE_DB`, or use the default:
-`$XDG_DATA_HOME/mindspace/mind.db`, falling back to
-`$HOME/.local/share/mindspace/mind.db`. No Mindspace configuration file is needed.
-Use the same database path for the CLI and your MCP client. Before opening
-existing data with a new binary, follow the offline pre-upgrade procedure.
+- `mind init` creates the database and prints its path.
+- `mind ingest` prints a summary, then the committed Markdown, text and Rust
+  files it read and the memories it created from them. Uncommitted and
+  untracked files are skipped. A large repository can take minutes.
+- `mind search` prints ranked hits. Each hit shows a snippet, its source file and
+  commit, and a memory id that you can pass to `mind inspect <memory-id>`. If
+  nothing matches, it prints `no results`.
 
-`mind setup` previews client registration; `--apply` changes the selected client's
-configuration after confirmation. Start with no repository access:
+If the repository contains Rust, look up a definition by name:
 
 ```sh
-mind setup claude-code
-# After reviewing the preview:
-mind setup claude-code --apply
+mind symbols parse_config --space myproject
 ```
 
-`mind setup codex` provides the corresponding Codex workflow. OpenCode setup is
-preview-only. Registration is read back, and existing entries are refused rather
-than overwritten. See [setup and undo](docs/setup.md).
+To index a single note instead, pass a Markdown or text file to `mind ingest`.
+For a complete walk-through with a throwaway repository, re-ingestion after a
+commit and creating a memory over MCP, see sections 6 to 9 of the
+[source-install guide](docs/source-install.md#6-initialize-a-private-demo-database).
 
-For manual configuration, the stdio server command is an absolute installed
-binary path followed by `--db /absolute/path/to/mind.db mcp`. Without an allowed
-root, memory tools work and repository calls are refused. To permit repository
-ingestion, append `--allow-root /absolute/path/to/repository:rw`. A `:ro` root
-permits outlining but refuses ingestion. Keep the database directory outside all
-allowed repository roots. Full client JSON examples are in the
-[reference](docs/reference.md).
+## Use it from an AI agent (MCP)
 
-MCP repository tools require Linux Landlock ABI 3+ and a successful startup
-canary. Check `mind doctor` and the tool result's sandbox status. If confinement
-fails, repository tools stay off. CLI ingestion has no equivalent confinement
-promise. Read access can disclose repository content to the connected agent;
-Mindspace's permissions do not restrict the agent's other tools.
+`mind setup` registers Mindspace as an MCP server with your coding agent. It
+shows a preview first and changes the client's configuration only with `--apply`:
 
-## Back up and restore
+```sh
+mind setup claude-code           # preview
+mind setup claude-code --apply   # register
+```
 
-Use the [offline recovery runbook](docs/offline-recovery.md) and its exact Python
-recipe. There is no native `mind backup` or `mind restore` command.
+`mind setup codex` does the same for Codex CLI. OpenCode is preview-only.
+Existing entries are refused rather than overwritten.
 
-Stop and account for every CLI/MCP/library connection and prevent automatic
-restarts. Preserve the old binary before an upgrade. Create a validated backup,
-then restore to a fresh directory and check its contents before selecting it.
-Never copy only live MAIN, delete WAL/SHM as a repair, or overwrite a backup.
-A restore omits later writes; preserve both states if any were accepted.
+Registration starts with no repository access: memory tools work and repository
+tools refuse. To share a repository, undo the registration and run setup again
+with `--ro /absolute/path` (recommended: Mindspace can read and outline it, and
+cannot change it) or `--rw /absolute/path` (Mindspace can also ingest it, which
+includes writing its marker file into the repository's `.git`; setup asks you
+to confirm write access). Repository tools need Linux Landlock and stay off if
+confinement cannot be confirmed; `mind doctor` shows the status. Sharing a
+folder lets the connected agent see its content; it does not restrict the
+agent's other tools.
 
-`STOP: unclassified unobservable process` means the recipe could not establish
-its required process inventory. It is not a database-corruption diagnosis.
-Stop and assess the reported PID/starttime using the runbook. Do not blanket
-allowlist unreadable processes. The recipe uses system Python/SQLite separately
-from Mindspace's bundled SQLite and is limited to trusted own data, not untrusted
-DB/WAL files or backup bundles.
+Setup registers the database that is selected when you run it: `--db`, then
+`MINDSPACE_DB`, otherwise the default `$XDG_DATA_HOME/mindspace/mind.db`. Check
+the `database` line in the preview. Use the same database path for the CLI and the MCP client, and keep
+the database outside any allowed repository.
 
-## Known limits
+See [setup and undo](docs/setup.md) and the
+[manual MCP configuration](docs/reference.md#manual-mcp-configuration) examples.
 
-- Linux x86_64 is the qualified platform. MCP repository access needs effective
-  Landlock ABI 3+; other operating systems and arbitrary filesystems/containers
-  are not qualified by this release.
-- MCP is local unauthenticated stdio. Anyone who can access it can use its tools,
-  including writes. Spaces organize retrieval; they are not access controls.
-- Storage is not encrypted and source deletion is not secure erasure. New
-  admitted private DB/sidecar files use `0600`, new private directories `0700`;
-  existing permissive files are preserved rather than silently changed.
-- Manual content and subject fields each allow 1 MiB of decoded UTF-8. MCP lines
-  allow 8 MiB including delimiters. Oversized fields return tool errors;
-  oversized lines close the transport. No aggregate storage quota is promised.
-- Human-readable ingest/search/recall output replaces terminal controls and bidi
-  overrides with `?`. Stored values and JSON remain unchanged.
-- Rust is the only structurally parsed language. Recovered parses can be partial.
-  Git repositories must use SHA-1. `--history` selects ref tips, not every
-  ancestor's file content. Serialize ingests while changing HEAD.
-- Large ingests can take minutes. MCP preparation deadlines do not interrupt a
-  database commit. An uncertain commit result requires preserving state and
-  investigating; process-kill tests do not certify power-loss recovery.
-- Semantic/hybrid retrieval and real-model inference are outside this release
-  profile. Package, schema and protocol versions are separate; Alpha command and
-  schema compatibility can change.
+## Documentation
 
-## Security model
-
-Repository content and agent requests can be untrusted. Confined MCP combines
-Landlock, descriptor-based path checks and hardened Git execution, including
-ignored user/system Git configuration and disabled hooks, fsmonitor and replace
-refs. Supported confined profiles also restrict new sockets and selected
-cross-process syscalls. Inherited descriptors and other interfaces remain;
-this is not complete network/IPC isolation or protection from hostile same-UID
-or root processes. CLI and zero-root MCP have different confinement scope.
-`--insecure-no-sandbox` removes the kernel boundary and has a documented race
-risk; it is outside the security guarantee.
-
-For details, see [SECURITY.md](SECURITY.md), [sandbox capabilities](docs/sandbox-capabilities.md)
-and the [Alpha architecture overview](docs/architecture.md).
-
-**Vulnerability reporting:** use [GitHub private vulnerability reporting](https://github.com/VikingOwl91/mindspace/security/advisories/new)
-(GitHub sign-in required). Keep details out of public issues, pull requests and
-discussions. [The security policy](SECURITY.md) explains supported versions,
-responsible disclosure and what to include. Responses are best effort.
-
-## More documentation
-
-- [Documentation index and capabilities](docs/index.md)
-- [Architecture overview](docs/architecture.md)
-- [Source installation and operation](docs/source-install.md)
-- [Release notes and excluded features](docs/release-notes.md)
-- [CLI/MCP reference](docs/reference.md)
-- [Offline recovery](docs/offline-recovery.md)
+- [Documentation index](docs/index.md)
+- [Source installation, verification and uninstall](docs/source-install.md)
+- [CLI and MCP reference](docs/reference.md)
+- [Client setup and undo](docs/setup.md)
+- [Offline backup and recovery](docs/offline-recovery.md)
+- [Architecture and security boundaries](docs/architecture.md)
+- [Release notes](docs/release-notes.md)
 - [Development and checks](CONTRIBUTING.md)
+
+## Important limitations
+
+- **Linux x86_64 only.** Other platforms are not qualified.
+- **MCP is local, unauthenticated stdio.** Anyone who can reach the process can
+  use its tools, including writes. Spaces organize retrieval; they are not
+  access controls.
+- **The sandbox has a defined scope.** It confines the MCP repository tools. It
+  is not full network or IPC isolation and does not protect against hostile
+  same-user or root processes. Command-line ingestion is not confined.
+  `--insecure-no-sandbox` removes the kernel boundary and is outside the
+  security guarantee.
+- **Storage is not encrypted**, and deleting a source is not secure erasure.
+- **No built-in backup.** There is no `mind backup` or `mind restore`. Before an
+  upgrade, follow the [offline recovery runbook](docs/offline-recovery.md) and
+  keep the old binary. The recovery procedure is for your own trusted database
+  only; see the [stop rules](docs/source-install.md#10-offline-backup-restore-and-pre-upgrade-stop-rules).
+- **Alpha compatibility.** Commands and the database schema can change.
+
+The complete list, with sizes and edge cases, is in the
+[reference](docs/reference.md#limits-and-security). The security boundaries are
+described in the [architecture overview](docs/architecture.md#security-boundaries)
+and [sandbox capabilities](docs/sandbox-capabilities.md).
+
+## Security reporting
+
+Report vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/VikingOwl91/mindspace/security/advisories/new)
+(GitHub sign-in required). Do not put details in public issues, pull requests or
+discussions. See the [security policy](SECURITY.md) for scope and what to
+include. Responses are best effort.
 
 ## License
 
-MIT; see [LICENSE](LICENSE). The RC.5 archive includes a tokenizer fixture with separate
-[third-party notices](THIRD_PARTY_NOTICES.md), [Apache 2.0 license text](LICENSES/Apache-2.0.txt)
-and `tokenizer-provenance.json`. No model weights are included.
+MIT; see [LICENSE](LICENSE). The Alpha archive includes a tokenizer test fixture
+under Apache 2.0, covered by the [third-party notices](THIRD_PARTY_NOTICES.md)
+and the [Apache 2.0 license text](LICENSES/Apache-2.0.txt). No model weights are
+included.

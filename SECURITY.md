@@ -1,61 +1,86 @@
 # Security policy
 
-Security reports are welcome. Use the private channel below for both the Alpha
-archive and the older repository implementation.
+Security reports are welcome. Please report privately, as described below.
 
 ## Supported versions
 
-| Version / source | Security-report scope |
+| Version / source | Reports |
 | --- | --- |
-| `0.1.0-alpha.1` / RC.5 source archive | Current Alpha prerelease; best-effort reports accepted. |
-| Public `main` | Older pre-alpha implementation; reports accepted, but it is not the RC.5 Alpha source. |
-| Earlier development snapshots, including the removed `v0.2.0` and `v0.3.0` releases | No maintained release line or backport commitment. Those releases and tags are no longer published. |
+| `v0.1.0-alpha.1` (the RC.5 source archive attached to the release) | Accepted, best effort. This is the current Alpha. |
+| Public `main` | Accepted, best effort. It contains an older implementation, not the Alpha source. |
+| Earlier development snapshots | Not maintained; no backports. |
 
-There is no stable release, LTS branch or guaranteed response time. Qualification
-applies to exact source/archive bytes, not every binary with the same version.
-Install from the [official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1), using the
-[source-install guide](docs/source-install.md). The named RC.5 asset is authoritative;
-the hosting tag and GitHub-generated source archives contain older code. RC.5's
-broader Git history is not public.
-
-The qualified profile is Linux x86_64, local private storage, CLI/stdio MCP and
-Legacy/Git ingestion built without embeddings. Canonical document/PDF ingestion
-and unfinished M8 publication are not supported Alpha features.
+There is no stable release, no LTS branch and no guaranteed response time.
+Qualification applies to the exact archive bytes, not to every binary that
+reports the same version. The supported profile is Linux x86_64, built from
+source without embeddings.
+Install the Alpha from the
+[official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
+using the [source-install guide](docs/source-install.md). The named release asset
+is the authoritative source. The release tag and GitHub's generated "Source code"
+archives contain older code.
 
 ## Reporting a vulnerability
 
-Use [GitHub Private Vulnerability Reporting](https://github.com/VikingOwl91/mindspace/security/advisories/new) from
-Security > Advisories > Report a vulnerability. GitHub sign-in is required;
-this is a private channel, not an anonymous submission form. Do not open a public
-issue, pull request or discussion containing vulnerability details.
+Use [GitHub private vulnerability reporting](https://github.com/VikingOwl91/mindspace/security/advisories/new)
+(Security > Advisories > Report a vulnerability). You need to be signed in to
+GitHub; the report is private, not anonymous.
 
-Include the archive hash or commit, Linux kernel/distribution, how you started
-`mind mcp` (flags and allowed roots), expected versus actual behavior, impact and
-a minimal reproduction using your own temporary data. Remove credentials and
-private source/data from examples. Coordinate disclosure through the private
-report; please allow time to assess it and discuss a fix before public disclosure.
-This is a volunteer project with best-effort handling and no guaranteed schedule.
+Do not open a public issue, pull request or discussion with vulnerability
+details.
 
-## What is in scope
+## What to include
 
-The MCP repository tools (`repo_outline`, `repo_ingest`) are designed to be run by an AI agent over
-untrusted repositories. Reports about these are the most valuable:
+- The archive SHA-256 or the commit you tested.
+- Linux distribution and kernel version.
+- How you started `mind mcp`: flags and allowed roots.
+- Expected and actual behavior, and the impact.
+- A minimal reproduction that uses your own temporary data.
 
-- reading or writing outside the allowed roots (symlinks, `.git` pointers, alternates, worktrees,
-  races between check and use, inherited file descriptors);
+Remove credentials and private source or data from examples.
+
+## Disclosure
+
+Please coordinate disclosure through the private report and allow time to assess
+the issue and discuss a fix before publishing. This is a volunteer project:
+handling is best effort, without a guaranteed schedule.
+
+## In scope
+
+The MCP repository tools (`repo_outline`, `repo_ingest`) are meant to be run by
+an AI agent over untrusted repositories. Reports about them are the most
+valuable:
+
+- reading or writing outside the allowed roots (symlinks, `.git` pointers,
+  alternates, worktrees, races between check and use, inherited file descriptors);
 - writing into a root marked `:ro`;
-- the Landlock sandbox reporting `enforced` when it is not;
+- the sandbox reporting `enforced` when it is not;
 - running code from a repository (hooks, configuration, Git helpers);
 - data from outside the roots ending up in the database or in a tool result.
 
-See the [Alpha architecture](docs/architecture.md), [sandbox capabilities](docs/sandbox-capabilities.md)
-and [README limits](README.md#known-limits). These describe the qualified archive,
-not an assertion that public main implements every Alpha protection.
+## Out of scope
 
-## Out of scope / known limitations
+- Running with `--insecure-no-sandbox`. It removes the kernel boundary, has a
+  documented race risk and is for trusted input only.
+- Anyone who can already start or talk to the local process. MCP is local stdio
+  without authentication.
+- General network or IPC isolation, and hostile same-user or root processes. On
+  supported x86_64 Linux hosts the MCP sandbox restricts new sockets and selected
+  cross-process system calls for servers started with allowed roots. Inherited
+  descriptors and other channels stay open, `/proc` is not hidden, and the
+  command line and MCP without roots are not confined this way.
+- Platforms other than Linux 6.2+ with Landlock. The repository tools are off
+  there.
+- Denial of service by very large repositories. A first ingest can take minutes.
 
-- Running with `--insecure-no-sandbox` (documented to have a remaining gap; use for trusted input only).
-- Anyone who can already start or talk to the local process: MCP is local stdio without authentication.
-- General network/IPC isolation and hostile same-UID/root processes. Sandboxed MCP with allowed roots applies scoped new-socket and selected cross-process syscall restrictions on supported x86_64 Linux; this is not a blanket network guarantee. Inherited stdio, socketpair and permitted signal paths remain outside that claim. CLI and zero-root MCP do not receive this socket filter. See [sandbox capabilities](docs/sandbox-capabilities.md); `/proc` is not generally hidden.
-- Platforms other than Linux 6.2+ with Landlock: the repository tools are off there.
-- Denial of service by very large repositories (a first ingest can take minutes).
+## Technical details
+
+The sandbox and its limits are documented separately:
+
+- [Sandbox capabilities](docs/sandbox-capabilities.md): what is enforced and
+  which channels stay open.
+- [Architecture: security boundaries](docs/architecture.md#security-boundaries)
+- [Limits](docs/reference.md#limits-and-security)
+
+These pages describe the qualified Alpha archive. Public `main` contains older
+code and may not implement every protection described there.

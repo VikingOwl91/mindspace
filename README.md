@@ -88,6 +88,9 @@ cargo build --release          # produces target/release/mind
 target/release/mind --version  # mind 0.1.0-alpha.1
 ```
 
+`mind` on your `PATH` may be an older build. `command -v mind` shows which one runs; use
+`target/release/mind` explicitly or follow [If `setup` is an unrecognized subcommand](docs/setup.md#if-setup-is-an-unrecognized-subcommand).
+
 You need Linux, Git, a C compiler and **Rust 1.96 or newer** (`rust-version` in
 `Cargo.toml`; CI builds with exactly 1.96.0). The repository also contains a
 `rust-toolchain.toml` that pins Rust 1.100.0 for development and CI. If you use

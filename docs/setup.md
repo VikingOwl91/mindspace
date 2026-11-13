@@ -37,6 +37,13 @@ mind setup codex --apply --yes                    # no terminal (script): --yes 
 `mind setup` on its own, in a terminal, guides you; without a terminal it lists the clients it finds on `PATH` and
 changes nothing. `mind setup --help` has the same explanations as this page.
 
+### If `setup` is an unrecognized subcommand
+
+Your shell is running an older `mind` binary. Check which one with `command -v mind`. Rebuilding does not
+update a copy that is already installed (for example in `~/.cargo/bin`): put the new build first on `PATH`, or
+install it with `cargo install --path . --locked --force`. Confirm with `mind setup --help` before you retry.
+Builds from different commits can report the same version, so `mind --version` alone does not tell them apart.
+
 ## What you share: `--ro` and `--rw`
 
 These are **Mindspace** permissions for the folders you name.

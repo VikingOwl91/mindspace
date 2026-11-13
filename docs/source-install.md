@@ -1,33 +1,51 @@
 # Source installation and operator guide
 
-This guide describes the **unreleased `0.1.0-alpha.1` Legacy/Git candidate**. No public tag or release is asserted. The initial profile uses Linux, local private SQLite storage, lexical retrieval, explicit memories and committed Git content. Canonical document publication/search and document-complete Alpha remain blocked; PDF extraction is incomplete. No Knowledge Graph or Multi-Store capability is included.
+This guide covers the **v0.1.0-alpha.1 Legacy/Git Public Alpha profile**, currently
+unpublished: local Linux SQLite storage, lexical retrieval, explicit memories,
+legacy Markdown/text and committed Git content. **Canonical document/PDF ingestion
+and M8 document publication are not part of this Alpha.** Private staging is not
+a supported ingestion route. Embedding inference is outside the model-free profile.
+
+The revised checkout README, this guide and [release notes](release-notes.md)
+postdate frozen RC.4. Public delivery needs a new reviewed archive containing
+these documents. RC.4's archive/signatures remain unchanged; do not mistake the
+current checkout documentation for its original payload.
 
 ## 1. Obtain and verify the source archive
 
-Obtain the matching archive, `source-archive-manifest.json`, `SHA256SUMS` and
-actual detached signatures for both the archive and manifest through the
-authorized local handoff. Before building, verify the supplied signatures with
-an independently trusted signer and verify the archive and manifest checksums.
-If any item is missing, its identity is uncertain or verification fails,
-**STOP**. Only then use the verified manifest's `archive.filename` to identify
-the archive and `baseline.commit` for its signed source provenance. No archive
-filename, hash or source commit is fixed in this guide.
+Obtain the complete matching delivery packet: the source `.tar.gz`,
+`source-archive-manifest.json`, `SHA256SUMS`, detached `.asc` signatures for both
+archive and manifest, `VERIFY.txt`, and the convenience public key. No public
+download endpoint is available yet; use only an authorized handoff.
 
-The curated archive contains no `.git` history or model weights. Its manifest
-identifies every selected file and hash; all payload files, including
-documentation and licensing inputs, come directly from its signed source commit. Keep the original
-archive and sidecars unchanged. Extract into a fresh controlled directory, set
-`SRC` to its absolute path and compare the extracted files with that manifest.
-Package identity alone does not authenticate any source bytes.
+1. Authenticate the publisher through an independently trusted contact/domain.
+   The pinned primary fingerprint is
+   `0E6699CB48F3941AE28CA88D509F78007F62D5EA`. A key or fingerprint obtained only
+   beside the download is not an independent trust anchor.
+2. Follow the complete commands in the packet's `VERIFY.txt` in its directory.
+   They use a fresh keyring, an independently authenticated key, GnuPG
+   `--assert-signer` with all 40 fingerprint characters, and checks for invalid,
+   expired or revoked signatures. GnuPG must support `--assert-signer`; do not
+   remove that check to accommodate an older installation.
+3. Require valid signatures on **both** archive and manifest. Match `SHA256SUMS`
+   against the pinned values in `VERIFY.txt`, then run
+   `sha256sum --check --strict SHA256SUMS`. This last command checks bytes, not
+   publisher identity; it does not replace signature verification.
+4. Only after verification, use `archive.filename` and `baseline.commit` from the
+   signed manifest. Extract into a new controlled directory with
+   `tar -xzf VERIFIED_ARCHIVE -C NEW_EMPTY_DIRECTORY`, replacing the two path
+   placeholders with the verified archive and a newly created empty directory.
+   Set `SRC` to the absolute extracted `mindspace-0.1.0-alpha.1` directory. Retain
+   the original archive and sidecars.
 
-No public release, tag or anonymous acquisition endpoint is asserted. The
-repository address `https://github.com/VikingOwl91/mindspace.git` is informational;
-the prior anonymous check requested credentials. Do not invent credentials or a
-release-download URL. If the authorized archive and verifiable provenance have
-not been supplied, **STOP here**. Historical installation checks used exact local
-source inputs, not a successful anonymous download, and do not newly qualify this
-curated archive. `cargo pkgid` displays package identity; it does not authenticate
-the source.
+The exact recipient procedure, including fresh-directory extraction, is in
+`VERIFY.txt`; it supplies actual filenames and hash pins rather than the path
+placeholders above. Stop on any missing, uncertain or mismatched item before
+building or opening data. The manifest inventories every payload file and hash;
+RC.4 files are exact blobs from its signed source commit, with no overlays.
+There is no Git history or model weight bundle. `cargo pkgid` below displays
+package identity only; it does not authenticate the source. The source repository
+address is informational, not a promised public clone/download route.
 
 <!-- identity-install: source-local -->
 ```sh
@@ -40,7 +58,7 @@ Historical internal versions (`0.5.0`, tags `v0.2.0`/`v0.3.0`) are not the publi
 
 ## 2. Install prerequisites
 
-The qualified clean userspace is Debian13/trixie, x86_64, with the pinned Rust/Cargo **1.98.1**. The rootfs qualification shares a Linux7.2 host kernel; it is not a guarantee for every Linux distribution, libc, filesystem or kernel.
+Use the pinned Rust/Cargo **1.98.1**. Historical clean-userspace qualification used Debian 13/trixie x86_64 on a Linux 7.2 host; RC.4 also had eligible-host native builds. Neither result qualifies every Linux distribution, libc, filesystem or container.
 
 | Profile | Build requirements | Runtime requirements |
 | --- | --- | --- |
@@ -113,7 +131,7 @@ Database selection is `--db` first, then `MINDSPACE_DB`, then `$XDG_DATA_HOME/mi
 
 No Mindspace configuration file is needed. Embedding selection/enablement is stored in the database. Models stay under the data directory's `models/` independently of `--db`. Grant state uses `$XDG_STATE_HOME/mindspace`, else `$HOME/.local/state/mindspace`. Keep these locations and backups when uninstalling an executable.
 
-The examples below use a **fresh demo workspace**. They do not open an existing user database. For your actual default database, first determine whether it already exists; if it does, use the offline pre-upgrade procedure before any ordinary command opens it.
+The examples below use a **fresh demo workspace**. In the CLI, `mind --db /absolute/path/to/mind.db search QUERY` explicitly selects a database; use that same path in MCP registration. They do not open an existing user database. For your actual default database, first determine whether it already exists; if it does, use the offline pre-upgrade procedure before any ordinary command opens it.
 
 ## 6. Initialize a private demo database
 
@@ -140,7 +158,7 @@ printf '# Alpha decision\n\nAlphaNotesToken records a local decision.\n' > "$DEM
 "$MIND_BIN" search AlphaNotesToken --space demo --json
 ```
 
-This existing legacy workflow is not canonical M8 document ingestion or a publication bypass. Canonical document publication and document-complete Alpha remain blocked. Spaces organize retrieval; they are not authentication or ACLs. Retired/superseded history remains stored; source removal is not secure erasure.
+This existing legacy workflow is not canonical M8 document ingestion or a publication bypass. Canonical document/PDF ingestion and M8 document publication are not part of this Alpha. Spaces organize retrieval; they are not authentication or ACLs. Retired/superseded history remains stored; source removal is not secure erasure.
 
 For manual memory creation without an external coding-agent account, the following optional Python3 example drives the existing stdio MCP server. It initializes the protocol, discovers tools, creates one synthetic manual memory, searches it, and closes stdin. Stdout is JSON protocol; diagnostics are on stderr.
 
@@ -181,7 +199,7 @@ PYMCP
 
 `mind setup` registers an absolute installed executable/DB path through the client's own native command. Default setup grants no repository root; ordinary repository tools remain advertised but refuse calls until allowed. The manual protocol example above is not a coding-agent UI or model-driven integration test.
 
-Codex0.166.0 native registration/readback/undo was qualified with fresh client configuration. Install/locate your chosen client separately; no credentials or client-download result is supplied here. Preview first. Existing entries are refused rather than overwritten.
+Native Codex registration/readback/undo was qualified with fresh client configuration, including Codex 0.167.2 in the RC.4 guide checks. This does not certify a client UI or model-driven session. Install/locate your chosen client separately; no credentials or client-download result is supplied here. Preview first. Existing entries are refused rather than overwritten.
 
 <!-- identity-install: mcp-codex -->
 ```sh
@@ -228,13 +246,13 @@ Git support is SHA-1 and Rust structural extraction. `--history` interprets sele
 
 ## 10. Offline backup, restore and pre-upgrade STOP rules
 
-**Recovery engine boundary.** Python recovery uses the system SQLite independently of Mindspace's bundled engine. This remediated candidate links SQLite3.54.1, but the qualified Python runtime used SQLite3.46.1; the Rust dependency update does not patch that runtime, and Cargo advisory checks do not cover it. Use this procedure only for your trusted private Mindspace database and retained own validated backups. **STOP before opening** any externally supplied, less-trusted or uncertain-origin database, WAL or bundle. Hashes establish consistency, not authenticity. Such inputs require separately patched and qualified tooling and are outside this recovery profile. Qualification does not establish malicious-file resistance or system-library security clearance.
+**Recovery engine boundary.** Python recovery uses the system SQLite independently of Mindspace's bundled engine. This remediated candidate links SQLite3.54.1, but the historical Debian Python recovery runtime used SQLite 3.46.1 (a separate earlier host qualification used 3.54.1); the Rust dependency update does not patch that runtime, and Cargo advisory checks do not cover it. Use this procedure only for your trusted private Mindspace database and retained own validated backups. **STOP before opening** any externally supplied, less-trusted or uncertain-origin database, WAL or bundle. Hashes establish consistency, not authenticity. Such inputs require separately patched and qualified tooling and are outside this recovery profile. Qualification does not establish malicious-file resistance or system-library security clearance.
 
 Use the [offline recovery runbook and exact recipe](offline-recovery.md#operator-runbook). There is no native Mindspace backup/restore command. The supported contract is cooperative offline operation: stop and account for every CLI/MCP/library reader/writer and prevent restarts. An unobservable potentially relevant process is a STOP; a process-name search or missing receipt is not writer exclusion.
 
 Before a new binary first opens existing data, preserve the exact old binary and a validated pre-upgrade backup. Ordinary reads can migrate. Never copy only live MAIN when acknowledged state may be in WAL; never delete WAL/SHM as cleanup. Restore to a fresh separate directory, validate integrity/FK/schema/logical contents and known retrieval/provenance, and keep the original backup immutable. Do not open the backup file with Mindspace.
 
-The following extracts the already accepted recipe and backs up **only the fresh demo**; it does not add or alter a backup mechanism. `DEMO_RECOVERY_BIN` is the executable that created this demo. It is not a substitute for preserving the actual old binary before a real upgrade. For an existing installation, stop and use the accepted pre-upgrade runbook before any new binary opens that data. The demo's clients must have exited before setting the assertion. Set `QUIESCENCE_INVENTORY` to your actual stopped-client/PID/restart inventory before running the block; a statement is not proof of quiescence. If the recipe reports an unobservable process, follow the accepted runbook's STOP/classification procedure instead of automatically exempting it.
+The following extracts the already accepted recipe and backs up **only the fresh demo**; it does not add or alter a backup mechanism. `DEMO_RECOVERY_BIN` is the executable that created this demo. It is not a substitute for preserving the actual old binary before a real upgrade. For an existing installation, stop and use the accepted pre-upgrade runbook before any new binary opens that data. The demo's clients must have exited before setting the assertion. Set `QUIESCENCE_INVENTORY` to your actual stopped-client/PID/restart inventory before running the block; a statement is not proof of quiescence. If the recipe reports an unobservable process, follow the accepted runbook's STOP/classification procedure instead of automatically exempting it. The demo block deliberately starts with an empty `unobservable` list. `STOP: unclassified unobservable process` means descriptor access was denied before backup/restore began; it is not a corruption result. Stop and use the full runbook to assess the exact PID/starttime. Do not populate the list automatically or claim a new recovery PASS from the refused run.
 
 <!-- identity-install: backup-extract -->
 ```sh
@@ -305,3 +323,12 @@ rm -- "$MIND_BIN"
 ```
 
 The command examples were qualified historically on disposable candidate-local state, not newly run against this curated archive. Local source handoff remains subject to verification; no public delivery is asserted. Native registration/readback does not certify a client UI or a model-driven agent session. Current dependency/advisory gates, the mandatory security profile and exact release-candidate review still precede any public release.
+
+## 12. Security reporting
+
+Once enabled, use **Security → Report a vulnerability** on the approved public
+delivery repository. Its exact link must be published and externally tested
+before public release. No working public reporting destination or security inbox
+is asserted here. Until that route is established, keep reports private; do not
+post vulnerability details in public issues, pull requests or discussions.
+See [SECURITY.md](../SECURITY.md) for scope and the information to include.

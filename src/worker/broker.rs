@@ -346,11 +346,14 @@ fn run_process(
 
 /// Whether the broker is configured with a per-operation limit that needs cgroup controllers. The
 /// product configures none yet; the test hook is the only source.
+#[cfg(feature = "spawn-gate")]
 fn limits_requested() -> bool {
-    #[cfg(feature = "spawn-gate")]
-    if std::env::var_os("MINDSPACE_BROKER_GATE_MEMORY_MAX").is_some() {
-        return true;
-    }
+    std::env::var_os("MINDSPACE_BROKER_GATE_MEMORY_MAX").is_some()
+}
+
+/// See the test-hook variant above: without the `spawn-gate` feature no limit is requested.
+#[cfg(not(feature = "spawn-gate"))]
+fn limits_requested() -> bool {
     false
 }
 

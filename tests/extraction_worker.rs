@@ -301,8 +301,15 @@ fn probe_binary() -> PathBuf {
     BUILT
         .get_or_init(|| {
             let exe = std::env::current_exe().unwrap();
-            // <target dir>/<profile dir>/deps/<this test binary>
-            let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
+            // The profile directory is the ancestor directly below the target directory, which
+            // Cargo marks with CACHEDIR.TAG. That holds for <target>/<profile>/deps/<exe> and for
+            // the layout of newer Cargo, <target>/<profile>/build/<package>/<hash>/out/<exe>.
+            let profile_dir = exe
+                .ancestors()
+                .skip(1)
+                .find(|a| a.parent().is_some_and(|p| p.join("CACHEDIR.TAG").is_file()))
+                .unwrap_or_else(|| panic!("cannot find the target directory of {exe:?}"))
+                .to_path_buf();
             let target_dir = profile_dir.parent().unwrap();
             let mut cmd = Command::new(env!("CARGO"));
             cmd.args(["build", "--locked", "--quiet", "--example", "worker_probe"])

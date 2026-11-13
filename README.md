@@ -54,8 +54,10 @@ release page.** They contain older code:
    follow `VERIFY.txt` to check both signatures and the checksums **before
    extracting or building**. A key or checksum found next to the download does
    not authenticate the publisher on its own.
-3. Build from the verified, extracted source tree. You need the pinned
-   Rust/Cargo 1.98.1, Git, a C compiler and C development headers.
+3. Build from the verified, extracted source tree. You need Rust/Cargo 1.98.1
+   (the toolchain the archive pins), Git, a C compiler and C development
+   headers. Public `main` uses a different development toolchain; see
+   [CONTRIBUTING](CONTRIBUTING.md#rust-toolchain).
 
    ```sh
    cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed

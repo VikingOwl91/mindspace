@@ -59,7 +59,7 @@ Historical internal versions (`0.5.0`, the removed tags `v0.2.0`/`v0.3.0`) are n
 
 ## 2. Install prerequisites
 
-Use the pinned Rust/Cargo **1.98.1**. Historical clean-userspace qualification used Debian 13/trixie x86_64 on a Linux 7.2 host; RC.4 also had eligible-host native builds. Neither result qualifies every Linux distribution, libc, filesystem or container.
+Use Rust/Cargo **1.98.1**, the toolchain this archive pins. Public `main` pins a different development toolchain that does not apply to the Alpha. Historical clean-userspace qualification used Debian 13/trixie x86_64 on a Linux 7.2 host; RC.4 also had eligible-host native builds. Neither result qualifies every Linux distribution, libc, filesystem or container.
 
 | Profile | Build requirements | Runtime requirements |
 | --- | --- | --- |
@@ -70,7 +70,7 @@ SQLite/FTS5 and Tree-sitter are compiled from source; a system SQLite CLI/server
 
 On Debian, the package sets used inside the clean environment were `git gcc libc6-dev ca-certificates`, adding `g++` for the default profile. Install packages using your system's normal administration process; no host `sudo` command is prescribed here. Python3 is needed only for the optional manual MCP example and offline recovery recipe; strace/binutils are qualification tools, not basic Mindspace runtime dependencies.
 
-`rust-toolchain.toml` pins1.98.1. The clean test image already supplied that toolchain. Rustup/bootstrap downloads from an empty machine were not separately qualified. Source builds may download Cargo dependencies. Runtime search never downloads a model automatically.
+The archive's `rust-toolchain.toml` pins 1.98.1. The clean test image already supplied that toolchain. Rustup/bootstrap downloads from an empty machine were not separately qualified. Source builds may download Cargo dependencies. Runtime search never downloads a model automatically.
 
 For MCP repository tools, Linux6.2+ with effective Landlock ABI3+ is required. The actual sandbox canary must succeed; do not substitute `--insecure-no-sandbox` for that guarantee. Ordinary CLI ingestion does not have the MCP kernel-confinement promise.
 

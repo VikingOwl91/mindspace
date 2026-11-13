@@ -31,7 +31,7 @@ After verification, read the archive's `README.md`, `docs/source-install.md`,
 `docs/release-notes.md` and `docs/offline-recovery.md` for installation, supported
 environment, recovery precautions and known limitations. The recommended build is
 `cargo build --locked --release --no-default-features --bin mind` with the pinned
-Rust/Cargo 1.98.1 toolchain. There is no bundled binary, dependency vendor tree or
+Rust/Cargo 1.98.1 toolchain of the archive. There is no bundled binary, dependency vendor tree or
 model weight package.
 
 ## Verification and provenance

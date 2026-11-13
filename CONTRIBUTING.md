@@ -22,7 +22,22 @@ cargo audit
 python3 scripts/check-doc-links.py                    # relative links and anchors in the Markdown files
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. Linux is the only tested platform.
+Linux is the only tested platform.
+
+## Rust toolchain
+
+| Purpose | Rust version | Where it is set |
+| --- | --- | --- |
+| Development and CI | 1.100.0, pinned exactly | `rust-toolchain.toml` |
+| Minimum supported (MSRV) | 1.96 | `rust-version` in `Cargo.toml`, checked by the `msrv` CI job |
+| Qualified Alpha source archive | 1.98.1, frozen | `rust-toolchain.toml` inside the RC.5 archive |
+
+Public `main` is not the qualified Alpha, and changing its toolchain does not
+change the published RC.5 archive, which is built with 1.98.1 as described in the
+[install guide](docs/source-install.md). The `msrv` job runs a locked check of all
+targets with default features, a check of the library and `mind` binary without
+embeddings, and the unit tests, using the minimum compiler. The full test suite
+runs on the pinned toolchain.
 
 Changes that touch the MCP repository tools, the sandbox or path handling must also pass
 `scripts/security-profile.sh` (needs Linux 6.2+ with Landlock, about 5 minutes; run

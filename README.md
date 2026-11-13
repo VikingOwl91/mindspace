@@ -71,9 +71,11 @@ always works and is the default.
 **Public source delivery is still blocked.** The repository address is
 `https://github.com/VikingOwl91/mindspace.git`, but anonymous acquisition requested
 credentials in the clean-user check. No release-download URL, public tag or
-credentials are supplied here. Obtain an authorized reviewed source tree and its
-provenance first; otherwise stop. The currently reviewed identity changes are not
-claimed to be present in an already signed source commit.
+credentials are supplied here. The frozen local RC.3 source archive has qualified
+build and provenance evidence, but no public delivery endpoint is available.
+Obtain and authenticate that exact reviewed archive before building; otherwise stop.
+See the [release-preparation decision](docs/releases/v0.1.0-alpha.1-release-preparation.md)
+for recipient verification, remaining reporting/hosting gates and artifact identity.
 
 Use the [source-install/operator guide](docs/source-install.md) for the full
 validated local-candidate path, stable version-specific installation/PATH,

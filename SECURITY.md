@@ -12,9 +12,18 @@ The intended initial profile is Linux, local private storage, ordinary CLI/stdio
 
 Please do **not** open a public issue, pull request or discussion for a vulnerability.
 
-Report it privately through GitHub: **Security > Report a vulnerability** on the repository page
-(GitHub private vulnerability reporting). This is the only reporting channel; it keeps the report
-visible to the maintainer alone until a fix is ready.
+**A usable public reporting destination has not yet been established.** The source
+repository is private; its reporting form is unavailable to anonymous visitors.
+GitHub private vulnerability reporting is supported for public repositories, so the
+intended route requires an approved public delivery repository, enabled reporting
+and a maintainer who monitors it. No dedicated security inbox is asserted here.
+Keep vulnerability details private until that route is published and verified.
+
+Before public distribution, the operator must publish the exact **Security >
+Report a vulnerability** link and verify it from an external GitHub account.
+This requires GitHub sign-in; it is not anonymous reporting. See the
+[release-preparation decision](docs/releases/v0.1.0-alpha.1-release-preparation.md).
+GitHub documents [availability and access](https://docs.github.com/en/code-security/concepts/vulnerability-reporting-and-management/repository-security-advisories).
 
 Please include: the version or commit, your Linux kernel and distribution, how you started `mind mcp`
 (flags, allowed roots), and a reproduction. Use temporary directories and your own repositories only.

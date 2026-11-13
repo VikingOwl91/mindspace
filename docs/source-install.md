@@ -4,19 +4,11 @@ This guide describes the **unreleased `0.1.0-alpha.1` Legacy/Git candidate**. No
 
 ## 1. Obtain an authorized source tree
 
-**Anonymous source acquisition is currently blocked.** The repository address remains `https://github.com/VikingOwl91/mindspace.git`, but the clean anonymous check requested authentication. A public GitHub transport control succeeded. Do not infer whether the repository is private, missing or differently permissioned; do not invent credentials or a release-download URL.
+**Anonymous source acquisition is currently blocked.** Authenticated repository metadata confirms that `VikingOwl91/mindspace` is private; anonymous repository and vulnerability-form requests return HTTP404. No public release-download URL is asserted. The [install qualification](releases/v0.1.0-alpha.1-install-qualification.md) used a local bundle, not a successful anonymous download.
 
-If you do not already have an authorized, reviewed candidate tree and its provenance, **STOP here**. Public source delivery is a remaining release gate. The [install qualification](releases/v0.1.0-alpha.1-install-qualification.md) used an exact local bundle, not a successful anonymous download.
+For the frozen local RC.3 handoff, obtain the exact source archive, manifest, SHA256SUMS, both detached signatures and recipient `VERIFY.txt` described in the [release-preparation decision](releases/v0.1.0-alpha.1-release-preparation.md). Authenticate the publisher independently, verify signatures and hashes, then extract into a new directory. If the source, verification key or provenance cannot be authenticated, **STOP**.
 
-The following future Git handoff is **provisional**: a maintainer must supply the actual authorized source and exact reviewed commit. No commit containing the currently uncommitted identity changes is asserted by this guide.
-
-```sh
-# Provisional acquisition only; these values must come from the source handoff.
-git clone "$AUTHORIZED_GIT_SOURCE" "$SRC"
-git -C "$SRC" checkout --detach "$REVIEWED_SOURCE_COMMIT"
-```
-
-For an already supplied review tree, set `SRC` to its absolute path. Record the supplied commit or signed-parent-plus-patch/file-hash manifest before building. `cargo pkgid` displays package identity; it does not authenticate the source.
+RC.3 identifies signed source commit `d2cf762b66276b5f4ac91a02b03ed4ae1e4dd3bb` plus the signed manifest's declared documentation overlays and additions. The archive is not a byte-for-byte Git checkout and does not require private Git history. Its top-level directory is `mindspace-0.1.0-alpha.1`; set `SRC` to that absolute extracted path. `cargo pkgid` displays package identity; it does not authenticate the source. The manifest is authoritative for the exact payload; the current developer HEAD is not its source identity.
 
 <!-- identity-install: source-local -->
 ```sh

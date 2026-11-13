@@ -1,23 +1,35 @@
-# Install Mindspace v0.1.0-alpha.1
+# Install Mindspace
 
-The installer downloads the signed Alpha release, authenticates it, builds it with Rust 1.98.1 and
-installs one binary under your home directory. It takes a few minutes and asks you one question in a
-terminal (or takes the answer as an option). For the
-manual procedure and the operator reference, see the [source-install guide](source-install.md).
+The installer selects the newest published GitHub release, including prereleases and excluding
+drafts. It authenticates one explicitly supported source-release contract, builds it with its exact
+Rust toolchain and installs a versioned binary under your home directory. Unsupported or unverifiable
+selected releases stop the operation; an older release is never tried silently. For manual RC.5
+verification and the operator reference, see the [source-install guide](source-install.md).
 
 ## Before you start
 
-- **Linux on x86_64.** Other systems are not qualified.
-- **Tools:** `curl`, `gpg` (GnuPG with `--assert-signer` support; the installer checks), `tar`, `gzip`,
-  `sha256sum`, `timeout`, `flock` (util-linux), and a C compiler with C headers (`gcc` or `cc`). Install Git too: ingesting a
-  repository needs it.
-- **Rust 1.98.1.** With [rustup](https://rustup.rs): `rustup toolchain install 1.98.1 --profile minimal`.
-  The installer checks for it and never installs it for you. It does not use `stable`, and it does not
-  use the toolchain pinned on the main branch.
-- **About 2 GiB of free space** in `/tmp`, or in the directory named by `TMPDIR`.
-- **Network access** to GitHub, `openpgpkey.nachtigall.dev` and, through Cargo, crates.io.
+- Linux on x86_64; other platforms are unsupported by the current contracts.
+- Python 3.11+, curl, GnuPG with `--assert-signer`, tar, gzip, sha256sum, timeout, flock (util-linux),
+  and a C compiler with C headers. Git is needed for repository ingestion.
+- The exact Rust toolchain named by the supported contract. RC.5 requires Rust 1.98.1:
+  `rustup toolchain install 1.98.1 --profile minimal`. Future contracts currently support 1.98.1 or
+  1.100.0. The installer prints the required version and never installs a toolchain itself.
+- About 2 GiB free in `/tmp` or `TMPDIR`, and access to GitHub, the publisher's key domain and crates.io.
 
 ## Install
+
+Confirm the fingerprint independently as explained below **before** using this noninteractive command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/VikingOwl91/mindspace/main/install.sh | sh -s -- --trust-fingerprint 0E6699CB48F3941AE28CA88D509F78007F62D5EA
+```
+
+This works from bash, zsh and Fish. Passing a fingerprint is a trust decision, not evidence that the
+identity was authenticated. The command also relies on trusted distribution of the installer through
+GitHub and TLS; verify a signed installer checkout before execution if you need to authenticate the
+script itself, using the [procedure below](#optional-check-the-installer-itself).
+
+To inspect the script and use its interactive fingerprint prompt instead:
 
 ```sh
 git clone https://github.com/VikingOwl91/mindspace.git
@@ -25,14 +37,11 @@ cd mindspace
 sh install.sh
 ```
 
-These commands work as written in bash, zsh and Fish. In Fish, run the installer as `sh install.sh`
-too; the installer itself is POSIX shell and Fish only starts it.
-
-The clone is only the way to obtain `install.sh`. **The clone is not the Alpha**: public `main` holds
-an older implementation, and so do the release tag and GitHub's "Source code" downloads. The installer
-never builds any of them. It downloads the seven assets of the
-[v0.1.0-alpha.1 release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1), checks
-them, and builds the signed `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` they contain.
+To select a version explicitly, append `--version 0.1.0-alpha.1` (one optional `v` prefix is accepted).
+This chooses the authenticated version binding. For a fresh client it does not establish historical
+byte immutability if a publisher re-signs that version; retain an independently authenticated digest
+for stronger reproducibility. Explicit RC.5 with local `--assets-dir` retains offline verification.
+The installer never builds GitHub-generated source ZIPs or the code in the checkout itself.
 
 ## The one decision you make: trusting the publisher
 
@@ -48,19 +57,24 @@ only after confirming the fingerprint through a channel you trust that is **not 
 example from the maintainer directly or from a record you already hold. The release page, the README
 and the installer all come from the same GitHub project, so they cannot vouch for each other.
 
-What the installer then checks, and stops on any failure:
+The GitHub API is used for discovery, not artifact authentication. Releases are ordered by
+`published_at`, then numeric release ID for a tie, across complete bounded pagination. Selection
+happens before compatibility checks. API errors, malformed/conflicting metadata, missing assets or
+release deletion fail without falling back. Unsigned discovery cannot prove global freshness or
+detect every omitted/replayed release, and pagination is not an atomic snapshot.
 
-1. All seven release assets have the exact size and SHA-256 that the installer pins.
-2. The publisher key fetched from the publisher's own domain (OpenPGP Web Key Directory) has the
-   fingerprint you confirmed. The key file bundled in the release must match it too, but it does not
-   authenticate anybody.
-3. Both detached signatures (archive and manifest) are good, made by that key, and neither the
-   signature nor the key is expired or revoked.
-4. The signed manifest names this archive and the expected source commit.
-5. The archive contains only regular files and directories below `mindspace-0.1.0-alpha.1/`.
+For RC.5 (`v0.1.0-alpha.1`), the installer retains the original seven exact asset names, sizes and
+SHA-256 pins, detached archive and source-manifest signatures, publisher fingerprint and source
+commit. The bundled key is checked for consistency and never establishes identity.
 
-The pinned hashes are what binds the installer to exactly these bytes; the signatures show that the
-publisher you confirmed signed them.
+Future releases require a signed `mindspace-release-v1` envelope with the explicitly supported
+platform, recipe, exact toolchain and four asset roles. The installer authenticates that envelope
+before using its fields, verifies all declared sizes/hashes, verifies detached archive and source
+manifest signatures, and cross-checks the manifest's source/archive identities and bounded USTAR
+members before extraction. It rejects unknown contracts, key/signature expiry/revocation and a
+changed publisher fingerprint. Key rotation requires an independently authenticated installer update.
+The [contract and trust decisions](installer-release-selection-proposal.md) describe the limits and
+future publisher workflow. Published RC.5 assets are unchanged.
 
 ## Running it again
 
@@ -69,8 +83,8 @@ You can run the installer as often as you like.
 | What it finds | What it does |
 | --- | --- |
 | Nothing | Installs. |
-| An intact install of this version (the binary runs, reports `mind 0.1.0-alpha.1` and matches its install record) | Says `Already up to date`, changes nothing, exits 0. It needs no Rust, no network and no fingerprint. |
-| An install of this version without an install record (made by an earlier installer or by hand) | Checks its layout and reported version; says `Already up to date`, changes nothing, exits 0. It explicitly warns that build authenticity cannot be re-established offline; use `--reinstall` for a freshly verified build. |
+| An intact install of the selected version | Says `Already up to date`, changes no installed files, exits 0. Rust is unnecessary. Default selection still needs discovery access; future contracts are authenticated before no-op validation. |
+| RC.5 without an install record | Checks layout and reported version; returns a no-op with an explicit authenticity caveat. Future-version prefixes without receipts fail safely and require explicit `--reinstall`. |
 | A directory that is not a valid install (missing or non-executable binary, a binary that reports another version or no longer matches its record, a symbolic link, a file) | Stops with exit 1 and tells you what is wrong. A directory that merely exists is never taken as proof of an install. |
 | A validated older version, with this version absent | Stops with exit 1 and explains `--upgrade`. With that option, installs beside the old version, preserving it. |
 | A newer version installed beside this one | Stops with exit 1 unless the intact install of this version is already there. `--allow-older` installs this version beside the newer one. |
@@ -104,9 +118,11 @@ directory. A receipt is parsed as data, never executed. Recorded binaries are ha
 version command is run; legacy binaries have no receipt to check first. Other version prefixes are
 validated too, and incomplete or invalid ones stop the operation with their path and a reason.
 
-This installer selects only the pinned RC.5 release, version `0.1.0-alpha.1`. `--upgrade` can install
-that version beside a validated older version; it does not discover newer releases. No newer release
-or automatic activation is provided by this option.
+A newer available release requires `--upgrade` when an older installation is present. Installation
+is side by side and does not activate the new binary. A newer installed version blocks an older
+selection unless `--allow-older` is explicitly requested. A receipt mismatch for changed signed
+archive/source content at the same version requires inspection or explicit reinstall; it never
+silently replaces the existing installation.
 
 ## Optional: check the installer itself
 
@@ -128,7 +144,7 @@ replaces that.
 ## What it does and does not do
 
 It builds with `cargo build --locked --release --no-default-features --bin mind` in a private temporary
-directory, then installs `~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind` (directories `0700`, binary
+directory, then installs `~/.local/lib/mindspace/<version>/bin/mind` (directories `0700`, binary
 `0755`) and prints its path, version and SHA-256. It removes its temporary files, also when you
 interrupt it.
 
@@ -146,7 +162,8 @@ install unless you ask with `--reinstall`.
 
 ## After installing
 
-Run the binary by its full path, or add it to your `PATH` yourself:
+Run the binary at the full path printed by the installer, or add that version to your `PATH` yourself.
+The examples below use RC.5; substitute the installed version if different:
 
 ```sh
 # bash or zsh (add to ~/.bashrc or ~/.zshrc to keep it)
@@ -178,9 +195,10 @@ on your `PATH` means an older binary shadows this one.
 
 | Option | Meaning |
 | --- | --- |
+| `--version VERSION` | Select an exact published version; default includes prereleases, ordered by publication time. |
 | `--trust-fingerprint FPR` | Give your confirmed fingerprint up front. Required without a terminal. |
 | `--verify-only` | Download and authenticate the release, then stop. Nothing is built or installed. |
-| `--assets-dir DIR` | Use seven assets you downloaded yourself. They are verified exactly like downloaded ones. |
+| `--assets-dir DIR` | Use local assets for the selected contract. With explicit RC.5 this also permits offline verification; signatures and hashes are still required. |
 | `--key-file FILE` | Use a public key file you obtained independently instead of the publisher's domain. |
 | `--upgrade` | Install this version beside validated older versions; preserve binaries and existing registrations. Activation is separate. |
 | `--reinstall` | Replace an existing install of this version, after a successful build. The old one is kept in `~/.local/lib/mindspace/previous/`. |
@@ -210,6 +228,8 @@ To authenticate the release without the installer, follow the
 `VERIFY.txt` asset.
 
 ## Uninstall
+
+The example removes RC.5; use the selected version printed by your installation:
 
 ```sh
 rm -f -- ~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind ~/.local/lib/mindspace/0.1.0-alpha.1/install-record
@@ -248,3 +268,16 @@ other preflight behavior without compiling. Add `--with-build` for real RC.5 bui
 repeat installation, reinstall, injected staging/publication failures and build interruption. That
 run needs the tools and network described above. Synthetic version-transition tests do not prove
 compatibility with a future unpublished release or a database migration.
+
+The strict parser, actual-installer discovery tests and signed future-release fixtures run with:
+
+```sh
+python3 -B tests/scripts/test_installer_release_contract.py
+python3 -B tests/scripts/install_discovery_test.py
+python3 -B tests/scripts/install_future_release_test.py
+python3 scripts/embed-installer-contract.py --check
+```
+
+The default future-fixture suite authenticates synthetic releases with an ephemeral test key and
+needs no Rust toolchain. Its optional real-build mode is documented in the test script. Fixtures do
+not modify published releases or establish compatibility with an unpublished production binary.

@@ -14,7 +14,7 @@ from pathlib import Path
 import sys
 s=Path(sys.argv[1]).read_text()
 header=s[:s.index('# ---------------------------------------------------------------- arguments')]
-a=s.index('ver_cmp() {'); b=s.index('if [ "$VERIFY_ONLY" != 1 ]; then check_existing; fi',a)
+a=s.index('ver_cmp() {'); b=s.index('# END INSTALLATION INSPECTION HELPERS',a)
 tail=s[s.index('# ---------------------------------------------------------------- 7. install'):]
 setup='''
 INSTALL_ROOT=$HOME/.local/lib/mindspace

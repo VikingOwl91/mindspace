@@ -38,23 +38,30 @@ goes through MCP. Commands and the database schema can still change.
 
 ## Install
 
+After independently authenticating the publisher fingerprint through a trusted channel outside this
+download, run:
+
 ```sh
-git clone https://github.com/VikingOwl91/mindspace.git
-cd mindspace
-sh install.sh
+curl -fsSL https://raw.githubusercontent.com/VikingOwl91/mindspace/main/install.sh | sh -s -- --trust-fingerprint 0E6699CB48F3941AE28CA88D509F78007F62D5EA
 ```
 
-`install.sh` downloads the signed Alpha release, verifies it, builds it with
-Rust 1.98.1 and installs one binary at
-`~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind`. It asks you to confirm the
-publisher's key fingerprint, never uses `sudo`, never edits your shell or agent
-configuration, and never touches an existing database. It is safe to run again: an
-intact install is reported as already up to date and left alone. It needs
-`curl`, `gpg`, a C compiler and Rust 1.98.1
-(`rustup toolchain install 1.98.1 --profile minimal`), and it downloads the locked
-Cargo dependencies into a temporary directory. Run it as `sh install.sh` from Fish
-as well. The [install guide](docs/install.md) has the details, the
-trust decision, options and troubleshooting.
+The installer selects the newest published release, including prereleases, verifies its supported
+signed contract and assets, and builds a versioned binary under `~/.local/lib/mindspace/`. It never
+falls back silently when the selected release is unsupported or fails verification. Use
+`--version 0.1.0-alpha.1` for an explicit version. RC.5 retains its original pins and signatures.
+
+It is safe to repeat: an intact selected installation exits successfully without replacement.
+`--upgrade` installs a newer selected version beside old binaries; `--reinstall` explicitly replaces
+the selected prefix while preserving its previous binary. Neither option changes PATH, databases,
+agent configuration or MCP registrations. Run it from Fish as written too.
+
+Prerequisites: Linux x86_64, Python 3.11+, curl, GnuPG, a C compiler, core command-line tools and the
+exact Rust toolchain selected by the supported contract (RC.5: 1.98.1). The
+[install guide](docs/install.md) explains trust, script authentication, dependencies, version
+selection, recovery and the remaining freshness/reproducibility limits. The fingerprint argument
+alone does not establish trust.
+
+The following PATH examples use RC.5; substitute the version printed by the installer if different.
 
 Then make `mind` easy to run, or use its full path:
 

@@ -21,7 +21,7 @@ fixture() {
 run() {
     RC=0
     OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-        timeout 20 sh "$ROOT/install.sh" --assets-dir "$T/missing" --trust-fingerprint "$FPR" "$@" 2>&1) || RC=$?
+        timeout 20 sh "$ROOT/install.sh" --version "$CUR" --assets-dir "$T/missing" --trust-fingerprint "$FPR" "$@" 2>&1) || RC=$?
 }
 check() {
     N=$((N + 1))

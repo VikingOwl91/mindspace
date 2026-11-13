@@ -39,7 +39,7 @@ fetch() { curl -q --fail --silent --show-error --location --proto '=https' --tls
 new_home() { H=$T/home-$1; mkdir -p "$H" "$T/tmp-$1"; }
 run_inst() {
     OUT=$(env -i HOME="$H" PATH="${TEST_PATH:-$PATH}" TMPDIR="$T/tmp-$HN" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-        sh "${INST:-$INSTALL}" "$@" </dev/null 2>&1)
+        sh "${INST:-$INSTALL}" --version 0.1.0-alpha.1 --assets-dir "$T/assets" "$@" </dev/null 2>&1)
     RC=$?
 }
 with_path() { TEST_PATH=$1; shift; "$@"; TEST_PATH=; }
@@ -86,7 +86,7 @@ expect "unsupported architecture is refused" 1 "x86_64 only"
 # A PATH without gpg / without a Rust toolchain.
 mkshim() { # DIR omitted-tool...
     d=$1; shift; mkdir -p "$d"
-    for tool in sh date timeout flock uname setsid pgrep sha256sum tar gzip gpg awk grep sed tr cmp mktemp install df wc curl cc gcc cut mv cp mkdir rmdir rm chmod cat head tail env dirname sleep cargo rustc rustup; do
+    for tool in sh date timeout flock python3 uname setsid pgrep sha256sum tar gzip gpg awk grep sed tr cmp mktemp install df wc curl cc gcc cut mv cp mkdir rmdir rm chmod cat head tail env dirname sleep cargo rustc rustup; do
         skip=0
         for o in "$@"; do [ "$o" = "$tool" ] && skip=1; done
         [ "$skip" = 1 ] && continue
@@ -293,7 +293,7 @@ HN=ok; new_home ok
 before=$(tree_of "$H")
 run_inst --assets-dir "$T/assets" --verify-only --trust-fingerprint "$FPR" --key-file "$T/key.asc"
 expect "verify-only with local assets and the key file succeeds" 0 "Authenticated"
-run_inst --verify-only --trust-fingerprint "$(printf '%s' "$FPR" | sed 's/\(....\)/\1 /g')"
+run_inst --verify-only --trust-fingerprint "$(printf '%s' "$FPR" | sed 's/\(....\)/\1 /g')" --assets-dir ""
 expect "verify-only with real downloads and the key from the publisher domain succeeds (spaced fingerprint)" 0 "Authenticated"
 [ "$before" = "$(tree_of "$H")" ] && pass "verify-only leaves HOME untouched" || fail "verify-only wrote to HOME"
 no_leftovers "verify-only"
@@ -306,13 +306,13 @@ done
 HN=cc; new_home cc
 mkdir -p "$T/cc/tmp" "$T/cc/.cargo"
 printf '[build]\n' >"$T/cc/.cargo/config.toml"
-OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/cc/tmp" sh "$INSTALL" --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist" </dev/null 2>&1); RC=$?
+OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/cc/tmp" sh "$INSTALL" --version 0.1.0-alpha.1 --trust-fingerprint "$FPR" --assets-dir "$T/does-not-exist" </dev/null 2>&1); RC=$?
 expect "a Cargo config above the build directory is refused before any work" 1 "Cargo would read"
-OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/cc/tmp" sh "$INSTALL" --verify-only --trust-fingerprint "$FPR" --assets-dir "$T/assets" --key-file "$T/key.asc" </dev/null 2>&1); RC=$?
+OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/cc/tmp" sh "$INSTALL" --version 0.1.0-alpha.1 --verify-only --trust-fingerprint "$FPR" --assets-dir "$T/assets" --key-file "$T/key.asc" </dev/null 2>&1); RC=$?
 expect "the same directory is fine for --verify-only (nothing is built)" 0 "Authenticated"
 HN=rel; new_home rel
 mkdir -p "$T/rel/reltmp"
-OUT=$(cd "$T/rel" && env -i HOME="$H" PATH="$PATH" TMPDIR=reltmp sh "$INSTALL" --verify-only --trust-fingerprint "$FPR" --assets-dir "$T/assets" --key-file "$T/key.asc" </dev/null 2>&1); RC=$?
+OUT=$(cd "$T/rel" && env -i HOME="$H" PATH="$PATH" TMPDIR=reltmp sh "$INSTALL" --version 0.1.0-alpha.1 --verify-only --trust-fingerprint "$FPR" --assets-dir "$T/assets" --key-file "$T/key.asc" </dev/null 2>&1); RC=$?
 expect "a relative TMPDIR is resolved" 0 "Authenticated"
 
 # --------------------------------------------------------------------------- the typed fingerprint prompt
@@ -320,7 +320,7 @@ if command -v script >/dev/null 2>&1; then
     HN=pty; new_home pty
     tty_run() { # ANSWER: runs the installer on a pseudo terminal and types ANSWER
         OUT=$(printf '%s\n' "$1" | env -i HOME="$H" PATH="$PATH" TERM=dumb TMPDIR="$T/tmp-$HN" \
-            script -qec "sh $INSTALL --assets-dir $T/assets --verify-only --key-file $T/key.asc" /dev/null 2>&1)
+            script -qec "sh $INSTALL --version 0.1.0-alpha.1 --assets-dir $T/assets --verify-only --key-file $T/key.asc" /dev/null 2>&1)
         RC=$?
     }
     tty_run "$FPR"
@@ -422,7 +422,7 @@ if [ "$WITH_BUILD" = 1 ]; then
     # Explicit reinstall, started from a Fish session when Fish is available.
     if command -v fish >/dev/null 2>&1; then
         OUT=$(env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-b1" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            fish -c "sh '$INSTALL' --reinstall --trust-fingerprint $FPR" </dev/null 2>&1); RC=$?
+            fish -c "sh '$INSTALL' --version 0.1.0-alpha.1 --reinstall --trust-fingerprint $FPR" </dev/null 2>&1); RC=$?
     else
         run_inst --reinstall --trust-fingerprint "$FPR"
     fi
@@ -461,7 +461,7 @@ EOF
 
     # Interrupted reinstall: the existing install is untouched.
     env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-b1" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-        sh "$INSTALL" --reinstall --trust-fingerprint "$FPR" >"$T/int.out" 2>&1 </dev/null &
+        sh "$INSTALL" --version 0.1.0-alpha.1 --reinstall --trust-fingerprint "$FPR" >"$T/int.out" 2>&1 </dev/null &
     ipid=$!
     i=0
     while [ $i -lt 120 ] && ! ls "$T/tmp-b1"/mindspace-install.*/build.log >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done
@@ -475,7 +475,7 @@ EOF
     # Interrupted first install: nothing is left.
     HN=int; new_home int
     env -i HOME="$H" PATH="$PATH" TMPDIR="$T/tmp-int" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-        sh "$INSTALL" --trust-fingerprint "$FPR" >"$T/int.out" 2>&1 </dev/null &
+        sh "$INSTALL" --version 0.1.0-alpha.1 --trust-fingerprint "$FPR" >"$T/int.out" 2>&1 </dev/null &
     ipid=$!
     i=0
     while [ $i -lt 120 ] && ! ls "$T/tmp-int"/mindspace-install.*/build.log >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done

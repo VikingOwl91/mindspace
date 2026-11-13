@@ -92,6 +92,14 @@ jobs:
           shellcheck -s sh -S warning tests/scripts/install_sh_test.sh
           shellcheck -s sh -S warning tests/scripts/install_lifecycle_test.sh
           shellcheck -s sh -S warning tests/scripts/install_publish_test.sh
+      - name: Embedded release parser parity
+        run: python3 scripts/embed-installer-contract.py --check
+      - name: Release contract unit tests
+        run: python3 -B tests/scripts/test_installer_release_contract.py
+      - name: Release discovery tests (offline)
+        run: python3 -B tests/scripts/install_discovery_test.py
+      - name: Signed future release tests (ephemeral test key)
+        run: python3 -B tests/scripts/install_future_release_test.py
       - name: Installer lifecycle tests (offline)
         run: sh tests/scripts/install_lifecycle_test.sh
       - name: Installer publication tests (offline fixtures)

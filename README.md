@@ -25,7 +25,7 @@ It is the only published release.
 
 | You can | With |
 | --- | --- |
-| Create, update or retire an explicit memory | MCP `memory_create`, `memory_update`, `memory_retire` |
+| Create, update or retire an explicit memory | MCP `memory_create`, `memory_update`, `memory_retire`; `mind memory create` and `mind retire` on the command line |
 | Ingest Markdown/text files and committed Git content | `mind ingest`; MCP `repo_ingest` for allowed repositories |
 | Search memories and inspect their evidence and history | `mind search`, `mind recall`, `mind inspect`; MCP memory tools |
 | Find Rust definitions with file and commit provenance | `mind symbols`; MCP `code_search` |
@@ -33,8 +33,9 @@ It is the only published release.
 
 Not part of this Alpha: canonical document/PDF ingestion, M8 document
 publication, and embedding-based (semantic or hybrid) search. Rust is the only
-structurally parsed language. There is no CLI command to create a memory; that
-goes through MCP. Commands and the database schema can still change.
+structurally parsed language. `mind memory create` exists on current `main` but not in the
+signed RC.5 archive, which creates memories through MCP only. Commands and the database
+schema can still change.
 
 ## Install
 

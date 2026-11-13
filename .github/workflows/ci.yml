@@ -73,6 +73,31 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+  msrv:
+    name: Minimum supported Rust
+    # The rust-version in Cargo.toml is the single source of truth. This job builds with exactly
+    # that compiler (the .0 release) and does not repeat the full test suite.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the minimum toolchain
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$msrv"
+          echo "MSRV=${msrv}.0" >> "$GITHUB_ENV"
+          rustup toolchain install "${msrv}.0" --profile minimal
+      - name: Check, default features
+        run: cargo +"$MSRV" check --locked --all-targets
+      - name: Check, no embeddings (the supported Alpha profile)
+        run: cargo +"$MSRV" check --locked --no-default-features --lib --bin mind
+      - name: Unit tests
+        run: cargo +"$MSRV" test --locked --lib
+
   security-profile:
     name: Landlock security profile
     # Landlock gate for the MCP repository tools (ADR-029), about 5 minutes.

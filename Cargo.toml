@@ -2,6 +2,9 @@
 name = "mindspace"
 version = "0.5.0"
 edition = "2021"
+# Minimum supported Rust version, checked by the `msrv` CI job. The development and CI toolchain is
+# pinned separately in rust-toolchain.toml.
+rust-version = "1.96"
 description = "Local-first memory engine: sources are evidence, memories are interpretations."
 license = "MIT"
 repository = "https://github.com/VikingOwl91/mindspace"

@@ -1743,7 +1743,7 @@ mod tests {
         let Some(real_git) = find_in_path("git") else {
             return;
         };
-        let run = |case: &str| -> String {
+        let run_once = |case: &str| -> String {
             let h = tempfile::tempdir().unwrap();
             let home = h.path();
             for d in ["bin", "real", "link", "repo"] {
@@ -1777,6 +1777,20 @@ mod tests {
             );
             eprintln!("--- {case}\n{text}");
             text
+        };
+        // The test writes the executables and runs them at once. When another test thread forks
+        // while the copy is still open for writing, execve fails with ETXTBSY (errno 26) until that
+        // child has exec'd. That is a test-harness race, not a sandbox result, so try again with a
+        // fresh copy; the sandbox outcomes asserted below are never errno 26.
+        let run = |case: &str| -> String {
+            for _ in 0..5 {
+                let text = run_once(case);
+                if !text.contains("errno 26") {
+                    return text;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            run_once(case)
         };
         let get = |text: &str, k: &str| {
             text.lines()

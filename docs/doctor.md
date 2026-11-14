@@ -33,7 +33,7 @@ mind doctor --json   # one JSON document on stdout, nothing else
 ```json
 {
   "format": "mind-doctor/1",
-  "mind_version": "0.5.0",
+  "mind_version": "0.1.0-alpha.2",
   "summary": {"pass": 4, "warn": 1, "fail": 0, "skip": 1, "exit_code": 0},
   "checks": [
     {

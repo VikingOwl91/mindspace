@@ -85,7 +85,7 @@ build the current `main`, build from a checkout instead:
 git clone https://github.com/VikingOwl91/mindspace
 cd mindspace
 cargo build --release          # produces target/release/mind
-target/release/mind --version  # mind 0.1.0-alpha.1
+target/release/mind --version  # mind 0.1.0-alpha.2
 ```
 
 `mind` on your `PATH` may be an older build. `command -v mind` shows which one runs; use
@@ -125,7 +125,8 @@ agent account is needed. The commands work in bash, zsh and Fish.
 
 **Before you start**
 
-- `mind --version` prints `mind 0.1.0-alpha.1`.
+- `mind --version` prints `mind 0.1.0-alpha.1` for the installer's RC.5 build and
+  `mind 0.1.0-alpha.2` for a build of current `main`.
 - Pick a repository you trust. Command-line ingestion is not sandboxed.
 - Ingesting a Git repository writes one small marker file,
   `.git/mindspace-repository-id`, into that repository. Tracked files and the

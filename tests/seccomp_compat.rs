@@ -326,7 +326,7 @@ fn the_sandboxed_server_installs_the_filter_and_real_workloads_work() {
     let tools = s.rpc("tools/list", json!({}));
     assert_eq!(
         tools["result"]["tools"].as_array().map(|a| a.len()),
-        Some(15)
+        Some(16)
     );
     let created = s.call(
         "memory_create",

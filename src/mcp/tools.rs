@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::path::Path;
 use std::str::FromStr;
 
 use crate::core::{normalize_subject, Error, ManualMemoryDraft, Result, SearchQuery, Ts, Uuid};
@@ -240,6 +241,17 @@ pub fn definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "server_status",
+            "Report which database this server process opened and how it was chosen (path, schema version, creation time, space count), the server version, and whether a plain `mind` in the same environment would choose the same database. Read-only. Use it to find a CLI/MCP database mismatch.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "full_path": { "type": "boolean", "default": false, "description": "Show the absolute path. By default the home directory is shown as ~." }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "space_list",
             "List spaces and counts of active memories.",
             empty_object_schema(),
@@ -463,6 +475,13 @@ fn call_tool(
             )?;
             serde_json::to_value(space).map_err(|e| Error::Storage(e.to_string()))
         }
+        "server_status" => {
+            let full_path = obj
+                .get("full_path")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            server_status(store, config, full_path)
+        }
         "space_list" => {
             let spaces = store
                 .list_spaces_with_counts()?
@@ -531,6 +550,7 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
         super::isolated_git::TOOL => (&["path", "spaces"], &["path", "spaces"]),
         "memory_history" => (&["subject"], &["subject"]),
         "memory_conflicts" | "space_list" => (&[], &[]),
+        "server_status" => (&["full_path"], &[]),
         "memory_add_spaces" => (&["id", "spaces"], &["id", "spaces"]),
         "space_create" => (&["name", "description"], &["name"]),
         "space_link" => (&["from", "to"], &["from", "to"]),
@@ -568,7 +588,7 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
             return Err("argument 'paths' must be an array of non-empty strings".to_string());
         }
     }
-    for key in ["history", "branches", "remotes", "tags"] {
+    for key in ["history", "branches", "remotes", "tags", "full_path"] {
         if obj.get(key).is_some_and(|v| !v.is_boolean()) {
             return Err(format!("argument '{key}' must be a boolean"));
         }
@@ -722,9 +742,75 @@ fn resolve_spaces(store: &dyn Store, names: Vec<&str>) -> Result<Vec<Uuid>> {
         .collect()
 }
 
+/// A path for display: the home directory becomes `~` unless the caller asks for the full path.
+fn shown_path(path: &Path, home: Option<&Path>, full: bool) -> String {
+    if !full {
+        if let Some(rest) = home.and_then(|h| path.strip_prefix(h).ok()) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn server_status(store: &dyn Store, config: &McpConfig, full_path: bool) -> Result<Value> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = home.as_deref().filter(|h| h.is_absolute());
+    let facts = store.database_facts()?;
+    let spaces = store.list_spaces()?.len();
+    let executable = std::env::current_exe()
+        .ok()
+        .map(|p| shown_path(&p, home, full_path));
+    let database = match config.database() {
+        Some(info) => json!({
+            "path": shown_path(&info.path, home, full_path),
+            "selected_by": info.selected_by,
+            "is_default": info.is_default,
+            "size_bytes": std::fs::metadata(&info.path).ok().map(|m| m.len()),
+            "schema_version": facts.schema_version,
+            "supported_schema_version": facts.supported_schema_version,
+            "created_at": facts.created_at.map(|t| t.to_string()),
+        }),
+        None => json!({
+            "path": Value::Null,
+            "selected_by": Value::Null,
+            "schema_version": facts.schema_version,
+            "supported_schema_version": facts.supported_schema_version,
+            "created_at": facts.created_at.map(|t| t.to_string()),
+        }),
+    };
+    let cli_default = config.database().map(|info| {
+        let matches = info.plain_default.as_deref() == Some(info.path.as_path());
+        let mut value = json!({
+            "path": info.plain_default.as_deref().map(|p| shown_path(p, home, full_path)),
+            "matches": matches,
+        });
+        if !matches {
+            let expected = info
+                .plain_default
+                .as_deref()
+                .map(|p| shown_path(p, home, full_path))
+                .unwrap_or_else(|| "unknown".to_string());
+            value["hint"] = json!(format!(
+                "This server uses a different database than a plain `mind` in the same environment \
+                 (which would use {expected}). If that is not intended, run `mind doctor` and \
+                 compare its database path, then fix the --db argument of this server's \
+                 registration (see docs/setup.md). Nothing was changed."
+            ));
+        }
+        value
+    });
+    Ok(json!({
+        "server": { "name": "mindspace", "version": env!("CARGO_PKG_VERSION"), "executable": executable },
+        "database": database,
+        "spaces": spaces,
+        "cli_default": cli_default,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::DatabaseInfo;
     use crate::storage::sqlite::SqliteStore;
 
     /// A server that started before the database was migrated by a newer `mind` must not
@@ -769,6 +855,94 @@ mod tests {
         }
     }
 
+    fn status_config(path: &Path, selected_by: &str, plain: Option<&Path>) -> McpConfig {
+        McpConfig::default().with_database(DatabaseInfo {
+            path: path.to_path_buf(),
+            selected_by: selected_by.to_string(),
+            is_default: false,
+            plain_default: plain.map(Path::to_path_buf),
+        })
+    }
+
+    #[test]
+    fn server_status_says_which_database_this_process_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mind.db");
+        let store = SqliteStore::open(&path).unwrap();
+        store.create_space("coding", "").unwrap();
+        let config = status_config(&path, "--db", Some(&path));
+        let mut semantic = SemanticCache::default();
+        let result = call_result(&store, &config, &mut semantic, "server_status", &json!({}));
+        assert_eq!(result["isError"], false, "{result}");
+        let s = &result["structuredContent"];
+        assert_eq!(s["server"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(s["database"]["selected_by"], "--db");
+        assert_eq!(
+            s["database"]["schema_version"],
+            s["database"]["supported_schema_version"]
+        );
+        assert!(s["database"]["created_at"].is_string(), "{s}");
+        assert_eq!(s["spaces"], 1);
+        assert_eq!(s["cli_default"]["matches"], true, "{s}");
+        assert!(s["database"]["path"].as_str().unwrap().ends_with("mind.db"));
+    }
+
+    #[test]
+    fn server_status_flags_a_database_a_plain_mind_would_not_choose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quickstart.db");
+        let other = dir.path().join("default.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let config = status_config(&path, "--db", Some(&other));
+        let mut semantic = SemanticCache::default();
+        let result = call_result(&store, &config, &mut semantic, "server_status", &json!({}));
+        let s = &result["structuredContent"];
+        assert_eq!(s["cli_default"]["matches"], false, "{s}");
+        let hint = s["cli_default"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("mind doctor") && hint.contains("default.db"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn server_status_hides_the_home_directory_unless_asked() {
+        let home = Path::new("/home/someone");
+        let inside = Path::new("/home/someone/.local/share/mindspace/mind.db");
+        assert_eq!(
+            shown_path(inside, Some(home), false),
+            "~/.local/share/mindspace/mind.db"
+        );
+        assert_eq!(
+            shown_path(inside, Some(home), true),
+            inside.display().to_string()
+        );
+        let outside = Path::new("/srv/data/mind.db");
+        assert_eq!(shown_path(outside, Some(home), false), "/srv/data/mind.db");
+        assert_eq!(
+            shown_path(inside, None, false),
+            inside.display().to_string()
+        );
+    }
+
+    #[test]
+    fn server_status_without_a_database_location_still_reports_the_store() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let config = McpConfig::default();
+        let mut semantic = SemanticCache::default();
+        let result = call_result(&store, &config, &mut semantic, "server_status", &json!({}));
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(result["structuredContent"]["database"]["path"].is_null());
+        let bad = call_result(
+            &store,
+            &config,
+            &mut semantic,
+            "server_status",
+            &json!({"full_path": "yes"}),
+        );
+        assert_eq!(bad["isError"], true, "{bad}");
+    }
+
     #[test]
     fn without_the_opt_in_the_tool_list_is_exactly_the_fixed_list() {
         let config = McpConfig::default();
@@ -793,7 +967,7 @@ mod tests {
     #[test]
     fn registers_all_tools_with_object_schemas() {
         let definitions = definitions();
-        assert_eq!(definitions.len(), 15);
+        assert_eq!(definitions.len(), 16);
         for tool in definitions {
             assert!(tool["inputSchema"]["type"].as_str() == Some("object"));
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);

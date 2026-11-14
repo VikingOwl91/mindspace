@@ -858,7 +858,7 @@ fn default_mcp_definitions_and_exposure_are_unchanged() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 15);
+    assert_eq!(names.len(), 16);
     assert!(names
         .iter()
         .all(|n| !n.contains("fence") && !n.contains("publish")));

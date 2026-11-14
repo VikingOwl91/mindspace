@@ -55,7 +55,23 @@ pub trait MemoryRead {
 /// traffic exclusively in `core` types. Each state-changing method owns its
 /// transaction; a future PostgreSQL backend would implement this trait
 /// without exposing transaction handles to callers.
+/// Facts about the database itself, for diagnostics. Nothing here changes the database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatabaseFacts {
+    /// Highest schema version recorded in the database.
+    pub schema_version: Option<i64>,
+    /// Highest schema version this binary supports.
+    pub supported_schema_version: Option<i64>,
+    /// When the first migration ran, i.e. when this database file was first created.
+    pub created_at: Option<crate::core::Ts>,
+}
+
 pub trait Store {
+    /// Read-only facts about the open database (version, creation time).
+    fn database_facts(&self) -> Result<DatabaseFacts> {
+        Ok(DatabaseFacts::default())
+    }
+
     /// Fails when the database was migrated past what this process supports after it
     /// started, so a long-running server cannot keep working against a schema it does not
     /// understand. Stores without a versioned schema are always current.

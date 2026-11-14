@@ -1212,6 +1212,19 @@ fn mcp_command(
         eprintln!("mind: the repository tools are OFF: {reason}");
     }
     let config = config.with_sandbox(state).with_seccomp(seccomp_report);
+    let config = match db_location(cli) {
+        Ok(located) => config.with_database(crate::mcp::DatabaseInfo {
+            path: located.path.clone(),
+            selected_by: if located.is_default {
+                format!("default location ({})", located.source.label())
+            } else {
+                located.source.label()
+            },
+            is_default: located.is_default,
+            plain_default: plain_default_db(),
+        }),
+        Err(_) => config,
+    };
     // The experimental tool exists only if it was asked for AND the kernel sandbox is verified AND
     // the broker channel arrived (stage 2 only). Anything else: no tool, and one line saying why.
     #[cfg(unix)]
@@ -1637,6 +1650,19 @@ pub fn parse() -> Cli {
 }
 
 /// The effective database location and where it came from.
+/// The database a plain `mind` (no `--db`) would choose in this process's environment.
+fn plain_default_db() -> Option<PathBuf> {
+    let env = std::env::var_os("MINDSPACE_DB").map(PathBuf::from);
+    let origin = if env.is_some() {
+        crate::paths::DbOrigin::Environment
+    } else {
+        crate::paths::DbOrigin::Unset
+    };
+    crate::paths::db_path_from(env.as_deref(), origin, crate::paths::data_dir)
+        .ok()
+        .map(|located| located.path)
+}
+
 fn db_location(cli: &Cli) -> Result<crate::paths::Located> {
     crate::paths::db_path_from(cli.db.as_deref(), cli.db_origin, crate::paths::data_dir)
 }

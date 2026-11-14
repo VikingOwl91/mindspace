@@ -134,13 +134,13 @@ fn tool_error_text(response: &Value) -> &str {
 }
 
 #[test]
-fn real_binary_exposes_all_fourteen_tools_and_runs_the_memory_lifecycle() {
+fn real_binary_exposes_all_sixteen_tools_and_runs_the_memory_lifecycle() {
     let (_dir, db) = database();
     let mut process = McpProcess::spawn(&db);
 
     let list = process.request(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool.get("outputSchema").is_none());
@@ -165,6 +165,7 @@ fn real_binary_exposes_all_fourteen_tools_and_runs_the_memory_lifecycle() {
         "space_create",
         "space_list",
         "space_link",
+        "server_status",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }

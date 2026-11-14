@@ -2086,6 +2086,22 @@ fn read_embedding_settings_on(conn: &Connection) -> Result<EmbeddingSettings> {
 // ---------------------------------------------------------------------------
 
 impl Store for SqliteStore {
+    fn database_facts(&self) -> Result<crate::storage::DatabaseFacts> {
+        let conn = self.connection()?;
+        let (schema_version, created_at): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT MAX(version), (SELECT applied_at FROM schema_migrations ORDER BY version LIMIT 1) FROM schema_migrations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(dberr)?;
+        Ok(crate::storage::DatabaseFacts {
+            schema_version,
+            supported_schema_version: Some(CURRENT_SCHEMA_VERSION),
+            created_at: created_at.map(Ts),
+        })
+    }
+
     fn ensure_schema_not_newer(&self) -> Result<()> {
         let conn = self.connection()?;
         match newer_schema_version(&conn)? {

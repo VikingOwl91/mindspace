@@ -44,6 +44,18 @@ update a copy that is already installed (for example in `~/.cargo/bin`): put the
 install it with `cargo install --path . --locked --force`. Confirm with `mind setup --help` before you retry.
 Builds from different commits can report the same version, so `mind --version` alone does not tell them apart.
 
+### If the agent and the command line see different data
+
+The agent's MCP server and your shell may use different databases. Ask the agent for `server_status` and
+compare it with `mind doctor` in your shell:
+
+- `database.path` and `database.selected_by` (agent) against `database.path` and `database.source` (`mind doctor`).
+- `cli_default.matches: false` means the registration pins another database than a plain `mind` would use. The usual
+  cause is a `--db` argument in the registration that points to a try-out database.
+
+Nothing is changed automatically. Fix the registration (undo it, then run `mind setup` again without `--db`, as
+described above) and restart the agent session.
+
 ### If an agent reports "the database is at schema version N, this server only supports M"
 
 A newer `mind` migrated your database while this agent session was already running its MCP server. The

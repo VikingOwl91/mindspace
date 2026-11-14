@@ -90,8 +90,20 @@ impl SandboxState {
     }
 }
 
+/// Which database this server opened and how it was chosen, for `server_status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseInfo {
+    pub path: PathBuf,
+    /// What decided the path: `--db`, an environment variable, or the default location.
+    pub selected_by: String,
+    pub is_default: bool,
+    /// The database a plain `mind` would pick in this process's environment (no `--db`).
+    pub plain_default: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct McpConfig {
+    database: Option<DatabaseInfo>,
     roots: Vec<AllowRoot>,
     ingest_timeout: Duration,
     sandbox: SandboxState,
@@ -115,6 +127,7 @@ pub struct McpConfig {
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
+            database: None,
             roots: Vec::new(),
             ingest_timeout: DEFAULT_INGEST_TIMEOUT,
             sandbox: SandboxState::Unavailable(
@@ -229,6 +242,7 @@ impl McpConfig {
                 .or_insert(access);
         }
         Ok(Self {
+            database: None,
             roots: merged
                 .into_iter()
                 .map(|(path, access)| AllowRoot { path, access })
@@ -289,6 +303,15 @@ impl McpConfig {
     #[cfg(not(unix))]
     pub fn isolated(&self) -> Option<&()> {
         None
+    }
+
+    pub fn with_database(mut self, info: DatabaseInfo) -> Self {
+        self.database = Some(info);
+        self
+    }
+
+    pub fn database(&self) -> Option<&DatabaseInfo> {
+        self.database.as_ref()
     }
 
     pub fn with_request_log(mut self, file: PathBuf) -> Self {

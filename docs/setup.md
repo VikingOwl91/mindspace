@@ -44,6 +44,12 @@ update a copy that is already installed (for example in `~/.cargo/bin`): put the
 install it with `cargo install --path . --locked --force`. Confirm with `mind setup --help` before you retry.
 Builds from different commits can report the same version, so `mind --version` alone does not tell them apart.
 
+### If an agent reports "the database is at schema version N, this server only supports M"
+
+A newer `mind` migrated your database while this agent session was already running its MCP server. The
+server refuses every call instead of working against a schema it does not understand. Restart the agent
+session: it then starts the current `mind` binary. Nothing is lost; the database itself is intact.
+
 ## What you share: `--ro` and `--rw`
 
 These are **Mindspace** permissions for the folders you name.

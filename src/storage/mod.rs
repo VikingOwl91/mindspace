@@ -56,6 +56,13 @@ pub trait MemoryRead {
 /// transaction; a future PostgreSQL backend would implement this trait
 /// without exposing transaction handles to callers.
 pub trait Store {
+    /// Fails when the database was migrated past what this process supports after it
+    /// started, so a long-running server cannot keep working against a schema it does not
+    /// understand. Stores without a versioned schema are always current.
+    fn ensure_schema_not_newer(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Retain one read-only snapshot for complete memory response collection.
     /// This must not be implemented as independently executed Store getters.
     fn read_session(&self) -> Result<Box<dyn MemoryRead + '_>>;

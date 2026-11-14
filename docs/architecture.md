@@ -1,8 +1,7 @@
 # Alpha architecture
 
-This overview describes the qualified RC.5 archive, using the architecture,
-README and operator guides included in it. Public main contains that source plus later
-changes.
+This overview describes the 0.1.0-alpha.2 archive (carried over from the qualified RC.5 documents).
+Public main is the development line: the release source plus later changes.
 
 ## Local engine
 

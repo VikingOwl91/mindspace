@@ -19,9 +19,9 @@ used through the `mind` command-line tool or as a stdio
 
 ## What the Alpha can do
 
-`v0.1.0-alpha.1` is a source-only public Alpha for Linux x86_64, published as a
-[GitHub prerelease](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
-It is the only published release.
+`v0.1.0-alpha.2` is the current source-only public Alpha for Linux x86_64, published as a
+[GitHub prerelease](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.2).
+It supersedes `v0.1.0-alpha.1`.
 
 | You can | With |
 | --- | --- |
@@ -33,9 +33,7 @@ It is the only published release.
 
 Not part of this Alpha: canonical document/PDF ingestion, M8 document
 publication, and embedding-based (semantic or hybrid) search. Rust is the only
-structurally parsed language. `mind memory create` exists on current `main` but not in the
-signed RC.5 archive, which creates memories through MCP only. Commands and the database
-schema can still change.
+structurally parsed language. Commands and the database schema can still change.
 
 ## Install
 
@@ -49,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/VikingOwl91/mindspace/main/install.
 The installer selects the newest published release, including prereleases, verifies its supported
 signed contract and assets, and builds a versioned binary under `~/.local/lib/mindspace/`. It never
 falls back silently when the selected release is unsupported or fails verification. Use
-`--version 0.1.0-alpha.1` for an explicit version. RC.5 retains its original pins and signatures.
+`--version 0.1.0-alpha.2` for an explicit version. The earlier RC.5 (`0.1.0-alpha.1`) retains its original pins and signatures.
 
 It is safe to repeat: an intact selected installation exits successfully without replacement.
 `--upgrade` installs a newer selected version beside old binaries; `--reinstall` explicitly replaces
@@ -57,23 +55,23 @@ the selected prefix while preserving its previous binary. Neither option changes
 agent configuration or MCP registrations. Run it from Fish as written too.
 
 Prerequisites: Linux x86_64, Python 3.11+, curl, GnuPG, a C compiler, core command-line tools and the
-exact Rust toolchain selected by the supported contract (RC.5: 1.98.1). The
+exact Rust toolchain selected by the supported contract (alpha.2: 1.100.0; RC.5: 1.98.1). The
 [install guide](docs/install.md) explains trust, script authentication, dependencies, version
 selection, recovery and the remaining freshness/reproducibility limits. The fingerprint argument
 alone does not establish trust.
 
-The following PATH examples use RC.5; substitute the version printed by the installer if different.
+The following PATH examples use 0.1.0-alpha.2; substitute the version printed by the installer if different.
 
 Then make `mind` easy to run, or use its full path:
 
 ```sh
 # bash or zsh
-export PATH="$HOME/.local/lib/mindspace/0.1.0-alpha.1/bin:$PATH"
+export PATH="$HOME/.local/lib/mindspace/0.1.0-alpha.2/bin:$PATH"
 ```
 
 ```fish
 # Fish
-fish_add_path ~/.local/lib/mindspace/0.1.0-alpha.1/bin
+fish_add_path ~/.local/lib/mindspace/0.1.0-alpha.2/bin
 ```
 
 ### Build from a checkout
@@ -102,9 +100,9 @@ rustup toolchain install 1.96.0 --profile minimal
 cargo +1.96.0 build --release
 ```
 
-The installer is separate. It builds the signed RC.5 archive, which is frozen at
-Rust 1.98.1 and says so when it runs. A checkout build is not that qualified
-archive, even where the code is the same.
+The installer is separate. It builds the signed release archive, which pins its own
+Rust version (alpha.2: 1.100.0) and says so when it runs. A checkout build is not that
+qualified archive, even where the code is the same.
 
 ## Your database and a try-out database
 
@@ -125,8 +123,7 @@ agent account is needed. The commands work in bash, zsh and Fish.
 
 **Before you start**
 
-- `mind --version` prints `mind 0.1.0-alpha.1` for the installer's RC.5 build and
-  `mind 0.1.0-alpha.2` for a build of current `main`.
+- `mind --version` prints `mind 0.1.0-alpha.2`.
 - Pick a repository you trust. Command-line ingestion is not sandboxed.
 - Ingesting a Git repository writes one small marker file,
   `.git/mindspace-repository-id`, into that repository. Tracked files and the
@@ -209,16 +206,17 @@ outside any shared repository. For manual configuration, see the
 
 ## Security and provenance
 
-The installer builds only the signed RC.5 source archive attached to the release.
+The installer builds only the signed source archive attached to the release.
 Other sources differ from the signed archive:
 
 | Source | What it contains |
 | --- | --- |
-| Release asset `mindspace-0.1.0-alpha.1-rc.5-source.tar.gz` | The qualified Alpha source (RC.5). The installer verifies and builds this. |
-| Public `main` (clone, Download ZIP) | The Alpha source baseline (`a027d94`) plus later changes, the current documentation and `install.sh`. Not signed, not the qualified archive. |
-| Tag `v0.1.0-alpha.1` and its generated "Source code" ZIP/tar.gz | The older commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`, which only anchors the release page. |
+| Release asset `mindspace-0.1.0-alpha.2-source.tar.gz` | The qualified Alpha source. The installer verifies and builds this. |
+| Public `main` (clone, Download ZIP) | The development line: the release source plus later changes, the current documentation and `install.sh`. Not signed, not the qualified archive. |
+| Tag `v0.1.0-alpha.2` and its generated "Source code" ZIP/tar.gz | The release commit of the archive's source baseline, including files that are not part of the archive. |
+| Tag `v0.1.0-alpha.1` (superseded) | The older commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`, which only anchors that release page. |
 
-Archive SHA-256: `b587a04edff66963162267fff805678b7c1ba8aefbaec795e518702e0e4149c0`.
+The archive's SHA-256 is in `SHA256SUMS` and in the release notes of the published release.
 Signing key fingerprint: `0E6699CB48F3941AE28CA88D509F78007F62D5EA`. The
 [release notes](docs/release-notes.md) describe the provenance, and the
 [manual verification steps](docs/source-install.md#1-obtain-and-verify-the-source-archive)

@@ -1,4 +1,4 @@
-# RC.5 archive third-party notices
+# Source archive third-party notices
 
 These notices are retained from the qualified RC.5 archive. The tokenizer fixture
 is in that archive; this documentation-only update does not add it to public main.

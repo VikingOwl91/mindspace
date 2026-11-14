@@ -6,7 +6,8 @@ Security reports are welcome. Please report privately, as described below.
 
 | Version / source | Reports |
 | --- | --- |
-| `v0.1.0-alpha.1` (the RC.5 source archive attached to the release) | Accepted, best effort. This is the current Alpha. |
+| `v0.1.0-alpha.2` (the source archive attached to the release) | Accepted, best effort. This is the current Alpha. |
+| `v0.1.0-alpha.1` (RC.5) | Superseded by alpha.2; reports are accepted but fixes ship in a newer release. |
 | Public `main` | Accepted, best effort. It contains the Alpha source plus later changes, but is not the qualified archive. |
 | Earlier development snapshots | Not maintained; no backports. |
 
@@ -15,10 +16,10 @@ Qualification applies to the exact archive bytes, not to every binary that
 reports the same version. The supported profile is Linux x86_64, built from
 source without embeddings.
 Install the Alpha from the
-[official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
+[official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.2)
 using the [install guide](docs/install.md). The named release asset
-is the authoritative source. The release tag and GitHub's generated "Source code"
-archives point to the older hosting commit and are not the Alpha.
+is the authoritative source. GitHub's generated "Source code"
+archives are not the qualified Alpha.
 
 ## Reporting a vulnerability
 

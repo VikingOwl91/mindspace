@@ -1,8 +1,8 @@
 # Contributing
 
-Public `main` contains the source of the qualified RC.5 Alpha archive (commit `a027d94`)
-plus later changes. Only the signed archive is the qualified Alpha: to run the Alpha, use the
-[official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1)
+Public `main` is the development line: the source of the qualified Alpha archive plus
+later changes. Only the signed archive is the qualified Alpha: to run the Alpha, use the
+[official release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.2)
 and the [install guide](docs/install.md). A clone or generated source ZIP is not that qualification,
 even where the code matches. Report vulnerabilities through the [private channel](SECURITY.md).
 
@@ -31,10 +31,10 @@ Linux is the only tested platform.
 | --- | --- | --- |
 | Development and CI | 1.100.0, pinned exactly | `rust-toolchain.toml` |
 | Minimum supported (MSRV) | 1.96 | `rust-version` in `Cargo.toml`, checked by the `msrv` CI job |
-| Qualified Alpha source archive | 1.98.1, frozen | `rust-toolchain.toml` inside the RC.5 archive |
+| Qualified Alpha source archive | 1.100.0 (alpha.1: 1.98.1), frozen | `rust-toolchain.toml` inside the archive |
 
 Changing the toolchain of `main` does not
-change the published RC.5 archive, which is built with 1.98.1 as described in the
+change a published archive, which is built with the version it pins, as described in the
 [install guide](docs/source-install.md). The `msrv` job runs a locked check of all
 targets with default features, a check of the library and `mind` binary without
 embeddings, and the unit tests, using the minimum compiler. The full test suite

@@ -3,7 +3,7 @@
 `mind setup` registers Mindspace as an MCP server with **Claude Code**, **Codex CLI** or **OpenCode**.
 
 For Alpha installation, first follow the [source-install guide](source-install.md)
-and verify the seven RC.5 release assets. Public main contains the same source plus later changes; these
+and verify the release assets. Public main is the development line (the release source plus later changes); these
 setup instructions describe the qualified Alpha archive. Keep the installed
 executable at its stable absolute path.
 Native client registration/readback was qualified with Codex CLI 0.166.0; this does

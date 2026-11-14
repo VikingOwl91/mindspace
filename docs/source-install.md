@@ -7,18 +7,17 @@ example (6 to 9), backup, restore and upgrade STOP rules (10), and limits, troub
 uninstall (11). The command blocks on this page are POSIX `sh`, not Fish syntax: run them in `sh`
 or bash, or save a block to a file and run it with `sh`.
 
-This guide covers the **v0.1.0-alpha.1 Legacy/Git Public Alpha profile**: local
+This guide covers the **v0.1.0-alpha.2 Legacy/Git Public Alpha profile**: local
 Linux x86_64 SQLite storage, lexical retrieval, explicit memories, legacy
 Markdown/text and committed Git content. Canonical document/PDF ingestion and M8
 publication are not supported. Embedding inference is outside the qualified profile.
 
-Use the explicitly attached RC.5 archive from the
-[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1). GitHub-generated source archives are
-older code, public main is the Alpha source plus later changes, and the release tag points to the older hosting commit `92f68ff646ec9b06ba21df2fb7879dfbc1281838`.
-These instructions are adapted from the qualified RC.5 documentation. The archive
-retains its original preparation-status wording and unchanged signed bytes. That wording
-("unpublished", "candidate", "no public reporting destination") is historical; the current
-statements are in this repository's documentation.
+Use the explicitly attached archive `mindspace-0.1.0-alpha.2-source.tar.gz` from the
+[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.2). GitHub-generated "Source code" archives are
+not the qualified archive: they hold the whole repository at the release commit, not the verified payload.
+These instructions were carried over from the qualified RC.5 (0.1.0-alpha.1) documentation. The
+clean-userspace, offline-recovery and independent-audit qualification of alpha.1 was not repeated for
+alpha.2; the [release notes](release-notes.md) say what was checked.
 
 ## 1. Obtain and verify the source archive
 
@@ -44,14 +43,14 @@ GitHub's generated "Source code" archives are not part of the packet.
    signed manifest. Extract into a new controlled directory with
    `tar -xzf VERIFIED_ARCHIVE -C NEW_EMPTY_DIRECTORY`, replacing the two path
    placeholders with the verified archive and a newly created empty directory.
-   Set `SRC` to the absolute extracted `mindspace-0.1.0-alpha.1` directory. Retain
+   Set `SRC` to the absolute extracted `mindspace-0.1.0-alpha.2` directory. Retain
    the original archive and sidecars.
 
 The exact recipient procedure, including fresh-directory extraction, is in
 `VERIFY.txt`; it supplies actual filenames and hash pins rather than the path
 placeholders above. Stop on any missing, uncertain or mismatched item before
 building or opening data. The manifest inventories every payload file and hash;
-RC.5 files are exact blobs from its signed source commit, with no overlays.
+The archive files are exact blobs from its signed source commit, with no overlays.
 There is no Git history or model weight bundle. `cargo pkgid` below displays
 package identity only; it does not authenticate the source. Cloning the public repository does not
 obtain the qualified archive. The signed manifest links the archive to its private
@@ -68,18 +67,18 @@ Historical internal versions (`0.5.0`, the removed tags `v0.2.0`/`v0.3.0`) are n
 
 ## 2. Install prerequisites
 
-Use Rust/Cargo **1.98.1**, the toolchain this archive pins. Public `main` pins a different development toolchain that does not apply to the Alpha. Historical clean-userspace qualification used Debian 13/trixie x86_64 on a Linux 7.2 host; RC.4 also had eligible-host native builds. Neither result qualifies every Linux distribution, libc, filesystem or container.
+Use Rust/Cargo **1.100.0**, the toolchain this archive pins (alpha.1 pinned 1.98.1). Historical clean-userspace qualification used Debian 13/trixie x86_64 on a Linux 7.2 host; RC.4 also had eligible-host native builds. Neither result qualifies every Linux distribution, libc, filesystem or container.
 
 | Profile | Build requirements | Runtime requirements |
 | --- | --- | --- |
-| Recommended no-embeddings Alpha | Rust/Cargo1.98.1, Git, C compiler and C development headers | GNU loader/libc, libm, libgcc_s; Git for repository operations. No embedding weights or C++ runtime required by the built application. |
+| Recommended no-embeddings Alpha | Rust/Cargo 1.100.0, Git, C compiler and C development headers | GNU loader/libc, libm, libgcc_s; Git for repository operations. No embedding weights or C++ runtime required by the built application. |
 | Default build, optional embeddings capability | The same prerequisites **plus a C++ compiler** (`g++` on Debian) | Also libstdc++; real semantic retrieval needs separately installed pinned model assets. It is outside the initial qualified model-free support profile. |
 
 SQLite/FTS5 and Tree-sitter are compiled from source; a system SQLite CLI/server is not required by Mindspace. Historical installation qualification observed a default-build failure without `c++` and a successful independent C-only noembed build. These observations are not a new build of this archive.
 
 On Debian, the package sets used inside the clean environment were `git gcc libc6-dev ca-certificates`, adding `g++` for the default profile. Install packages using your system's normal administration process; no host `sudo` command is prescribed here. Python3 is needed only for the optional manual MCP example and offline recovery recipe; strace/binutils are qualification tools, not basic Mindspace runtime dependencies.
 
-The archive's `rust-toolchain.toml` pins 1.98.1. The clean test image already supplied that toolchain. Rustup/bootstrap downloads from an empty machine were not separately qualified. Source builds may download Cargo dependencies. Runtime search never downloads a model automatically.
+The archive's `rust-toolchain.toml` pins 1.100.0 (the clean test image of alpha.1 supplied 1.98.1). Rustup/bootstrap downloads from an empty machine were not separately qualified. Source builds may download Cargo dependencies. Runtime search never downloads a model automatically.
 
 For MCP repository tools, Linux6.2+ with effective Landlock ABI3+ is required. The actual sandbox canary must succeed; do not substitute `--insecure-no-sandbox` for that guarantee. Ordinary CLI ingestion does not have the MCP kernel-confinement promise.
 
@@ -94,7 +93,7 @@ Recommended Alpha profile:
 cd "$SRC"
 cargo build --locked --release --no-default-features --bin mind --target-dir target/alpha-noembed
 export BUILD_BIN="$SRC/target/alpha-noembed/release/mind"
-test "$("$BUILD_BIN" --version)" = 'mind 0.1.0-alpha.1'
+test "$("$BUILD_BIN" --version)" = 'mind 0.1.0-alpha.2'
 ```
 
 Alternative default build, requiring the additional C++ prerequisites:
@@ -104,7 +103,7 @@ Alternative default build, requiring the additional C++ prerequisites:
 cd "$SRC"
 cargo build --locked --release --bin mind --target-dir target/alpha-default
 export BUILD_BIN="$SRC/target/alpha-default/release/mind"
-test "$("$BUILD_BIN" --version)" = 'mind 0.1.0-alpha.1'
+test "$("$BUILD_BIN" --version)" = 'mind 0.1.0-alpha.2'
 ```
 
 Running the alternative changes `BUILD_BIN`; choose the intended artifact before installation. Building embeddings support does not install model weights or qualify real inference. Keep its dependency/model requirements separate from the model-free Alpha.
@@ -119,7 +118,7 @@ The block below installs a new version-specific prefix and stops if it already e
 ```sh
 set -eu
 : "${BUILD_BIN:?Choose the ordinary binary to install}"
-export PREFIX="$HOME/.local/lib/mindspace/0.1.0-alpha.1"
+export PREFIX="$HOME/.local/lib/mindspace/0.1.0-alpha.2"
 if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
     printf '%s\n' 'STOP: installation prefix already exists; preserve it and choose a separate reviewed destination.' >&2
     exit 1
@@ -158,7 +157,7 @@ New admitted private database directories use0700; new MAIN/WAL/SHM files use060
 
 ## 7. Store and retrieve a memory
 
-The CLI can ingest existing legacy Markdown/text and retrieve/inspect its memories. Explicit manual creation/update/retirement is provided by MCP/library interfaces; the RC.5 archive has no `mind memory create` CLI command (current `main` has one).
+The CLI can ingest existing legacy Markdown/text and retrieve/inspect its memories. Explicit memories are created with `mind memory create` or over MCP, updated over MCP and retired with `mind retire` or over MCP.
 
 <!-- identity-install: legacy-memory -->
 ```sh
@@ -194,7 +193,7 @@ assert p.returncode == 0, err
 replies = {m["id"]:m for m in map(json.loads, out.splitlines())}
 assert set(replies) == {1,2,3,4}
 assert all("error" not in r for r in replies.values())
-assert replies[1]["result"]["serverInfo"]["version"] == "0.1.0-alpha.1"
+assert replies[1]["result"]["serverInfo"]["version"] == "0.1.0-alpha.2"
 assert not replies[3]["result"].get("isError")
 assert not replies[4]["result"].get("isError")
 r = replies[4]["result"]
@@ -301,7 +300,7 @@ A valid snapshot omits later writes. If clients accepted post-backup writes, **S
 
 | Symptom / limit | Action |
 | --- | --- |
-| Source handoff is missing or verification fails | Stop. Obtain all seven matching RC.5 assets from the official release; do not substitute the generated source archive. |
+| Source handoff is missing or verification fails | Stop. Obtain all matching assets from the official release (archive, manifest, both signatures, `SHA256SUMS`, `VERIFY.txt`, the signing key and the installer envelope); do not substitute the generated source archive. |
 | `c++` missing | Use the noembed profile or install the additional C++ prerequisites for the default profile. Do not change the lockfile to bypass the build failure. |
 | Version is still0.5.0 | Stop; you are building an older tree or using a different executable. Check source provenance, chosen BUILD_BIN and first `mind` on PATH. |
 | Database missing | Initialize a new selected path only. If an existing path/data was expected, stop and investigate before recreating anything. |
@@ -327,7 +326,7 @@ Uninstall only the deliberately selected executable after stopping its clients. 
 test "$MIND_BIN" = "$PREFIX/bin/mind"
 test -f "$MIND_BIN"
 test ! -L "$MIND_BIN"
-test "$("$MIND_BIN" --version)" = 'mind 0.1.0-alpha.1'
+test "$("$MIND_BIN" --version)" = 'mind 0.1.0-alpha.2'
 rm -- "$MIND_BIN"
 ```
 

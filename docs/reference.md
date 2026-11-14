@@ -1,9 +1,8 @@
 # Alpha CLI and MCP reference
 
 These examples are selected/adapted from the qualified RC.5 README, reference
-and install guide. First [verify and install the RC.5 archive](source-install.md).
-The hosting tag and generated source downloads contain older code; public main contains the
-Alpha source plus later changes.
+and install guide. First [verify and install the archive](source-install.md).
+Public main is the development line: the release source plus later changes.
 
 ## Database configuration
 
@@ -36,8 +35,8 @@ Markdown file. Git ingestion reads committed objects, not dirty/untracked files.
 while changing HEAD. `mind inspect <memory-id> --json` inspects a returned memory.
 Create a memory on the command line with
 `mind memory create "text" --space demo` (`--subject` sets the subject, `-` reads the text from
-standard input, repeating it only adds missing spaces). The signed RC.5 archive has no such
-command; there, create/update/retire use MCP. The install
+standard input, repeating it only adds missing spaces). MCP offers the same plus update; retire
+is also available as `mind retire`. The install
 guide includes a standalone Python/stdio MCP example. Use the verified binary's
 `--help` and subcommand help for full syntax. These examples are retained docs,
 not a new runtime qualification.

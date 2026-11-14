@@ -203,6 +203,7 @@ tests/mcp_git_isolated.rs
 tests/mcp_ingest_timeout.rs
 tests/mcp_isolated.rs
 tests/mcp_repo_tools.rs
+tests/mcp_server_status.rs
 tests/models.rs
 tests/old_client_adversarial.rs
 tests/ownership_admin.rs

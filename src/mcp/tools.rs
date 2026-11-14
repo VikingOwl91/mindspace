@@ -279,6 +279,12 @@ pub fn call_result(
     name: &str,
     arguments: &Value,
 ) -> Value {
+    if let Err(error) = store.ensure_schema_not_newer() {
+        return json!({
+            "content": [{ "type": "text", "text": error.to_string() }],
+            "isError": true
+        });
+    }
     match call_tool(store, config, semantic, name, arguments) {
         Ok(structured) => {
             let text = serde_json::to_string(&structured)
@@ -720,6 +726,48 @@ fn resolve_spaces(store: &dyn Store, names: Vec<&str>) -> Result<Vec<Uuid>> {
 mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
+
+    /// A server that started before the database was migrated by a newer `mind` must not
+    /// keep answering: it lacks the SQL functions the newer schema relies on, so its writes
+    /// fail with "no such function" and its reads may be wrong.
+    #[test]
+    fn a_server_older_than_its_database_refuses_every_call_with_a_restart_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mind.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let config = McpConfig::default();
+        let mut semantic = SemanticCache::default();
+        let before = call_result(&store, &config, &mut semantic, "space_list", &json!({}));
+        assert_eq!(before["isError"], false, "{before}");
+
+        // another, newer binary migrates the database after this server has started
+        let newer = rusqlite::Connection::open(&path).unwrap();
+        newer
+            .execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (9999, 0)",
+                [],
+            )
+            .unwrap();
+
+        for tool in ["space_list", "memory_search"] {
+            let args = if tool == "space_list" {
+                json!({})
+            } else {
+                json!({"query": "anything"})
+            };
+            let after = call_result(&store, &config, &mut semantic, tool, &args);
+            assert_eq!(after["isError"], true, "{tool}: {after}");
+            let text = after["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("9999"),
+                "{tool}: names the database schema: {text}"
+            );
+            assert!(
+                text.to_lowercase().contains("restart"),
+                "{tool}: tells the user what to do: {text}"
+            );
+        }
+    }
 
     #[test]
     fn without_the_opt_in_the_tool_list_is_exactly_the_fixed_list() {

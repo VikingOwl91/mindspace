@@ -912,7 +912,8 @@ fn classify_query_err(e: rusqlite::Error) -> Error {
     }
 }
 
-fn reject_future_schema(conn: &Connection) -> Result<()> {
+/// The highest recorded schema version above what this binary supports, if any.
+fn newer_schema_version(conn: &Connection) -> Result<Option<i64>> {
     let has_migration_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
@@ -923,16 +924,18 @@ fn reject_future_schema(conn: &Connection) -> Result<()> {
         .map_err(dberr)?
         .is_some();
     if !has_migration_table {
-        return Ok(());
+        return Ok(None);
     }
-    let future: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(version) FROM schema_migrations WHERE version > ?1",
-            rusqlite::params![CURRENT_SCHEMA_VERSION],
-            |row| row.get(0),
-        )
-        .map_err(dberr)?;
-    if let Some(version) = future {
+    conn.query_row(
+        "SELECT MAX(version) FROM schema_migrations WHERE version > ?1",
+        rusqlite::params![CURRENT_SCHEMA_VERSION],
+        |row| row.get(0),
+    )
+    .map_err(dberr)
+}
+
+fn reject_future_schema(conn: &Connection) -> Result<()> {
+    if let Some(version) = newer_schema_version(conn)? {
         return Err(Error::Storage(format!(
             "database schema version {version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
         )));
@@ -2083,6 +2086,18 @@ fn read_embedding_settings_on(conn: &Connection) -> Result<EmbeddingSettings> {
 // ---------------------------------------------------------------------------
 
 impl Store for SqliteStore {
+    fn ensure_schema_not_newer(&self) -> Result<()> {
+        let conn = self.connection()?;
+        match newer_schema_version(&conn)? {
+            Some(version) => Err(Error::Storage(format!(
+                "the database is at schema version {version}, this server only supports {CURRENT_SCHEMA_VERSION}: \
+                 a newer mind migrated it after this server started. Restart the agent session \
+                 so it starts the current mind binary"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     fn read_session(&self) -> Result<Box<dyn crate::storage::MemoryRead + '_>> {
         Ok(Box::new(read_session::SqliteMemoryRead::begin(self)?))
     }

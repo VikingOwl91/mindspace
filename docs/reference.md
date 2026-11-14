@@ -89,6 +89,13 @@ create/update/retire/get/search/history. Repository tools include `repo_outline`
 and `repo_ingest`; `code_search` finds Rust definitions. Spaces organize retrieval
 and are not access controls. MCP is local stdio without authentication.
 
+`server_status` (read-only) tells you which database a running server opened: the path (the home
+directory is shown as `~`; pass `full_path: true` for the absolute path), what chose it (`--db`,
+`MINDSPACE_DB` or the default location), the schema version, when the database was created, the
+number of spaces and the server version. `cli_default` says whether a plain `mind` in the same
+environment would choose the same database and, if not, how to find out which one is right.
+
+
 ## Limits and security
 
 The supported profile is Linux x86_64 without embedding models. MCP repository

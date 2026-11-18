@@ -89,6 +89,8 @@ pub enum WorkerError {
     Sandbox(String),
     /// The hard wall-clock limit or the idle limit expired; the worker's group was killed.
     Timeout(&'static str),
+    /// Timed out before Ready. A late reply and descriptor may still be queued.
+    BrokerReadyTimeout,
     Cancelled,
     /// The grant behind the operation was revoked (or expired, or could not be verified) while it
     /// ran or before its result could be accepted; the worker was ended and nothing may be
@@ -116,6 +118,7 @@ impl std::fmt::Display for WorkerError {
             Self::Extraction(r) => write!(f, "extraction refused: {r}"),
             Self::Sandbox(m) => write!(f, "the extraction worker is not confined: {m}"),
             Self::Timeout(w) => write!(f, "the extraction worker timed out ({w})"),
+            Self::BrokerReadyTimeout => write!(f, "timed out waiting for broker Ready"),
             Self::Cancelled => write!(f, "the extraction was cancelled"),
             Self::Revoked => write!(
                 f,
@@ -136,7 +139,7 @@ impl WorkerError {
         match self {
             Self::Refused(r) | Self::Extraction(r) => r.kind.as_str(),
             Self::Sandbox(_) => "confinement_not_verified",
-            Self::Timeout(_) => "timeout",
+            Self::Timeout(_) | Self::BrokerReadyTimeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::Revoked => "revoked",
             Self::Context(_) => "context_refused",
@@ -144,6 +147,10 @@ impl WorkerError {
             Self::Died { .. } => "worker_failed",
             Self::Spawn(_) | Self::Io(_) => "broker_io",
         }
+    }
+
+    pub fn discard_broker_link(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::BrokerReadyTimeout)
     }
 
     fn manifest(e: crate::core::Error) -> Self {
@@ -900,8 +907,12 @@ fn broker_operation(
     })?;
     link.set_read_timeout(Some(cfg.wall_timeout))
         .map_err(|e| WorkerError::Io(e.to_string()))?;
-    let (bytes, fd) =
-        recv_with_fd(link).map_err(|e| WorkerError::Io(format!("the broker: {e}")))?;
+    let (bytes, fd) = recv_with_fd(link).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            WorkerError::BrokerReadyTimeout
+        }
+        _ => WorkerError::Io(format!("the broker: {e}")),
+    })?;
     if bytes.is_empty() {
         // end of file: the broker (or its watchdog) is gone. Explicit, never a silent fallback to
         // an in-process or unconfined extraction.
@@ -1076,24 +1087,36 @@ pub enum CommitAnswer {
     Denied(Refusal),
     /// No usable answer (timeout, end of file, garbage): the broker may still answer or may hold a
     /// lease. Do NOT commit, and do not use this link again.
-    Lost(String),
+    Lost(Refusal),
 }
 
 /// Asks the broker for the commit-time decision of the operation `op` that just ended `done`.
 pub fn commit_request(link: &UnixStream, op: Uuid) -> CommitAnswer {
-    let lost = |m: String| CommitAnswer::Lost(m);
+    let lost = |kind, detail: String| CommitAnswer::Lost(Refusal::new(kind, detail));
     let Ok(mut b) = serde_json::to_vec(&ToBroker::CommitRequest { op }) else {
-        return lost("cannot encode the commit request".into());
+        return lost(
+            RefusalKind::CommitNotAuthorized,
+            "cannot encode the commit request".into(),
+        );
     };
     b.push(b'\n');
     if let Err(e) = (&*link).write_all(&b) {
-        return lost(format!("the broker is not available: {e}"));
+        return lost(
+            RefusalKind::BrokerUnavailable,
+            format!("the broker is not available: {e}"),
+        );
     }
     if link.set_read_timeout(Some(COMMIT_HOLD_MAX)).is_err() {
-        return lost("cannot wait for the broker".into());
+        return lost(
+            RefusalKind::CommitNotAuthorized,
+            "cannot wait for the broker".into(),
+        );
     }
     let Ok(clone) = link.try_clone() else {
-        return lost("cannot read from the broker".into());
+        return lost(
+            RefusalKind::CommitNotAuthorized,
+            "cannot read from the broker".into(),
+        );
     };
     let mut reader = BufReader::new(clone);
     let mut line = Vec::new();
@@ -1101,10 +1124,32 @@ pub fn commit_request(link: &UnixStream, op: Uuid) -> CommitAnswer {
         .take(MAX_LINE as u64 + 1)
         .read_until(b'\n', &mut line)
     {
-        Ok(0) => return lost("the broker is not available (it exited before deciding)".into()),
+        Ok(0) => {
+            return lost(
+                RefusalKind::BrokerUnavailable,
+                "the broker is not available (it exited before deciding)".into(),
+            )
+        }
         Ok(_) if line.last() == Some(&b'\n') => {}
-        Ok(_) => return lost("a truncated answer from the broker".into()),
-        Err(e) => return lost(format!("no commit decision from the broker in time: {e}")),
+        Ok(_) => {
+            return lost(
+                RefusalKind::CommitNotAuthorized,
+                "a truncated answer from the broker".into(),
+            )
+        }
+        Err(e) => {
+            let kind = match e.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe => RefusalKind::BrokerUnavailable,
+                _ => RefusalKind::CommitNotAuthorized,
+            };
+            return lost(
+                kind,
+                format!("could not read the broker's commit decision: {e}"),
+            );
+        }
     }
     match serde_json::from_slice::<FromBroker>(&line) {
         Ok(FromBroker::CommitGranted { op: o }) if o == op => CommitAnswer::Granted,
@@ -1113,9 +1158,10 @@ pub fn commit_request(link: &UnixStream, op: Uuid) -> CommitAnswer {
             kind,
             reason,
         }) if o == op => CommitAnswer::Denied(Refusal::new(kind, reason)),
-        other => lost(format!(
-            "unexpected answer to the commit request: {other:?}"
-        )),
+        other => lost(
+            RefusalKind::CommitNotAuthorized,
+            format!("unexpected answer to the commit request: {other:?}"),
+        ),
     }
 }
 
@@ -1251,12 +1297,7 @@ pub(crate) fn persist_with_lease<T>(
             CommitAnswer::Denied(reason) => refuse(reason.kind.as_str(), reason.detail, false),
             CommitAnswer::Lost(reason) => {
                 release.set(true);
-                let kind = if reason.contains("broker is not available") {
-                    "broker_unavailable"
-                } else {
-                    "commit_not_authorized"
-                };
-                refuse(kind, reason, true)
+                refuse(reason.kind.as_str(), reason.detail, true)
             }
         }
     });

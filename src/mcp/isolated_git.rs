@@ -77,7 +77,7 @@ fn failure_commit(
 
 fn error_of(e: WorkerError) -> (ToolFailure, bool) {
     let text = e.to_string();
-    let poison = matches!(e, WorkerError::Io(_));
+    let poison = e.discard_broker_link();
     let kind = e.kind();
     (failure(kind, text), poison)
 }

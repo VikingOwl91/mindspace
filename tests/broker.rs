@@ -195,6 +195,52 @@ fn extract(
     )
 }
 
+#[test]
+fn an_expired_ready_wait_is_a_timeout_and_discards_the_link() {
+    let db = db();
+    let store = db.store();
+    let (link, _silent_peer) = UnixStream::pair().unwrap();
+    let mut cfg = wcfg();
+    cfg.wall_timeout = Duration::from_millis(10);
+    let error = extract_via_broker(
+        &cfg,
+        &link,
+        Path::new("/fixture"),
+        &[db.space()],
+        &StoreContext(&store),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), "timeout");
+    assert!(error.discard_broker_link());
+}
+
+#[test]
+fn a_mismatched_commit_decision_cannot_set_the_failure_category_with_its_message() {
+    use mindspace::core::RefusalKind;
+    use mindspace::worker::client::{commit_request, CommitAnswer};
+    let (link, mut peer) = UnixStream::pair().unwrap();
+    serde_json::to_writer(
+        &mut peer,
+        &FromBroker::CommitDenied {
+            op: Uuid::now_v7(),
+            kind: RefusalKind::BrokerUnavailable,
+            reason: "the broker is not available".into(),
+        },
+    )
+    .unwrap();
+    peer.write_all(b"\n").unwrap();
+    assert!(
+        matches!(commit_request(&link, Uuid::now_v7()), CommitAnswer::Lost(r)
+        if r.kind == RefusalKind::CommitNotAuthorized)
+    );
+    drop(peer);
+    assert!(
+        matches!(commit_request(&link, Uuid::now_v7()), CommitAnswer::Lost(r)
+        if r.kind == RefusalKind::BrokerUnavailable)
+    );
+}
+
 // ------------------------------------------------------------------ the happy path
 
 #[test]

@@ -185,12 +185,36 @@ impl Anchor {
         max: Option<usize>,
     ) -> Result<Option<Vec<u8>>> {
         use std::io::Read;
+        let Some(mut file) = self.open_beneath(rel, policy, need_rw)? else {
+            return Ok(None);
+        };
+        let mut buf = Vec::new();
+        let read = match max {
+            Some(m) => (&mut file).take(m as u64 + 1).read_to_end(&mut buf),
+            None => file.read_to_end(&mut buf),
+        };
+        read.map_err(|e| Error::Io {
+            path: rel.display().to_string(),
+            source: e,
+        })?;
+        if max.is_some_and(|m| buf.len() > m) {
+            return Err(refuse(format!("{} is unexpectedly large", rel.display())));
+        }
+        Ok(Some(buf))
+    }
+
+    fn open_beneath(
+        &self,
+        rel: &Path,
+        policy: &dyn PathPolicy,
+        need_rw: bool,
+    ) -> Result<Option<File>> {
         let opened = OpenOptions::new()
             .read(true)
             // Never block on a FIFO or a device that replaced the file.
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(self.proc_path().join(rel));
-        let mut file = match opened {
+        let file = match opened {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -220,19 +244,29 @@ impl Anchor {
             Some((root, Mode::ReadOnly)) => return Err(refuse(read_only_message(&root))),
             None => return Err(refuse(OUTSIDE)),
         }
-        let mut buf = Vec::new();
-        let read = match max {
-            Some(m) => (&mut file).take(m as u64 + 1).read_to_end(&mut buf),
-            None => file.read_to_end(&mut buf),
-        };
-        read.map_err(|e| Error::Io {
-            path: rel.display().to_string(),
-            source: e,
+        Ok(Some(file))
+    }
+
+    pub(super) fn observe_beneath(
+        &self,
+        rel: &Path,
+        policy: &dyn PathPolicy,
+        spaces: &[Uuid],
+        limit: u64,
+    ) -> Result<super::text_policy::FileCandidate> {
+        let file = self.open_beneath(rel, policy, true)?.ok_or_else(|| {
+            refuse(format!(
+                "{} disappeared while it was being read",
+                rel.display()
+            ))
         })?;
-        if max.is_some_and(|m| buf.len() > m) {
-            return Err(refuse(format!("{} is unexpectedly large", rel.display())));
-        }
-        Ok(Some(buf))
+        super::observe_open_file(
+            rel,
+            file,
+            self.real.join(rel).display().to_string(),
+            spaces,
+            limit,
+        )
     }
 }
 
@@ -519,16 +553,12 @@ pub fn extract_directory(
             .strip_prefix(&base)
             .map_err(|_| refuse("walk escaped the anchored directory"))?
             .to_path_buf();
-        let bytes = anchor
-            .read_beneath(&rel, policy, true, None)?
-            .ok_or_else(|| {
-                refuse(format!(
-                    "{} disappeared while it was being read",
-                    rel.display()
-                ))
-            })?;
-        let location = anchor.real().join(&rel).display().to_string();
-        files.push(super::observe_bytes(&rel, bytes, location, space_ids)?);
+        files.push(anchor.observe_beneath(
+            &rel,
+            policy,
+            space_ids,
+            super::text_policy::MAX_TEXT_BYTES,
+        )?);
     }
     super::prepare_observed_files(
         ctx,

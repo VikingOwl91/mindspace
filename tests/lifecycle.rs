@@ -101,6 +101,91 @@ fn unchanged_observation_is_idempotent() {
     assert_eq!(active_by_subject(&store, "kernel").len(), 1);
 }
 
+#[test]
+fn a_skipped_present_path_reports_the_retained_version_and_can_resume() {
+    let e = env();
+    let store = e.open();
+    let text = "# Marker\n\nPreviously accepted.\n";
+    e.write("note.md", text);
+    let first = e.scan(&store);
+    let logical = first.files[0].logical_id;
+    let memory = active_by_subject(&store, "marker")[0].memory_id;
+    let version = store.get_memory_detail(memory).unwrap().unwrap().source.id;
+    let path = Path::new(&first.files[0].location);
+    std::fs::write(path, b"new \xff").unwrap();
+    let skipped = e.scan(&store);
+    assert!(skipped.files.is_empty());
+    assert!(skipped.events.is_empty());
+    assert_eq!(
+        skipped.skipped_files[0].retained_previous_version,
+        Some(version)
+    );
+    assert_eq!(active_by_subject(&store, "marker").len(), 1);
+    std::fs::write(path, text).unwrap();
+    let resumed = e.scan(&store);
+    assert!(resumed.skipped_files.is_empty());
+    assert_eq!(resumed.files[0].logical_id, logical);
+    assert_eq!(resumed.files[0].outcome, FileOutcome::Unchanged);
+}
+
+#[test]
+fn oversized_pre_policy_file_version_retires_its_memory_and_exact_limit_is_accepted() {
+    use mindspace::ingest::{
+        deadline::Deadline,
+        extract::{Extracted, StoreContext},
+        stream::DEFAULT_MAX_BLOB,
+    };
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let path = e.write("old.md", "# Large\n\nprevious text\n");
+    let Extracted::Files(mut legacy) = ingest::extract_path_with_deadline(
+        &StoreContext(&store),
+        &path,
+        &["coding"],
+        &Deadline::none(),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    // The old observation accepted the original bytes; the Markdown section
+    // still has its ordinary evidence. Padding on a blank line adds no claims.
+    let prior = &mut legacy.observation.files[0];
+    prior.content.extend(std::iter::repeat_n(
+        ' ',
+        DEFAULT_MAX_BLOB as usize + 1 - prior.content.len(),
+    ));
+    prior.size_bytes = prior.content.len() as u64;
+    prior.content_hash = mindspace::core::sha256_hex(prior.content.as_bytes());
+    std::fs::write(&path, prior.content.as_bytes()).unwrap();
+    ingest::extract::persist_files(&store, legacy, &Deadline::none()).unwrap();
+    assert_eq!(active_by_subject(&store, "large").len(), 1);
+    for _ in 0..2 {
+        let report = ingest::ingest_file(&store, &path, &["coding"]).unwrap();
+        assert_eq!(report.skipped_files[0].size_bytes, DEFAULT_MAX_BLOB + 1);
+        assert_eq!(report.skipped_files[0].retained_previous_version, None);
+        assert!(active_by_subject(&store, "large").is_empty());
+    }
+
+    let exact = e.root().join("exact.rs");
+    std::fs::File::create(&exact)
+        .unwrap()
+        .set_len(DEFAULT_MAX_BLOB)
+        .unwrap();
+    let Extracted::Files(at_limit) = ingest::extract_path_with_deadline(
+        &StoreContext(&store),
+        &exact,
+        &["coding"],
+        &Deadline::none(),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert!(at_limit.observation.skipped_files.is_empty());
+    assert_eq!(at_limit.observation.files[0].size_bytes, DEFAULT_MAX_BLOB);
+    assert_eq!(at_limit.code_inputs.len(), 1);
+}
+
 // 2. SAME PATH, CHANGED CONTENT -------------------------------------------------
 
 #[test]

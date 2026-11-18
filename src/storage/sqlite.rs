@@ -97,6 +97,7 @@ pub(crate) mod lexical_staging;
 pub(crate) mod ownership;
 pub(crate) mod semantic_input;
 pub(crate) mod semantic_staging;
+mod text_policy;
 
 pub struct SqliteStore {
     conn: Mutex<Option<Connection>>,
@@ -3315,6 +3316,7 @@ struct FileObservationPlan<'conn> {
     spaces: Vec<Uuid>,
     classifications: Vec<Plan>,
     residual_disappearances: BTreeMap<Uuid, String>,
+    skipped_files: Vec<crate::core::SkippedFile>,
 }
 
 /// What the engine believes about one logical source inside an ingest
@@ -3520,6 +3522,7 @@ fn plan_file_observation<'conn>(
     let IngestObservation {
         session,
         mut files,
+        skipped_files,
         spaces,
     } = observation;
     let full = session.scope == IngestScope::Directory;
@@ -3604,8 +3607,13 @@ fn plan_file_observation<'conn>(
                 unmatched_new.push(idx);
             }
         }
+        let observed_paths: HashSet<&str> = files
+            .iter()
+            .map(|f| f.location.as_str())
+            .chain(skipped_files.iter().map(|s| s.path.as_str()))
+            .collect();
         for (logical, (location, _)) in &present {
-            if !files.iter().any(|f| &f.location == location) {
+            if !observed_paths.contains(location.as_str()) {
                 gone.insert(*logical, location.clone());
             }
         }
@@ -3735,6 +3743,7 @@ fn plan_file_observation<'conn>(
         spaces,
         classifications: plans,
         residual_disappearances: gone,
+        skipped_files,
     })
 }
 
@@ -3759,6 +3768,7 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
         spaces,
         classifications,
         residual_disappearances,
+        mut skipped_files,
     } = plan;
     let at = session.observed_at;
     let root = session.root.clone();
@@ -3919,7 +3929,12 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
         events.push(event);
     }
 
+    for skip in &mut skipped_files {
+        text_policy::recheck(conn, None, skip, at)?;
+        skip.retained_previous_version = text_policy::last_accepted(conn, &skip.path)?;
+    }
     Ok(ObservationReport {
+        skipped_files,
         session_id,
         root,
         scope: session.scope,
@@ -5376,7 +5391,11 @@ fn record_git_observation_tx(
         }
     }
 
+    for skip in &observation.skipped_files {
+        text_policy::recheck(conn, Some(observation.repository_id), skip, at)?;
+    }
     Ok(GitObservationReport {
+        skipped_files: observation.skipped_files.clone(),
         session_id,
         repository_id: observation.repository_id,
         repository_path: observation.repository_path.clone(),

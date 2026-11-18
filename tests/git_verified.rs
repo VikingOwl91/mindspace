@@ -1426,3 +1426,144 @@ fn a_rejected_transport_stores_nothing_and_an_accepted_one_is_one_revision() {
     }
     let _ = hex_encode(&[0]);
 }
+
+#[test]
+fn exact_text_policy_agrees_across_git_verified_head_directory_and_single_file() {
+    use mindspace::core::{sha256_hex, TextSkipReason};
+    use mindspace::ingest::{
+        extract_path_with_deadline,
+        stream::{stream_verified_head, DEFAULT_MAX_BLOB},
+    };
+    use std::os::fd::AsFd;
+
+    if !prerequisites::system_git() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let plain = base.path().join("plain");
+    let repo = base.path().join("repo");
+    let valid = "literal \u{fffd} and café\r\n";
+    for root in [&repo, &plain] {
+        std::fs::create_dir(root).unwrap();
+        std::fs::write(root.join("good.txt"), valid).unwrap();
+        std::fs::write(root.join("bad.md"), b"# Old\n\nbad \xff\n").unwrap();
+        std::fs::write(root.join("also-bad.md"), b"# Old\n\nbad \xff\n").unwrap();
+        std::fs::File::create(root.join("big.rs"))
+            .unwrap()
+            .set_len(DEFAULT_MAX_BLOB + 1)
+            .unwrap();
+    }
+    git(&repo, &["init", "-q", "-b", "main"]);
+    // Prevent host Git attributes or autocrlf from changing the committed test bytes.
+    std::fs::write(repo.join(".git/info/attributes"), "* -text\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "example"]);
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = StoreContext(&store);
+    let spaces: &[&str] = &[];
+    let deadline = Deadline::none();
+    let all = PathSelection::all();
+    let direct = extract_git_repository_selected_with_deadline(
+        &ctx,
+        &repo,
+        spaces,
+        &all,
+        GitScope::Head,
+        &deadline,
+    )
+    .unwrap();
+    let file = std::fs::File::open(&repo).unwrap();
+    let exe = GitExecutable::resolve(Path::new(GIT)).unwrap();
+    let reader = ConfinedGitReader::open(file.as_fd(), &exe, deadline).unwrap();
+    let limits = VerifyLimits::default();
+    let closure = reader.head_closure(&limits).unwrap();
+    let tree = verify_head(&closure.commit_oid, &closure.objects, &limits).unwrap();
+    let mut records = Collect(vec![]);
+    stream_verified_head(
+        &ctx,
+        &reader,
+        &closure,
+        &tree.files,
+        direct.observation.repository_id,
+        &repo,
+        &[],
+        &all,
+        &deadline,
+        &Default::default(),
+        &mut records,
+    )
+    .unwrap();
+    let (Extracted::Git(verified), stats) = receive(&records.0, &StreamLimits::default()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(stats.verification.unwrap().unverified_blobs, 2);
+    assert_eq!(
+        verified.observation.skipped_files,
+        direct.observation.skipped_files
+    );
+    let git_skips = &direct.observation.skipped_files;
+    assert_eq!(
+        git_skips
+            .iter()
+            .map(|s| s.path.as_str())
+            .collect::<Vec<_>>(),
+        ["also-bad.md", "bad.md", "big.rs"]
+    );
+    assert_eq!(git_skips[0].reason, TextSkipReason::InvalidUtf8);
+    assert_eq!(git_skips[1].reason, TextSkipReason::InvalidUtf8);
+    assert_eq!(
+        git_skips[2].reason,
+        TextSkipReason::TooLarge {
+            limit: DEFAULT_MAX_BLOB
+        }
+    );
+    for skip in git_skips {
+        let git = skip.git.as_ref().unwrap();
+        assert_eq!(git.commit_oid, closure.commit_oid);
+        let blob = direct
+            .observation
+            .blobs
+            .iter()
+            .find(|b| b.oid == git.blob_oid)
+            .unwrap();
+        assert_eq!(blob.size_bytes, skip.size_bytes);
+        assert!(blob.content.is_none());
+    }
+    for obs in [&direct.observation, &verified.observation] {
+        let [d] = obs.derivations.as_slice() else {
+            panic!()
+        };
+        assert_eq!(d.path, "good.txt");
+        assert_eq!(d.content, valid);
+        assert_eq!(d.content_hash, sha256_hex(valid.as_bytes()));
+        verify_blob(&d.blob_oid, valid.as_bytes()).unwrap();
+    }
+    let Extracted::Files(dir) =
+        extract_path_with_deadline(&ctx, &plain, spaces, &deadline).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(dir.observation.files.len(), 1);
+    assert_eq!(
+        dir.observation.files[0].content_hash,
+        sha256_hex(valid.as_bytes())
+    );
+    assert_eq!(dir.observation.skipped_files.len(), 3);
+    for (skipped, git) in dir.observation.skipped_files.iter().zip(git_skips) {
+        assert_eq!(Path::new(&skipped.path), plain.join(&git.path));
+        assert_eq!(
+            (skipped.reason, skipped.size_bytes),
+            (git.reason, git.size_bytes)
+        );
+        let r = mindspace::ingest::ingest_file(&store, &plain.join(&git.path), spaces).unwrap();
+        assert!(r.files.is_empty());
+        assert_eq!(r.skipped_files, std::slice::from_ref(skipped));
+    }
+    let mut bound = StreamLimits::default();
+    bound.extraction.max_files = 3;
+    assert!(
+        receive(&records.0, &bound).is_err(),
+        "skipped paths also count against the aggregate file limit"
+    );
+}

@@ -61,6 +61,7 @@ fn s3e4d_probe_file(first: &str, spaces: &[Uuid]) -> ObservedFile {
 
 fn s3e4d_probe_observation(files: Vec<ObservedFile>, spaces: &[Uuid]) -> IngestObservation {
     IngestObservation {
+        skipped_files: Vec::new(),
         session: SessionDraft {
             root: ROOT.into(),
             scope: IngestScope::File,
@@ -451,6 +452,7 @@ fn s3e4d_success_compatibility_fixed_clock() {
         .unwrap()
     };
     let input = |scope: IngestScope, files: Vec<ObservedFile>, at: i64| IngestObservation {
+        skipped_files: Vec::new(),
         session: SessionDraft {
             root: ROOT.into(),
             scope,

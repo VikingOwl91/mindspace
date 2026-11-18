@@ -691,6 +691,7 @@ pub(super) fn summarize(outcome: &IngestOutcome) -> Value {
             let mut v = serde_json::to_value(report).unwrap_or(Value::Null);
             v["kind"] = json!("files");
             v["files"] = capped(v["files"].clone());
+            v["skipped_files"] = capped(v["skipped_files"].clone());
             v["events"] = capped(v["events"].clone());
             v
         }
@@ -704,6 +705,7 @@ pub(super) fn summarize(outcome: &IngestOutcome) -> Value {
                     "path": f["path"], "commit_oid": f["commit_oid"], "outcome": f["outcome"]
                 })).collect::<Vec<_>>()
             });
+            v["skipped_files"] = capped(v["skipped_files"].clone());
             v["events"] = capped(v["events"].clone());
             v
         }

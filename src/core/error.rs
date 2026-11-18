@@ -41,8 +41,7 @@ pub enum Error {
     #[error("invalid extraction result: {0}")]
     InvalidExtraction(String),
 
-    /// A text file or blob that extraction would read is larger than the configured
-    /// limit. The operation fails; nothing is truncated or skipped.
+    /// Legacy strict-reader error. Ordinary ingestion reports per-path text exclusions.
     #[error("`{path}` is {size} bytes, over the limit of {limit} bytes for one text file or blob; exclude it with --path or raise the limit")]
     BlobTooLarge { path: String, size: u64, limit: u64 },
 

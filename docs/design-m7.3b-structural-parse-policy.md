@@ -9,7 +9,7 @@ Basis: `docs/m7.3b-parser-safety.md`, `docs/m7.3b-resource-safety.md`, the code 
 
 | Layer | Question | Where decided | Deterministic from content? | Outcome when exceeded |
 |---|---|---|---|---|
-| 1. Text ingestion | May this file or blob be read as text? | producer, `ProducerLimits.max_blob_bytes` (32 MiB, implemented) | yes | operation fails: `BlobTooLarge` (`--path` excludes the file) |
+| 1. Text ingestion | May this file or blob be read as text? | producer, `ProducerLimits.max_blob_bytes` (32 MiB, implemented) | yes | path skipped and reported (`too_large`) |
 | 2. Structural parsing | May this *source file* be parsed into entities? | producer, `ParsePolicy` (below, proposed) | yes | **text is ingested, structure skipped, reported** |
 | 3. Stream record | May this record travel? | writer and consumer (1 MiB frame, 96 MiB record, 512 MiB / 100k frames, implemented) | yes | operation fails |
 | 4. Worker resources | May the process continue? | OS: `RLIMIT_AS`, cgroup `MemoryMax`, CPU and wall timeouts, kill | **no** | worker dies or is killed; operation fails, nothing persisted |

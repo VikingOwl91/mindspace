@@ -101,6 +101,7 @@ fn observation(
     at: i64,
 ) -> IngestObservation {
     IngestObservation {
+        skipped_files: Vec::new(),
         session: SessionDraft {
             root: ROOT.into(),
             scope,

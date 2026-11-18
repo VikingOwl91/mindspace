@@ -165,6 +165,26 @@ pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
 
 /// One line when the structural-parse policy skipped sources: their text was ingested, their
 /// structure was not.
+fn text_skips(skipped: &[crate::core::SkippedFile]) {
+    for skip in skipped {
+        let reason = match skip.reason {
+            crate::core::TextSkipReason::InvalidUtf8 => "invalid UTF-8".into(),
+            crate::core::TextSkipReason::TooLarge { limit } => {
+                format!("exceeds {limit}-byte text limit")
+            }
+        };
+        let retained = skip
+            .retained_previous_version
+            .map(|v| format!(", prior version {v} retained"))
+            .unwrap_or_default();
+        println!(
+            "  skipped {} ({} bytes, {reason}{retained})",
+            display(&skip.path),
+            skip.size_bytes
+        );
+    }
+}
+
 fn code_skips(code: &crate::core::CodeObservationReport) {
     if code.skipped == 0 {
         return;
@@ -286,6 +306,7 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
             ),
         }
     }
+    text_skips(&report.skipped_files);
     code_skips(&report.code);
 }
 
@@ -322,6 +343,7 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
         report.code.entities,
         report.code.parse_errors
     );
+    text_skips(&report.skipped_files);
     code_skips(&report.code);
     for event in &report.events {
         match event.kind {

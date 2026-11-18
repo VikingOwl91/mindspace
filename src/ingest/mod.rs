@@ -13,6 +13,7 @@ pub mod release;
 pub mod remote;
 pub mod repo_info;
 pub mod stream;
+pub(crate) mod text_policy;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -126,7 +127,7 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
     // Spaces must pre-exist; the first missing one fails the ingest.
     let space_ids = resolve_spaces_with(ctx, space_names)?;
 
-    let (root, scope, files) = if metadata.is_dir() {
+    let (root, scope, candidates) = if metadata.is_dir() {
         (
             canonical.display().to_string(),
             IngestScope::Directory,
@@ -141,7 +142,7 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
         )
     };
 
-    prepare_observed_files(ctx, root, scope, files, space_ids, deadline).map(Extracted::Files)
+    prepare_observed_files(ctx, root, scope, candidates, space_ids, deadline).map(Extracted::Files)
 }
 
 /// The code input of one observed file: `None` for files that are not source code.
@@ -295,10 +296,18 @@ pub(crate) fn prepare_observed_files(
     ctx: &dyn ExtractionContext,
     root: String,
     scope: IngestScope,
-    files: Vec<ObservedFile>,
+    candidates: Vec<text_policy::FileCandidate>,
     space_ids: Vec<Uuid>,
     deadline: &Deadline,
 ) -> Result<ExtractedFiles> {
+    let mut files = Vec::new();
+    let mut skipped_files = Vec::new();
+    for candidate in candidates {
+        match candidate {
+            Ok(file) => files.push(file),
+            Err(skip) => skipped_files.push(skip),
+        }
+    }
     let mut code_inputs = Vec::new();
     for f in &files {
         if let Some(input) = code_input_for_file(ctx, f, deadline, &code::ParsePolicy::default())? {
@@ -306,6 +315,7 @@ pub(crate) fn prepare_observed_files(
         }
     }
     let observation = IngestObservation {
+        skipped_files,
         session: SessionDraft {
             root,
             scope,
@@ -643,26 +653,11 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
 
     // Refs: heads, remotes, tags, and HEAD, sorted by name.
     let refs = reader.refs()?;
-    let views = match scope {
-        GitScope::Views(v) => v,
-        _ => GitViews::default(),
-    };
     let worktree_heads: Vec<String> = match scope {
         GitScope::History => Vec::new(),
         _ => reader.worktree_heads()?,
     };
-    let selected: Vec<&crate::core::GitRefObservation> = refs
-        .iter()
-        .filter(|r| match scope {
-            GitScope::History => true,
-            _ => {
-                r.name == "HEAD"
-                    || (views.branches && r.name.starts_with("refs/heads/"))
-                    || (views.remotes && r.name.starts_with("refs/remotes/"))
-                    || (views.tags && r.name.starts_with("refs/tags/"))
-            }
-        })
-        .collect();
+    let selected = select_refs(&refs, scope);
 
     // Object discovery: everything reachable from the scope's tips.
     let mut tips: Vec<String> = selected.iter().map(|r| r.target_oid.clone()).collect();
@@ -689,7 +684,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         }
     }
     deadline.check("reading git objects")?;
-    let (mut commits, trees, tags) = reader.objects(&reachable)?;
+    let (mut commits, trees, tags) = reader.objects(&structural)?;
     let blob_datas: Vec<crate::core::GitBlobData> = blob_sizes
         .into_iter()
         .map(|(oid, size_bytes)| crate::core::GitBlobData {
@@ -749,54 +744,47 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
     let text_oids: Vec<String> = text_blob_oids.into_iter().collect();
     deadline.check("reading file contents")?;
     let contents = reader.blob_contents(&text_oids)?;
-    let content_by_oid: std::collections::HashMap<String, String> = contents
-        .into_iter()
-        .map(|b| (b.oid, b.content.unwrap_or_default()))
-        .collect();
+    let mut content_by_oid = std::collections::HashMap::new();
+    let mut exclusions = std::collections::HashMap::new();
+    for blob in contents {
+        if let Some(text) = blob.content {
+            content_by_oid.insert(blob.oid, text);
+        } else {
+            exclusions.insert(blob.oid, blob.size_bytes);
+        }
+    }
 
-    let mut derivations: Vec<GitDerivedFile> = Vec::new();
+    let mut derivations = Vec::new();
+    let mut skipped_files = Vec::new();
     for (commit, files) in tip_files {
         for (blob_oid, path) in files {
             deadline.check("deriving memories")?;
-            let Some(content) = content_by_oid.get(&blob_oid) else {
+            if let Some(&size) = exclusions.get(&blob_oid) {
+                skipped_files.push(text_policy::git_skip(
+                    &path,
+                    &commit,
+                    &blob_oid,
+                    size,
+                    text_policy::MAX_TEXT_BYTES,
+                ));
                 continue;
-            };
-            let media_type = media_type_of(Path::new(&path)).unwrap_or("text/rust");
-            let stem = Path::new(&path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("untitled")
-                .to_string();
-            let mut parsed = if media_type == "text/rust" {
-                ParsedMaterial {
-                    title: stem.clone(),
-                    evidences: vec![],
-                    assertions: vec![],
-                    memories: vec![],
-                }
-            } else {
-                parse_material(&stem, content, media_type, &space_ids)
-            };
-            // Git derivations carry their own extractor identity: the rule
-            // is the same parser, applied to git material.
-            for a in &mut parsed.assertions {
-                a.extraction = format!("git:{}", a.extraction);
             }
-            derivations.push(GitDerivedFile {
-                source_kind: crate::core::SourceKind::GitBlob,
-                path,
-                blob_oid,
-                commit_oid: commit.clone(),
-                content_hash: sha256_hex(content.as_bytes()),
-                content: content.clone(),
-                title: parsed.title,
-                media_type: media_type.to_string(),
-                evidences: parsed.evidences,
-                assertions: parsed.assertions,
-                memories: parsed.memories,
-            });
+            let text = content_by_oid
+                .get(&blob_oid)
+                .ok_or_else(|| Error::InvalidExtraction("selected Git blob disappeared".into()))?;
+            let mut file = derive_git_file(
+                &path,
+                &blob_oid,
+                &commit,
+                text,
+                &sha256_hex(text.as_bytes()),
+                &space_ids,
+            )?;
+            file.content = text.clone();
+            derivations.push(file);
         }
     }
+    text_policy::sort_skips(&mut skipped_files);
     derivations.sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
 
     // Ref delta against the last observed state. The fast-forward question
@@ -805,54 +793,9 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
     // force-push. A symbolic HEAD is a view of its branch, not an
     // independent pointer: it is observed in the ref state but produces no
     // events of its own. A detached HEAD is a real pointer and is journalled.
-    let current = ctx.git_refs_current(repository_id)?;
-    let current_by_name: std::collections::HashMap<String, &crate::core::GitRefObservation> =
-        current.iter().map(|r| (r.name.clone(), r)).collect();
-    let mut ref_events: Vec<GitRefEventDraft> = Vec::new();
-    for r in &refs {
-        if r.name == "HEAD" && r.symbolic_target.is_some() {
-            continue;
-        }
-        match current_by_name.get(&r.name) {
-            None => ref_events.push(GitRefEventDraft {
-                name: r.name.clone(),
-                kind: GitRefEventKind::Created,
-                from_oid: None,
-                to_oid: Some(r.target_oid.clone()),
-            }),
-            Some(prev) if prev.target_oid != r.target_oid => {
-                let kind = if prev.target_kind == GitObjectKind::Commit
-                    && r.target_kind == GitObjectKind::Commit
-                    && reader.is_ancestor(&prev.target_oid, &r.target_oid)?
-                {
-                    GitRefEventKind::FastForward
-                } else {
-                    GitRefEventKind::NonFastForward
-                };
-                ref_events.push(GitRefEventDraft {
-                    name: r.name.clone(),
-                    kind,
-                    from_oid: Some(prev.target_oid.clone()),
-                    to_oid: Some(r.target_oid.clone()),
-                });
-            }
-            Some(_) => {}
-        }
-    }
-    for prev in &current {
-        if prev.name == "HEAD" && prev.symbolic_target.is_some() {
-            continue;
-        }
-        if !refs.iter().any(|r| r.name == prev.name) {
-            ref_events.push(GitRefEventDraft {
-                name: prev.name.clone(),
-                kind: GitRefEventKind::Deleted,
-                from_oid: Some(prev.target_oid.clone()),
-                to_oid: None,
-            });
-        }
-    }
-    ref_events.sort_by(|a, b| a.name.cmp(&b.name));
+    let ref_events = ref_events(&ctx.git_refs_current(repository_id)?, &refs, |a, b| {
+        reader.is_ancestor(a, b)
+    })?;
 
     // Blob rows: content only for the text blobs actually fetched.
     let content_oids: BTreeSet<String> = derivations.iter().map(|d| d.blob_oid.clone()).collect();
@@ -890,6 +833,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         None
     };
     let observation = GitObservation {
+        skipped_files,
         session: SessionDraft {
             root: repo_path.display().to_string(),
             scope: IngestScope::GitRepository,
@@ -928,6 +872,83 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         code_inputs,
         reused: Default::default(),
     })
+}
+
+fn select_refs(
+    refs: &[crate::core::GitRefObservation],
+    scope: GitScope,
+) -> Vec<&crate::core::GitRefObservation> {
+    let views = match scope {
+        GitScope::Views(v) => v,
+        _ => GitViews::default(),
+    };
+    refs.iter()
+        .filter(|r| match scope {
+            GitScope::History => true,
+            _ => {
+                r.name == "HEAD"
+                    || (views.branches && r.name.starts_with("refs/heads/"))
+                    || (views.remotes && r.name.starts_with("refs/remotes/"))
+                    || (views.tags && r.name.starts_with("refs/tags/"))
+            }
+        })
+        .collect()
+}
+
+fn ref_events(
+    current: &[crate::core::GitRefObservation],
+    refs: &[crate::core::GitRefObservation],
+    is_ancestor: impl Fn(&str, &str) -> Result<bool>,
+) -> Result<Vec<GitRefEventDraft>> {
+    let current_by_name: std::collections::HashMap<String, &crate::core::GitRefObservation> =
+        current.iter().map(|r| (r.name.clone(), r)).collect();
+    let mut ref_events: Vec<GitRefEventDraft> = Vec::new();
+    for r in refs {
+        if r.name == "HEAD" && r.symbolic_target.is_some() {
+            continue;
+        }
+        match current_by_name.get(&r.name) {
+            None => ref_events.push(GitRefEventDraft {
+                name: r.name.clone(),
+                kind: GitRefEventKind::Created,
+                from_oid: None,
+                to_oid: Some(r.target_oid.clone()),
+            }),
+            Some(prev) if prev.target_oid != r.target_oid => {
+                let kind = if prev.target_kind == GitObjectKind::Commit
+                    && r.target_kind == GitObjectKind::Commit
+                    && is_ancestor(&prev.target_oid, &r.target_oid)?
+                {
+                    GitRefEventKind::FastForward
+                } else {
+                    GitRefEventKind::NonFastForward
+                };
+                ref_events.push(GitRefEventDraft {
+                    name: r.name.clone(),
+                    kind,
+                    from_oid: Some(prev.target_oid.clone()),
+                    to_oid: Some(r.target_oid.clone()),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for prev in current {
+        if prev.name == "HEAD" && prev.symbolic_target.is_some() {
+            continue;
+        }
+        if !refs.iter().any(|r| r.name == prev.name) {
+            ref_events.push(GitRefEventDraft {
+                name: prev.name.clone(),
+                kind: GitRefEventKind::Deleted,
+                from_oid: Some(prev.target_oid.clone()),
+                to_oid: None,
+            });
+        }
+    }
+    ref_events.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(ref_events)
 }
 
 fn tip_files_to_code_inputs(
@@ -993,7 +1014,7 @@ fn observe_directory(
     root: &Path,
     space_ids: &[Uuid],
     deadline: &Deadline,
-) -> Result<Vec<ObservedFile>> {
+) -> Result<Vec<text_policy::FileCandidate>> {
     let mut paths: Vec<PathBuf> = outline::walk_files(root)?
         .into_iter()
         .filter(|p| is_ingestable(p))
@@ -1035,9 +1056,9 @@ fn media_type_of(path: &Path) -> Result<&'static str> {
 }
 
 /// Reads and deterministically parses one file into an observed file.
-fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<ObservedFile> {
+fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<text_policy::FileCandidate> {
     media_type_of(path)?;
-    let bytes = std::fs::read(path).map_err(|e| Error::Io {
+    let file = std::fs::File::open(path).map_err(|e| Error::Io {
         path: path.display().to_string(),
         source: e,
     })?;
@@ -1048,41 +1069,53 @@ fn observe_file(path: &Path, space_ids: &[Uuid]) -> Result<ObservedFile> {
         })?
         .display()
         .to_string();
-    observe_bytes(path, bytes, location, space_ids)
+    observe_open_file(path, file, location, space_ids, text_policy::MAX_TEXT_BYTES)
 }
 
-/// Builds the observation of one file from bytes that were already read.
-/// `name` decides the media type and title; `location` is what is recorded.
+fn observe_open_file(
+    path: &Path,
+    file: std::fs::File,
+    location: String,
+    space_ids: &[Uuid],
+    limit: u64,
+) -> Result<text_policy::FileCandidate> {
+    let text = match text_policy::read_file(file, &location, limit)? {
+        Ok(text) => text,
+        Err(skip) => return Ok(Err(skip)),
+    };
+    observe_text(path, text, location, space_ids).map(Ok)
+}
+
+#[cfg(test)]
 pub(crate) fn observe_bytes(
-    name: &Path,
+    path: &Path,
     bytes: Vec<u8>,
+    location: String,
+    spaces: &[Uuid],
+) -> Result<ObservedFile> {
+    let text = text_policy::decode(bytes).ok_or_else(|| Error::InvalidEncoding {
+        path: location.clone(),
+    })?;
+    observe_text(path, text, location, spaces)
+}
+
+fn observe_text(
+    path: &Path,
+    text: String,
     location: String,
     space_ids: &[Uuid],
 ) -> Result<ObservedFile> {
-    let path = name;
     let media_type = media_type_of(path)?;
-    let text = String::from_utf8(bytes.clone()).map_err(|_| Error::InvalidEncoding {
-        path: path.display().to_string(),
-    })?;
-
-    let stem = file_stem(path);
-    let parsed = if media_type == "text/rust" {
-        ParsedMaterial {
-            title: stem.clone(),
-            evidences: vec![],
-            assertions: vec![],
-            memories: vec![],
-        }
-    } else {
-        parse_material(&stem, &text, media_type, space_ids)
-    };
+    let parsed = parse_file_material(path, &text, media_type, space_ids);
+    let content_hash = sha256_hex(text.as_bytes());
+    let size_bytes = text.len() as u64;
     Ok(ObservedFile {
         location,
         content: text,
-        content_hash: sha256_hex(&bytes),
+        content_hash,
         title: parsed.title,
         media_type: media_type.to_string(),
-        size_bytes: bytes.len() as u64,
+        size_bytes,
         evidences: parsed.evidences,
         assertions: parsed.assertions,
         memories: parsed.memories,
@@ -1103,6 +1136,56 @@ struct ParsedMaterial {
     evidences: Vec<EvidenceDraft>,
     assertions: Vec<AssertionDraft>,
     memories: Vec<MemorySpec>,
+}
+
+fn parse_file_material(
+    path: &Path,
+    content: &str,
+    media_type: &str,
+    spaces: &[Uuid],
+) -> ParsedMaterial {
+    let stem = file_stem(path);
+    if !matches!(media_type, "text/plain" | "text/markdown") {
+        ParsedMaterial {
+            title: stem,
+            evidences: vec![],
+            assertions: vec![],
+            memories: vec![],
+        }
+    } else {
+        parse_material(&stem, content, media_type, spaces)
+    }
+}
+
+/// The stream can send shared content separately. The in-process caller attaches
+/// the same exact bytes to the draft before persistence.
+fn derive_git_file(
+    path: &str,
+    blob: &str,
+    commit: &str,
+    text: &str,
+    hash: &str,
+    spaces: &[Uuid],
+) -> Result<GitDerivedFile> {
+    let name = Path::new(path);
+    let media_type = media_type_of(name)?;
+    let mut parsed = parse_file_material(name, text, media_type, spaces);
+    for assertion in &mut parsed.assertions {
+        assertion.extraction = format!("git:{}", assertion.extraction);
+    }
+    Ok(GitDerivedFile {
+        source_kind: crate::core::SourceKind::GitBlob,
+        path: path.into(),
+        blob_oid: blob.into(),
+        commit_oid: commit.into(),
+        content_hash: hash.into(),
+        content: String::new(),
+        title: parsed.title,
+        media_type: media_type.into(),
+        evidences: parsed.evidences,
+        assertions: parsed.assertions,
+        memories: parsed.memories,
+    })
 }
 
 fn parse_material(stem: &str, text: &str, media_type: &str, space_ids: &[Uuid]) -> ParsedMaterial {

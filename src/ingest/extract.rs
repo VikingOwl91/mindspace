@@ -160,7 +160,11 @@ pub fn persist_git(
 /// The version of the relationship resolver: it moves with the extractor whose derivations it
 /// resolves (see [`persist_git_gated`]).
 pub fn resolver_version() -> String {
-    format!("extractor-{}", crate::ingest::code::IDENTITY.1)
+    format!(
+        "extractor-{}-{}",
+        crate::ingest::code::IDENTITY.1,
+        super::text_policy::REVISION
+    )
 }
 
 /// As [`persist_git`], with a decision taken right before the COMMIT: if `before_commit` fails the
@@ -267,6 +271,56 @@ pub(crate) fn is_oid(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+pub(super) fn check_skip(
+    skip: &crate::core::SkippedFile,
+    git: bool,
+    root: Option<&Path>,
+    limits: &ExtractionLimits,
+) -> Result<()> {
+    use crate::core::TextSkipReason;
+    if skip.retained_previous_version.is_some() {
+        return reject("skip claims a stored version");
+    }
+    if !super::is_ingestable(Path::new(&skip.path)) {
+        return reject("ineligible skipped path");
+    }
+    let consistent = match skip.reason {
+        TextSkipReason::TooLarge { limit } => {
+            limit <= super::text_policy::MAX_TEXT_BYTES && skip.size_bytes > limit
+        }
+        TextSkipReason::InvalidUtf8 => {
+            skip.size_bytes > 0 && skip.size_bytes <= super::text_policy::MAX_TEXT_BYTES
+        }
+    };
+    if !consistent {
+        return reject("skip reason disagrees with its size");
+    }
+    match &skip.git {
+        Some(g) if git => {
+            check_relative(&skip.path, limits)?;
+            if Path::new(&skip.path).is_absolute() || !is_oid(&g.commit_oid) || !is_oid(&g.blob_oid)
+            {
+                return reject("invalid skipped Git path or object id");
+            }
+        }
+        None if !git => {
+            let path = Path::new(&skip.path);
+            if skip.path.len() > limits.max_path_bytes
+                || skip.path.contains('\0')
+                || !path.is_absolute()
+                || root.is_some_and(|r| !path.starts_with(r))
+                || path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            {
+                return reject("invalid skipped file location");
+            }
+        }
+        _ => return reject("skip has the wrong observation kind"),
+    }
+    Ok(())
+}
+
 impl Extracted {
     /// Bytes of file content held (the part that dominates memory).
     pub fn content_bytes(&self) -> u64 {
@@ -309,11 +363,12 @@ impl Extracted {
         }
         match self {
             Extracted::Files(f) => {
-                if f.observation.files.len() > limits.max_files {
-                    return reject(format!(
-                        "{} files exceed the limit",
-                        f.observation.files.len()
-                    ));
+                for skip in &f.observation.skipped_files {
+                    check_skip(skip, false, root, limits)?;
+                }
+                let count = f.observation.files.len() + f.observation.skipped_files.len();
+                if count > limits.max_files {
+                    return reject(format!("{count} files exceed the limit"));
                 }
                 if let Some(root) = root {
                     if Path::new(&f.observation.session.root) != root {
@@ -321,6 +376,9 @@ impl Extracted {
                     }
                 }
                 for file in &f.observation.files {
+                    if file.size_bytes > super::text_policy::MAX_TEXT_BYTES {
+                        return reject("one file exceeds the ingestion limit");
+                    }
                     if file.location.len() > limits.max_path_bytes || file.location.contains('\0') {
                         return reject("a file location is too long or contains NUL");
                     }
@@ -351,13 +409,19 @@ impl Extracted {
             }
             Extracted::Git(g) => {
                 let o = &g.observation;
-                if o.derivations.len() > limits.max_files {
-                    return reject(format!(
-                        "{} derivations exceed the limit",
-                        o.derivations.len()
-                    ));
+                for skip in &o.skipped_files {
+                    check_skip(skip, true, None, limits)?;
+                }
+                let count = o.derivations.len() + o.skipped_files.len();
+                if count > limits.max_files {
+                    return reject(format!("{count} derivations exceed the limit"));
                 }
                 for d in &o.derivations {
+                    if d.source_kind == crate::core::SourceKind::GitBlob
+                        && d.content.len() as u64 > super::text_policy::MAX_TEXT_BYTES
+                    {
+                        return reject("one blob exceeds the ingestion limit");
+                    }
                     check_relative(&d.path, limits)?;
                     if !is_oid(&d.blob_oid) || !is_oid(&d.commit_oid) {
                         return reject(format!("malformed object id for `{}`", short(&d.path)));
@@ -367,6 +431,12 @@ impl Extracted {
                     }
                 }
                 for b in &o.blobs {
+                    if b.content
+                        .as_ref()
+                        .is_some_and(|s| s.len() as u64 > super::text_policy::MAX_TEXT_BYTES)
+                    {
+                        return reject("one blob exceeds the ingestion limit");
+                    }
                     if !is_oid(&b.oid) {
                         return reject("malformed blob id");
                     }
@@ -388,6 +458,9 @@ fn code_bytes(inputs: &[CodeInputDraft]) -> u64 {
 
 fn check_code(inputs: &[CodeInputDraft], limits: &ExtractionLimits) -> Result<()> {
     for c in inputs {
+        if c.content.len() as u64 > super::text_policy::MAX_TEXT_BYTES {
+            return reject("one code input exceeds the ingestion limit");
+        }
         if sha256_hex(c.content.as_bytes()) != c.content_hash {
             return reject("code content hash mismatch");
         }

@@ -358,6 +358,7 @@ pub fn run(
             "derivations_reused": report.derivations_reused,
             "stale_retired": report.stale_retired,
             "files": report.files.len(),
+            "skipped_files": { "total": report.skipped_files.len(), "sample": report.skipped_files.iter().take(10).collect::<Vec<_>>() },
             "code": {
                 "supported_inputs": report.code.supported_inputs,
                 "parsed": report.code.parsed,
@@ -374,7 +375,7 @@ pub fn run(
                 "that the objects exist in the repository as the git on disk would serve them beyond what the worker read",
                 "SHA-1 collision resistance (git's SHA-1 without collision detection)"
             ],
-            "unverified_blob_claims": "blobs that are not valid UTF-8 text are recorded as (oid, size) only",
+            "unverified_blob_claims": "blobs without verified content carry only an object ID and a reported size",
         },
         "isolation": {
             "authority": authority,

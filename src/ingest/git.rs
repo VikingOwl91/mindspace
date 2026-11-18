@@ -408,22 +408,47 @@ impl GitReader {
         Ok((!name.is_empty()).then_some(name))
     }
 
-    /// Blob contents by oid. One git call.
+    /// Exact UTF-8 content for eligible blobs. Oversized and non-UTF-8 blobs
+    /// retain their object metadata. Oversized bodies are never requested.
     pub fn blob_contents(&self, oids: &[String]) -> Result<Vec<GitBlobData>> {
+        self.blob_contents_under(oids, super::text_policy::MAX_TEXT_BYTES)
+    }
+
+    pub(super) fn blob_contents_under(
+        &self,
+        oids: &[String],
+        limit: u64,
+    ) -> Result<Vec<GitBlobData>> {
+        let limit = limit.min(super::text_policy::MAX_TEXT_BYTES);
         let checked = self.batch_check(oids)?;
-        let sizes: std::collections::HashMap<String, u64> = checked
-            .into_iter()
-            .map(|(oid, _, size)| (oid, size))
-            .collect();
-        let raw = self.batch_raw(oids)?;
-        Ok(raw
-            .into_iter()
-            .map(|(oid, _, bytes)| GitBlobData {
-                content: Some(String::from_utf8_lossy(&bytes).into_owned()),
-                size_bytes: sizes.get(&oid).copied().unwrap_or(bytes.len() as u64),
+        let mut blobs = Vec::with_capacity(checked.len());
+        let mut wanted = Vec::new();
+        for (oid, kind, size_bytes) in checked {
+            if kind != GitObjectKind::Blob {
+                return Err(Error::InvalidExtraction("expected a Git blob".into()));
+            }
+            if size_bytes <= limit {
+                wanted.push(oid.clone());
+            }
+            blobs.push(GitBlobData {
                 oid,
-            })
-            .collect())
+                size_bytes,
+                content: None,
+            });
+        }
+        let mut raw = self.batch_raw(&wanted)?.into_iter();
+        for blob in blobs.iter_mut().filter(|b| b.size_bytes <= limit) {
+            let Some((oid, GitObjectKind::Blob, bytes)) = raw.next() else {
+                return Err(Error::InvalidExtraction(
+                    "selected Git blob disappeared".into(),
+                ));
+            };
+            if oid != blob.oid || bytes.len() as u64 != blob.size_bytes {
+                return Err(Error::InvalidExtraction("Git blob metadata changed".into()));
+            }
+            blob.content = super::text_policy::decode(bytes);
+        }
+        Ok(blobs)
     }
 
     /// All entries of one commit's tree, recursively, as

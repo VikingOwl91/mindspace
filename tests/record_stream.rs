@@ -1412,15 +1412,8 @@ fn git_with_limit(f: &Fixture, store: &SqliteStore, max: u64) -> (Result<()>, Ve
     (r, out, op)
 }
 
-fn too_large(r: Result<()>) -> (String, u64, u64) {
-    match r {
-        Err(Error::BlobTooLarge { path, size, limit }) => (path, size, limit),
-        other => panic!("wanted BlobTooLarge, got {other:?}"),
-    }
-}
-
 #[test]
-fn a_text_file_exactly_at_the_limit_is_read_and_one_byte_more_is_refused() {
+fn a_text_file_at_the_limit_is_read_and_one_byte_more_is_reported() {
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "ok.txt", &"a".repeat(100_000));
     write(d.path(), "small.md", "# S\n\nx\n");
@@ -1444,16 +1437,25 @@ fn a_text_file_exactly_at_the_limit_is_read_and_one_byte_more_is_refused() {
         text_of(&direct),
         text_of(&read(&bytes, op, Kind::Files, Some(&f.root)).unwrap())
     );
-    let (r, _, _) = dir_with_limit(&f, &store, 99_999);
-    let (path, size, limit) = too_large(r);
-    assert_eq!((path.as_str(), size, limit), ("ok.txt", 100_000, 99_999));
-    // the message names the way out
-    let e = Error::BlobTooLarge { path, size, limit }.to_string();
-    assert!(e.contains("--path") && e.contains("100000 bytes"), "{e}");
+    let (r, bytes, op) = dir_with_limit(&f, &store, 99_999);
+    r.unwrap();
+    let Extracted::Files(got) = read(&bytes, op, Kind::Files, Some(&f.root)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(got.observation.files.len(), 1);
+    let [skip] = got.observation.skipped_files.as_slice() else {
+        panic!()
+    };
+    assert_eq!(Path::new(&skip.path), f.root.join("ok.txt"));
+    assert_eq!(skip.size_bytes, 100_000);
+    assert_eq!(
+        skip.reason,
+        mindspace::core::TextSkipReason::TooLarge { limit: 99_999 }
+    );
 }
 
 #[test]
-fn a_blob_exactly_at_the_limit_is_read_and_one_byte_more_fails_the_operation() {
+fn a_blob_at_the_limit_is_read_and_one_byte_more_is_reported() {
     let d = tempfile::tempdir().unwrap();
     git(d.path(), &["init", "-q", "-b", "main", "."]);
     write(d.path(), "ok.txt", &"b".repeat(100_000));
@@ -1482,10 +1484,20 @@ fn a_blob_exactly_at_the_limit_is_read_and_one_byte_more_fails_the_operation() {
         text_of(&read(&bytes, op, Kind::Git, None).unwrap())
     );
     let (r, bytes, op) = git_with_limit(&f, &store, 99_999);
-    let (path, size, limit) = too_large(r);
-    assert_eq!((path.as_str(), size, limit), ("ok.txt", 100_000, 99_999));
-    // what was written before the failure is not a complete stream
-    assert!(read(&bytes, op, Kind::Git, None).is_err());
+    r.unwrap();
+    let Extracted::Git(got) = read(&bytes, op, Kind::Git, None).unwrap() else {
+        panic!()
+    };
+    assert_eq!(got.observation.derivations.len(), 1);
+    let [skip] = got.observation.skipped_files.as_slice() else {
+        panic!()
+    };
+    assert_eq!(skip.path, "ok.txt");
+    assert_eq!(skip.size_bytes, 100_000);
+    assert_eq!(
+        skip.reason,
+        mindspace::core::TextSkipReason::TooLarge { limit: 99_999 }
+    );
 }
 
 #[test]
@@ -1521,7 +1533,7 @@ fn many_small_blobs_and_repeated_references_pass_a_per_blob_limit() {
 }
 
 #[test]
-fn an_extremely_large_blob_is_refused_without_being_read() {
+fn an_extremely_large_blob_is_skipped_without_being_read() {
     let d = tempfile::tempdir().unwrap();
     git(d.path(), &["init", "-q", "-b", "main", "."]);
     write(d.path(), "huge.txt", &"x".repeat(150 * 1024 * 1024));
@@ -1532,13 +1544,18 @@ fn an_extremely_large_blob_is_refused_without_being_read() {
     let db = db();
     let store = db.store();
     let t = std::time::Instant::now();
-    let (r, _, _) = git_with_limit(&f, &store, mindspace::ingest::stream::DEFAULT_MAX_BLOB);
-    let (path, size, limit) = too_large(r);
-    assert_eq!(path, "huge.txt");
-    assert_eq!(size, 150 * 1024 * 1024);
-    assert_eq!(limit, 32 * 1024 * 1024);
+    let (r, bytes, op) = git_with_limit(&f, &store, mindspace::ingest::stream::DEFAULT_MAX_BLOB);
+    r.unwrap();
+    let Extracted::Git(got) = read(&bytes, op, Kind::Git, None).unwrap() else {
+        panic!()
+    };
+    let [skip] = got.observation.skipped_files.as_slice() else {
+        panic!()
+    };
+    assert_eq!(skip.path, "huge.txt");
+    assert_eq!(skip.size_bytes, 150 * 1024 * 1024);
     assert!(t.elapsed().as_secs() < 20, "it must not read the blob");
-    // selecting the rest makes the repository ingestable again
+    // A path outside the selection contributes no skip.
     let op = Uuid::now_v7();
     let mut out = Vec::new();
     {
@@ -1561,13 +1578,19 @@ fn an_extremely_large_blob_is_refused_without_being_read() {
 }
 
 #[test]
-fn a_file_over_the_default_limit_is_refused_by_the_directory_producer() {
+fn a_file_over_the_default_limit_is_reported_by_the_directory_producer() {
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "big.txt", &"y".repeat(32 * 1024 * 1024 + 1));
     let f = fixture(d.path());
     let db = db();
     let store = db.store();
-    let (r, _, _) = dir_with_limit(&f, &store, mindspace::ingest::stream::DEFAULT_MAX_BLOB);
-    let (_, size, limit) = too_large(r);
-    assert_eq!((size, limit), (32 * 1024 * 1024 + 1, 32 * 1024 * 1024));
+    let (r, bytes, op) = dir_with_limit(&f, &store, mindspace::ingest::stream::DEFAULT_MAX_BLOB);
+    r.unwrap();
+    let Extracted::Files(got) = read(&bytes, op, Kind::Files, Some(&f.root)).unwrap() else {
+        panic!()
+    };
+    let [skip] = got.observation.skipped_files.as_slice() else {
+        panic!()
+    };
+    assert_eq!(skip.size_bytes, 32 * 1024 * 1024 + 1);
 }

@@ -501,6 +501,7 @@ fn search_at_time_sees_the_past() {
     let t2 = Ts(t1.0 + 1_000_000); // one second later
     let coding = store.get_space("coding").unwrap().id;
     let observation = |ts: Ts, fact: &str| IngestObservation {
+        skipped_files: Vec::new(),
         session: SessionDraft {
             root: "/tmp/facts.md".into(),
             scope: IngestScope::File,

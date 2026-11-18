@@ -60,9 +60,9 @@ use serde::{Deserialize, Serialize};
 use crate::core::{
     sha256_hex, AssertionDraft, CodeContextDraft, CodeEntityDraft, CodeImportDraft, CodeInputDraft,
     CodeRelationshipDraft, Error, EvidenceDraft, GitBlobData, GitCommitData, GitDerivedFile,
-    GitObjectKind, GitObservation, GitRefEventDraft, GitRefEventKind, GitRefObservation,
-    GitRemoteDraft, GitTagData, GitTreeData, IngestObservation, IngestScope, MemorySpec,
-    ObservedFile, Result, SessionDraft, Uuid,
+    GitObjectKind, GitObservation, GitRefEventDraft, GitRefObservation, GitRemoteDraft, GitTagData,
+    GitTreeData, IngestObservation, IngestScope, MemorySpec, ObservedFile, Result, SessionDraft,
+    SkippedFile, Uuid,
 };
 
 use super::deadline::Deadline;
@@ -91,7 +91,7 @@ pub const MAX_RECORD: usize = 96 * 1024 * 1024;
 /// The default limit for one text file or blob that extraction reads (raw bytes,
 /// not encoded size). Its JSON form can be several times larger (escaping), which
 /// is why [`MAX_RECORD`] is three times this.
-pub const DEFAULT_MAX_BLOB: u64 = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_BLOB: u64 = super::text_policy::MAX_TEXT_BYTES;
 
 /// What a producer refuses to read.
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +192,9 @@ pub enum Record {
         file: ObservedFile,
         content_len: u64,
     },
+    Skipped {
+        item: SkippedFile,
+    },
     // ---- git
     GitHeader {
         session: SessionDraft,
@@ -290,6 +293,7 @@ impl Record {
             Record::Begin { .. } => "begin",
             Record::FilesHeader { .. } => "files_header",
             Record::File { .. } => "file",
+            Record::Skipped { .. } => "skipped",
             Record::GitHeader { .. } => "git_header",
             Record::Head { .. } => "head",
             Record::RawObject { .. } => "raw_object",
@@ -734,34 +738,13 @@ pub fn stream_directory(
             .strip_prefix(&base)
             .map_err(|_| Error::InvalidExtraction("walk escaped the anchored directory".into()))?
             .to_path_buf();
-        // The size is checked before the file is read, and the read itself is capped
-        // (the file may grow in between).
-        let too_large = |size: u64| Error::BlobTooLarge {
-            path: rel.display().to_string(),
-            size,
-            limit: limits.max_blob_bytes,
-        };
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > limits.max_blob_bytes {
-                return Err(too_large(meta.len()));
+        let file = match anchor.observe_beneath(&rel, policy, space_ids, limits.max_blob_bytes)? {
+            Ok(file) => file,
+            Err(item) => {
+                sink.emit(&Record::Skipped { item })?;
+                continue;
             }
-        }
-        let bytes = anchor
-            .read_beneath(&rel, policy, true, Some(limits.max_blob_bytes as usize))
-            .map_err(|e| match e {
-                Error::Storage(m) if m.ends_with("is unexpectedly large") => {
-                    too_large(limits.max_blob_bytes + 1)
-                }
-                other => other,
-            })?
-            .ok_or_else(|| {
-                Error::InvalidExtraction(format!(
-                    "{} disappeared while it was being read",
-                    rel.display()
-                ))
-            })?;
-        let location = anchor.real().join(&rel).display().to_string();
-        let file = super::observe_bytes(&rel, bytes, location, space_ids)?;
+        };
         let code = super::code_input_for_file_marked(ctx, &file, deadline, &limits.parse_policy)?;
         emit_file(sink, file)?;
         if let Some((input, reused)) = code {
@@ -815,32 +798,17 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     limits: &ProducerLimits,
     sink: &mut dyn RecordSink,
 ) -> Result<()> {
-    use super::{code, is_ingestable, media_type_of, parse_material, ParsedMaterial};
+    use super::{code, is_ingestable};
     // before the identity marker is created or anything is emitted (see `require_sha1`)
     reader.require_sha1()?;
     let repository_id = reader.repository_id()?;
     let space_ids = super::resolve_spaces_with(ctx, space_names)?;
     let refs = reader.refs()?;
-    let views = match scope {
-        super::GitScope::Views(v) => v,
-        _ => super::GitViews::default(),
-    };
     let worktree_heads: Vec<String> = match scope {
         super::GitScope::History => Vec::new(),
         _ => reader.worktree_heads()?,
     };
-    let selected: Vec<&GitRefObservation> = refs
-        .iter()
-        .filter(|r| match scope {
-            super::GitScope::History => true,
-            _ => {
-                r.name == "HEAD"
-                    || (views.branches && r.name.starts_with("refs/heads/"))
-                    || (views.remotes && r.name.starts_with("refs/remotes/"))
-                    || (views.tags && r.name.starts_with("refs/tags/"))
-            }
-        })
-        .collect();
+    let selected = super::select_refs(&refs, scope);
     let mut tips: Vec<String> = selected.iter().map(|r| r.target_oid.clone()).collect();
     tips.extend(worktree_heads.iter().cloned());
     tips.sort();
@@ -949,21 +917,6 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
         by_blob.entry(blob).or_default().push((commit, path));
     }
 
-    // A blob over the limit fails the operation before any content is read.
-    for (oid, uses) in &by_blob {
-        let size = size_of.get(oid).copied().unwrap_or(0);
-        if size > limits.max_blob_bytes {
-            return Err(Error::BlobTooLarge {
-                path: uses
-                    .first()
-                    .map(|u| u.1.clone())
-                    .unwrap_or_else(|| oid.clone()),
-                size,
-                limit: limits.max_blob_bytes,
-            });
-        }
-    }
-
     // ---- releases (small, own content), before the commits are complete
     let mut release_files: Vec<GitDerivedFile> = Vec::new();
     let mut tag_commits: Vec<GitCommitData> = Vec::new();
@@ -995,54 +948,9 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             },
         })?;
     }
-    let current = ctx.git_refs_current(repository_id)?;
-    let current_by_name: HashMap<String, &GitRefObservation> =
-        current.iter().map(|r| (r.name.clone(), r)).collect();
-    let mut ref_events: Vec<GitRefEventDraft> = Vec::new();
-    for r in &refs {
-        if r.name == "HEAD" && r.symbolic_target.is_some() {
-            continue;
-        }
-        match current_by_name.get(&r.name) {
-            None => ref_events.push(GitRefEventDraft {
-                name: r.name.clone(),
-                kind: GitRefEventKind::Created,
-                from_oid: None,
-                to_oid: Some(r.target_oid.clone()),
-            }),
-            Some(prev) if prev.target_oid != r.target_oid => {
-                let kind = if prev.target_kind == GitObjectKind::Commit
-                    && r.target_kind == GitObjectKind::Commit
-                    && reader.is_ancestor(&prev.target_oid, &r.target_oid)?
-                {
-                    GitRefEventKind::FastForward
-                } else {
-                    GitRefEventKind::NonFastForward
-                };
-                ref_events.push(GitRefEventDraft {
-                    name: r.name.clone(),
-                    kind,
-                    from_oid: Some(prev.target_oid.clone()),
-                    to_oid: Some(r.target_oid.clone()),
-                });
-            }
-            Some(_) => {}
-        }
-    }
-    for prev in &current {
-        if prev.name == "HEAD" && prev.symbolic_target.is_some() {
-            continue;
-        }
-        if !refs.iter().any(|r| r.name == prev.name) {
-            ref_events.push(GitRefEventDraft {
-                name: prev.name.clone(),
-                kind: GitRefEventKind::Deleted,
-                from_oid: Some(prev.target_oid.clone()),
-                to_oid: None,
-            });
-        }
-    }
-    ref_events.sort_by(|a, b| a.name.cmp(&b.name));
+    let ref_events = super::ref_events(&ctx.git_refs_current(repository_id)?, &refs, |a, b| {
+        reader.is_ancestor(a, b)
+    })?;
     for e in ref_events {
         sink.emit(&Record::RefEvent { item: e })?;
     }
@@ -1081,45 +989,38 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     }
 
     // ---- bodies: blob batches
-    let mut batch: Vec<String> = Vec::new();
-    let mut batch_bytes = 0u64;
-    let oids: Vec<String> = by_blob.keys().cloned().collect();
-    let mut pending: Vec<Vec<String>> = Vec::new();
-    for oid in oids {
-        let size = size_of.get(&oid).copied().unwrap_or(0);
-        if !batch.is_empty()
-            && (batch_bytes + size > BLOB_BATCH_BYTES || batch.len() >= BLOB_BATCH_COUNT)
-        {
-            pending.push(std::mem::take(&mut batch));
-            batch_bytes = 0;
-        }
-        batch_bytes += size;
-        batch.push(oid);
-    }
-    if !batch.is_empty() {
-        pending.push(batch);
-    }
+    let limit = limits.max_blob_bytes.min(DEFAULT_MAX_BLOB);
+    let pending = blob_batches(
+        by_blob.keys(),
+        |oid| size_of.get(oid).copied(),
+        limit,
+        |oid, size| {
+            for (commit, path) in &by_blob[oid] {
+                sink.emit(&Record::Skipped {
+                    item: super::text_policy::git_skip(path, commit, oid, size, limit),
+                })?;
+            }
+            Ok(())
+        },
+    )?;
     for batch in pending {
         deadline.check("reading file contents")?;
-        let contents = reader.blob_contents(&batch)?;
+        let contents = reader.blob_contents_under(&batch, limit)?;
         for blob in contents {
-            let Some(content) = blob.content else {
-                continue;
-            };
-            // The declared size was checked; the bytes Git returned are too.
-            if content.len() as u64 > limits.max_blob_bytes {
-                return Err(Error::BlobTooLarge {
-                    path: by_blob
-                        .get(&blob.oid)
-                        .and_then(|u| u.first())
-                        .map(|u| u.1.clone())
-                        .unwrap_or_else(|| blob.oid.clone()),
-                    size: content.len() as u64,
-                    limit: limits.max_blob_bytes,
-                });
-            }
             let blob_oid = blob.oid;
-            let Some(uses) = by_blob.get(&blob_oid) else {
+            let uses = &by_blob[&blob_oid];
+            let Some(content) = blob.content else {
+                for (commit, path) in uses {
+                    sink.emit(&Record::Skipped {
+                        item: super::text_policy::git_skip(
+                            path,
+                            commit,
+                            &blob_oid,
+                            blob.size_bytes,
+                            limit,
+                        ),
+                    })?;
+                }
                 continue;
             };
             sink.emit(&Record::BlobContent {
@@ -1131,40 +1032,16 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             let mut code_input: Option<CodeInputDraft> = None;
             for (commit, path) in uses {
                 deadline.check("deriving memories")?;
-                let media_type = media_type_of(Path::new(path)).unwrap_or("text/rust");
-                let stem = Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("untitled")
-                    .to_string();
-                let mut parsed = if media_type == "text/rust" {
-                    ParsedMaterial {
-                        title: stem.clone(),
-                        evidences: vec![],
-                        assertions: vec![],
-                        memories: vec![],
-                    }
-                } else {
-                    parse_material(&stem, &content, media_type, &space_ids)
-                };
-                for a in &mut parsed.assertions {
-                    a.extraction = format!("git:{}", a.extraction);
-                }
                 emit_derivation(
                     sink,
-                    GitDerivedFile {
-                        source_kind: crate::core::SourceKind::GitBlob,
-                        path: path.clone(),
-                        blob_oid: blob_oid.clone(),
-                        commit_oid: commit.clone(),
-                        content_hash: content_hash.clone(),
-                        content: String::new(),
-                        title: parsed.title,
-                        media_type: media_type.to_string(),
-                        evidences: parsed.evidences,
-                        assertions: parsed.assertions,
-                        memories: parsed.memories,
-                    },
+                    super::derive_git_file(
+                        path,
+                        &blob_oid,
+                        commit,
+                        &content,
+                        &content_hash,
+                        &space_ids,
+                    )?,
                     true,
                 )?;
                 // Code input: one per blob, created at its first source path.
@@ -1258,6 +1135,15 @@ pub fn emit_verified(
     for item in o.remotes {
         sink.emit(&Record::Remote { item })?;
     }
+    for item in o.skipped_files {
+        if item
+            .git
+            .as_ref()
+            .is_some_and(|g| g.commit_oid == closure.commit_oid)
+        {
+            sink.emit(&Record::Skipped { item })?;
+        }
+    }
     for d in o.derivations {
         if d.commit_oid == closure.commit_oid {
             emit_derivation(sink, d, false)?;
@@ -1319,6 +1205,38 @@ pub fn head_code_candidates(
     out
 }
 
+/// Schedule only selected, size-checked bodies. Structural object and wire
+/// budgets are enforced independently of this per-blob decision.
+fn blob_batches<'a>(
+    oids: impl Iterator<Item = &'a String>,
+    size_of: impl Fn(&str) -> Option<u64>,
+    limit: u64,
+    mut skip: impl FnMut(&str, u64) -> Result<()>,
+) -> Result<Vec<Vec<String>>> {
+    let mut pending = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0;
+    for oid in oids {
+        let size = size_of(oid)
+            .ok_or_else(|| Error::InvalidExtraction("missing selected blob size".into()))?;
+        if size > limit {
+            skip(oid, size)?;
+            continue;
+        }
+        if !batch.is_empty()
+            && (batch_bytes + size > BLOB_BATCH_BYTES || batch.len() >= BLOB_BATCH_COUNT)
+        {
+            pending.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes += size;
+        batch.push(oid.clone());
+    }
+    if !batch.is_empty() {
+        pending.push(batch);
+    }
+    Ok(pending)
+}
 /// Streams a verified HEAD: the producer side of [`Kind::GitVerified`], used by the Git worker.
 ///
 /// `closure` is what the worker read ([`super::confined_git::ConfinedGitReader::head_closure`])
@@ -1344,24 +1262,13 @@ pub fn stream_verified_head(
     limits: &ProducerLimits,
     sink: &mut dyn RecordSink,
 ) -> Result<()> {
-    use super::{code, media_type_of, parse_material, ParsedMaterial};
+    use super::code;
     let by_blob = ingestable_blobs(files, selection);
     let size_of: HashMap<&str, u64> = closure
         .blobs
         .iter()
         .map(|(o, s)| (o.as_str(), *s))
         .collect();
-    // a blob over the limit fails the operation before any content is read
-    for (oid, paths) in &by_blob {
-        let size = size_of.get(oid.as_str()).copied().unwrap_or(0);
-        if size > limits.max_blob_bytes {
-            return Err(Error::BlobTooLarge {
-                path: paths.first().cloned().unwrap_or_else(|| oid.clone()),
-                size,
-                limit: limits.max_blob_bytes,
-            });
-        }
-    }
     sink.emit(&Record::Begin {
         kind: Kind::GitVerified,
     })?;
@@ -1409,39 +1316,40 @@ pub fn stream_verified_head(
     }
 
     // ---- bodies: blob batches
-    let mut pending: Vec<Vec<String>> = Vec::new();
-    let (mut batch, mut batch_bytes): (Vec<String>, u64) = (Vec::new(), 0);
-    for oid in by_blob.keys() {
-        let size = size_of.get(oid.as_str()).copied().unwrap_or(0);
-        if !batch.is_empty()
-            && (batch_bytes + size > BLOB_BATCH_BYTES || batch.len() >= BLOB_BATCH_COUNT)
-        {
-            pending.push(std::mem::take(&mut batch));
-            batch_bytes = 0;
-        }
-        batch_bytes += size;
-        batch.push(oid.clone());
-    }
-    if !batch.is_empty() {
-        pending.push(batch);
-    }
+    let limit = limits.max_blob_bytes.min(DEFAULT_MAX_BLOB);
+    let pending = blob_batches(
+        by_blob.keys(),
+        |oid| size_of.get(oid).copied(),
+        limit,
+        |oid, size| {
+            for path in &by_blob[oid] {
+                sink.emit(&Record::Skipped {
+                    item: super::text_policy::git_skip(path, &closure.commit_oid, oid, size, limit),
+                })?;
+            }
+            Ok(())
+        },
+    )?;
     for batch in pending {
         deadline.check("reading file contents")?;
         for (blob_oid, bytes) in reader.blob_bytes(&batch)? {
-            if bytes.len() as u64 > limits.max_blob_bytes {
-                return Err(Error::BlobTooLarge {
-                    path: by_blob
-                        .get(&blob_oid)
-                        .and_then(|u| u.first().cloned())
-                        .unwrap_or_else(|| blob_oid.clone()),
-                    size: bytes.len() as u64,
-                    limit: limits.max_blob_bytes,
-                });
+            let size = bytes.len() as u64;
+            if size_of.get(blob_oid.as_str()).copied() != Some(size) || size > limit {
+                return bad("Git blob size changed after preflight");
             }
-            let Ok(content) = String::from_utf8(bytes) else {
-                continue; // not text: stays an unverified (oid, size) row
-            };
-            let Some(uses) = by_blob.get(&blob_oid) else {
+            let uses = &by_blob[&blob_oid];
+            let Some(content) = super::text_policy::decode(bytes) else {
+                for path in uses {
+                    sink.emit(&Record::Skipped {
+                        item: super::text_policy::git_skip(
+                            path,
+                            &closure.commit_oid,
+                            &blob_oid,
+                            size,
+                            limit,
+                        ),
+                    })?;
+                }
                 continue;
             };
             sink.emit(&Record::BlobContent {
@@ -1453,40 +1361,16 @@ pub fn stream_verified_head(
             let mut code_input: Option<(CodeInputDraft, bool)> = None;
             for path in uses {
                 deadline.check("deriving memories")?;
-                let media_type = media_type_of(Path::new(path)).unwrap_or("text/rust");
-                let stem = Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("untitled")
-                    .to_string();
-                let mut parsed = if media_type == "text/rust" {
-                    ParsedMaterial {
-                        title: stem.clone(),
-                        evidences: vec![],
-                        assertions: vec![],
-                        memories: vec![],
-                    }
-                } else {
-                    parse_material(&stem, &content, media_type, space_ids)
-                };
-                for a in &mut parsed.assertions {
-                    a.extraction = format!("git:{}", a.extraction);
-                }
                 emit_derivation(
                     sink,
-                    GitDerivedFile {
-                        source_kind: crate::core::SourceKind::GitBlob,
-                        path: path.clone(),
-                        blob_oid: blob_oid.clone(),
-                        commit_oid: closure.commit_oid.clone(),
-                        content_hash: content_hash.clone(),
-                        content: String::new(),
-                        title: parsed.title,
-                        media_type: media_type.to_string(),
-                        evidences: parsed.evidences,
-                        assertions: parsed.assertions,
-                        memories: parsed.memories,
-                    },
+                    super::derive_git_file(
+                        path,
+                        &blob_oid,
+                        &closure.commit_oid,
+                        &content,
+                        &content_hash,
+                        space_ids,
+                    )?,
                     true,
                 )?;
                 let Some(language) = code::language_for(Path::new(path)) else {
@@ -1548,6 +1432,9 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 .into_iter()
                 .filter_map(|c| c.contexts.first().map(|x| x.path.clone()).map(|p| (p, c)))
                 .collect();
+            for item in f.observation.skipped_files {
+                sink.emit(&Record::Skipped { item })?;
+            }
             for file in f.observation.files {
                 let input = code.remove(&file.location);
                 emit_file(sink, file)?;
@@ -1612,6 +1499,9 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                         pairs: part.to_vec(),
                     })?;
                 }
+            }
+            for item in o.skipped_files {
+                sink.emit(&Record::Skipped { item })?;
             }
             for d in o.derivations {
                 emit_derivation(sink, d, false)?;
@@ -1926,6 +1816,7 @@ struct Assembler<'a> {
     session: Option<SessionDraft>,
     spaces: Vec<Uuid>,
     files: Vec<ObservedFile>,
+    skipped_files: Vec<SkippedFile>,
     repository_id: Option<Uuid>,
     repository_path: String,
     refs: Vec<GitRefObservation>,
@@ -1971,6 +1862,7 @@ impl<'a> Assembler<'a> {
             session: None,
             spaces: Vec::new(),
             files: Vec::new(),
+            skipped_files: Vec::new(),
             repository_id: None,
             repository_path: String::new(),
             refs: Vec::new(),
@@ -2041,8 +1933,15 @@ impl<'a> Assembler<'a> {
         Ok(())
     }
 
+    fn add_file_content(&mut self, n: u64) -> Result<()> {
+        if n > DEFAULT_MAX_BLOB {
+            return bad("one text payload exceeds the ingestion limit");
+        }
+        self.add_content(n)
+    }
+
     fn add_content(&mut self, n: u64) -> Result<()> {
-        self.content_bytes += n;
+        self.content_bytes = self.content_bytes.saturating_add(n);
         if self.content_bytes > self.limits.extraction.max_content_bytes {
             return bad(format!(
                 "{} bytes of content exceed the limit of {}",
@@ -2056,7 +1955,10 @@ impl<'a> Assembler<'a> {
         // The record being opened is the owner and is not in the lists until it closes: count it,
         // or the limit would admit one file more than it says (the in-process validation counts
         // exactly).
-        let n = self.derivations.len() + self.files.len() + usize::from(self.owner.is_some());
+        let n = self.skipped_files.len()
+            + self.derivations.len()
+            + self.files.len()
+            + usize::from(self.owner.is_some());
         if n > self.limits.extraction.max_files {
             return bad(format!("{n} files exceed the limit"));
         }
@@ -2190,6 +2092,34 @@ impl<'a> Assembler<'a> {
                 self.spaces = spaces;
                 self.phase = Phase::Header;
             }
+            Record::Skipped { item } => {
+                self.at(Phase::Body, name)?;
+                self.close_owner()?;
+                super::extract::check_skip(
+                    &item,
+                    self.expect != Kind::Files,
+                    self.root,
+                    &self.limits.extraction,
+                )?;
+                if let Some(git) = &item.git {
+                    self.unique(
+                        "selected path",
+                        &format!("{}\0{}", git.commit_oid, item.path),
+                    )?;
+                    if self
+                        .blob_index
+                        .get(&git.blob_oid)
+                        .map(|i| self.blobs[*i].size_bytes)
+                        != Some(item.size_bytes)
+                    {
+                        return bad("skip disagrees with the announced blob size");
+                    }
+                } else {
+                    self.unique("file", &item.path)?;
+                }
+                self.skipped_files.push(item);
+                self.count_check()?;
+            }
             Record::File { file, content_len } => {
                 if self.expect != Kind::Files || self.phase != Phase::Body {
                     return bad("`file` out of place");
@@ -2219,7 +2149,10 @@ impl<'a> Assembler<'a> {
                     return bad("a `file` record must not carry content or parts");
                 }
                 self.unique("file", &file.location)?;
-                self.add_content(content_len)?;
+                if file.size_bytes > DEFAULT_MAX_BLOB {
+                    return bad("one file exceeds the ingestion limit");
+                }
+                self.add_file_content(content_len)?;
                 self.replace_slot(Slot::new(file.location.clone(), content_len, None));
                 self.owner = Some(Owner::File(file));
                 self.count_check()?;
@@ -2399,7 +2332,7 @@ impl<'a> Assembler<'a> {
                     return bad(format!("content for an unannounced blob `{}`", short(&oid)));
                 };
                 self.unique("blob content", &oid)?;
-                self.add_content(len)?;
+                self.add_file_content(len)?;
                 self.replace_slot(Slot::new(oid, len, Some(idx)));
             }
             Record::Derivation { file, content } => {
@@ -2410,18 +2343,24 @@ impl<'a> Assembler<'a> {
                 self.oid(&file.blob_oid, "blob")?;
                 self.oid(&file.commit_oid, "commit")?;
                 self.unique("derivation", &format!("{}\0{}", file.commit_oid, file.path))?;
+                self.unique(
+                    "selected path",
+                    &format!("{}\0{}", file.commit_oid, file.path),
+                )?;
                 if !file.content.is_empty() {
                     return bad("a `derivation` record must not carry content");
                 }
-                match content {
-                    ContentSource::Shared => {
-                        let len = self.shared_slot(&file.blob_oid)?;
-                        self.add_content(len)?;
-                    }
+                let len = match content {
+                    ContentSource::Shared => self.shared_slot(&file.blob_oid)?,
                     ContentSource::Own { len } => {
-                        self.add_content(len)?;
                         self.replace_slot(Slot::new(file.blob_oid.clone(), len, None));
+                        len
                     }
+                };
+                if self.expect == Kind::Git && file.source_kind == crate::core::SourceKind::GitTag {
+                    self.add_content(len)?;
+                } else {
+                    self.add_file_content(len)?;
                 }
                 self.seen.derivations += 1;
                 self.owner = Some(Owner::Derivation(file));
@@ -2504,10 +2443,10 @@ impl<'a> Assembler<'a> {
                 match content {
                     ContentSource::Shared => {
                         let len = self.shared_slot(&id)?;
-                        self.add_content(len)?;
+                        self.add_file_content(len)?;
                     }
                     ContentSource::Own { len } => {
-                        self.add_content(len)?;
+                        self.add_file_content(len)?;
                         self.replace_slot(Slot::new(id, len, None));
                     }
                 }
@@ -2657,6 +2596,7 @@ impl<'a> Assembler<'a> {
             .session
             .take()
             .ok_or_else(|| Error::InvalidExtraction("record stream: no header".into()))?;
+        super::text_policy::sort_skips(&mut self.skipped_files);
         if self.expect == Kind::GitVerified {
             let (extracted, summary) = self.finish_verified(session)?;
             return Ok((extracted, Some(summary)));
@@ -2664,6 +2604,7 @@ impl<'a> Assembler<'a> {
         Ok(match self.expect {
             Kind::Files => Extracted::Files(ExtractedFiles {
                 observation: IngestObservation {
+                    skipped_files: self.skipped_files,
                     session,
                     files: self.files,
                     spaces: self.spaces,
@@ -2678,6 +2619,7 @@ impl<'a> Assembler<'a> {
                     .sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
                 Extracted::Git(ExtractedGit {
                     observation: GitObservation {
+                        skipped_files: self.skipped_files,
                         session,
                         repository_id: self.repository_id.unwrap_or_default(),
                         repository_path: self.repository_path,
@@ -2720,9 +2662,9 @@ impl<'a> Assembler<'a> {
 
         // blob ids named by the verified trees, and the paths each one is at
         let mut tree_blobs: HashMap<&str, &str> = HashMap::new(); // oid -> any path
-        let mut at_path: HashMap<&str, (&str, GitObjectKind)> = HashMap::new(); // path -> (oid, kind)
+        let mut at_path: HashMap<&str, (&str, GitObjectKind, &str)> = HashMap::new(); // path -> (oid, kind)
         for f in &v.files {
-            at_path.insert(&f.path, (&f.oid, f.kind));
+            at_path.insert(&f.path, (&f.oid, f.kind, &f.mode));
             if f.kind == GitObjectKind::Blob {
                 tree_blobs.insert(&f.oid, &f.path);
             }
@@ -2784,7 +2726,7 @@ impl<'a> Assembler<'a> {
                 ));
             }
             match at_path.get(d.path.as_str()) {
-                Some((oid, GitObjectKind::Blob)) if *oid == d.blob_oid => {}
+                Some((oid, GitObjectKind::Blob, _)) if *oid == d.blob_oid => {}
                 _ => {
                     return bad(format!(
                         "the derivation of `{}` names a blob the verified tree does not have there",
@@ -2806,7 +2748,7 @@ impl<'a> Assembler<'a> {
                     return bad("a code context at a commit other than the verified head");
                 }
                 match at_path.get(ctx.path.as_str()) {
-                    Some((o, GitObjectKind::Blob)) if *o == oid.as_str() => {}
+                    Some((o, GitObjectKind::Blob, _)) if *o == oid.as_str() => {}
                     _ => {
                         return bad(format!(
                         "the code input at `{}` names a blob the verified tree does not have there",
@@ -2817,6 +2759,20 @@ impl<'a> Assembler<'a> {
             }
         }
 
+        for skip in &self.skipped_files {
+            let git = skip
+                .git
+                .as_ref()
+                .ok_or_else(|| Error::InvalidExtraction("missing skipped Git object".into()))?;
+            if git.commit_oid != head_commit
+                || !matches!(at_path.get(skip.path.as_str()), Some((oid, GitObjectKind::Blob, mode)) if *oid == git.blob_oid && *mode != "120000")
+            {
+                return bad("skipped path disagrees with the verified tree");
+            }
+            if verified_blobs.contains(&git.blob_oid) {
+                return bad("a skipped blob also supplied verified text");
+            }
+        }
         let mut summary = v.summary;
         summary.content_verified_blobs = verified_blobs.len() as u64;
         summary.unverified_blobs = (tree_blobs.len() - verified_blobs.len()) as u64;
@@ -2831,6 +2787,7 @@ impl<'a> Assembler<'a> {
         }];
         let extracted = Extracted::Git(ExtractedGit {
             observation: GitObservation {
+                skipped_files: self.skipped_files,
                 session,
                 repository_id: self.repository_id.unwrap_or_default(),
                 repository_path: self.repository_path,

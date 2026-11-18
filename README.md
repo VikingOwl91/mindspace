@@ -145,6 +145,13 @@ remove the try-out database with `rm -r ~/mindspace-tryout`.
 - `mind ingest` prints a summary, then the committed Markdown, text and Rust
   files it read and the memories it created from them. Uncommitted and
   untracked files are skipped. A large repository can take minutes.
+- Git, directory and single-file ingestion accept UTF-8 files up to 32 MiB
+  each. The report lists eligible paths skipped for invalid UTF-8 or size.
+  On reingestion, the byte-exact policy rechecks older interpretations for
+  skipped paths and retires memories derived from lossy or oversized text.
+  Earlier evidence and source versions remain available as history. A skipped
+  filesystem path reports its previous version ID when earlier eligible text
+  stays searchable.
 - `mind search` prints ranked hits. Each hit shows a snippet, its source file and
   commit, and a memory id that you can pass to `mind inspect <memory-id>`. If
   a plain question has no matches, lexical search retries its keywords and ranks

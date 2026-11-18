@@ -1280,11 +1280,40 @@ pub struct CodeObservationReport {
     pub skip_reasons: std::collections::BTreeMap<String, u64>,
 }
 
+/// Why an eligible path supplied no text under the byte-exact ingestion policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TextSkipReason {
+    InvalidUtf8,
+    TooLarge { limit: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedGitBlob {
+    pub commit_oid: String,
+    pub blob_oid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub path: String,
+    pub size_bytes: u64,
+    pub reason: TextSkipReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<SkippedGitBlob>,
+    /// Directory/file report only: last accepted version still searchable at this path.
+    /// Its bytes belong to that prior observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_previous_version: Option<Uuid>,
+}
+
 /// Everything one ingest operation observed, handed to the store in a
 /// single call. The store owns the transaction, the lifecycle rules, and
 /// the reconciliation rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestObservation {
+    #[serde(default)]
+    pub skipped_files: Vec<SkippedFile>,
     pub session: SessionDraft,
     pub files: Vec<ObservedFile>,
     /// Spaces the session root's scope is attached to (add-only).
@@ -1371,6 +1400,8 @@ pub struct FileObservation {
 /// What one ingest operation did, per file and to the lifecycle journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservationReport {
+    #[serde(default)]
+    pub skipped_files: Vec<SkippedFile>,
     pub session_id: Uuid,
     pub root: String,
     pub scope: IngestScope,
@@ -1537,6 +1568,8 @@ pub struct GitRefEventDraft {
 /// call. The store owns the transaction, identity decisions, and counters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitObservation {
+    #[serde(default)]
+    pub skipped_files: Vec<SkippedFile>,
     pub session: SessionDraft,
     pub repository_id: Uuid,
     pub repository_path: String,
@@ -1649,6 +1682,8 @@ pub struct GitRefEventRecord {
 /// Deterministic counters and per-file results of one git observation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitObservationReport {
+    #[serde(default)]
+    pub skipped_files: Vec<SkippedFile>,
     pub session_id: Uuid,
     pub repository_id: Uuid,
     pub repository_path: String,

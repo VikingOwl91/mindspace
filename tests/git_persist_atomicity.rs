@@ -562,3 +562,117 @@ fn a_late_git_lease_is_released_after_rollback_and_the_channel_is_discarded() {
     store.get_space("p").unwrap();
     store.create_space("after-rollback", "").unwrap();
 }
+
+#[test]
+fn reobserving_pre_policy_lossy_rows_retires_only_obsolete_results_atomically() {
+    use mindspace::core::{Error, SkippedFile, SkippedGitBlob, TextSkipReason};
+    let _lock = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    let previous = [
+        ("note.md", "# Intake\n\nlegacy \u{fffd}\n"),
+        ("sample.rs", "pub fn marker() {} // \u{fffd}\n"),
+        ("separate.rs", "pub fn separate() {} // \u{fffd}\n"),
+        ("literal.md", "# Literal\n\nvalid \u{fffd}\n"),
+    ];
+    for (name, text) in previous {
+        std::fs::write(repo.join(name), text).unwrap();
+    }
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "previous"]);
+    let db = db();
+    let store = db.store();
+    let extract = || {
+        extract_git_repository_selected_with_deadline(
+            &StoreContext(&store),
+            repo,
+            &["p"],
+            &PathSelection::all(),
+            GitScope::Head,
+            &Deadline::none(),
+        )
+        .unwrap()
+    };
+    let accepted = extract();
+    for (name, text) in &previous[..3] {
+        let (start, end) = text.split_once('\u{fffd}').unwrap();
+        let bytes: Vec<u8> = [start.as_bytes(), &[0xff], end.as_bytes()].concat();
+        std::fs::write(repo.join(name), bytes).unwrap();
+    }
+    git(repo, &["commit", "-qam", "current"]);
+    let current = extract();
+    // Reconstruct precisely the old associations: the immutable Git id is the
+    // one for raw bytes, while the persisted content/hash came from lossy decoding.
+    let mut legacy = current.clone();
+    let skips = std::mem::take(&mut legacy.observation.skipped_files);
+    for excluded in &skips {
+        let g = excluded.git.as_ref().unwrap();
+        let mut d = accepted
+            .observation
+            .derivations
+            .iter()
+            .find(|d| d.path == excluded.path)
+            .unwrap()
+            .clone();
+        d.blob_oid = g.blob_oid.clone();
+        d.commit_oid = g.commit_oid.clone();
+        legacy
+            .observation
+            .blobs
+            .iter_mut()
+            .find(|b| b.oid == g.blob_oid)
+            .unwrap()
+            .content = Some(d.content.clone());
+        if excluded.path.ends_with(".rs") {
+            let mut code = accepted
+                .code_inputs
+                .iter()
+                .find(|c| c.contexts[0].path == excluded.path)
+                .unwrap()
+                .clone();
+            code.blob_oid = Some(g.blob_oid.clone());
+            code.contexts[0].commit_oid = Some(g.commit_oid.clone());
+            legacy.code_inputs.push(code);
+        }
+        // A separately recorded structural observation has no text source version.
+        if excluded.path != "separate.rs" {
+            legacy.observation.derivations.push(d);
+        }
+    }
+    persist_git(&store, legacy, &Deadline::none()).unwrap();
+    let counts = || {
+        let c = db.raw();
+        let count = |q| c.query_row(q, [], |r| r.get::<_, i64>(0)).unwrap();
+        (count("SELECT COUNT(*) FROM memories WHERE state='active'"),
+         count("SELECT COUNT(*) FROM code_derivations WHERE extractor_version LIKE 'text-v2+skip(%'"))
+    };
+    assert_eq!(counts(), (2, 0));
+    let before = db.dump();
+    assert!(
+        persist_git_gated(&store, current.clone(), &Deadline::none(), &|| Err(
+            Error::Storage("veto".into())
+        ))
+        .is_err()
+    );
+    assert_eq!(db.dump(), before);
+    let report = persist_git(&store, current.clone(), &Deadline::none()).unwrap();
+    assert_eq!(report.skipped_files, skips);
+    assert_eq!(counts(), (1, 2));
+    // Even an assertion that the remaining valid blob is invalid cannot retire
+    // its DB-confirmed bytes, including a literal Unicode replacement character.
+    let mut claimed = current;
+    let good = claimed.observation.derivations.pop().unwrap();
+    claimed.observation.skipped_files.push(SkippedFile {
+        path: good.path,
+        size_bytes: good.content.len() as u64,
+        reason: TextSkipReason::InvalidUtf8,
+        git: Some(SkippedGitBlob {
+            commit_oid: good.commit_oid,
+            blob_oid: good.blob_oid,
+        }),
+        retained_previous_version: None,
+    });
+    persist_git(&store, claimed, &Deadline::none()).unwrap();
+    assert_eq!(counts(), (1, 2));
+}

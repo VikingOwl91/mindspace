@@ -903,6 +903,7 @@ mod tests {
         .unwrap();
         store
             .record_observation(IngestObservation {
+                skipped_files: Vec::new(),
                 session: crate::core::SessionDraft {
                     root: "/passive.md".to_owned(),
                     scope: IngestScope::File,

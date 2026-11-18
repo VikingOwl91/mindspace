@@ -11,6 +11,9 @@
 //! the doctor starts for its self-test. (The filter builder below is a copy of
 //! that file's; the two should be merged into a shared helper one day.)
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -908,8 +911,10 @@ mod linux {
     /// kernel but is not: the doctor says "unknown", never "no".
     #[test]
     fn a_blocked_seccomp_query_is_unknown_not_unsupported() {
-        let Some(prog) = common::seccomp_denier(&[(libc::SYS_seccomp, None)], libc::ENOSYS) else {
-            eprintln!("skipped: no verified seccomp audit constant for this architecture");
+        let Some(prog) = crate::prerequisites::required_value(
+            common::seccomp_denier(&[(libc::SYS_seccomp, None)], libc::ENOSYS),
+            "seccomp audit architecture",
+        ) else {
             return;
         };
         let t = tmp();
@@ -931,11 +936,13 @@ mod linux {
     /// that merely lacks the filter: the repository tools stay off.
     #[test]
     fn a_filter_that_cannot_be_installed_makes_the_sandbox_unavailable() {
-        let Some(prog) = common::seccomp_denier(
-            &[(libc::SYS_prctl, Some(libc::PR_SET_SECCOMP as u32))],
-            libc::EPERM,
+        let Some(prog) = crate::prerequisites::required_value(
+            common::seccomp_denier(
+                &[(libc::SYS_prctl, Some(libc::PR_SET_SECCOMP as u32))],
+                libc::EPERM,
+            ),
+            "seccomp audit architecture",
         ) else {
-            eprintln!("skipped: no verified seccomp audit constant for this architecture");
             return;
         };
         let t = tmp();
@@ -1319,11 +1326,13 @@ done"#,
         let t = tmp();
         let scratch = t.path().join("tmpdir");
         std::fs::create_dir(&scratch).unwrap();
-        let Some(truebin) = ["/bin/true", "/usr/bin/true"]
-            .iter()
-            .map(Path::new)
-            .find(|p| p.exists())
-        else {
+        let Some(truebin) = crate::prerequisites::required_value(
+            ["/bin/true", "/usr/bin/true"]
+                .iter()
+                .map(Path::new)
+                .find(|p| p.exists()),
+            "/bin/true or /usr/bin/true",
+        ) else {
             return;
         };
         // `true` exits at once: depending on timing the first write may hit a closed pipe.

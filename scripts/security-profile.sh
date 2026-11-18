@@ -33,6 +33,9 @@ cargo test --lib -- sandbox the_marker
 echo
 echo "== 4/4  existing MCP tests under the default sandbox"
 cargo test --test mcp_repo_tools --test mcp_allowlist_modes --test mcp_ingest_timeout --test repo_info --test agent_e2e
+if [[ -n "${MINDSPACE_E2E_REPO:-}" ]]; then
+    cargo test --test agent_e2e real_repo_agent_flow -- --exact --ignored
+fi
 
 echo
 echo "security profile: PASSED"

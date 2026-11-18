@@ -10,6 +10,9 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -70,26 +73,9 @@ fn git_exe() -> GitExecutable {
 }
 
 fn prerequisites() -> bool {
-    if !Path::new(GIT).exists() {
-        eprintln!("SKIPPED: {GIT} not found");
-        return false;
-    }
-    if mindspace::sandbox::landlock_abi() < 3 {
-        eprintln!("SKIPPED: Landlock ABI 3 or newer is required");
-        return false;
-    }
-    let mut c = BrokerConfig::new(mind());
-    c.git = Some(git_exe());
-    match Broker::new(
-        Box::new(StaticRoots::new(&[std::env::temp_dir()]).unwrap()),
-        c,
-    ) {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("SKIPPED: cgroup v2 delegation is unavailable here: {e}");
-            false
-        }
-    }
+    prerequisites::system_git()
+        && prerequisites::landlock(3)
+        && prerequisites::cgroup_delegated(prerequisites::Cgroup::DirectOrSibling)
 }
 
 /// The commit-fault hooks are process-global one-shot switches; every test of this file holds this
@@ -119,6 +105,9 @@ struct Repo {
 /// A repository like `mind ingest` leaves it: two commits, Rust modules that reference each
 /// other, a document and the identity marker (`marker`: its text, `None`: no marker).
 fn repo_with(marker: Option<&str>, format: &str) -> Option<Repo> {
+    if format == "sha256" && !prerequisites::git_object_format(GIT) {
+        return None;
+    }
     let d = tempfile::tempdir().unwrap();
     let path = std::fs::canonicalize(d.path()).unwrap().join("repo");
     std::fs::create_dir_all(path.join("src")).unwrap();
@@ -136,9 +125,7 @@ fn repo_with(marker: Option<&str>, format: &str) -> Option<Repo> {
         .env_clear()
         .output()
         .unwrap();
-    if !init.status.success() {
-        return None;
-    }
+    assert!(init.status.success(), "git init failed: {}", init.status);
     let w = |rel: &str, text: &str| std::fs::write(path.join(rel), text).unwrap();
     w("docs/guide.md", "# Guide\n\nalpha text\n");
     w(
@@ -616,7 +603,6 @@ fn git_is_refused_without_configuration_for_an_unauthorized_root_and_for_unsuppo
 fn a_sha256_repository_is_refused_before_anything_is_persisted() {
     need!();
     let Some(repo) = repo_with(Some(MARKER), "sha256") else {
-        eprintln!("SKIPPED: this git cannot create a SHA-256 repository");
         return;
     };
     let db = db();

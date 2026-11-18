@@ -20,6 +20,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 mod common;
 
 use std::io::{Read, Write};
@@ -32,7 +35,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use mindspace::doctor::capabilities::{probe_kernel, LandlockState, Tri};
+use mindspace::doctor::capabilities::{probe_kernel, Tri};
 
 const PRE_UNIX_FD: i32 = 100;
 const PRE_TCP_FD: i32 = 101;
@@ -703,25 +706,21 @@ fn run_child(w: &World, mode: &str) -> Run {
 /// `None`: the experiment cannot run here, with the reason printed.
 fn prerequisites(need_landlock: bool, need_seccomp: bool) -> Option<World> {
     if need_seccomp {
-        if common::audit_arch().is_none() {
-            eprintln!(
-                "skipped: no verified seccomp audit constant for this architecture (UNKNOWN)"
-            );
+        if !prerequisites::require(common::audit_arch().is_some(), "seccomp audit architecture") {
             return None;
         }
-        if probe_kernel().seccomp_filter != Tri::Yes {
-            eprintln!("skipped: seccomp filters are not supported here");
+        let supported = probe_kernel().seccomp_filter;
+        assert_ne!(
+            supported,
+            Tri::Unknown,
+            "could not determine support for seccomp filters"
+        );
+        if !prerequisites::require(supported == Tri::Yes, "kernel seccomp filter support") {
             return None;
         }
     }
-    if need_landlock {
-        match probe_kernel().landlock {
-            LandlockState::Available(v) if v >= 3 => {}
-            other => {
-                eprintln!("skipped: Landlock ABI 3+ not available ({other:?})");
-                return None;
-            }
-        }
+    if need_landlock && !prerequisites::landlock(3) {
+        return None;
     }
     Some(world())
 }

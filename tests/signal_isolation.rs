@@ -13,6 +13,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -277,6 +280,17 @@ fn alive(pid: i32) -> bool {
 }
 
 fn run(mode: &str) -> Option<Run> {
+    if !prerequisites::landlock(if mode == "scope" { 6 } else { 3 }) {
+        return None;
+    }
+    if mode == "seccomp"
+        && !prerequisites::require(
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
+            "x86_64 or aarch64",
+        )
+    {
+        return None;
+    }
     let _one_at_a_time = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     install_handlers();
     for c in [&USR1, &USR2, &IO, &RT] {
@@ -327,20 +341,14 @@ fn run(mode: &str) -> Option<Run> {
             sleeper_alive: alive(sleeper_pid),
             group_alive: group.iter().any(|g| alive(g.id() as i32)),
         })
-    } else if err.contains("Landlock")
-        || text.contains("needs Landlock ABI 6")
-        || err.contains("needs Landlock ABI 6")
-    {
-        eprintln!("skipped {mode}: {err}");
-        None
     } else {
-        panic!("child failed ({mode}): {text}\n{err}");
+        None
     };
     for c in sleeper.iter_mut().chain(group.iter_mut()) {
         let _ = c.kill();
         let _ = c.wait();
     }
-    result
+    Some(result.unwrap_or_else(|| panic!("signal test child failed ({mode}): {text}\n{err}")))
 }
 
 fn show(mode: &str, r: &Run) {
@@ -356,7 +364,9 @@ fn show(mode: &str, r: &Run) {
 
 #[test]
 fn at_the_current_abi_a_sandboxed_process_can_really_signal_outsiders() {
-    let r = run("fs").expect("fs mode runs everywhere");
+    let Some(r) = run("fs") else {
+        return;
+    };
     show("fs (what the product applies today)", &r);
     // Not just permission: the signals ARRIVED, a process died, a process group died.
     assert!(
@@ -378,7 +388,6 @@ fn at_the_current_abi_a_sandboxed_process_can_really_signal_outsiders() {
 #[test]
 fn landlock_signal_scope_stops_every_route_and_keeps_own_children_killable() {
     let Some(r) = run("scope") else {
-        eprintln!("skipped: Landlock ABI 6 (Linux 6.12) is not available here");
         return;
     };
     show("scope (Landlock ABI 6 Scope::Signal)", &r);
@@ -407,7 +416,6 @@ fn landlock_signal_scope_stops_every_route_and_keeps_own_children_killable() {
 #[test]
 fn a_seccomp_filter_on_the_signal_calls_cannot_keep_own_children_killable() {
     let Some(r) = run("seccomp") else {
-        eprintln!("skipped: seccomp program needs x86_64 or aarch64");
         return;
     };
     show("seccomp (deny the signal system calls)", &r);

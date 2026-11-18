@@ -8,6 +8,9 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -60,8 +63,7 @@ struct Fixture {
 }
 
 fn fixture() -> Option<Fixture> {
-    if !Path::new(GIT).exists() {
-        eprintln!("SKIP: {GIT} not found");
+    if !prerequisites::system_git() {
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();

@@ -9,13 +9,16 @@
 //!    anything.
 //!  - REAL clients, run in throw-away configuration directories (HOME,
 //!    CLAUDE_CONFIG_DIR, CODEX_HOME). They check the assumptions the fakes
-//!    encode. Skipped, with a message, when the client is not installed. The
+//!    encode. Run explicitly with `-- --ignored` and the client installed. The
 //!    user's own configuration is never touched: every test sets its own HOME.
 //!  - library-level tests of the guided session with scripted input.
 //!
 //! Nothing here touches the network.
 
 #![cfg(unix)]
+
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
 
 use std::io::{Cursor, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -100,13 +103,19 @@ sys.exit(64)
 "#;
 
 fn python3_available() -> bool {
-    Command::new("python3")
+    match Command::new("python3")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    {
+        Ok(status) => {
+            assert!(status.success(), "python3 --version failed: {status}");
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("could not check python3: {e}"),
+    }
 }
 
 /// A throw-away world: HOME, fake client programs, an initialized database, folders to share.
@@ -313,11 +322,38 @@ fn shell_split(line: &str) -> Vec<String> {
 
 macro_rules! need_python {
     () => {
-        if !python3_available() {
-            eprintln!("skipped: python3 is not available (the fake clients need it)");
+        if !prerequisites::require(python3_available(), "python3 for the setup fixtures") {
             return;
         }
     };
+}
+
+#[test]
+fn missing_python_is_visible_locally_and_fails_in_strict_mode() {
+    let empty_path = tempfile::tempdir().unwrap();
+    let child_test = "clients_are_detected_absent_present_and_ambiguous_without_running_them";
+    for strict in [false, true] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", child_test])
+            .env("PATH", empty_path.path())
+            .env_remove("MINDSPACE_STRICT_TESTS")
+            .env_remove("MINDSPACE_TEST_PREREQUISITE_LOG");
+        if strict {
+            child.env("MINDSPACE_STRICT_TESTS", "1");
+        }
+        let output = child.output().unwrap();
+        assert_eq!(output.status.success(), !strict, "unexpected child status");
+        let message = if strict {
+            String::from_utf8_lossy(&output.stdout)
+        } else {
+            String::from_utf8_lossy(&output.stderr)
+        };
+        assert!(
+            message.contains(child_test) && message.contains("python3 for the setup fixtures"),
+            "{message}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- detection
@@ -1847,11 +1883,9 @@ impl Real {
 }
 
 #[test]
+#[ignore = "requires the installed claude client"]
 fn real_claude_code_registers_verifies_refuses_a_second_time_and_keeps_foreign_entries() {
-    let Some(claude) = find_real("claude") else {
-        eprintln!("skipped: `claude` is not installed");
-        return;
-    };
+    let claude = find_real("claude").expect("install claude to run this test");
     let r = real_world(&claude);
     let repos = r.root.join("repos");
     std::fs::create_dir(&repos).unwrap();
@@ -1913,11 +1947,9 @@ fn real_claude_code_registers_verifies_refuses_a_second_time_and_keeps_foreign_e
 }
 
 #[test]
+#[ignore = "requires the installed claude client"]
 fn real_claude_code_local_scope_is_keyed_to_the_directory_setup_runs_in() {
-    let Some(claude) = find_real("claude") else {
-        eprintln!("skipped: `claude` is not installed");
-        return;
-    };
+    let claude = find_real("claude").expect("install claude to run this test");
     let r = real_world(&claude);
     let o = run(r.setup(&["claude-code", "--scope", "local", "--apply", "--yes"]));
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
@@ -1926,11 +1958,9 @@ fn real_claude_code_local_scope_is_keyed_to_the_directory_setup_runs_in() {
 }
 
 #[test]
+#[ignore = "requires the installed codex client"]
 fn real_codex_registers_backs_up_keeps_foreign_servers_and_never_overwrites() {
-    let Some(codex) = find_real("codex") else {
-        eprintln!("skipped: `codex` is not installed");
-        return;
-    };
+    let codex = find_real("codex").expect("install codex to run this test");
     let mut r = real_world(&codex);
     // Exercise the selected real runtime without reintroducing other installed
     // Codex binaries through /usr/bin. Production ambiguity checks remain intact.
@@ -1999,11 +2029,9 @@ fn real_codex_registers_backs_up_keeps_foreign_servers_and_never_overwrites() {
 }
 
 #[test]
+#[ignore = "requires the installed opencode client"]
 fn real_opencode_is_never_started_by_a_preview() {
-    let Some(opencode) = find_real("opencode") else {
-        eprintln!("skipped: `opencode` is not installed");
-        return;
-    };
+    let opencode = find_real("opencode").expect("install opencode to run this test");
     let r = real_world(&opencode);
     let o = run(r.setup(&["opencode"]));
     assert!(o.status.success(), "{}", err(&o));

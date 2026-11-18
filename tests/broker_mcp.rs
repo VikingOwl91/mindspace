@@ -13,6 +13,9 @@
 #![cfg(feature = "spawn-gate")]
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -132,6 +135,17 @@ impl Fe {
     }
 
     fn start_unlocked(w: &World, static_root: &Path, vars: &[(&str, String)]) -> Option<Fe> {
+        let placement = if vars
+            .iter()
+            .any(|(key, _)| *key == "MINDSPACE_BROKER_GATE_MEMORY_MAX")
+        {
+            prerequisites::Cgroup::WithControllers
+        } else {
+            prerequisites::Cgroup::Direct
+        };
+        if !prerequisites::cgroup_delegated(placement) {
+            return None;
+        }
         let mut c = w.mind(&["mcp", "--allow-root"]);
         c.arg(static_root)
             .args(["--grants", "--broker"])
@@ -172,8 +186,7 @@ impl Fe {
         me["broker_pid"] = broker.into();
         if me.get("fatal").is_some() || broker == 0 {
             let err = std::fs::read_to_string(w.root.join("fe.stderr")).unwrap_or_default();
-            eprintln!("SKIPPED: the broker did not start: {me} / stderr: {err}");
-            return None;
+            panic!("the broker did not start: {me} / stderr: {err}");
         }
         fe.broker_pid = me["broker_pid"].as_i64().unwrap() as i32;
         fe.watchdog_pid = wd;
@@ -181,8 +194,7 @@ impl Fe {
         std::thread::sleep(Duration::from_millis(300));
         if !alive(fe.broker_pid as u32) {
             let err = std::fs::read_to_string(w.root.join("fe.stderr")).unwrap_or_default();
-            eprintln!("SKIPPED: the broker is gone (no cgroup delegation?): {err}");
-            return None;
+            panic!("the broker exited after a successful delegation probe: {err}");
         }
         assert!(
             me["sandbox"].as_str().unwrap().contains("enforced"),

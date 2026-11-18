@@ -7,6 +7,9 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -63,7 +66,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// An honest verified result in which EVERY code input is an announced placeholder, with the
 /// context that announced them.
 fn fixture() -> Option<(Fx, GitContext)> {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return None;
     }
     let t = tempfile::tempdir().unwrap();

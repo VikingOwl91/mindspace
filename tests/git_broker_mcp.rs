@@ -12,6 +12,9 @@
 #![cfg(feature = "spawn-gate")]
 #![allow(clippy::field_reassign_with_default, dead_code)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -152,6 +155,9 @@ impl Fe {
     }
 
     fn start_unlocked(w: &World, static_root: &Path, vars: &[(&str, String)]) -> Option<Fe> {
+        if !prerequisites::cgroup_delegated(prerequisites::Cgroup::Direct) {
+            return None;
+        }
         let mut c = w.mind(&["mcp", "--allow-root"]);
         c.arg(static_root)
             .args(["--grants", "--broker"])
@@ -192,8 +198,7 @@ impl Fe {
         me["broker_pid"] = broker.into();
         if me.get("fatal").is_some() || broker == 0 {
             let err = std::fs::read_to_string(w.root.join("fe.stderr")).unwrap_or_default();
-            eprintln!("SKIPPED: the broker did not start: {me} / stderr: {err}");
-            return None;
+            panic!("the broker did not start: {me} / stderr: {err}");
         }
         fe.broker_pid = me["broker_pid"].as_i64().unwrap() as i32;
         fe.watchdog_pid = wd;
@@ -201,8 +206,7 @@ impl Fe {
         std::thread::sleep(Duration::from_millis(300));
         if !alive(fe.broker_pid as u32) {
             let err = std::fs::read_to_string(w.root.join("fe.stderr")).unwrap_or_default();
-            eprintln!("SKIPPED: the broker is gone (no cgroup delegation?): {err}");
-            return None;
+            panic!("the broker exited after a successful delegation probe: {err}");
         }
         assert!(
             me["sandbox"].as_str().unwrap().contains("enforced"),
@@ -373,7 +377,7 @@ fn git_vars(mode: Option<&str>) -> Vec<(&'static str, String)> {
 
 #[test]
 fn a_git_ingestion_through_the_sandboxed_frontend_persists_once_and_repeats_idempotently() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let w = World::new();
@@ -469,7 +473,7 @@ fn hung(mode: &str) -> Option<Hung> {
 
 #[test]
 fn broker_sigkill_ends_the_git_worker_and_its_git_child() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let Some(mut h) = hung("hang") else { return };
@@ -486,7 +490,7 @@ fn broker_sigkill_ends_the_git_worker_and_its_git_child() {
 
 #[test]
 fn frontend_sigkill_ends_the_git_worker_and_its_git_child() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let Some(mut h) = hung("hang") else { return };
@@ -503,7 +507,7 @@ fn frontend_sigkill_ends_the_git_worker_and_its_git_child() {
 
 #[test]
 fn without_usable_cgroup_containment_the_git_operation_is_refused_and_runs_nothing() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let _exclusive = SWEEP.write().unwrap_or_else(|e| e.into_inner());
@@ -553,7 +557,7 @@ fn without_usable_cgroup_containment_the_git_operation_is_refused_and_runs_nothi
 
 #[test]
 fn a_broker_started_the_production_way_without_a_git_executable_refuses_every_git_operation() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let w = World::new();

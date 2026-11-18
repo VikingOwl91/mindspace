@@ -8,6 +8,9 @@
 
 #![allow(clippy::field_reassign_with_default, dead_code)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -108,6 +111,9 @@ impl World {
     }
     /// A Git repository (HEAD with two source files and a README), identity marker optional.
     fn repo_with(&self, name: &str, marker: Option<&str>, format: &str) -> Option<PathBuf> {
+        if format == "sha256" && !prerequisites::git_object_format(GIT) {
+            return None;
+        }
         let d = self.root.join(name);
         std::fs::create_dir_all(d.join("src")).unwrap();
         let g = |args: &[&str]| {
@@ -138,9 +144,7 @@ impl World {
                 &format!("--object-format={format}"),
             ])
         };
-        if !init.status.success() {
-            return None;
-        }
+        assert!(init.status.success(), "git init failed: {}", init.status);
         std::fs::write(
             d.join("src/lib.rs"),
             "pub mod util;\npub fn run() { util::helper(); }\n",
@@ -263,6 +267,11 @@ fn find_watchdog(frontend: u32) -> Option<i32> {
 
 impl Mcp {
     fn start(w: &World, roots: &[&Path], extra: &[&str], vars: &[(&str, String)]) -> Option<Mcp> {
+        let isolated =
+            extra.contains(&"--isolated-ingest") || extra.contains(&"--isolated-git-ingest");
+        if isolated && !prerequisites::cgroup_delegated(prerequisites::Cgroup::Direct) {
+            return None;
+        }
         let mut c = w.mind(&["mcp"]);
         for r in roots {
             c.arg("--allow-root").arg(r);
@@ -291,12 +300,10 @@ impl Mcp {
                    "clientInfo":{"name":"t","version":"0"}}),
         );
         m.notify("notifications/initialized");
-        if extra.contains(&"--isolated-ingest") || extra.contains(&"--isolated-git-ingest") {
+        if isolated {
             let pid = m.child.id();
-            let Some(wd) = find_watchdog(pid) else {
-                eprintln!("SKIPPED: no watchdog appeared");
-                return None;
-            };
+            let wd =
+                find_watchdog(pid).expect("no watchdog appeared after successful cgroup probe");
             let end = Instant::now() + Duration::from_secs(3);
             let br = loop {
                 if let Some(b) = children_of(wd).first() {
@@ -310,8 +317,7 @@ impl Mcp {
             std::thread::sleep(Duration::from_millis(300));
             if br == 0 || !alive(br as u32) {
                 let err = std::fs::read_to_string(w.root.join("mcp.stderr")).unwrap_or_default();
-                eprintln!("SKIPPED: the broker did not start (no cgroup delegation?): {err}");
-                return None;
+                panic!("broker startup failed after successful cgroup probe: {err}");
             }
             m.watchdog = wd;
             m.broker = br;

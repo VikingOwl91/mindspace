@@ -12,6 +12,9 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -28,15 +31,7 @@ const GIT: &str = "/usr/bin/git";
 const MARKER: &str = "0190b2c4-7d5e-7a31-9c11-3f2d5a6b7c8d";
 
 fn kernel_ok() -> bool {
-    if !Path::new(GIT).exists() {
-        eprintln!("SKIP: {GIT} not found");
-        return false;
-    }
-    if mindspace::sandbox::landlock_abi() < 3 {
-        eprintln!("SKIP: Landlock ABI 3 or newer is required");
-        return false;
-    }
-    true
+    prerequisites::system_git() && prerequisites::landlock(3)
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -334,7 +329,7 @@ fn head_is_read_by_a_non_dumpable_landlocked_worker_and_matches_git() {
 #[test]
 fn the_same_reader_works_without_the_kernel_confinement_too() {
     // the descriptor style and the pins do not depend on Landlock
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let fx = fixture();
@@ -598,7 +593,7 @@ fn refusal(root: &Path) -> String {
 
 #[test]
 fn linked_worktrees_external_alternates_grafts_and_links_are_refused() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     // a linked worktree as the root: `.git` is a file
@@ -702,7 +697,10 @@ fn linked_worktrees_external_alternates_grafts_and_links_are_refused() {
 fn a_sha256_repository_is_refused_instead_of_misread() {
     // The tree parser reads 20-byte entries: on a SHA-256 repository it returns 40-digit ids that
     // name no object. The reader says so up front.
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
+        return;
+    }
+    if !prerequisites::git_object_format(GIT) {
         return;
     }
     let fx = fixture();
@@ -715,10 +713,7 @@ fn a_sha256_repository_is_refused_instead_of_misread() {
         .env_clear()
         .output()
         .unwrap();
-    if !out.status.success() {
-        eprintln!("SKIP: this git cannot create a SHA-256 repository");
-        return;
-    }
+    assert!(out.status.success(), "git init failed: {}", out.status);
     write(&root, "a.txt", "a\n");
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-q", "-m", "one"]);
@@ -843,7 +838,7 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
 #[cfg(feature = "spawn-gate")]
 #[test]
 fn a_git_child_inherits_one_descriptor_a_cleared_environment_and_the_root_as_its_directory() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let fx = fixture();
@@ -940,7 +935,7 @@ for f in /proc/self/fd/*; do t=$(readlink "$f"); echo "fd ${f##*/} -> $t"; done"
 #[cfg(feature = "spawn-gate")]
 #[test]
 fn a_hung_git_child_is_killed_at_the_deadline_and_leaves_no_process() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let fx = fixture();
@@ -1040,7 +1035,7 @@ fn a_git_child_ends_when_its_worker_is_killed() {
 #[test]
 #[ignore]
 fn performance_observation() {
-    if !Path::new(GIT).exists() {
+    if !prerequisites::system_git() {
         return;
     }
     let fx = fixture();

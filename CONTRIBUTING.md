@@ -33,6 +33,9 @@ To exercise the optional installed clients, run `cargo test --test setup real_ -
 with the selected clients installed (or filter by client name). For the real-repository
 flow, set `MINDSPACE_E2E_REPO` and run
 `cargo test --test agent_e2e real_repo_agent_flow -- --exact --ignored`.
+To check model-backed semantic search in a filtered MCP server, set `M72D_MODEL_SRC`
+to an installed models directory and run
+`cargo test --features embeddings --test seccomp_compat semantic_search_works_inside_the_filtered_server -- --exact --ignored`.
 
 ## Rust toolchain
 

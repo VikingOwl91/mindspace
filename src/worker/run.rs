@@ -236,7 +236,7 @@ impl crate::ingest::extract::ExtractionContext for AlwaysKnown {
 /// selects anything.
 ///
 /// Descriptors, as for the directory worker: stdio, the channel (3), the root (4) and, with a
-/// broker, the control channel (5). The root descriptor is the only authority over the repository.
+/// broker, the control channel (5). Extended Git layouts also receive broker-selected read-only metadata and object pins.
 /// Before it confines itself the worker resolves the git executable and its ELF interpreter; its
 /// Landlock domain then allows reading the root and the system directories and EXECUTING exactly
 /// those two files. Every git child inherits that domain.
@@ -250,6 +250,7 @@ pub fn main_git(
         crate::ingest::confined_git::FilePin,
         Option<crate::ingest::confined_git::FilePin>,
     )>,
+    layout_fds: &[i32],
     gate: Option<&str>,
 ) -> i32 {
     #[cfg(not(feature = "spawn-gate"))]
@@ -277,6 +278,14 @@ pub fn main_git(
     } else {
         vec![CHANNEL_FD, ROOT_FD]
     };
+    let layout = if layout_fds.is_empty() {
+        Vec::new()
+    } else {
+        match crate::ingest::confined_git::layout::adopt(layout_fds) {
+            Ok(files) => files,
+            Err(e) => return fail(&format!("layout: {e}"), 78),
+        }
+    };
     // resolved BEFORE the confinement, from the broker's argv
     let git = match GitExecutable::resolve(git_path) {
         Ok(g) => g,
@@ -290,11 +299,12 @@ pub fn main_git(
             let git = git.clone().with_pins(exe_pin, interp_pin);
             match git.verify_pins() {
                 Ok(files) => {
-                    let r = crate::sandbox::enter_extraction_worker_with_exec_files(
+                    let r = crate::sandbox::enter_extraction_worker_with_layout(
                         &root,
                         &keep,
                         &[],
                         &files,
+                        &layout,
                     );
                     // the rules hold the inodes now; the descriptors are no longer needed
                     drop(files);
@@ -303,7 +313,13 @@ pub fn main_git(
                 Err(e) => return fail(&format!("git executable: {e}"), 78),
             }
         }
-        None => crate::sandbox::enter_extraction_worker_with_exec(&root, &keep, &git.exec_grants()),
+        None => crate::sandbox::enter_extraction_worker_with_layout(
+            &root,
+            &keep,
+            &git.exec_grants(),
+            &[],
+            &layout,
+        ),
     };
     let sandbox = match entered {
         Ok(s) => s,
@@ -357,7 +373,12 @@ pub fn main_git(
         parse_policy: request.parse_policy(),
     };
     let verify = VerifyLimits::default();
-    let reader = match ConfinedGitReader::open(root.as_fd(), &git, Deadline::none()) {
+    let reader = if layout.is_empty() {
+        ConfinedGitReader::open(root.as_fd(), &git, Deadline::none())
+    } else {
+        ConfinedGitReader::from_layout(root.as_fd(), layout, &git, Deadline::none())
+    };
+    let reader = match reader {
         Ok(r) => r,
         Err(e) => return fail(&format!("repository refused: {e}"), 2),
     };

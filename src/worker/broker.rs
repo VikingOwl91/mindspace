@@ -9,7 +9,7 @@
 //! 3. opens that root itself with `openat2` (no symlinks), checks device/inode against the
 //!    authority's pinned identity and keeps the descriptor (the frontend never supplies one);
 //! 4. creates a cgroup for the operation (fail closed unless the experimental mode is chosen),
-//!    spawns the worker into it with exactly three descriptors (channel 3, root 4, control 5);
+//!    spawns the worker with channel 3, root 4 and control 5. Extended Git layouts also carry read-only pins;
 //! 5. waits for the worker's `READY` (sent after it confined itself), observes it from outside
 //!    (`/proc/<pid>/status`, `/proc/<pid>/cgroup`) and only then sends `GO`;
 //! 6. hands the frontend the worker's channel (SCM_RIGHTS) together with what it observed;
@@ -62,6 +62,7 @@ pub enum AuthoritySource {
 /// One root the broker may serve, with the identity that was approved.
 #[derive(Debug, Clone)]
 pub struct AuthorizedRoot {
+    pub access: crate::mcp::Access,
     pub source: AuthoritySource,
     pub path: PathBuf,
     pub dev: u64,
@@ -93,15 +94,25 @@ pub struct StaticRoots(Vec<AuthorizedRoot>);
 
 impl StaticRoots {
     pub fn new(paths: &[PathBuf]) -> Result<Self, String> {
+        Self::with_access(
+            &paths
+                .iter()
+                .map(|p| (p.clone(), crate::mcp::Access::ReadWrite))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn with_access(paths: &[(PathBuf, crate::mcp::Access)]) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
         let mut v = Vec::new();
-        for p in paths {
+        for (p, access) in paths {
             let c = std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()))?;
             let m = std::fs::metadata(&c).map_err(|e| format!("{}: {e}", c.display()))?;
             if !m.is_dir() {
                 return Err(format!("{} is not a directory", c.display()));
             }
             v.push(AuthorizedRoot {
+                access: *access,
                 source: AuthoritySource::Static,
                 path: c,
                 dev: m.dev(),
@@ -143,7 +154,7 @@ impl GrantRoots {
         }
         let state = self.store.load().map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        for (path, _access) in &res.roots {
+        for (path, access) in &res.roots {
             let (dev, ino) = res.identities.get(path).copied().unwrap_or_default();
             let id = state
                 .records
@@ -152,6 +163,7 @@ impl GrantRoots {
                 .map(|r| r.grant.id.clone())
                 .unwrap_or_default();
             out.push(AuthorizedRoot {
+                access: *access,
                 source: AuthoritySource::Grant(id),
                 path: path.clone(),
                 dev,
@@ -220,11 +232,10 @@ impl RootAuthority for CombinedAuthority {
 fn process_main(
     link: UnixStream,
     exe: PathBuf,
-    static_roots: Vec<PathBuf>,
-    grants: Option<(PathBuf, crate::grants::PathPolicy)>,
-    git: Option<crate::ingest::confined_git::GitExecutable>,
+    request: crate::sandbox::BrokerRequest,
     scope: &CgroupScope,
     watchdog: i32,
+    scratch: Option<std::fs::File>,
 ) -> ! {
     ScopeHandle::adopt(scope);
     // SAFETY: plain prctl/open/dup2 calls on this process. Not dumpable: the frontend is an
@@ -247,8 +258,10 @@ fn process_main(
             }
         }
     }
-    crate::sandbox::close_all_except(&[link.as_raw_fd()]);
-    let code = run_process(link, exe, static_roots, grants, git);
+    let mut keep = vec![link.as_raw_fd()];
+    keep.extend(scratch.iter().map(AsRawFd::as_raw_fd));
+    crate::sandbox::close_all_except(&keep);
+    let code = run_process(link, exe, request, scratch);
     // SAFETY: leave without running the parent's atexit handlers or flushing its buffers.
     unsafe { libc::_exit(code) }
 }
@@ -256,15 +269,19 @@ fn process_main(
 fn run_process(
     link: UnixStream,
     exe: PathBuf,
-    static_roots: Vec<PathBuf>,
-    grants: Option<(PathBuf, crate::grants::PathPolicy)>,
-    git: Option<crate::ingest::confined_git::GitExecutable>,
+    request: crate::sandbox::BrokerRequest,
+    scratch: Option<std::fs::File>,
 ) -> i32 {
     let fail = |m: String, c: i32| {
         eprintln!("mind broker: {m}");
         c
     };
-    let static_roots = match StaticRoots::new(&static_roots) {
+    let crate::sandbox::BrokerRequest {
+        static_roots,
+        grants,
+        git,
+    } = request;
+    let static_roots = match StaticRoots::with_access(&static_roots) {
         Ok(s) => s,
         Err(e) => return fail(format!("static roots: {e}"), 70),
     };
@@ -278,6 +295,7 @@ fn run_process(
     #[allow(unused_mut)]
     let mut cfg = BrokerConfig::new(exe);
     cfg.git = git;
+    cfg.git_projection_parent = scratch.map(Arc::new);
     // Test builds only (feature `spawn-gate`, enabled for `cargo test`, absent from a plain
     // build): stand-in workers and short limits for the failure tests.
     #[cfg(feature = "spawn-gate")]
@@ -378,9 +396,8 @@ pub fn watchdog_main(
     frontend: i32,
     frontend_pidfd: i32,
     exe: PathBuf,
-    static_roots: Vec<PathBuf>,
-    grants: Option<(PathBuf, crate::grants::PathPolicy)>,
-    git: Option<crate::ingest::confined_git::GitExecutable>,
+    request: crate::sandbox::BrokerRequest,
+    scratch: PathBuf,
 ) -> ! {
     let fail = |m: String, c: i32| -> ! {
         eprintln!("mind broker: {m}");
@@ -411,15 +428,38 @@ pub fn watchdog_main(
         Ok(s) => s,
         Err(e) => fail(format!("cannot start (no cgroup delegation?): {e}"), 71),
     };
+    let session = if request.git.is_some() {
+        match crate::ingest::confined_git::layout::View::session(&scratch) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("mind broker: extended Git layouts unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let broker = unsafe { libc::fork() };
     if broker < 0 {
         scope.teardown();
+        drop(session);
         fail("cannot fork the broker".into(), 70);
     }
     if broker == 0 {
-        process_main(back, exe, static_roots, grants, git, &scope, unsafe {
-            libc::getppid()
-        });
+        process_main(
+            back,
+            exe,
+            request,
+            &scope,
+            unsafe { libc::getppid() },
+            match session.as_ref().map(|s| s.open()).transpose() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!("mind broker: extended Git layouts unavailable: {e}");
+                    None
+                }
+            },
+        );
     }
     drop(back); // the broker holds the only copy; the watchdog has no channel at all
     let pidfd = |pid: i32| -> i32 {
@@ -434,6 +474,7 @@ pub fn watchdog_main(
     };
     if bfd < 0 {
         scope.teardown();
+        drop(session);
         fail(
             "pidfd_open is unavailable (kernel older than 5.3?)".into(),
             71,
@@ -503,6 +544,7 @@ pub fn watchdog_main(
         std::thread::sleep(Duration::from_millis(2));
     }
     scope.teardown();
+    drop(session);
     // SAFETY: leave without running the parent's atexit handlers.
     unsafe { libc::_exit(0) }
 }
@@ -1105,6 +1147,8 @@ pub enum CleanupPolicy {
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
+    /// Private directory outside the frontend's Landlock rules for descriptor-link metadata.
+    pub git_projection_parent: Option<Arc<std::fs::File>>,
     /// The worker binary and its arguments (`mind extraction-worker`).
     pub exe: PathBuf,
     pub args: Vec<OsString>,
@@ -1144,6 +1188,7 @@ pub struct BrokerConfig {
 impl BrokerConfig {
     pub fn new(exe: impl Into<PathBuf>) -> Self {
         Self {
+            git_projection_parent: None,
             exe: exe.into(),
             args: vec![OsString::from("extraction-worker")],
             git: None,
@@ -1226,6 +1271,62 @@ fn reopen_dir(pinned: &OwnedFd) -> std::io::Result<OwnedFd> {
     }
     // SAFETY: freshly returned by the kernel.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Local metadata may extend beyond the selected checkout only inside an explicit static
+/// read-write enclosure. A separate revocable grant cannot share the checkout's commit lease.
+fn git_dependency(
+    root: &std::fs::File,
+    selected: &AuthorizedRoot,
+    roots: &[AuthorizedRoot],
+    path: &Path,
+) -> crate::core::Result<std::fs::File> {
+    use crate::ingest::confined_git::layout;
+    use crate::mcp::Access;
+    let deny = || {
+        layout::unsupported(
+            "linked worktree or object alternates outside the authorized read-write scope",
+        )
+    };
+    let anchor = if path.starts_with(&selected.path) {
+        selected
+    } else {
+        roots
+            .iter()
+            .filter(|r| {
+                r.source == AuthoritySource::Static
+                    && r.access == Access::ReadWrite
+                    && selected.path.starts_with(&r.path)
+                    && path.starts_with(&r.path)
+            })
+            .max_by_key(|r| r.path.components().count())
+            .ok_or_else(deny)?
+    };
+    // Git reads contents below each granted directory. A nested read-only exception must
+    // exclude the whole dependency even when the pointer names its read-write parent.
+    let restricted = roots.iter().any(|r| {
+        r.source == AuthoritySource::Static
+            && r.access == Access::ReadOnly
+            && (r.path.starts_with(path)
+                || (path.starts_with(&r.path) && r.path.starts_with(&anchor.path)))
+    });
+    if restricted || selected.access != Access::ReadWrite {
+        return Err(deny());
+    }
+    let base = if anchor.path == selected.path {
+        root.try_clone().map_err(|_| deny())?
+    } else {
+        crate::sandbox::open_verified_dir(&anchor.path, (anchor.dev, anchor.ino))
+            .map_err(|_| deny())?
+            .into()
+    };
+    let file = layout::open_relative(&base, path.strip_prefix(&anchor.path).map_err(|_| deny())?)?;
+    let actual =
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| deny())?;
+    if actual != path {
+        return Err(deny());
+    }
+    Ok(file)
 }
 
 fn real_path_of_fd(fd: &OwnedFd) -> std::io::Result<PathBuf> {
@@ -1412,7 +1513,7 @@ impl Broker {
         validate_spaces(&spaces)?;
         // 1. authority: from trusted state, the root must be exactly one of the authorized ones
         let roots = self.authority.roots()?;
-        let Some(auth) = roots.into_iter().find(|r| r.path == Path::new(&root)) else {
+        let Some(auth) = roots.iter().find(|r| r.path == Path::new(&root)).cloned() else {
             return Err("the root is not authorized".into());
         };
         // 2. replay: an operation id is usable once, and only after authorization succeeded
@@ -1435,17 +1536,23 @@ impl Broker {
         //     repository identity from the pinned root (no process started, no content parsed).
         //     Both are decided BEFORE a worker exists; the worker's own claims are checked against
         //     this value by the frontend.
+        let mut git_layout = None;
         let (worker_args, repository_id) = match kind {
             OpKind::DirectoryExtract => (self.cfg.args.clone(), None),
             OpKind::GitExtract => {
                 let Some(git) = &self.cfg.git else {
                     return Err("git extraction is not configured on this broker".into());
                 };
-                let id = crate::ingest::confined_git::inspect_root({
-                    use std::os::fd::AsFd;
-                    pinned.as_fd()
-                })
+                use crate::ingest::confined_git::layout;
+                let root_file = std::fs::File::from(pinned.try_clone().map_err(|e| e.to_string())?);
+                let (id, prepared) = layout::prepare(
+                    &root_file,
+                    &auth.path,
+                    self.cfg.git_projection_parent.as_deref(),
+                    |path| git_dependency(&root_file, &auth, &roots, path),
+                )
                 .map_err(|e| format!("repository refused: {e}"))?;
+                git_layout = prepared;
                 let mut a: Vec<OsString> = vec![
                     OsString::from("git-extraction-worker"),
                     OsString::from("--git-exe"),
@@ -1458,6 +1565,18 @@ impl Broker {
                         a.push(OsString::from("--interp-pin"));
                         a.push(OsString::from(p.to_arg()));
                     }
+                }
+                if let Some(layout) = &git_layout {
+                    a.push("--layout-fds".into());
+                    a.push(
+                        layout
+                            .files
+                            .iter()
+                            .map(|f| f.as_raw_fd().to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                            .into(),
+                    );
                 }
                 a.push(OsString::from("--repository-id"));
                 // TEST HARNESS (feature `spawn-gate`): the worker is told another identity than
@@ -1509,6 +1628,7 @@ impl Broker {
             &root_fd,
             &ctl_child,
             procs_fd.as_ref(),
+            git_layout.as_ref().map_or(&[], |l| l.files.as_slice()),
         )?;
         drop(child_end);
         drop(ctl_child);
@@ -1659,6 +1779,7 @@ impl Broker {
         root: &OwnedFd,
         control: &UnixStream,
         cgroup_procs: Option<&std::fs::File>,
+        layout: &[std::fs::File],
     ) -> Result<std::process::Child, String> {
         let mut cmd = Command::new(&self.cfg.exe);
         cmd.args(args)
@@ -1674,6 +1795,7 @@ impl Broker {
         }
         let (chan, rootfd, ctl) = (channel.as_raw_fd(), root.as_raw_fd(), control.as_raw_fd());
         let procs = cgroup_procs.map(|f| f.as_raw_fd());
+        let layout_fds: Vec<_> = layout.iter().map(AsRawFd::as_raw_fd).collect();
         let (rlimit_as, rlimit_cpu) = (self.cfg.rlimit_as_mib, self.cfg.rlimit_cpu_secs);
         // SAFETY: only async-signal-safe calls between fork and exec (write, setpgid, prctl,
         // setrlimit, fcntl, dup2, close).
@@ -1729,6 +1851,11 @@ impl Broker {
                 }
                 for t in staged {
                     libc::close(t);
+                }
+                for &fd in &layout_fds {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });

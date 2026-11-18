@@ -151,7 +151,7 @@ pub struct BrokerRequest {
     /// The roots named explicitly on the command line (`--allow-root`): the broker's static,
     /// non-revocable authority. Grants that happened to be active at start are NOT in here: they
     /// stay revocable and are read from the store by the broker like any later grant.
-    pub static_roots: Vec<PathBuf>,
+    pub static_roots: Vec<(PathBuf, crate::mcp::Access)>,
     pub grants: Option<(PathBuf, crate::grants::PathPolicy)>,
 }
 
@@ -204,6 +204,7 @@ pub fn broker_fd_from_env() -> Option<i32> {
 fn spawn_broker(
     plan: &Plan,
     req: &BrokerRequest,
+    scratch: &Path,
 ) -> Result<std::os::unix::net::UnixStream, String> {
     use std::os::fd::AsRawFd;
     let (front, back) =
@@ -236,9 +237,8 @@ fn spawn_broker(
                     frontend,
                     pidfd,
                     plan.exe.clone(),
-                    req.static_roots.clone(),
-                    req.grants.clone(),
-                    req.git.clone(),
+                    req.clone(),
+                    scratch.to_owned(),
                 );
             }
             libc::_exit(if wd < 0 { 70 } else { 0 });
@@ -890,7 +890,7 @@ pub fn enter_with_broker(
 
     // The broker must exist before this process confines itself: a child of a confined process
     // can never be less confined. Failure is a start failure (the repository tools stay off).
-    let broker_link = match broker.map(|b| spawn_broker(plan, b)) {
+    let broker_link = match broker.map(|b| spawn_broker(plan, b, &canary_dir)) {
         Some(Ok(l)) => Some(l),
         Some(Err(e)) => return Outcome::Unavailable(format!("broker: {e}")),
         None => None,
@@ -1060,6 +1060,18 @@ pub fn enter_extraction_worker_with_exec_files(
     exec: &[PathBuf],
     exec_files: &[std::fs::File],
 ) -> Result<WorkerSandbox, String> {
+    enter_extraction_worker_with_layout(root, keep, exec, exec_files, &[])
+}
+
+/// Additional object-layout descriptors have read rights only. No enclosing authority root
+/// is handed to the worker.
+pub(crate) fn enter_extraction_worker_with_layout(
+    root: &std::os::fd::OwnedFd,
+    keep: &[i32],
+    exec: &[PathBuf],
+    exec_files: &[std::fs::File],
+    layout: &[std::fs::File],
+) -> Result<WorkerSandbox, String> {
     use std::os::fd::AsRawFd;
     // SAFETY: plain prctl calls on this process.
     unsafe {
@@ -1071,6 +1083,7 @@ pub fn enter_extraction_worker_with_exec_files(
     // the verified descriptors must survive the clean-up below until the rules are installed
     let mut keep: Vec<i32> = keep.to_vec();
     keep.extend(exec_files.iter().map(|f| f.as_raw_fd()));
+    keep.extend(layout.iter().map(AsRawFd::as_raw_fd));
     let keep = &keep[..];
     close_all_except(keep);
     let root_raw = root.as_raw_fd();
@@ -1104,6 +1117,16 @@ pub fn enter_extraction_worker_with_exec_files(
         rs = rs
             .add_rule(PathBeneath::new(f, AccessFs::Execute | AccessFs::ReadFile))
             .map_err(|e| format!("execute rule for a verified descriptor: {e}"))?;
+    }
+    for (i, f) in layout.iter().enumerate() {
+        let rights = if i < 3 {
+            AccessFs::ReadFile | AccessFs::ReadDir
+        } else {
+            AccessFs::ReadFile.into()
+        };
+        rs = rs
+            .add_rule(PathBeneath::new(f, rights))
+            .map_err(|e| format!("read rule for Git layout descriptor: {e}"))?;
     }
     let status = rs
         .restrict_self()

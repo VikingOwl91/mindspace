@@ -4,26 +4,22 @@
 //! changing it. It differs from the in-process reader ([`super::git::GitReader`]) in exactly the
 //! ways the confinement needs, and shares its command execution and parsers:
 //!
-//! * **Authority is a descriptor.** The caller passes the repository root as an already verified
-//!   directory descriptor (in the worker: descriptor 4, placed by the broker). Everything else is
-//!   opened *beneath* it with `openat(.., O_NOFOLLOW)`: no path of the filesystem is ever
-//!   resolved, so there is nothing to swap.
-//! * **Git inherits descriptors; it is not given paths.** The git directory's descriptor is
-//!   inherited by each git child under the same number and named `GIT_DIR=/proc/self/fd/<n>`
-//!   (resolved in the child). The worker's own `/proc/<pid>/fd/<n>` is NOT used for a child: a
-//!   child of a non-dumpable process may not open it (see `docs/design-m7.3b5-git-worker.md`
-//!   section 3 and the tests).
+//! * **Descriptor authority.** Plain repositories are opened below the pinned root. For linked
+//!   worktrees and local object alternates the broker resolves the metadata within the accepted
+//!   roots. It passes directory and object pins to the worker. The object projection contains
+//!   only descriptor links to regular files, so Git never re-traverses the alternate graph.
+//! * **Child-local descriptors.** Git resolves each pin through its own `/proc/self/fd` table.
 //! * **The executable is explicit.** An absolute path, resolved once by the caller (the broker, in
 //!   the worker design), with its ELF interpreter, so that the kernel sandbox can grant execution
 //!   of exactly those two files. No `PATH` lookup, no shell, a cleared environment.
 //! * **Read only, by construction.** The reader opens nothing for writing and creates nothing; in
 //!   particular it never creates the identity marker. The worker's Landlock rule is read-only too.
-//! * **Refuse what v1 cannot confine.** A linked worktree (`.git` is a file, or the git directory
-//!   has a `commondir`), a repository that has linked worktrees (`worktrees/`), external object
-//!   alternates, a grafts file, and links among the top-level entries of the git directory are
-//!   refused with a precise error. A bare repository is refused too (v1 reads `<root>/.git`).
+//! * **Offline reads.** Transport is disabled. Every required HEAD object must be present.
 //!
 //! Scope: HEAD. The API has no ref listing, no history walk, no branch/remote/tag access.
+
+#[path = "confined_git_layout.rs"]
+pub(crate) mod layout;
 
 use std::ffi::CString;
 use std::fs::File;
@@ -532,6 +528,10 @@ fn require_sha1_oids(oids: &[String]) -> Result<()> {
 
 // ---------------------------------------------------------------------------------- reader
 
+fn missing_local_object() -> Error {
+    refuse("a required HEAD object is missing locally or has the wrong type")
+}
+
 /// What HEAD points at: the commit and every entry of its tree (`mode`, `kind`, `oid`, `path`;
 /// symlinks and gitlinks keep their true modes so the caller can leave them out).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,11 +580,7 @@ fn check_layout(root_fd: RawFd) -> Result<File> {
             "unsupported repository: the git directory belongs to a linked worktree (`commondir`)",
         ));
     }
-    if exists_beneath(gfd, &["worktrees"])? {
-        return Err(refuse(
-                "unsupported repository: it has linked worktrees (`.git/worktrees`); they are not supported",
-            ));
-    }
+    // HEAD-only plumbing never traverses the worktrees registry of a main checkout.
     for alt in ["alternates", "http-alternates"] {
         if exists_beneath(gfd, &["objects", "info", alt])? {
             return Err(refuse(format!(
@@ -634,7 +630,7 @@ fn read_marker_at(git_dir_fd: RawFd) -> Result<Uuid> {
         path: format!(".git/{NAME}"),
         reason,
     };
-    let mut f = match open_beneath(git_dir_fd, NAME, libc::O_RDONLY) {
+    let pin = match open_beneath(git_dir_fd, NAME, libc::O_PATH) {
         Ok(f) => f,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
             return Err(at(
@@ -644,6 +640,11 @@ fn read_marker_at(git_dir_fd: RawFd) -> Result<Uuid> {
         }
         Err(e) => return Err(at(format!("cannot read marker: {e}"))),
     };
+    if !pin.metadata().map_err(|e| at(e.to_string()))?.is_file() {
+        return Err(at("marker must be a regular file".into()));
+    }
+    let mut f =
+        File::open(format!("/proc/self/fd/{}", pin.as_raw_fd())).map_err(|e| at(e.to_string()))?;
     let mut text = String::new();
     (&mut f)
         .take(256)
@@ -690,25 +691,53 @@ impl ConfinedGitReader {
                 source: e,
             })?
             .into();
-        let root_fd = root_file.as_raw_fd();
-        let git_dir = check_layout(root_fd)?;
+        let git_dir = check_layout(root_file.as_raw_fd())?;
+        Self::from_dirs(root_file, git_dir, None, git, deadline)
+    }
+
+    pub(crate) fn from_layout(
+        root: BorrowedFd<'_>,
+        mut files: Vec<File>,
+        git: &GitExecutable,
+        deadline: Deadline,
+    ) -> Result<Self> {
+        let root_file = File::from(root.try_clone_to_owned().map_err(|source| Error::Io {
+            path: "<root descriptor>".into(),
+            source,
+        })?);
+        let git_dir = files.remove(0);
+        Self::from_dirs(root_file, git_dir, Some(files), git, deadline)
+    }
+
+    fn from_dirs(
+        root_file: File,
+        git_dir: File,
+        layout: Option<Vec<File>>,
+        git: &GitExecutable,
+        deadline: Deadline,
+    ) -> Result<Self> {
         let gfd = git_dir.as_raw_fd();
+        let mut keep = layout.unwrap_or_default();
+        let common = keep.first().unwrap_or(&git_dir);
+        let common_fd = common.as_raw_fd();
+        let marker_dir = common.try_clone().map_err(|source| Error::Io {
+            path: ".git".into(),
+            source,
+        })?;
         let exec = ConfinedExec {
             exe: git.exe().to_path_buf(),
             git_dir_fd: gfd,
-            root_fd,
+            common_dir_fd: keep.first().map(AsRawFd::as_raw_fd),
+            object_pins: keep.iter().skip(1).map(AsRawFd::as_raw_fd).collect(),
+            root_fd: root_file.as_raw_fd(),
             #[cfg(feature = "spawn-gate")]
             apply_pins: true,
         };
-        let marker_dir = git_dir.try_clone().map_err(|e| Error::Io {
-            path: ".git".into(),
-            source: e,
-        })?;
+        keep.extend([git_dir, root_file]);
         let pin = GitPin {
             git_dir: PathBuf::from(format!("/proc/self/fd/{gfd}")),
-            common_dir: PathBuf::from(format!("/proc/self/fd/{gfd}")),
-            // the descriptors must outlive every child: the reader owns them
-            keep: vec![git_dir, root_file],
+            common_dir: PathBuf::from(format!("/proc/self/fd/{common_fd}")),
+            keep,
             confined: Some(exec.clone()),
         };
         // `work` is only a label here; a confined child changes into the root by descriptor
@@ -745,7 +774,19 @@ impl ConfinedGitReader {
     /// is collected, so an oversized repository stops early; a subtree shared by several paths
     /// is read once. Parents are NOT read.
     pub fn head_closure(&self, limits: &VerifyLimits) -> Result<HeadClosure> {
-        let commit_oid = self.inner.head_commit()?;
+        let commit_oid = match self.inner.head_commit() {
+            Ok(oid) => oid,
+            Err(e @ Error::GitCommand { .. }) => {
+                if let Ok(oid) = self.inner.unpeeled_head() {
+                    require_sha1_oids(std::slice::from_ref(&oid))?;
+                    if self.inner.batch_check(&[oid])?.is_empty() {
+                        return Err(missing_local_object());
+                    }
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         require_sha1_oids(std::slice::from_ref(&commit_oid))?;
         let symbolic = self.inner.head_symbolic()?;
         let too_big =
@@ -767,10 +808,11 @@ impl ConfinedGitReader {
             }
             Ok(())
         };
-        take(
-            self.inner.raw_objects(std::slice::from_ref(&commit_oid))?,
-            &mut objects,
-        )?;
+        let commit = self.inner.raw_objects(std::slice::from_ref(&commit_oid))?;
+        if commit.len() != 1 || commit[0].0 != commit_oid || commit[0].1 != GitObjectKind::Commit {
+            return Err(missing_local_object());
+        }
+        take(commit, &mut objects)?;
         let commit = parse_commit(&commit_oid, &objects[0].bytes)?;
         let mut seen: HashSet<String> = HashSet::new();
         let mut level = vec![commit.tree_oid.clone()];
@@ -789,7 +831,15 @@ impl ConfinedGitReader {
                     return Err(too_big("too many trees"));
                 }
                 let before = objects.len();
-                take(self.inner.raw_objects(chunk)?, &mut objects)?;
+                let raw = self.inner.raw_objects(chunk)?;
+                if raw.len() != chunk.len()
+                    || raw.iter().zip(chunk).any(|((oid, kind, _), wanted)| {
+                        oid != wanted || *kind != GitObjectKind::Tree
+                    })
+                {
+                    return Err(missing_local_object());
+                }
+                take(raw, &mut objects)?;
                 for o in &objects[before..] {
                     let t = parse_tree(&o.oid, &o.bytes)?;
                     entries = entries.saturating_add(t.entries.len());
@@ -817,9 +867,16 @@ impl ConfinedGitReader {
             return Err(too_big("too many blobs"));
         }
         let wanted: Vec<String> = blobs.into_iter().collect();
-        let blobs = self
-            .inner
-            .batch_check(&wanted)?
+        let checked = self.inner.batch_check(&wanted)?;
+        if checked.len() != wanted.len()
+            || checked
+                .iter()
+                .zip(&wanted)
+                .any(|((oid, kind, _), wanted)| oid != wanted || *kind != GitObjectKind::Blob)
+        {
+            return Err(missing_local_object());
+        }
+        let blobs = checked
             .into_iter()
             .map(|(oid, _, size)| (oid, size))
             .collect();
@@ -854,11 +911,17 @@ impl ConfinedGitReader {
     /// Blob contents as the exact bytes git stores (no text conversion), by oid. One git call.
     pub fn blob_bytes(&self, oids: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
         require_sha1_oids(oids)?;
-        Ok(self
-            .inner
-            .raw_objects(oids)?
+        let raw = self.inner.raw_objects(oids)?;
+        if raw.len() != oids.len()
+            || raw
+                .iter()
+                .zip(oids)
+                .any(|((oid, kind, _), wanted)| oid != wanted || *kind != GitObjectKind::Blob)
+        {
+            return Err(missing_local_object());
+        }
+        Ok(raw
             .into_iter()
-            .filter(|(_, kind, _)| *kind == GitObjectKind::Blob)
             .map(|(oid, _, bytes)| (oid, bytes))
             .collect())
     }

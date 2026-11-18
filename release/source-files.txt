@@ -83,6 +83,7 @@ src/indexing/mod.rs
 src/ingest/code.rs
 src/ingest/confined.rs
 src/ingest/confined_git.rs
+src/ingest/confined_git_layout.rs
 src/ingest/deadline.rs
 src/ingest/document/chunk.rs
 src/ingest/document/detect.rs

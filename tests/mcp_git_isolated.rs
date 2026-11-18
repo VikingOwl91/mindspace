@@ -56,6 +56,7 @@ impl World {
         c.args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
             .env("MINDSPACE_DB", &self.db)
             .env("XDG_DATA_HOME", self.root.join("xdg"))
             .env("XDG_STATE_HOME", &self.state)
@@ -960,8 +961,8 @@ fn missing_identity_unsupported_layouts_and_sha256_are_refused_and_persist_nothi
     let before = w.counts();
     assert_refused(&m.ingest(&no_marker), "identity_missing");
     assert_refused(&m.ingest(&plain), "not_a_repository");
-    assert_refused(&m.ingest(&wt), "unsupported_repository"); // `.git` is a file
-    assert_refused(&m.ingest(&with_worktrees), "unsupported_repository");
+    assert_refused(&m.ingest(&wt), "unsupported_repository"); // No shared static enclosure.
+
     assert_refused(&m.ingest(&alternates), "unsupported_repository");
     assert_eq!(w.counts(), before, "refusals persist nothing");
     assert!(
@@ -974,6 +975,8 @@ fn missing_identity_unsupported_layouts_and_sha256_are_refused_and_persist_nothi
         assert_eq!(r["structuredContent"]["persisted"], false);
         assert_eq!(w.counts(), before);
     }
+    // A registered worktree does not change the main checkout HEAD.
+    assert_eq!(m.ingest(&with_worktrees)["isError"], false);
     // the server still works afterwards
     let ok = w.repo("fine");
     w.ok(&["grant", "add", ok.to_str().unwrap(), "--yes"]);
@@ -1259,4 +1262,250 @@ fn a_failed_commit_is_a_clean_rollback_and_an_unknown_outcome_is_reported_as_unk
         assert_eq!(code_and_git(&w), structure);
         m2.finish();
     }
+}
+
+/// A real repository of each supported layout goes through the production MCP broker, cgroup,
+/// worker, hash verification and database. All repositories and Git transports are local.
+#[test]
+fn linked_worktree_local_alternates_and_partial_clone_use_only_local_head_objects() {
+    let w = World::new();
+    let enclosure = w.root.join("projects");
+    std::fs::create_dir(&enclosure).unwrap();
+    let source = w.repo("projects/source");
+    let main = enclosure.join("main");
+    let linked = enclosure.join("linked");
+    let pool = enclosure.join("pool");
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new(GIT)
+            .arg("-C")
+            .arg(cwd)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture Git returned {}",
+            output.status
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let p = |p: &Path| p.to_str().unwrap().to_owned();
+    let head = w.head(&source);
+    git(
+        &enclosure,
+        &["clone", "--shared", "--quiet", &p(&source), &p(&main)],
+    );
+    std::fs::write(main.join(".git/mindspace-repository-id"), MARKER).unwrap();
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked-topic", &p(&linked)],
+    );
+    std::fs::write(main.join("extra.rs"), "pub fn only_main() {}\n").unwrap();
+    git(&main, &["add", "extra.rs"]);
+    git(&main, &["commit", "-qm", "second"]);
+    // Both loose and packed layouts of the same required external data are exercised.
+    let mut m = mcp!(w, &[&enclosure, &linked, &main], OPT_IN, &[]);
+    for packed in [false, true] {
+        if packed {
+            git(&source, &["gc", "--prune=now", "-q"]);
+        }
+        let r = m.ingest(&linked);
+        let s = &r["structuredContent"];
+        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(s["head"]["commit"], head);
+        assert_eq!(s["head"]["symbolic_ref"], "refs/heads/linked-topic");
+        assert_eq!(s["repository"]["id"], MARKER);
+        assert_eq!(s["commit_state"], "COMMITTED");
+        assert_eq!(s["isolation"]["worker"]["contained_in_server_cgroup"], true);
+        assert_eq!(s["isolation"]["worker"]["seccomp"], "2");
+    }
+    // Even an authorized administration directory must actually belong to this checkout.
+    let admin = std::fs::read_to_string(linked.join(".git")).unwrap();
+    let backlink = Path::new(admin.trim().strip_prefix("gitdir: ").unwrap()).join("gitdir");
+    let old = std::fs::read(&backlink).unwrap();
+    std::fs::write(&backlink, main.join(".git").as_os_str().as_encoded_bytes()).unwrap();
+    let before = w.counts();
+    assert_refused(&m.ingest(&linked), "unsupported_repository");
+    assert_eq!(w.counts(), before);
+    std::fs::write(backlink, old).unwrap();
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            &p(&enclosure.join("detached")),
+            &head,
+        ],
+    );
+    let r = m.ingest(&main);
+    assert_eq!(
+        r["structuredContent"]["head"]["commit"],
+        w.head(&main),
+        "{r}"
+    );
+    m.finish();
+
+    // A real local promisor clone contains commit and trees, but no blobs before checkout.
+    git(&source, &["config", "uploadpack.allowFilter", "true"]);
+    let partial = enclosure.join("partial");
+    let url = format!("file://{}", source.display());
+    git(
+        &enclosure,
+        &[
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--filter=blob:none",
+            &url,
+            &p(&partial),
+        ],
+    );
+    std::fs::write(partial.join(".git/mindspace-repository-id"), MARKER).unwrap();
+    let blob = git(&source, &["rev-parse", "HEAD:src/lib.rs"]);
+    assert!(!Command::new(GIT)
+        .arg("-C")
+        .arg(&partial)
+        .args(["--no-lazy-fetch", "cat-file", "-e", blob.trim()])
+        .env_clear()
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // A two-level chain makes the missing objects available locally.
+    std::fs::create_dir_all(pool.join("info")).unwrap();
+    let alt = partial.join(".git/objects/info/alternates");
+    std::fs::write(&alt, "../../../pool\n").unwrap();
+    std::fs::write(pool.join("info/alternates"), "../source/.git/objects\n").unwrap();
+    let detached = enclosure.join("detached");
+    let mut m = mcp!(w, &[&enclosure, &partial, &detached], OPT_IN, &[]);
+    let r = m.ingest(&detached);
+    assert_eq!(r["structuredContent"]["head"]["commit"], head, "{r}");
+    assert!(r["structuredContent"]["head"]["symbolic_ref"].is_null());
+    assert_eq!(
+        m.ingest(&partial)["structuredContent"]["commit_state"],
+        "COMMITTED"
+    );
+    let outside = w.root.join("outside.git");
+    git(
+        &w.root,
+        &["clone", "--bare", "-q", &p(&source), &p(&outside)],
+    );
+    let before = w.counts();
+    let rev = w.revisions();
+    for (file, value) in [
+        (&pool.join("info/alternates"), "../pool\n".to_owned()),
+        (&pool.join("info/alternates"), p(&outside.join("objects"))),
+    ] {
+        std::fs::write(file, value).unwrap();
+        assert_refused(&m.ingest(&partial), "unsupported_repository");
+    }
+    std::fs::write(pool.join("info/alternates"), "../source/.git/objects\n").unwrap();
+    std::fs::write(
+        pool.join("info/http-alternates"),
+        "https://example.invalid/objects\n",
+    )
+    .unwrap();
+    assert_refused(&m.ingest(&partial), "unsupported_repository");
+    std::fs::remove_file(pool.join("info/http-alternates")).unwrap();
+    // Finite acyclic chains must also respect the discovery depth bound.
+    for n in 0..6 {
+        let dir = enclosure.join(format!("depth-{n}"));
+        std::fs::create_dir_all(dir.join("info")).unwrap();
+        std::fs::write(
+            dir.join("info/alternates"),
+            if n == 5 {
+                "../source/.git/objects".into()
+            } else {
+                format!("../depth-{}", n + 1)
+            },
+        )
+        .unwrap();
+    }
+    std::fs::write(&alt, "../../../depth-0\n").unwrap();
+    let too_deep = m.ingest(&partial);
+    assert_refused(&too_deep, "too_large");
+    // Leave a valid alternate chain with no blobs. This failure occurs inside a worker
+    // that received a projection, after the broker finished validating the layout.
+    std::fs::write(&alt, "../../../pool\n").unwrap();
+    std::fs::remove_file(pool.join("info/alternates")).unwrap();
+    let r = m.ingest(&partial);
+    assert_eq!(r["isError"], true, "{r}");
+    assert_eq!(r["structuredContent"]["persisted"], false, "{r}");
+    assert_eq!(w.counts(), before);
+    assert_eq!(w.revisions(), rev);
+    assert!(!Command::new(GIT)
+        .arg("-C")
+        .arg(&partial)
+        .args(["--no-lazy-fetch", "cat-file", "-e", blob.trim()])
+        .env_clear()
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let parent = w.root.join("runtime/mindspace-canary");
+    let sessions: Vec<_> = std::fs::read_dir(&parent)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        std::fs::read_dir(&sessions[0]).unwrap().count(),
+        0,
+        "failed worker left projection metadata"
+    );
+    std::fs::write(pool.join("info/alternates"), "../source/.git/objects\n").unwrap();
+    m.finish();
+
+    // A nested read-only grant on the supplemental pack directory overrides the enclosing rw root.
+    std::fs::write(&alt, "../../../pool\n").unwrap();
+    let read_only = PathBuf::from(format!("{}:ro", source.join(".git/objects/pack").display()));
+    let mut m = mcp!(w, &[&enclosure, &partial, &read_only], OPT_IN, &[]);
+    assert_refused(&m.ingest(&partial), "unsupported_repository");
+    assert_eq!(w.counts(), before);
+    m.finish();
+}
+
+#[test]
+fn required_head_commit_tree_and_blob_must_be_present_locally() {
+    let w = World::new();
+    let repo = w.repo("local");
+    let mut m = mcp!(w, &[&repo], OPT_IN, &[]);
+    let before = w.counts();
+    for rev in ["HEAD:src/lib.rs", "HEAD^{tree}", "HEAD"] {
+        let out = Command::new(GIT)
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", rev])
+            .env_clear()
+            .output()
+            .unwrap();
+        let hex = String::from_utf8(out.stdout).unwrap();
+        let oid = hex.trim();
+        let file = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        let held = w.root.join("held-object");
+        std::fs::rename(&file, &held).unwrap();
+        let result = m.ingest(&repo);
+        assert_eq!(result["isError"], true, "{rev}: {result}");
+        assert_eq!(result["structuredContent"]["persisted"], false);
+        assert_eq!(w.counts(), before);
+        std::fs::rename(held, file).unwrap();
+    }
+    assert_eq!(
+        m.ingest(&repo)["structuredContent"]["commit_state"],
+        "COMMITTED"
+    );
+    m.finish();
 }

@@ -896,3 +896,83 @@ fn memory_create_refuses_unknown_spaces_empty_content_and_a_missing_space() {
     let (_, err, ok) = mind.run(&["memory", "create", "x"]);
     assert!(!ok && err.contains("--space"), "{err}");
 }
+
+#[test]
+fn detail_history_and_conflict_output_is_safe_and_json_preserves_stored_text() {
+    use mindspace::core::{ManualMemoryDraft, Ts};
+    use mindspace::storage::Store;
+
+    let mind = Mind::new();
+    let store = mindspace::SqliteStore::open(&mind.db.path().join("mind.db")).unwrap();
+    let space_name = "notes\x1b";
+    let subject = "grüße\x1b";
+    let content = "first line\x1b\nsecond line\x1b";
+    let reason = "withdrawn\x1b";
+    let space = store.create_space(space_name, "").unwrap();
+    let write = |body: &str| {
+        store
+            .record_manual_write(ManualMemoryDraft {
+                subject: Some(subject.to_string()),
+                content: body.to_string(),
+                spaces: vec![space.id],
+                supersedes: None,
+            })
+            .unwrap()
+            .memory_id
+    };
+    let id = write(content);
+    write("different content");
+
+    let human_and_json = |args: &[&str]| {
+        let (out, err, ok) = mind.run(args);
+        assert!(ok, "{err}");
+        assert_terminal_safe(&out);
+        let mut args = args.to_vec();
+        args.push("--json");
+        let (json, err, ok) = mind.run(&args);
+        assert!(ok, "{err}");
+        (
+            out,
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        )
+    };
+
+    let (out, groups) = human_and_json(&["conflicts"]);
+    assert!(out.contains("notes? / \"grüße?\""));
+    assert_eq!(groups[0]["space_name"], space_name);
+    assert_eq!(groups[0]["subject"], subject);
+    assert_eq!(groups[0]["members"][0]["subject"], subject);
+
+    store
+        .retire_memory(id, Some(reason.into()), Ts::now())
+        .unwrap();
+    let id = id.to_string();
+    for command in ["inspect", "trace"] {
+        let (out, detail) = human_and_json(&[command, &id]);
+        assert!(out.contains("grüße?"));
+        assert!(out.contains("notes?"));
+        assert!(out.contains("first line?"));
+        if command == "inspect" {
+            assert!(out.contains("  first line?\n  second line?"));
+            assert!(out.contains("withdrawn?"));
+        }
+        assert_eq!(detail["assertion"]["subject"], subject);
+        assert_eq!(detail["assertion"]["content"], content);
+        assert_eq!(detail["memory"]["retire_reason"], reason);
+        assert_eq!(detail["spaces"][0]["name"], space_name);
+    }
+
+    let (out, history) = human_and_json(&["history", subject]);
+    assert!(out.contains("grüße?"));
+    assert!(out.contains("first line?"));
+    assert!(out.contains("withdrawn?"));
+    let retired = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["memory_id"] == id)
+        .unwrap();
+    assert_eq!(retired["subject"], subject);
+    assert_eq!(retired["content"], content);
+    assert_eq!(retired["retire_reason"], reason);
+}

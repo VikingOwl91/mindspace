@@ -539,25 +539,28 @@ fn a_real_result_validates_and_a_tampered_one_is_rejected() {
         &limits,
         "session root",
     );
-    // size limits
-    reject(
-        &files,
-        Some(&root),
-        &ExtractionLimits {
-            max_files: 1,
-            ..limits
-        },
-        "file count",
-    );
-    reject(
-        &files,
-        Some(&root),
-        &ExtractionLimits {
-            max_content_bytes: 10,
-            ..limits
-        },
-        "content bytes",
-    );
+    // Size budgets carry the type assigned by the validating component.
+    for (limits, kind) in [
+        (
+            ExtractionLimits {
+                max_files: 1,
+                ..limits
+            },
+            mindspace::core::RefusalKind::TooManyFiles,
+        ),
+        (
+            ExtractionLimits {
+                max_content_bytes: 10,
+                ..limits
+            },
+            mindspace::core::RefusalKind::TooLarge,
+        ),
+    ] {
+        let error = files
+            .validate(Some(&root), &limits)
+            .expect_err("budget exceeded");
+        assert_eq!(error.refusal_kind(), Some(kind));
+    }
     // code inputs
     let mut x = files.clone();
     if let Extracted::Files(f) = &mut x {

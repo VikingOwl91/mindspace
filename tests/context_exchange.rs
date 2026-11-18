@@ -916,7 +916,14 @@ mod fake_workers {
                 MAX_MANIFEST_LINE + 1024
             ),
         );
-        context_err(run(&c), "too long");
+        let assert_limit = |result, expected, detail: &str| match result {
+            Err(WorkerError::Extraction(refusal)) => {
+                assert_eq!(refusal.kind, expected);
+                assert!(refusal.detail.contains(detail), "{refusal}");
+            }
+            other => panic!("expected a typed manifest limit, got {other:?}"),
+        };
+        assert_limit(run(&c), mindspace::core::RefusalKind::TooLarge, "too long");
         // within the line limit but more entries than any directory can have
         let n = mindspace::worker::context::MAX_MANIFEST_ENTRIES + 1;
         let entry = format!(r#"{{"language":"rust","hash":"{}"}}"#, "cc".repeat(32));
@@ -938,7 +945,11 @@ mod fake_workers {
             out
         };
         assert!(body.len() < MAX_MANIFEST_LINE, "{}", body.len());
-        context_err(run(&manifest(t.path(), &body)), "manifest entries");
+        assert_limit(
+            run(&manifest(t.path(), &body)),
+            mindspace::core::RefusalKind::TooManyFiles,
+            "manifest entries",
+        );
     }
 
     #[test]

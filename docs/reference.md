@@ -68,7 +68,11 @@ query with zero hits means that no indexed declaration matched its filters.
 `mind scan --json` and `repo_outline` report counts of observed unsupported file
 extensions per directory. Directory scans honor ignore rules; Git scans outline
 HEAD. Ingest reports count submitted code inputs by language, including reused
-and policy-skipped inputs. Policy skips and recovered parses can affect results.
+and policy-skipped inputs. Their `code.unsupported_extensions` counts selected
+regular files excluded by format, including when the selected directory contains
+only unsupported files. Ordinary Git counts each selected (tip, path); the
+isolated Git tool derives whole-HEAD counts from its verified tree. Outlines and
+ingest reports group unrecognized and extensionless names under `other`. Policy skips and recovered parses can affect results.
 
 ## Client registration
 

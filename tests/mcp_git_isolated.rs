@@ -760,6 +760,7 @@ fn head_only_ingestion_reports_what_was_verified_and_what_was_not_and_repeats_wi
     };
     g(&["branch", "side"]);
     std::fs::write(repo.join("src/more.rs"), "pub fn more() {}\n").unwrap();
+    std::fs::write(repo.join("src/other.py"), "def omitted(): pass").unwrap();
     for name in ["shared.js", "shared.ts"] {
         std::fs::write(
             repo.join("src").join(name),
@@ -786,6 +787,10 @@ fn head_only_ingestion_reports_what_was_verified_and_what_was_not_and_repeats_wi
     assert_eq!(s["persisted_revision"].as_i64().unwrap(), w.revisions());
     assert!(s["counts"]["objects_new"].as_u64().unwrap() > 0);
     assert!(s["counts"]["code"]["parsed"].as_u64().unwrap() >= 3, "{s}");
+    assert_eq!(
+        s["counts"]["code"]["unsupported_extensions"],
+        json!({"py":1})
+    );
     // the result keeps the two claims apart
     let v = &s["verification"];
     assert!(v["internally_verified"]

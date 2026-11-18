@@ -361,6 +361,7 @@ pub fn run(
             "code": {
                 "supported_inputs": report.code.supported_inputs,
                 "inputs_by_language": report.code.inputs_by_language,
+                "unsupported_extensions": report.code.unsupported_extensions,
                 "parsed": report.code.parsed,
                 "reused": report.code.reused,
                 "entities": report.code.entities,

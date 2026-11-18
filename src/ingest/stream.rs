@@ -266,6 +266,11 @@ pub enum Record {
         reused: bool,
     },
     // ---- both
+    /// Selected regular paths skipped before opening their contents. Verified HEAD
+    /// computes these counts from the authenticated tree at the receiver.
+    UnsupportedExtensions {
+        counts: super::outline::ExtensionCounts,
+    },
     Chunk {
         data: String,
     },
@@ -288,6 +293,7 @@ impl Record {
     fn name(&self) -> &'static str {
         match self {
             Record::Begin { .. } => "begin",
+            Record::UnsupportedExtensions { .. } => "unsupported_extensions",
             Record::FilesHeader { .. } => "files_header",
             Record::File { .. } => "file",
             Record::GitHeader { .. } => "git_header",
@@ -619,6 +625,16 @@ fn emit_parts<T: Serialize>(
     }
 }
 
+fn emit_unsupported(
+    sink: &mut dyn RecordSink,
+    counts: super::outline::ExtensionCounts,
+) -> Result<()> {
+    if !counts.is_empty() {
+        sink.emit(&Record::UnsupportedExtensions { counts })?;
+    }
+    Ok(())
+}
+
 fn emit_file(sink: &mut dyn RecordSink, mut file: ObservedFile) -> Result<()> {
     let content = std::mem::take(&mut file.content);
     let (ev, asr, mem) = (
@@ -723,11 +739,9 @@ pub fn stream_directory(
         spaces: space_ids.to_vec(),
     })?;
     let base = anchor.proc_path();
-    let mut paths: Vec<std::path::PathBuf> = outline::walk_files(&base)?
-        .into_iter()
-        .filter(|p| super::is_ingestable(p))
-        .collect();
-    paths.sort();
+    let mut unsupported = Default::default();
+    let paths = outline::ingest_paths(&base, &mut unsupported)?;
+    emit_unsupported(sink, unsupported)?;
     for path in paths {
         deadline.check("reading files")?;
         let rel = path
@@ -927,6 +941,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     }
 
     // ---- which blobs are derived, at which commit and path
+    let mut unsupported = Default::default();
     let mut keys: Vec<(String, String, String)> = Vec::new(); // (commit, path, blob)
     for commit in &tip_commits {
         deadline.check("listing files")?;
@@ -937,12 +952,14 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             if !selection.matches(&path) {
                 continue;
             }
-            if !is_ingestable(Path::new(&path)) && code::language_for(Path::new(&path)).is_none() {
+            if !is_ingestable(Path::new(&path)) {
+                super::outline::count_unsupported(&mut unsupported, Path::new(&path));
                 continue;
             }
             keys.push((commit.clone(), path, oid));
         }
     }
+    emit_unsupported(sink, unsupported)?;
     keys.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     let mut by_blob: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (commit, path, blob) in keys {
@@ -1543,6 +1560,7 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 session: f.observation.session,
                 spaces: f.observation.spaces,
             })?;
+            emit_unsupported(sink, f.unsupported_extensions)?;
             let mut code: HashMap<String, CodeInputDraft> = f
                 .code_inputs
                 .into_iter()
@@ -1565,6 +1583,7 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 repository_path: o.repository_path,
                 spaces: o.spaces,
             })?;
+            emit_unsupported(sink, g.unsupported_extensions)?;
             for item in o.refs {
                 sink.emit(&Record::Ref { item })?;
             }
@@ -1926,6 +1945,7 @@ struct Assembler<'a> {
     session: Option<SessionDraft>,
     spaces: Vec<Uuid>,
     files: Vec<ObservedFile>,
+    unsupported_extensions: Option<super::outline::ExtensionCounts>,
     repository_id: Option<Uuid>,
     repository_path: String,
     refs: Vec<GitRefObservation>,
@@ -1971,6 +1991,7 @@ impl<'a> Assembler<'a> {
             session: None,
             spaces: Vec::new(),
             files: Vec::new(),
+            unsupported_extensions: None,
             repository_id: None,
             repository_path: String::new(),
             refs: Vec::new(),
@@ -2159,6 +2180,22 @@ impl<'a> Assembler<'a> {
                     ));
                 }
                 self.phase = Phase::Begun;
+            }
+            Record::UnsupportedExtensions { counts } => {
+                if self.expect == Kind::GitVerified
+                    || self.session.is_none()
+                    || self.unsupported_extensions.is_some()
+                {
+                    return bad("unexpected unsupported extension counts");
+                }
+                if counts.is_empty()
+                    || counts.iter().any(|(key, n)| {
+                        *n == 0 || !super::outline::COVERAGE_EXTENSIONS.contains(&key.as_str())
+                    })
+                {
+                    return bad("invalid unsupported extension counts");
+                }
+                self.unsupported_extensions = Some(counts);
             }
             Record::FilesHeader { session, spaces } => {
                 if self.expect != Kind::Files || self.phase != Phase::Begun {
@@ -2461,7 +2498,9 @@ impl<'a> Assembler<'a> {
                     return bad("a `code_input` record must not carry content or parts");
                 }
                 for c in &input.contexts {
-                    if super::code::language_for(Path::new(&c.path)) != Some(input.language) {
+                    if self.expect != Kind::GitVerified
+                        && super::code::language_for(Path::new(&c.path)) != Some(input.language)
+                    {
                         return bad("a code context path does not match its language");
                     }
                     if c.path.len() > self.limits.extraction.max_path_bytes || c.path.contains('\0')
@@ -2666,6 +2705,7 @@ impl<'a> Assembler<'a> {
         }
         Ok(match self.expect {
             Kind::Files => Extracted::Files(ExtractedFiles {
+                unsupported_extensions: self.unsupported_extensions.unwrap_or_default(),
                 observation: IngestObservation {
                     session,
                     files: self.files,
@@ -2680,6 +2720,7 @@ impl<'a> Assembler<'a> {
                 self.derivations
                     .sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
                 Extracted::Git(ExtractedGit {
+                    unsupported_extensions: self.unsupported_extensions.unwrap_or_default(),
                     observation: GitObservation {
                         session,
                         repository_id: self.repository_id.unwrap_or_default(),
@@ -2720,11 +2761,18 @@ impl<'a> Assembler<'a> {
         };
         let v = verify_head(&head_oid, &self.raw_objects, &self.limits.verify)?;
         let head_commit = v.commit.oid.clone();
+        let mut unsupported_extensions = Default::default();
 
         // blob ids named by the verified trees, and the paths each one is at
         let mut tree_blobs: HashMap<&str, &str> = HashMap::new(); // oid -> any path
         let mut at_path: HashMap<&str, (&str, GitObjectKind)> = HashMap::new(); // path -> (oid, kind)
         for f in &v.files {
+            if f.kind == GitObjectKind::Blob
+                && f.mode != "120000"
+                && !super::is_ingestable(Path::new(&f.path))
+            {
+                super::outline::count_unsupported(&mut unsupported_extensions, Path::new(&f.path));
+            }
             at_path.insert(&f.path, (&f.oid, f.kind));
             if f.kind == GitObjectKind::Blob {
                 tree_blobs.insert(&f.oid, &f.path);
@@ -2817,6 +2865,9 @@ impl<'a> Assembler<'a> {
                     ))
                     }
                 }
+                if super::code::language_for(Path::new(&ctx.path)) != Some(c.language) {
+                    return bad("a code context path does not match its language");
+                }
             }
         }
 
@@ -2833,6 +2884,7 @@ impl<'a> Assembler<'a> {
             symbolic_target: symbolic,
         }];
         let extracted = Extracted::Git(ExtractedGit {
+            unsupported_extensions,
             observation: GitObservation {
                 session,
                 repository_id: self.repository_id.unwrap_or_default(),

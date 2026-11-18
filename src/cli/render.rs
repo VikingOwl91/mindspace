@@ -178,6 +178,15 @@ pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
 }
 
 fn code_coverage(code: &crate::core::CodeObservationReport) {
+    if !code.unsupported_extensions.is_empty() {
+        let extensions = code
+            .unsupported_extensions
+            .iter()
+            .map(|(ext, count)| format!("{ext}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("unsupported file extensions: {extensions}");
+    }
     if !code.inputs_by_language.is_empty() {
         let counts = code
             .inputs_by_language

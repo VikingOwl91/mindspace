@@ -211,12 +211,31 @@ fn outline_then_scoped_ingest_then_search() {
     assert!(dirs.contains(&"docs") && dirs.contains(&"src") && dirs.contains(&"other"));
 
     assert_eq!(nodes[0]["unsupported_extensions"]["py"], 1);
+    std::fs::create_dir(root.join("unsupported")).unwrap();
+    std::fs::write(root.join("unsupported/only.rb"), "def only; end").unwrap();
+    let only = s.call(
+        "repo_ingest",
+        json!({"path":p,"spaces":["p"],"paths":["unsupported"]}),
+    );
+    assert_eq!(only["isError"], false, "{}", text(&only));
+    assert_eq!(
+        only["structuredContent"]["ingested"][0]["code"]["unsupported_extensions"],
+        json!({"rb":1})
+    );
+
     // Ingest only docs and src (what the outline pointed at).
     let r = s.call(
         "repo_ingest",
         json!({"path": p, "spaces": ["p"], "paths": ["docs", "src"]}),
     );
     assert_eq!(r["isError"], false, "{}", text(&r));
+    let observed: Vec<_> = r["structuredContent"]["ingested"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["code"]["unsupported_extensions"]["py"].as_u64())
+        .collect();
+    assert_eq!(observed, [1]);
     let found = s.call("memory_search", json!({"query": "guidemarker"}));
     assert_eq!(
         found["structuredContent"]["hits"].as_array().unwrap().len(),

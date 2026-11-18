@@ -225,6 +225,59 @@ fn language_specific_definitions_keep_their_path_and_blob_across_ingests() {
 }
 
 #[test]
+fn selected_unsupported_only_and_mixed_inputs_report_observed_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("unknown")).unwrap();
+    for (p, text) in [
+        ("unknown/first.py", "def first(): pass"),
+        ("unknown/second.PY", "def second(): pass"),
+        ("unknown/record.private-suffix", "opaque"),
+        ("outside.rb", "def outside; end"),
+        ("known.go", "package pkg\nfunc Known() {}"),
+    ] {
+        std::fs::write(root.join(p), text).unwrap();
+    }
+    for git_repo in [false, true] {
+        let m = Mind::new();
+        if git_repo {
+            git(root, &["init", "-q", "-b", "main"]);
+            git(root, &["add", "."]);
+            git(root, &["commit", "-qm", "file types"]);
+        }
+        let args = ["ingest", root.to_str().unwrap(), "--space", "p"];
+        let read = |extra: &[&str]| {
+            let mut a = args.to_vec();
+            a.extend_from_slice(extra);
+            let (out, err, ok) = m.run(&a);
+            assert!(ok, "{err}");
+            out
+        };
+        let selected: serde_json::Value =
+            serde_json::from_str(&read(&["--path", "unknown", "--json"])).unwrap();
+        assert_eq!(
+            selected["code"]["unsupported_extensions"],
+            serde_json::json!({"py":2,"other":1})
+        );
+        assert_eq!(selected["code"]["supported_inputs"], 0);
+        let human = read(&["--path", "unknown"]);
+        assert!(
+            human.contains("unsupported file extensions: other=1 py=2"),
+            "{human}"
+        );
+        let mixed: serde_json::Value = serde_json::from_str(&read(&["--json"])).unwrap();
+        assert_eq!(
+            mixed["code"]["unsupported_extensions"],
+            serde_json::json!({"py":2,"other":1,"rb":1})
+        );
+        assert_eq!(
+            mixed["code"]["inputs_by_language"],
+            serde_json::json!({"go":1})
+        );
+    }
+}
+
+#[test]
 fn file_edits_make_old_definitions_not_current() {
     let m = Mind::new();
     let dir = tempfile::tempdir().unwrap();

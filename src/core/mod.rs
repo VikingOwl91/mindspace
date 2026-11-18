@@ -1302,6 +1302,10 @@ pub struct CodeObservation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CodeObservationReport {
     pub supported_inputs: u64,
+    /// Selected regular paths with unsupported extensions, counted once per observed Git tip/path.
+    /// Unrecognized suffixes and extensionless files share the bounded "other" bucket.
+    #[serde(default)]
+    pub unsupported_extensions: std::collections::BTreeMap<String, u64>,
     /// Code inputs submitted by this observation, including policy skips and reuse.
     #[serde(default)]
     pub inputs_by_language: std::collections::BTreeMap<String, u64>,

@@ -15,7 +15,7 @@ pub mod repo_info;
 pub mod stream;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::core::{
     normalize_subject, sha256_hex, AssertionDraft, Error, EvidenceDraft, GitDerivedFile,
@@ -126,11 +126,17 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
     // Spaces must pre-exist; the first missing one fails the ingest.
     let space_ids = resolve_spaces_with(ctx, space_names)?;
 
+    let mut unsupported_extensions = Default::default();
     let (root, scope, files) = if metadata.is_dir() {
         (
             canonical.display().to_string(),
             IngestScope::Directory,
-            observe_directory(&canonical, &space_ids, deadline)?,
+            observe_directory(
+                &canonical,
+                &space_ids,
+                deadline,
+                &mut unsupported_extensions,
+            )?,
         )
     } else {
         let file = observe_file(&canonical, &space_ids)?;
@@ -141,7 +147,16 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
         )
     };
 
-    prepare_observed_files(ctx, root, scope, files, space_ids, deadline).map(Extracted::Files)
+    prepare_observed_files(
+        ctx,
+        root,
+        scope,
+        files,
+        space_ids,
+        deadline,
+        unsupported_extensions,
+    )
+    .map(Extracted::Files)
 }
 
 /// The code input of one observed file: `None` for files that are not source code.
@@ -298,6 +313,7 @@ pub(crate) fn prepare_observed_files(
     files: Vec<ObservedFile>,
     space_ids: Vec<Uuid>,
     deadline: &Deadline,
+    unsupported_extensions: outline::ExtensionCounts,
 ) -> Result<ExtractedFiles> {
     let mut code_inputs = Vec::new();
     for f in &files {
@@ -315,6 +331,7 @@ pub(crate) fn prepare_observed_files(
         spaces: space_ids.clone(),
     };
     Ok(ExtractedFiles {
+        unsupported_extensions,
         observation,
         code_inputs,
         reused: Default::default(),
@@ -725,6 +742,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
     }
 
     // Text paths at each tip, then blob contents in one batch.
+    let mut unsupported_extensions = Default::default();
     let mut tip_files: Vec<(String, Vec<(String, String)>)> = Vec::new();
     let mut text_blob_oids: BTreeSet<String> = BTreeSet::new();
     for commit in &tip_commits {
@@ -738,7 +756,8 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
             if !selection.matches(&path) {
                 continue;
             }
-            if !is_ingestable(Path::new(&path)) && code::language_for(Path::new(&path)).is_none() {
+            if !is_ingestable(Path::new(&path)) {
+                outline::count_unsupported(&mut unsupported_extensions, Path::new(&path));
                 continue;
             }
             text_blob_oids.insert(oid.clone());
@@ -924,6 +943,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
             .then(|| tip_commits.iter().cloned().collect()),
     };
     Ok(ExtractedGit {
+        unsupported_extensions,
         observation,
         code_inputs,
         reused: Default::default(),
@@ -992,12 +1012,9 @@ fn observe_directory(
     root: &Path,
     space_ids: &[Uuid],
     deadline: &Deadline,
+    unsupported_extensions: &mut outline::ExtensionCounts,
 ) -> Result<Vec<ObservedFile>> {
-    let mut paths: Vec<PathBuf> = outline::walk_files(root)?
-        .into_iter()
-        .filter(|p| is_ingestable(p))
-        .collect();
-    paths.sort();
+    let paths = outline::ingest_paths(root, unsupported_extensions)?;
     paths
         .iter()
         .map(|p| {

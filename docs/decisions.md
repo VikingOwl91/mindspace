@@ -826,6 +826,12 @@ residual risk described there remains.
 is synchronous, so a long ingest can outlive a client's tool timeout, and a
 hung git (the original deadlock) stalled without any message.
 
+**Development update (MIND-9, 2026-11-18).** The single-transaction Git and
+file writers now check the operator deadline between work items and again after
+the authorization hook, immediately before COMMIT. The historical measurements
+and preparation-only design below describe the earlier implementation.
+See the [current timeout and retry semantics](reference.md#repository-ingest-deadlines-in-the-development-checkout).
+
 Decision: `mind mcp --ingest-timeout <SECONDS>` (also
 `MINDSPACE_MCP_INGEST_TIMEOUT`, default 30, accepted range 0.001 to 3600;
 zero, negative, non-finite and out-of-range values stop the server at startup).

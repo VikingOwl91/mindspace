@@ -18,6 +18,7 @@ docs/architecture.md
 docs/decisions.md
 docs/doctor.md
 docs/grants.md
+docs/ingest-performance.md
 docs/memory-model.md
 docs/offline-recovery.md
 docs/reference.md

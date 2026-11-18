@@ -1,10 +1,13 @@
-# Source archive third-party notices
+# Third-party notices
 
-These notices are retained from the qualified RC.5 archive. The tokenizer fixture
-is in that archive; this documentation-only update does not add it to public main.
-The original notice follows.
+## Document preview corpus
 
-# Third-party tokenizer fixture
+The preview tests reference PLOS ONE articles by Makovski et al. (2008) and
+Fitzhugh et al. (2019). The corpus records their authors, publisher URLs,
+Creative Commons Attribution licenses, and the revisions used for testing.
+[Corpus sources and permissions](https://github.com/VikingOwl91/mindspace/blob/main/docs/experiments/m8/document-corpus/README.md#sources-and-permissions)
+
+## Third-party tokenizer fixture
 
 Mindspace's MIT license applies to Mindspace-authored source code. The separately sourced fixture `tests/fixtures/nomic-tokenizer.json` is provided under Apache License, Version 2.0; see `LICENSES/Apache-2.0.txt`.
 

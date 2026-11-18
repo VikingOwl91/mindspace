@@ -11,6 +11,7 @@ walk-through, including a memory written by a client, use the
 | Verify the source archive or build it manually | [Source installation](source-install.md) |
 | Connect an agent or undo registration | [Client setup](setup.md) |
 | Search memories, inspect code, or handle ingest refusals | [CLI and MCP reference](reference.md) |
+| Find a section in a PDF or DOCX, compare paper cohorts, or look up a bestiary entry | [Document preview from a checkout](https://github.com/VikingOwl91/mindspace/blob/main/docs/document-preview.md) |
 | Understand storage, provenance, and confinement | [Architecture](architecture.md) and [memory model](memory-model.md) |
 | Back up or restore a trusted database | [Offline recovery](offline-recovery.md) |
 | See what has landed since the release and what comes next | [Development roadmap](roadmap.md) |

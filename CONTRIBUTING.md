@@ -24,6 +24,19 @@ sh tests/scripts/install_sh_test.sh                   # release installer, no bu
 shellcheck -s sh install.sh                           # POSIX shell lint of the installer
 ```
 
+For document preview changes, run these commands from the repository root with
+Python 3, Poppler, and curl. The first two commands prepare the public papers
+used by CI. Later runs can reuse the verified copies offline. With the cache
+variable unset, the suites run the original fixtures and skip publisher-paper
+checks.
+
+```sh
+export MINDSPACE_PREVIEW_PAPERS="${XDG_CACHE_HOME:-$HOME/.cache}/mindspace/preview-papers"
+python3 -B docs/experiments/m8/document-corpus/fetch_papers.py "$MINDSPACE_PREVIEW_PAPERS"
+python3 -B -m unittest scripts.document_preview.test_formats scripts.document_preview.test_query scripts.document_preview.test_bestiary_fields scripts.document_preview.test_sections scripts.document_preview.test_cohorts
+python3 -B tests/scripts/test_document_preview.py
+```
+
 Linux is the only tested platform. CI sets `MINDSPACE_STRICT_TESTS=1` on both full
 suites. A missing runtime prerequisite fails the test. Local runs print the test name
 and missing prerequisite on stderr. Broker tests require a writable delegated cgroup v2

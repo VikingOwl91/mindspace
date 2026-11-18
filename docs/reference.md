@@ -40,6 +40,10 @@ Use `--subject` to set its subject or `-` to read from standard input.
 Repeating a creation only adds missing spaces. MCP also supports updating a
 memory. To retire it from the CLI, run `mind retire <memory-id>`.
 
+For a trusted PDF or DOCX, the development checkout provides a separate
+read-only Python command. It prints cited answers without opening the database.
+[Document preview quickstart](../README.md#preview-a-document)
+
 ## Repository ingest on main
 
 Git, directory and single-file ingestion accept UTF-8 text up to and including

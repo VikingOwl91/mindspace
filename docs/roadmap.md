@@ -2,8 +2,8 @@
 
 The published Linux x86_64 release, v0.1.0-alpha.2, includes explicit memories,
 Markdown and text ingestion, committed Git content, lexical search and Rust
-definitions. Install the signed archive for that profile. The changes below
-are available by building `main`. [Release notes](release-notes.md) · [Build from a checkout](../README.md#build-from-a-checkout)
+definitions. The sections below describe the current `main` checkout.
+[Release notes](release-notes.md) · [Build from a checkout](../README.md#build-from-a-checkout)
 
 ## Repository ingest on main
 
@@ -19,6 +19,16 @@ are available by building `main`. [Release notes](release-notes.md) · [Build fr
 The [CLI and MCP reference](reference.md) covers the commands and their limits.
 The [benchmark](ingest-performance.md) includes the fixture, measurement method
 and individual phase timings.
+
+## Document preview
+
+The offline preview reads trusted DOCX and PDF files independently of the
+database. Section lookup returns heading paths and cited text, including
+candidates when a heading repeats. The paper profile distinguishes enrollment
+from analysis counts for a numbered experiment. The bestiary profile follows
+supported defense rows across columns and pages. The tests use a project-authored
+handbook and bestiary plus two public papers fetched from the publisher.
+[Preview commands and limits](https://github.com/VikingOwl91/mindspace/blob/main/docs/document-preview.md)
 
 ## Open work
 

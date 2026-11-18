@@ -1,10 +1,11 @@
 # Mindspace
 
-Mindspace gives coding agents a local memory they can use across sessions. Save
-a decision, index a Git checkout, then search for a note or a code definition
-and inspect where it came from. The `mind` CLI and the stdio Model Context
-Protocol (MCP) server use the same SQLite database. Lexical search works
-without a model, an account, or a daemon.
+Mindspace gives coding agents a local memory across sessions. Save a decision,
+index a Git checkout, then search for a note or code definition and inspect
+its source. The `mind` CLI and stdio Model Context Protocol (MCP) server share
+a SQLite database. Lexical search runs locally without a model or an account.
+The [document preview](#preview-a-document) also answers cited questions about
+papers and manuals from a checkout.
 
 ## Install
 
@@ -24,9 +25,8 @@ Use the binary path the installer prints, or add its directory to your shell's
 ### Build from a checkout
 
 Build `main` for Go, JavaScript/JSX, TypeScript/TSX and inline Svelte symbol
-search, linked-worktree ingest improvements, and ingest deadlines. This
-model-free build uses the locked dependencies. Development pins Rust 1.100.0
-and CI also checks the minimum supported toolchain, Rust 1.96.0.
+search, linked-worktree ingest, and ingest deadlines. This command builds the
+model-free CLI with the project's pinned Rust toolchain and locked dependencies.
 
 ```sh
 git clone https://github.com/VikingOwl91/mindspace
@@ -66,6 +66,23 @@ For your own database, run `mind init` without `--db`. The CLI and agent use
 `$XDG_DATA_HOME/mindspace/` (normally `~/.local/share/mindspace/mind.db`).
 Keep the database outside any repository you share with an agent.
 
+## Preview a document
+
+From a Linux checkout, query a trusted PDF or DOCX and get JSON with citations
+to the exact file revision. The preview runs offline with Python 3. PDFs also
+need Poppler's `pdfinfo`, `pdftotext`, and `pdfimages`. You can run it before
+building Mindspace or creating a database.
+
+```sh
+python3 -B scripts/document_preview/cli.py docs/experiments/m8/document-corpus/procedure.docx section "Hill station > Equipment"
+```
+
+The example handbook has two Equipment sections. Selecting the hill station
+returns “Pack the wind gauge.” with its heading and paragraph citations.
+For scientific papers, the `paper` profile cites enrollment and analysis
+counts separately for each experiment.
+[Preview commands, examples and limits](https://github.com/VikingOwl91/mindspace/blob/main/docs/document-preview.md)
+
 ## Connect an agent
 
 Preview registration against your own database, then apply it.
@@ -83,11 +100,9 @@ working Linux confinement. [Setup, permissions and undo](docs/setup.md) · [Manu
 
 ## Documentation
 
-- [CLI and MCP reference](docs/reference.md) for search, symbol coverage, ingest limits and failure handling.
-- [Development roadmap](docs/roadmap.md) for what has landed on `main` and what remains open.
-- [Architecture and security boundaries](docs/architecture.md#security-boundaries) for local stdio access, confinement and storage.
-- [Offline backup and recovery](docs/offline-recovery.md) before upgrading an existing database.
-- [Documentation index](docs/index.md) for operator guides, release notes and development checks.
+[CLI and MCP reference](docs/reference.md) · [Development roadmap](docs/roadmap.md) ·
+[Architecture and security boundaries](docs/architecture.md#security-boundaries) ·
+[Backup and recovery](docs/offline-recovery.md) · [All guides](docs/index.md)
 
 Report vulnerabilities through the project's private reporting channel. [Security policy](SECURITY.md)
 

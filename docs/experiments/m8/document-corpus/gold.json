@@ -1,0 +1,64 @@
+{
+  "procedure": {
+    "file": "procedure.docx",
+    "question": "How do I reset the beacon?",
+    "heading": "Reset the beacon",
+    "steps": [
+      "Disconnect the signal lead.",
+      "Hold the amber switch for five seconds.",
+      "Reconnect the signal lead after the lamp pulses twice."
+    ],
+    "location": {"part": "word/document.xml", "heading_style": "Heading1", "list_positions": [1, 2, 3]},
+    "excluded": ["Reset the clock", "Turn the silver dial to noon."]
+  },
+  "paper": {
+    "file": "paper.pdf",
+    "publisher_pdf": "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0002228&type=printable",
+    "sha256": "b5df0cd314fec5bae87b6814574572066bf71d1887c68c1ae9794425a4e2ba89",
+    "question": "How many participants took part in Experiment 2?",
+    "experiment": 2,
+    "participants": 15,
+    "group": "new participants",
+    "page": 2,
+    "column": "right",
+    "section": ["Materials and Methods", "Participants"],
+    "evidence": "fifteen new participants (mean age 20.9 years) took part in Experiment 2",
+    "excluded_counts": [12, 20.9, 27]
+  },
+  "equipment": {
+    "file": "procedure.docx",
+    "heading": "Equipment",
+    "matches": [
+      {"path": ["Harbor station", "Equipment"], "text": "Take the lead line."},
+      {"path": ["Hill station", "Equipment"], "text": "Pack the wind gauge."}
+    ]
+  },
+  "stroop": {
+    "file": "stroop.pdf",
+    "publisher_pdf": "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0210736&type=printable",
+    "sha256": "c550105965e08b766189a0fe7d454344b35ad22a6cfa94587a77f1737645bdca",
+    "experiment": 2,
+    "page": 9,
+    "methods": [
+      {"path": ["Experiment 1", "Materials and methods"], "page": 5},
+      {"path": ["Experiment 2", "Materials and methods"], "page": 9}
+    ],
+    "enrolled": {"count": 24, "evidence": "24 individuals were enrolled"},
+    "analyzed": {"count": 20, "evidence": "20 participants (11 female) were included in the subsequent analyses"}
+  },
+  "bestiary": {
+    "file": "bestiary.pdf",
+    "question": "Which creatures resist cold in Edition 2, and under what conditions?",
+    "edition": "Edition 2",
+    "field": "Damage Resistances",
+    "value": "cold",
+    "matches": [
+      {"entry": "Rime Hart", "wording": "cold", "entry_page": 1, "evidence_page": 1},
+      {"entry": "Lantern Eel", "wording": "cold only while submerged", "entry_page": 1, "evidence_page": 2}
+    ],
+    "excluded": ["Glass Jackal"],
+    "unreadable_pages": [3],
+    "exhaustive": false,
+    "total_pages": 3
+  }
+}

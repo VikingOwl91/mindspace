@@ -43,6 +43,18 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
+      - name: Check document preview against original fixtures and public papers
+        shell: bash
+        env:
+          MINDSPACE_PREVIEW_PAPERS: ${{ runner.temp }}/preview-papers
+        run: |
+          if ! command -v pdfinfo >/dev/null || ! command -v pdftotext >/dev/null || ! command -v pdfimages >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends poppler-utils
+          fi
+          python3 -B docs/experiments/m8/document-corpus/fetch_papers.py "$MINDSPACE_PREVIEW_PAPERS"
+          python3 -B -m unittest scripts.document_preview.test_formats scripts.document_preview.test_query scripts.document_preview.test_bestiary_fields scripts.document_preview.test_sections scripts.document_preview.test_cohorts
+          python3 -B tests/scripts/test_document_preview.py
       - name: Build
         run: cargo build --locked --all-targets --features spawn-gate
       - name: Clippy

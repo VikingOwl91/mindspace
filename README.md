@@ -147,7 +147,9 @@ remove the try-out database with `rm -r ~/mindspace-tryout`.
   untracked files are skipped. A large repository can take minutes.
 - `mind search` prints ranked hits. Each hit shows a snippet, its source file and
   commit, and a memory id that you can pass to `mind inspect <memory-id>`. If
-  nothing matches, it prints `no results`.
+  a plain question has no matches, lexical search retries its keywords and ranks
+  nearby terms higher. Quoted phrases and explicit FTS operators keep their
+  exact search behavior. If nothing matches, it prints `no results`.
 
 If the repository contains Rust, look up a definition by name with
 `mind --db ~/mindspace-tryout/mind.db symbols parse_config --space myproject`.

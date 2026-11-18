@@ -537,10 +537,82 @@ pub(super) fn search_on(
         p[0] = Value::Text(match_text.to_string());
         run_search_sql(conn, &sql, p)
     };
-    match run(text) {
+    let hits = match run(text) {
         Err(Error::QuerySyntax(_)) => run(&format!("\"{}\"", text.replace('"', "\"\""))),
         other => other,
+    }?;
+    if hits.is_empty() && query.limit > 0 {
+        if let Some(expression) = question_keywords(text) {
+            return run(&expression);
+        }
     }
+    Ok(hits)
+}
+
+/// Only broaden a plain question after its original FTS or literal search missed.
+/// Keyword clauses supply recall; nearby words contribute additional BM25 evidence.
+fn question_keywords(text: &str) -> Option<String> {
+    const QUESTION_STARTERS: &[&str] = &[
+        "what", "when", "where", "which", "who", "why", "how", "was", "wann", "wo", "wer", "wie",
+        "warum", "welche", "welcher", "welches",
+    ];
+    // English and German function words. Keep short domain terms such as "R" and "Go".
+    const FUNCTION_WORDS: &[&str] = &[
+        "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "from", "with", "by",
+        "before", "after", "i", "we", "you", "it", "its", "my", "our", "this", "that", "these",
+        "those", "is", "are", "were", "be", "been", "can", "could", "should", "would", "do",
+        "does", "did", "have", "has", "der", "die", "das", "den", "dem", "des", "ein", "eine",
+        "einen", "einem", "einer", "ist", "sind", "wird", "werden", "kann", "ich", "wir", "man",
+        "es", "im", "am", "zum", "zur", "vor", "nach", "bei", "mit", "von", "für", "zu", "und",
+        "oder",
+    ];
+    // Limit expansion of untrusted question text, including a single oversized word.
+    if text.len() > 4096 {
+        return None;
+    }
+    let body = text.strip_suffix('?').unwrap_or(text);
+    if !body
+        .chars()
+        .all(|c| c.is_alphanumeric() || c.is_whitespace() || matches!(c, ',' | '-' | '\''))
+    {
+        return None;
+    }
+    let mut words = body
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .peekable();
+    let first = words.peek()?.to_lowercase();
+    if body == text && !QUESTION_STARTERS.contains(&first.as_str()) {
+        return None;
+    }
+
+    // Bound the generated FTS expression (one term and at most one NEAR clause per word).
+    const MAX_KEYWORDS: usize = 16;
+    let mut terms = Vec::new();
+    for word in words {
+        if matches!(word, "AND" | "OR" | "NOT" | "NEAR") {
+            return None;
+        }
+        let word = word.to_lowercase();
+        if QUESTION_STARTERS.contains(&word.as_str())
+            || FUNCTION_WORDS.contains(&word.as_str())
+            || terms.contains(&word)
+        {
+            continue;
+        }
+        if terms.len() == MAX_KEYWORDS {
+            return None;
+        }
+        terms.push(word);
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let mut clauses: Vec<_> = terms.iter().map(|term| format!("\"{term}\"")).collect();
+    for pair in terms.windows(2) {
+        clauses.push(format!("NEAR(\"{}\" \"{}\", 5)", pair[0], pair[1]));
+    }
+    Some(clauses.join(" OR "))
 }
 
 pub(super) fn list_conflicts_on(conn: &Connection) -> Result<Vec<ConflictGroup>> {

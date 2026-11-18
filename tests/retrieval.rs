@@ -1893,3 +1893,95 @@ fn resolved_mode_adapter_searches_without_mutating_storage() {
     assert!(auto.fallback.is_some());
     assert_eq!(snapshot_db(&f.db), before);
 }
+
+#[test]
+fn plain_questions_recover_nearby_topic_words_within_the_requested_space() {
+    let f = Fixture::new();
+    let guides = space(&f.store, "guides");
+    let private = space(&f.store, "private");
+    // Equal lengths and term frequencies: only proximity favors the later memory.
+    let distant = write(
+        &f.store,
+        "Archive",
+        "The telescope logs every winter observation and requires periodic manual alignment.",
+        &[guides],
+        None,
+    );
+    let nearby = write(
+        &f.store,
+        "Guide",
+        "Manual telescope alignment is required for every observation during the winter.",
+        &[guides],
+        None,
+    );
+    write(
+        &f.store,
+        "Filler",
+        "What is required before the next shift?",
+        &[guides],
+        None,
+    );
+    write(
+        &f.store,
+        "Other guide",
+        "Telescope alignment",
+        &[private],
+        None,
+    );
+
+    for text in [
+        "What is needed for telescope alignment?",
+        "What is needed for telescope alignment",
+        "Wie funktioniert Telescope Alignment?",
+    ] {
+        let hits = retrieval::search(&f.store, query(text, Some(vec![guides]), 4)).unwrap();
+        let actual: Vec<_> = hits.iter().map(|hit| hit.memory_id).collect();
+        assert_eq!(actual, [nearby.memory_id, distant.memory_id], "{text}");
+        let outcome = run(
+            &f.store,
+            query(text, Some(vec![guides]), 1),
+            SearchMode::Auto,
+            &unavailable(FallbackReason::EmbeddingsDisabled),
+        )
+        .unwrap();
+        assert_eq!(ids(&outcome), [nearby.memory_id]);
+    }
+}
+
+#[test]
+fn question_fallback_preserves_literal_phrases_and_explicit_fts_constraints() {
+    let f = Fixture::new();
+    let guides = space(&f.store, "guides");
+    let faq = write(
+        &f.store,
+        "FAQ",
+        "How is a telescope aligned?",
+        &[guides],
+        None,
+    );
+    write(
+        &f.store,
+        "Other",
+        "The telescope mount can be aligned.",
+        &[guides],
+        None,
+    );
+    let search = |text| retrieval::search(&f.store, query(text, None, 10)).unwrap();
+
+    assert_eq!(
+        search("How is a telescope aligned?")
+            .iter()
+            .map(|hit| hit.memory_id)
+            .collect::<Vec<_>>(),
+        [faq.memory_id]
+    );
+    for text in [
+        "telescope quartz",
+        "What AND quartz?",
+        "How does \"quartz telescope\" work?",
+        "What is it?",
+        "Where is cryovolcanism?",
+    ] {
+        assert!(search(text).is_empty(), "{text}");
+    }
+}

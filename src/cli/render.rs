@@ -636,27 +636,35 @@ fn render_spaces(hit: &crate::core::SearchHit) -> String {
     }
 }
 
+// Sanitize a complete human-readable line so nested provenance fields are covered too.
+// Only the renderer supplies line breaks. display() replaces control characters in each field.
+macro_rules! display_line {
+    ($($arg:tt)*) => {
+        println!("{}", display(&format!($($arg)*)))
+    };
+}
+
 pub fn inspect(detail: &MemoryDetail, as_json: bool) {
     if as_json {
         json(detail);
         return;
     }
     let m = &detail.memory;
-    println!("memory   {} ({}, created {})", m.id, m.state, m.created_at);
+    display_line!("memory   {} ({}, created {})", m.id, m.state, m.created_at);
     if let Some(sb) = &detail.superseded_by {
-        println!("superseded by {} (created {})", sb.memory_id, sb.created_at);
+        display_line!("superseded by {} (created {})", sb.memory_id, sb.created_at);
     }
     for s in &detail.supersedes {
-        println!("supersedes {} (created {})", s.memory_id, s.created_at);
+        display_line!("supersedes {} (created {})", s.memory_id, s.created_at);
     }
     if let Some(at) = m.retired_at {
-        println!(
+        display_line!(
             "retired  {} {}",
             at,
             m.retire_reason.as_deref().unwrap_or("")
         );
     }
-    println!(
+    display_line!(
         "assert   {} subject=\"{}\" kind={} extraction={}",
         detail.assertion.id,
         detail.assertion.subject,
@@ -664,10 +672,10 @@ pub fn inspect(detail: &MemoryDetail, as_json: bool) {
         detail.assertion.extraction
     );
     for line in detail.assertion.content.lines() {
-        println!("  {line}");
+        display_line!("  {line}");
     }
     let e = &detail.evidence;
-    println!(
+    display_line!(
         "evidence {} {} {} lines {}-{}",
         e.id,
         e.kind,
@@ -676,23 +684,27 @@ pub fn inspect(detail: &MemoryDetail, as_json: bool) {
         e.end_line.map_or("-".to_string(), |v| v.to_string())
     );
     let s = &detail.source;
-    println!(
+    display_line!(
         "source   {} {} {} sha256:{}",
         s.id,
         s.kind,
         s.location,
-        &s.content_hash[..16.min(s.content_hash.len())]
+        s.content_hash.chars().take(16).collect::<String>()
     );
     if let Some(git) = &detail.git {
-        println!(
+        display_line!(
             "git      repo {} blob {} path {} commit {} ({})",
-            git.repository_path, git.blob_oid, git.path, git.commit_oid, git.commit_time
+            git.repository_path,
+            git.blob_oid,
+            git.path,
+            git.commit_oid,
+            git.commit_time
         );
         if !git.refs.is_empty() {
-            println!("  refs: {}", git.refs.join(", "));
+            display_line!("  refs: {}", git.refs.join(", "));
         }
     }
-    println!(
+    display_line!(
         "spaces   {}",
         if detail.spaces.is_empty() {
             "-".to_string()
@@ -716,16 +728,22 @@ pub fn trace(detail: &MemoryDetail, as_json: bool) {
     let a = &detail.assertion;
     let e = &detail.evidence;
     let s = &detail.source;
-    println!(
+    display_line!(
         "memory    {} state={} created={}",
-        m.id, m.state, m.created_at
+        m.id,
+        m.state,
+        m.created_at
     );
-    println!(
+    display_line!(
         "assertion {} kind={} subject=\"{}\" extraction={} extracted={}",
-        a.id, a.kind, a.subject, a.extraction, a.created_at
+        a.id,
+        a.kind,
+        a.subject,
+        a.extraction,
+        a.created_at
     );
-    println!("  content: {}", first_line(&a.content));
-    println!(
+    display_line!("  content: {}", first_line(&a.content));
+    display_line!(
         "evidence  {} kind={} heading={} lines={}-{}",
         e.id,
         e.kind,
@@ -733,23 +751,30 @@ pub fn trace(detail: &MemoryDetail, as_json: bool) {
         e.start_line.map_or("-".to_string(), |v| v.to_string()),
         e.end_line.map_or("-".to_string(), |v| v.to_string())
     );
-    println!(
+    display_line!(
         "source    {} kind={} location={} ingested={}",
-        s.id, s.kind, s.location, s.ingested_at
+        s.id,
+        s.kind,
+        s.location,
+        s.ingested_at
     );
-    println!("  sha256:{}", s.content_hash);
+    display_line!("  sha256:{}", s.content_hash);
     render_lifecycle(&detail.source_lifecycle);
     if let Some(git) = &detail.git {
-        println!(
+        display_line!(
             "git       repo {} blob {} path {} commit {} ({})",
-            git.repository_path, git.blob_oid, git.path, git.commit_oid, git.commit_time
+            git.repository_path,
+            git.blob_oid,
+            git.path,
+            git.commit_oid,
+            git.commit_time
         );
-        println!("  commit message: {}", first_line(&git.commit_message));
+        display_line!("  commit message: {}", first_line(&git.commit_message));
         if !git.refs.is_empty() {
-            println!("  refs: {}", git.refs.join(", "));
+            display_line!("  refs: {}", git.refs.join(", "));
         }
     }
-    println!(
+    display_line!(
         "spaces    {}",
         detail
             .spaces
@@ -765,7 +790,7 @@ pub fn history(subject: &str, memories: &[MemorySummary], as_json: bool) {
         json(&memories);
         return;
     }
-    println!("subject \"{}\": {} memories", subject, memories.len());
+    display_line!("subject \"{}\": {} memories", subject, memories.len());
     for m in memories {
         let tail = match (m.state, m.superseded_by, m.retire_reason.as_deref()) {
             (crate::core::MemoryState::Superseded, Some(by), _) => {
@@ -776,7 +801,7 @@ pub fn history(subject: &str, memories: &[MemorySummary], as_json: bool) {
             }
             _ => String::new(),
         };
-        println!(
+        display_line!(
             "  {} {} {} \"{}\"{}",
             m.state,
             m.memory_id,
@@ -793,15 +818,18 @@ pub fn conflicts(groups: &[ConflictGroup], as_json: bool) {
         return;
     }
     if groups.is_empty() {
-        println!("no conflicts");
+        display_line!("no conflicts");
         return;
     }
     for group in groups {
-        println!("{} / \"{}\":", group.space_name, group.subject);
+        display_line!("{} / \"{}\":", group.space_name, group.subject);
         for m in &group.members {
-            println!(
+            display_line!(
                 "  {} {} {} \"{}\"",
-                m.memory_id, m.state, m.created_at, m.subject
+                m.memory_id,
+                m.state,
+                m.created_at,
+                m.subject
             );
         }
     }
@@ -835,7 +863,7 @@ fn first_line(s: &str) -> &str {
 
 fn render_lifecycle(lifecycle: &crate::core::SourceLifecycle) {
     let l = &lifecycle.logical;
-    println!(
+    display_line!(
         "logical   {} state={} current={} created={}",
         l.id,
         l.state,
@@ -847,13 +875,13 @@ fn render_lifecycle(lifecycle: &crate::core::SourceLifecycle) {
             crate::core::SourceEventKind::Moved {
                 from_location,
                 to_location,
-            } => println!(
+            } => display_line!(
                 "  moved {} -> {} at {}",
                 from_location.as_deref().unwrap_or("?"),
                 to_location,
                 event.created_at
             ),
-            crate::core::SourceEventKind::Disappeared { from_location } => println!(
+            crate::core::SourceEventKind::Disappeared { from_location } => display_line!(
                 "  disappeared from {} at {}",
                 from_location.as_deref().unwrap_or("?"),
                 event.created_at

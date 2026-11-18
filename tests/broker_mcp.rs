@@ -10,6 +10,7 @@
 //!
 //! Skipped with a message when the broker cannot start (no cgroup v2 delegation).
 
+#![cfg(feature = "spawn-gate")]
 #![allow(clippy::field_reassign_with_default)]
 
 use std::io::{BufRead, BufReader, Write};

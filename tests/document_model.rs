@@ -24,6 +24,7 @@ use mindspace::{initialize, SqliteStore};
 /// tests that arm a hook hold it exclusively, so an armed fault can only hit the commit it was meant for.
 static HOOKS: RwLock<()> = RwLock::new(());
 
+#[cfg(feature = "spawn-gate")]
 fn exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
     HOOKS.write().unwrap_or_else(|e| e.into_inner())
 }
@@ -842,6 +843,7 @@ fn a_failure_at_any_row_leaves_no_partial_document() {
     }
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_vetoed_commit_rolls_back_and_a_lost_acknowledgement_is_reported_as_unknown() {
     let _g = exclusive();

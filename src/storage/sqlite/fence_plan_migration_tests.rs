@@ -415,6 +415,7 @@ fn false_when_unknown_udf_is_not_an_inert_old_writer_guard_on_bundled_sqlite() {
     crate::ingest::ingest_file(&old, &file, &["before"]).unwrap();
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn lost_migration_ack_reopens_once_without_consuming_another_schema_revision() {
     const CHILD: &str = "MINDSPACE_S3E2_MIGRATION_ACK_CHILD";

@@ -13,7 +13,8 @@ Thanks for your interest. Mindspace is an Alpha; please open an issue before sta
 
 ```sh
 cargo build --release
-cargo test --locked                                   # about 430 tests, no model download needed
+cargo test --locked --features spawn-gate             # embeddings and fault-injection tests
+cargo test --locked --no-default-features             # installer feature configuration
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo deny check advisories licenses bans sources     # config: deny.toml (no ignored advisories)

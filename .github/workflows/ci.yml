@@ -44,13 +44,45 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Build
-        run: cargo build --locked --all-targets
+        run: cargo build --locked --all-targets --features spawn-gate
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test --locked
+        run: cargo clippy --locked --all-targets --features spawn-gate -- -D warnings
+      - name: Tests with embeddings and fault injection
+        run: cargo test --locked --features spawn-gate
+      - name: Check the installer binary against staged receipts
+        shell: bash
+        run: |
+          cargo build --locked --no-default-features --bin mind
+          cp target/debug/mind "$RUNNER_TEMP/installer-mind"
+          export MINDSPACE_S3D_PRODUCTION_BINARY="$RUNNER_TEMP/installer-mind"
+          export MINDSPACE_S3D2_PRODUCTION_BINARY="$RUNNER_TEMP/installer-mind"
+          export MINDSPACE_S3D2_PRODUCTION_MODE=no-embeddings
+          smoke() {
+            cargo test --locked --features spawn-gate --color never --test "$1" "$2" -- --ignored --exact --color never |
+              tee "$RUNNER_TEMP/smoke.log"
+            grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/smoke.log"
+          }
+          smoke lexical_staging_admin ordinary_production_binary_stages_and_inspects_without_test_hooks
+          smoke semantic_staging_admin production_and_no_embeddings_binaries_preserve_receipts_without_test_hooks
       - name: Documentation links
         run: python3 scripts/check-doc-links.py
+
+  installer-profile:
+    name: Tests with installer features
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check resolved features including dev dependencies
+        run: |
+          cargo metadata --locked --format-version 1 --no-default-features |
+            jq -e '.resolve | .root as $root | [.nodes[] | select(.id == $root) | .features] == [[]]'
+      - run: cargo test --locked --no-default-features
 
   dependencies:
     name: Dependencies (audit, deny)

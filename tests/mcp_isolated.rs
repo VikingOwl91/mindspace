@@ -578,6 +578,7 @@ fn revoking_a_grant_during_extraction_cancels_it_and_persists_nothing() {
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn revoking_a_grant_during_the_context_exchange_cancels_it() {
     let w = World::new();
@@ -617,6 +618,7 @@ fn revoking_a_grant_during_the_context_exchange_cancels_it() {
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_static_root_is_not_revocable_and_a_timeout_ends_the_operation() {
     let w = World::new();
@@ -654,6 +656,7 @@ fn a_static_root_is_not_revocable_and_a_timeout_ends_the_operation() {
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn the_brokers_wall_clock_ends_a_stalled_operation_and_the_broker_serves_again() {
     let w = World::new();
@@ -692,6 +695,7 @@ fn the_brokers_wall_clock_ends_a_stalled_operation_and_the_broker_serves_again()
 
 // ------------------------------------------------------------------ 8, 9, 10: failures
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_malformed_worker_stream_changes_no_rows() {
     let w = World::new();
@@ -966,6 +970,7 @@ fn grant_world(w: &World, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
     (project, dynamic)
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn revocation_after_worker_completion_but_before_persistence_denies_the_commit() {
     let w = World::new();
@@ -1015,6 +1020,7 @@ fn revocation_after_worker_completion_but_before_persistence_denies_the_commit()
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn revocation_during_persistence_waits_for_the_commit_and_is_ordered_after_it() {
     let w = World::new();
@@ -1067,6 +1073,7 @@ fn revocation_during_persistence_waits_for_the_commit_and_is_ordered_after_it() 
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_frontend_that_never_begins_its_commit_is_removed_at_the_grant_ceiling() {
     let w = World::new();
@@ -1334,6 +1341,7 @@ const SYMBOL_FILES: &[(&str, &str)] = &[
 
 // 1 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn frontend_crash_before_commit_leaves_no_trace_and_no_lock_and_a_retry_is_clean() {
     let w = World::new();
@@ -1387,6 +1395,7 @@ fn frontend_crash_before_commit_leaves_no_trace_and_no_lock_and_a_retry_is_clean
 
 // 2 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn frontend_crash_right_after_commit_keeps_the_data_frees_the_lock_and_a_retry_adds_no_structure() {
     let w = World::new();
@@ -1453,6 +1462,7 @@ fn frontend_crash_right_after_commit_keeps_the_data_frees_the_lock_and_a_retry_a
 
 // 3 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn broker_crash_before_the_commit_is_granted_rolls_back() {
     let w = World::new();
@@ -1484,6 +1494,7 @@ fn broker_crash_before_the_commit_is_granted_rolls_back() {
 
 // 4 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn broker_crash_while_holding_the_grant_lock_frees_it_and_the_frontend_does_not_commit() {
     let w = World::new();
@@ -1521,6 +1532,7 @@ fn broker_crash_while_holding_the_grant_lock_frees_it_and_the_frontend_does_not_
 
 // 5 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_lost_completion_message_costs_the_frontend_at_the_in_flight_ceiling_and_the_data_is_committed()
 {
@@ -1560,6 +1572,7 @@ fn a_lost_completion_message_costs_the_frontend_at_the_in_flight_ceiling_and_the
 
 // 6 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_commit_decision_that_arrives_too_late_rolls_back_and_the_link_is_not_reused() {
     let w = World::new();
@@ -1601,6 +1614,7 @@ fn a_commit_decision_that_arrives_too_late_rolls_back_and_the_link_is_not_reused
 
 // 7 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_frontend_stalled_after_the_commit_is_removed_and_the_committed_data_stays() {
     let w = World::new();
@@ -1636,6 +1650,7 @@ fn a_frontend_stalled_after_the_commit_is_removed_and_the_committed_data_stays()
 
 // 8 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn revocation_racing_the_commit_boundary_is_always_ordered_one_way_or_the_other() {
     let w = World::new();
@@ -1702,6 +1717,7 @@ fn revocation_racing_the_commit_boundary_is_always_ordered_one_way_or_the_other(
 
 // 9 ------------------------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_failed_sqlite_commit_is_rolled_back_and_costs_no_revision() {
     let w = World::new();
@@ -1741,6 +1757,7 @@ fn a_failed_sqlite_commit_is_rolled_back_and_costs_no_revision() {
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn an_unknown_commit_outcome_is_never_reported_as_success_and_a_retry_is_consistent() {
     let w = World::new();
@@ -1820,6 +1837,7 @@ fn store_lock_holders(w: &World) -> Vec<(u32, String)> {
         .collect()
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_commit_held_inside_sqlite_beyond_the_ceiling_is_aborted_by_removing_the_frontend_before_the_revocation_completes(
 ) {
@@ -1876,6 +1894,7 @@ fn a_commit_held_inside_sqlite_beyond_the_ceiling_is_aborted_by_removing_the_fro
     eprintln!("COMMIT in flight beyond the ceiling: revocation completed {waited:?} after it began blocking, frontend removed first, database unchanged");
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_commit_in_flight_within_the_ceiling_finishes_before_the_revocation_completes() {
     let w = World::new();
@@ -1920,6 +1939,7 @@ fn a_commit_in_flight_within_the_ceiling_finishes_before_the_revocation_complete
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_frontend_that_dies_during_the_commit_aborts_it_and_frees_the_lock() {
     let w = World::new();
@@ -1951,6 +1971,7 @@ fn a_frontend_that_dies_during_the_commit_aborts_it_and_frees_the_lock() {
     eprintln!("frontend death during COMMIT: revocation completed {waited:?} after the kill; database unchanged");
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_broker_that_dies_during_the_commit_loses_the_lease_which_is_the_documented_weaker_guarantee() {
     // PINNED LIMIT, not a goal: the lock dies with the broker, so a revocation can complete while

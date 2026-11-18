@@ -742,6 +742,7 @@ impl Drop for Paused {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn paused_prebegin_writer_returns_original_receipt_after_retry_wins() {
     let w = World::new();
@@ -754,6 +755,7 @@ fn paused_prebegin_writer_returns_original_receipt_after_retry_wins() {
     assert_eq!(w.count("asset_control_intents"), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_death_before_or_during_commit_rolls_back_and_retry_has_one_effect() {
     for phase in ["before_begin", "after_begin", "after_write", "in_commit"] {
@@ -772,6 +774,7 @@ fn process_death_before_or_during_commit_rolls_back_and_retry_has_one_effect() {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_death_after_commit_preserves_receipt_and_restart_retry_spends_no_revision() {
     let w = World::new();
@@ -799,6 +802,7 @@ fn process_death_after_commit_preserves_receipt_and_restart_retry_spends_no_revi
     assert_eq!(w.count("asset_control_intents"), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn inflight_writer_blocks_retry_without_claiming_previous_rollback() {
     let w = World::new();
@@ -815,6 +819,7 @@ fn inflight_writer_blocks_retry_without_claiming_previous_rollback() {
     assert_eq!(w.count("asset_control_intents"), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn veto_is_known_noncommit_but_lost_ack_preserves_durable_receipt() {
     let w = World::new();
@@ -1077,6 +1082,7 @@ fn immutable_revision(path: &Path) -> i64 {
     .unwrap()
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn transient_missing_shm_repeats_admission_without_losing_the_exact_intent() {
     let w = World::new();
@@ -1129,6 +1135,7 @@ fn stable_missing_shm_is_bounded_and_never_repaired_or_written() {
     assert_eq!(immutable_revision(&w.db), revision);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn missing_shm_retry_revalidates_identity_journal_and_nonregular_sidecar() {
     for hazard in ["identity", "journal", "directory", "permissions"] {

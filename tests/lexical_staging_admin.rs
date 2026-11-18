@@ -368,6 +368,7 @@ impl Drop for Paused {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn paused_prebegin_writer_returns_winners_original_receipt() {
     let w = World::new();
@@ -380,6 +381,7 @@ fn paused_prebegin_writer_returns_winners_original_receipt() {
     assert_eq!(w.count(RECEIPTS), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn paused_prebegin_writer_rejects_content_changed_after_validation() {
     let w = World::new();
@@ -395,6 +397,7 @@ fn paused_prebegin_writer_rejects_content_changed_after_validation() {
     w.assert_unstaged(r);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_interruption_before_or_during_commit_leaves_no_partial_lexical_staging() {
     for phase in [
@@ -417,6 +420,7 @@ fn process_interruption_before_or_during_commit_leaves_no_partial_lexical_stagin
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_interruption_after_commit_is_recovered_from_durable_receipt() {
     let w = World::new();
@@ -434,6 +438,7 @@ fn process_interruption_after_commit_is_recovered_from_durable_receipt() {
     assert_eq!(w.revision(), r + 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn live_writer_timeout_never_proves_previous_unknown_rolled_back() {
     let w = World::new();
@@ -450,6 +455,7 @@ fn live_writer_timeout_never_proves_previous_unknown_rolled_back() {
     assert_eq!(w.count(RECEIPTS), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn concurrent_inspection_waits_for_staging_commit_or_rollback_without_partial_readiness() {
     struct Inspector(Option<Child>);
@@ -514,6 +520,7 @@ fn concurrent_inspection_waits_for_staging_commit_or_rollback_without_partial_re
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn veto_rolls_back_but_lost_ack_retains_original_successful_receipt() {
     let w = World::new();
@@ -1186,6 +1193,7 @@ fn malformed_modes_and_control_bearing_versions_do_not_create_authority() {
     w.assert_unstaged(r);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn partial_entry_fts_and_receipt_failures_roll_back_the_entire_artifact() {
     for fault in ["entry:1", "receipt"] {

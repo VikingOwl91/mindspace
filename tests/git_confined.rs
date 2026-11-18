@@ -73,6 +73,7 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     outside: PathBuf,
+    #[cfg(feature = "spawn-gate")]
     secret: PathBuf,
     canary: PathBuf,
     canary_log: PathBuf,
@@ -119,6 +120,7 @@ fn fixture() -> Fixture {
         _tmp: tmp,
         root,
         outside,
+        #[cfg(feature = "spawn-gate")]
         secret,
         canary,
         canary_log,
@@ -291,6 +293,7 @@ fn an_untrusted_executable_is_refused() {
 
 // ------------------------------------------------------------------------- success in the kernel
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn head_is_read_by_a_non_dumpable_landlocked_worker_and_matches_git() {
     if !kernel_ok() {
@@ -344,6 +347,7 @@ fn the_same_reader_works_without_the_kernel_confinement_too() {
 
 // ------------------------------------------------------------------------------- read-only
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn reading_head_changes_nothing_in_the_repository_confined_or_not() {
     if !kernel_ok() {
@@ -371,6 +375,7 @@ fn reading_head_changes_nothing_in_the_repository_confined_or_not() {
     );
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn the_identity_marker_is_never_created() {
     if !kernel_ok() {
@@ -396,6 +401,7 @@ fn the_identity_marker_is_never_created() {
 
 // ------------------------------------------------------------------------------ adversarial
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn every_adversarial_attempt_is_refused_by_the_kernel_and_nothing_changes() {
     if !kernel_ok() {
@@ -456,6 +462,7 @@ fn every_adversarial_attempt_is_refused_by_the_kernel_and_nothing_changes() {
     eprintln!("legacy pin style, git said: {}", legacy["detail"]);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_hostile_repository_configuration_runs_nothing_with_or_without_the_kernel() {
     if !kernel_ok() {
@@ -690,6 +697,7 @@ fn linked_worktrees_external_alternates_grafts_and_links_are_refused() {
     assert!(refusal(&fx.outside).contains("not a git repository"));
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_sha256_repository_is_refused_instead_of_misread() {
     // The tree parser reads 20-byte entries: on a SHA-256 repository it returns 40-digit ids that
@@ -735,6 +743,7 @@ fn a_sha256_repository_is_refused_instead_of_misread() {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn the_sandboxed_worker_refuses_a_linked_worktree_too() {
     if !kernel_ok() {
@@ -779,6 +788,7 @@ fn the_sandboxed_worker_refuses_a_linked_worktree_too() {
 
 // ---------------------------------------------------------------------- inherited descriptors
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn absent_descriptors_fail_closed() {
     if !kernel_ok() {
@@ -822,6 +832,7 @@ fn absent_descriptors_fail_closed() {
 }
 
 /// Writes an executable script into `dir`.
+#[cfg(feature = "spawn-gate")]
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let p = dir.join(name);
     std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -829,6 +840,7 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     p
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_git_child_inherits_one_descriptor_a_cleared_environment_and_the_root_as_its_directory() {
     if !Path::new(GIT).exists() {
@@ -925,6 +937,7 @@ for f in /proc/self/fd/*; do t=$(readlink "$f"); echo "fd ${f##*/} -> $t"; done"
     );
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_hung_git_child_is_killed_at_the_deadline_and_leaves_no_process() {
     if !Path::new(GIT).exists() {
@@ -986,6 +999,7 @@ fn gone(pid: i32) -> bool {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_git_child_ends_when_its_worker_is_killed() {
     if !kernel_ok() {
@@ -1117,6 +1131,7 @@ fn finish_probe(
     serde_json::from_str(rest.lines().last().unwrap_or("{}")).unwrap_or_else(|_| panic!("{rest:?}"))
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_binary_replaced_after_the_confinement_is_not_executed() {
     if !kernel_ok() {
@@ -1154,6 +1169,7 @@ fn a_binary_replaced_after_the_confinement_is_not_executed() {
 /// that the attacker could write to is exposed, which is why the resolver refuses group/other
 /// writable files; the directories above it are not checked. When a content hash or an ownership
 /// check is added, this test is the one to flip.
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_binary_modified_in_place_after_the_confinement_still_runs_a_documented_limit() {
     if !kernel_ok() {

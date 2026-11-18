@@ -174,6 +174,7 @@ fn a_middle_chunk_insert_failure_rolls_back_the_extraction_and_recording_revisio
     );
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn vetoed_commit_is_rolled_back_and_unknown_commit_is_idempotent_on_retry() {
     let _lock = HOOKS.write().unwrap();

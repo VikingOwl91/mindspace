@@ -1129,6 +1129,7 @@ fn a_failure_mid_write_leaves_nothing_and_a_retry_succeeds() {
     assert_eq!(env.count("m6_revisions"), counts["m6_revisions"] + 1);
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_vetoed_commit_rolls_back_and_a_lost_acknowledgement_stays_unknown() {
     let _g = HOOKS.write().unwrap_or_else(|e| e.into_inner());

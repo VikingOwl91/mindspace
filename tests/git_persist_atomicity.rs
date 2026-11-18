@@ -449,6 +449,7 @@ fn a_refusal_right_before_the_commit_rolls_everything_back() {
 
 // ------------------------------------------------------------------ the COMMIT itself
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_failed_sqlite_commit_is_a_clean_rollback_and_the_handle_stays_usable() {
     let _serial = serial();
@@ -474,6 +475,7 @@ fn a_failed_sqlite_commit_is_a_clean_rollback_and_the_handle_stays_usable() {
     assert_eq!(d.derived(), clean.derived());
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn an_unknown_commit_outcome_is_reported_as_unknown_and_a_retry_adds_no_derived_structure() {
     let _serial = serial();

@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Mutex};
+#[cfg(feature = "spawn-gate")]
 use std::time::Instant;
 use tempfile::TempDir;
 

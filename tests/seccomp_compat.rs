@@ -779,15 +779,18 @@ fn the_harness_kills_a_hung_child_and_its_group() {
 ///
 /// The index is built by an ordinary (unfiltered) CLI command; the semantic
 /// search then runs INSIDE the sandboxed, filtered server.
+#[cfg(feature = "embeddings")]
 #[test]
+#[ignore = "requires installed model weights in M72D_MODEL_SRC"]
 fn semantic_search_works_inside_the_filtered_server() {
-    let Some(src) = std::env::var_os("M72D_MODEL_SRC").map(PathBuf::from) else {
-        eprintln!("UNKNOWN: embeddings not exercised (set M72D_MODEL_SRC to an installed models directory)");
-        return;
-    };
-    if !applicable() {
-        return;
-    }
+    let src = PathBuf::from(
+        std::env::var_os("M72D_MODEL_SRC")
+            .expect("set M72D_MODEL_SRC to the installed models directory"),
+    );
+    assert!(
+        applicable(),
+        "the filtered-server model test requires the sandbox"
+    );
     fn copy(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for ent in std::fs::read_dir(from).unwrap() {

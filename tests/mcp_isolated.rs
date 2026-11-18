@@ -173,8 +173,9 @@ fn find_watchdog(frontend: u32) -> Option<i32> {
 
 impl Mcp {
     fn start(w: &World, roots: &[&Path], extra: &[&str], vars: &[(&str, String)]) -> Option<Mcp> {
-        let isolated = extra.contains(&"--isolated-ingest");
-        if isolated && !prerequisites::cgroup_delegated(prerequisites::Cgroup::Direct) {
+        let expect_live_broker =
+            extra.contains(&"--broker") || extra.contains(&"--isolated-ingest");
+        if expect_live_broker && !prerequisites::cgroup_delegated(prerequisites::Cgroup::Direct) {
             return None;
         }
         let mut c = w.mind(&["mcp"]);
@@ -205,7 +206,7 @@ impl Mcp {
                    "clientInfo":{"name":"t","version":"0"}}),
         );
         m.notify("notifications/initialized");
-        if isolated {
+        if expect_live_broker {
             let pid = m.child.id();
             let wd =
                 find_watchdog(pid).expect("no watchdog appeared after successful cgroup probe");

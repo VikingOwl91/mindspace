@@ -317,6 +317,12 @@ fn probe_binary() -> PathBuf {
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
                 .arg("--target-dir")
                 .arg(target_dir);
+            if !cfg!(feature = "embeddings") {
+                cmd.arg("--no-default-features");
+            }
+            if cfg!(feature = "spawn-gate") {
+                cmd.args(["--features", "spawn-gate"]);
+            }
             match profile_dir.file_name().and_then(|n| n.to_str()) {
                 Some("debug") => {}
                 Some("release") => {

@@ -678,6 +678,7 @@ impl Drop for Paused {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn delayed_before_begin_retry_returns_the_winners_original_receipt() {
     let w = World::new();
@@ -689,6 +690,7 @@ fn delayed_before_begin_retry_returns_the_winners_original_receipt() {
     assert_eq!(w.revision(), r + 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn interrupted_transactions_leave_no_passive_fragments_and_restart_retry_recovers() {
     for phase in ["before_begin", "after_begin", "after_write", "in_commit"] {
@@ -704,6 +706,7 @@ fn interrupted_transactions_leave_no_passive_fragments_and_restart_retry_recover
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_death_after_commit_recovers_durable_receipt_without_another_revision() {
     let w = World::new();
@@ -717,6 +720,7 @@ fn process_death_after_commit_recovers_durable_receipt_without_another_revision(
     assert_eq!(w.revision(), r + 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn veto_is_known_noncommit_while_lost_ack_keeps_one_successful_receipt() {
     let w = World::new();
@@ -746,6 +750,7 @@ fn veto_is_known_noncommit_while_lost_ack_keeps_one_successful_receipt() {
     assert_eq!(w.preserved(), before);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_live_paused_writer_timeout_is_not_evidence_of_rollback() {
     let w = World::new();

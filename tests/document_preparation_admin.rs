@@ -706,6 +706,7 @@ impl Drop for Paused {
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn paused_prebegin_writer_returns_winners_original_receipt() {
     let w = World::new();
@@ -718,6 +719,7 @@ fn paused_prebegin_writer_returns_winners_original_receipt() {
     assert_eq!(w.count(RECEIPTS), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn paused_prebegin_writer_rejects_content_changed_after_validation() {
     let w = World::new();
@@ -733,6 +735,7 @@ fn paused_prebegin_writer_rejects_content_changed_after_validation() {
     w.assert_unprepared(r);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_interruption_before_or_during_commit_leaves_no_partial_preparation() {
     for phase in ["before_begin", "after_begin", "after_write", "in_commit"] {
@@ -748,6 +751,7 @@ fn process_interruption_before_or_during_commit_leaves_no_partial_preparation() 
     }
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn process_interruption_after_commit_is_recovered_from_durable_receipt() {
     let w = World::new();
@@ -765,6 +769,7 @@ fn process_interruption_after_commit_is_recovered_from_durable_receipt() {
     assert_eq!(w.revision(), r + 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn live_writer_timeout_never_proves_previous_unknown_rolled_back() {
     let w = World::new();
@@ -781,6 +786,7 @@ fn live_writer_timeout_never_proves_previous_unknown_rolled_back() {
     assert_eq!(w.count(RECEIPTS), 1);
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn veto_rolls_back_but_lost_ack_retains_original_successful_receipt() {
     let w = World::new();

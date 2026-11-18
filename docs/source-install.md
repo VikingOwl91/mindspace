@@ -84,7 +84,7 @@ For MCP repository tools, Linux6.2+ with effective Landlock ABI3+ is required. T
 
 ## 3. Build an ordinary binary
 
-Choose one profile. Separate output directories keep ordinary install artifacts apart from test/dev builds, whose self-dependency enables the test-only spawn-gate. Do not distribute a `cargo test`/`--all-targets` output.
+Choose one profile. Separate output directories keep ordinary install artifacts apart from test/dev builds, which may enable the test-only spawn-gate explicitly. Do not distribute a `cargo test`/`--all-targets` output.
 
 Recommended Alpha profile:
 

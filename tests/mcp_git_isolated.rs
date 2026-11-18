@@ -934,6 +934,7 @@ fn missing_identity_unsupported_layouts_and_sha256_are_refused_and_persist_nothi
 
 // ------------------------------------------------------------------ revocation
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn revocation_before_the_commit_denies_it_and_leaves_no_trace_and_no_revision() {
     let w = World::new();
@@ -968,6 +969,7 @@ fn revocation_before_the_commit_denies_it_and_leaves_no_trace_and_no_revision() 
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn revocation_during_extraction_ends_the_worker_and_its_git_child() {
     let w = World::new();
@@ -1000,6 +1002,7 @@ fn revocation_during_extraction_ends_the_worker_and_its_git_child() {
     m.finish();
 }
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_commit_held_by_the_lease_orders_a_concurrent_revocation_after_it() {
     let w = World::new();
@@ -1034,6 +1037,7 @@ fn a_commit_held_by_the_lease_orders_a_concurrent_revocation_after_it() {
 
 // ------------------------------------------------------------------ hostile transport
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_hostile_git_worker_is_refused_whatever_it_sends_and_persists_nothing() {
     for mode in [
@@ -1071,6 +1075,7 @@ fn a_hostile_git_worker_is_refused_whatever_it_sends_and_persists_nothing() {
 
 // ------------------------------------------------------------------ termination
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn killing_the_worker_the_broker_or_the_frontend_leaves_no_process_and_no_rows() {
     // worker: an error, the broker serves the next operation
@@ -1152,6 +1157,7 @@ fn killing_the_worker_the_broker_or_the_frontend_leaves_no_process_and_no_rows()
 
 // ------------------------------------------------------------------ commit outcomes
 
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
 fn a_failed_commit_is_a_clean_rollback_and_an_unknown_outcome_is_reported_as_unknown() {
     // vetoed COMMIT: certain rollback, no revision, the handle stays usable

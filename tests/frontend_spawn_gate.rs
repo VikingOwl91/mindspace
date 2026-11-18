@@ -4,6 +4,7 @@
 //! serving MCP, see `worker::gate`). Nothing here fakes or weakens a sandbox: the stand-in workers in
 //! the failure tests run INSIDE the frontend's inherited confinement and are used to observe it.
 
+#![cfg(feature = "spawn-gate")]
 #![allow(dead_code)]
 
 use std::path::PathBuf;

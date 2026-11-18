@@ -1,5 +1,6 @@
 //! Isolated semantic staging protocols. Fake vectors verify storage/recovery, not model correctness.
 //! Model A trusts the operating account; these tests do not authenticate a human.
+#![cfg(feature = "spawn-gate")]
 #![cfg(all(target_os = "linux", feature = "embeddings"))]
 
 use std::collections::BTreeMap;

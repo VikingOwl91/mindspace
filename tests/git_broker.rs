@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "spawn-gate")]
+use std::time::Instant;
 
 use mindspace::core::Uuid;
 use mindspace::ingest::confined_git::GitExecutable;
@@ -272,6 +274,7 @@ fn bcfg() -> BrokerConfig {
     c
 }
 
+#[cfg(feature = "spawn-gate")]
 fn gated(mode: &str) -> BrokerConfig {
     let mut c = bcfg();
     c.git_gate = Some(mode.into());
@@ -329,6 +332,7 @@ fn gone(pid: u32) -> bool {
     false
 }
 
+#[cfg(feature = "spawn-gate")]
 fn children_of(pid: u32) -> Vec<u32> {
     let mut v = Vec::new();
     if let Ok(rd) = std::fs::read_dir("/proc") {
@@ -634,6 +638,7 @@ fn a_sha256_repository_is_refused_before_anything_is_persisted() {
 
 // ====================================================== hostile workers (real confinement)
 
+#[cfg(feature = "spawn-gate")]
 fn hostile(mode: &str, needle: &str) {
     let repo = new_repo();
     let db = db();
@@ -661,6 +666,7 @@ fn hostile(mode: &str, needle: &str) {
     persist(&r2, &db, g, &rep);
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_worker_that_lies_about_the_repository_identity_is_refused() {
     need!();
@@ -670,6 +676,7 @@ fn a_worker_that_lies_about_the_repository_identity_is_refused() {
     hostile("lie-header-identity", "another repository");
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_worker_refuses_a_repository_identity_other_than_the_one_the_broker_bound() {
     need!();
@@ -677,6 +684,7 @@ fn a_worker_refuses_a_repository_identity_other_than_the_one_the_broker_bound() 
     hostile("broker-wrong-identity", "before the manifest");
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_worker_cannot_swap_the_head_the_root_the_operation_or_forge_reuse() {
     need!();
@@ -686,6 +694,7 @@ fn a_worker_cannot_swap_the_head_the_root_the_operation_or_forge_reuse() {
     hostile("forge-reuse", "did not announce");
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn malformed_oversized_and_truncated_streams_are_refused_and_nothing_is_persisted() {
     need!();
@@ -696,6 +705,7 @@ fn malformed_oversized_and_truncated_streams_are_refused_and_nothing_is_persiste
 
 // ================================================================================ lifecycle
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_crashing_git_worker_costs_an_error_and_the_broker_serves_the_next_operation() {
     need!();
@@ -720,6 +730,7 @@ fn a_crashing_git_worker_costs_an_error_and_the_broker_serves_the_next_operation
 /// Starts an operation against a worker that hangs (with a git child blocked on its stdin) and
 /// returns what a test needs to watch it.
 #[allow(clippy::type_complexity)]
+#[cfg(feature = "spawn-gate")]
 fn start_hanging(
     r: &Rig,
     repo: &Repo,
@@ -752,6 +763,7 @@ fn start_hanging(
     (pid, cancel, h)
 }
 
+#[cfg(feature = "spawn-gate")]
 fn wait_for_git_child(pid: &AtomicU32) -> (u32, u32) {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
@@ -766,6 +778,7 @@ fn wait_for_git_child(pid: &AtomicU32) -> (u32, u32) {
     }
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_hung_worker_and_its_git_child_are_ended_at_the_broker_wall_clock() {
     need!();
@@ -790,6 +803,7 @@ fn a_hung_worker_and_its_git_child_are_ended_at_the_broker_wall_clock() {
     assert_eq!(db.count("git_commits"), 0);
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn cancelling_ends_the_worker_and_its_git_child() {
     need!();
@@ -808,7 +822,7 @@ fn cancelling_ends_the_worker_and_its_git_child() {
 
 struct Grants {
     /// `XDG_STATE_HOME` of the revoking CLI: the store lives in `<xdg>/mindspace`.
-    xdg: tempfile::TempDir,
+    _xdg: tempfile::TempDir,
     _dbdir: tempfile::TempDir,
     store: mindspace::grants::Store,
     id: String,
@@ -840,7 +854,7 @@ fn granted(root: &Path) -> Grants {
         policy,
     });
     Grants {
-        xdg,
+        _xdg: xdg,
         _dbdir: dbdir,
         store,
         id: g.id,
@@ -861,13 +875,14 @@ impl Grants {
 
     /// `mind grant revoke` as a separate process: it needs the grant store's exclusive lock, which
     /// the broker holds (shared) for the duration of a commit lease.
+    #[cfg(feature = "spawn-gate")]
     fn revoke_process(&self) -> std::process::Child {
         Command::new(mind())
             .args(["grant", "revoke", &self.id])
             .env_clear()
-            .env("XDG_STATE_HOME", self.xdg.path())
-            .env("HOME", self.xdg.path())
-            .env("MINDSPACE_DB", self.xdg.path().join("unused.db"))
+            .env("XDG_STATE_HOME", self._xdg.path())
+            .env("HOME", self._xdg.path())
+            .env("MINDSPACE_DB", self._xdg.path().join("unused.db"))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -875,6 +890,7 @@ impl Grants {
     }
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn revocation_during_extraction_ends_the_operation() {
     need!();
@@ -941,6 +957,7 @@ fn a_commit_needs_the_lease_of_its_own_operation() {
 
 // ====================================================================== commit outcomes
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_vetoed_sqlite_commit_is_a_clean_rollback_and_a_lost_acknowledgement_is_unknown() {
     need!();
@@ -1000,6 +1017,7 @@ fn a_vetoed_sqlite_commit_is_a_clean_rollback_and_a_lost_acknowledgement_is_unkn
 
 // ================================================================== revocation ordering
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn a_commit_that_outlasts_the_grant_ceiling_keeps_its_lease_and_a_revocation_waits_for_it() {
     need!();
@@ -1113,11 +1131,14 @@ fn a_git_operation_id_cannot_be_reused_and_the_identity_in_ready_is_the_brokers(
 
 // ================================================================== the trusted executable
 
+#[cfg(feature = "spawn-gate")]
 use mindspace::ingest::confined_git::TrustPolicy;
+#[cfg(feature = "spawn-gate")]
 use std::os::unix::fs::PermissionsExt;
 
 /// A copy of git in a private directory below `target`, resolved with the PRODUCTION resolver
 /// (pins included), the test user accepted as an owner so the fixture can be trusted at all.
+#[cfg(feature = "spawn-gate")]
 fn trusted_copy() -> (tempfile::TempDir, PathBuf, GitExecutable) {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/trust-tests");
     std::fs::create_dir_all(&base).unwrap();
@@ -1138,12 +1159,14 @@ fn trusted_copy() -> (tempfile::TempDir, PathBuf, GitExecutable) {
     (d, exe, g)
 }
 
+#[cfg(feature = "spawn-gate")]
 fn trusted_cfg(g: GitExecutable) -> BrokerConfig {
     let mut c = BrokerConfig::new(mind());
     c.git = Some(g);
     c
 }
 
+#[cfg(feature = "spawn-gate")]
 #[test]
 fn the_worker_gets_the_pins_and_a_binary_that_changed_before_it_started_never_runs() {
     need!();

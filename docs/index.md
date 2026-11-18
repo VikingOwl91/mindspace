@@ -1,33 +1,23 @@
-# Alpha documentation
+# Mindspace documentation
 
-Start with the [README](../README.md), then the [install guide](install.md): `sh install.sh` verifies
-and builds the RC.5 source archive from the
-[official Alpha release](https://github.com/VikingOwl91/mindspace/releases/tag/v0.1.0-alpha.1).
-Public main contains the Alpha source, later changes and these documentation updates.
-The release tag points to the older hosting commit
-`92f68ff646ec9b06ba21df2fb7879dfbc1281838`; the tag and generated source downloads
-do not identify or contain the qualified RC.5 implementation. The former
-`v0.2.0` and `v0.3.0` pre-alpha releases and their tags have been removed;
-`v0.1.0-alpha.1` is the only published release.
+Start with the [README quickstart](../README.md#quickstart) to index a small
+Git repository and inspect a search result. For a complete CLI and stdio MCP
+walk-through, including a memory written by a client, use the
+[operator demo](source-install.md#6-initialize-a-private-demo-database).
 
-- [Install guide: the installer, the trust decision, troubleshooting](install.md)
-- [Operator reference: manual verification, build requirements, backup and recovery, uninstall](source-install.md)
-- [CLI, configuration and manual MCP examples](reference.md)
-- [Client setup and undo](setup.md)
-- [Release notes and excluded capabilities](release-notes.md)
-- [Architecture and security boundaries](architecture.md)
-- [Offline backup and pre-upgrade recovery](offline-recovery.md)
-- [Security reports and supported versions](../SECURITY.md)
-- [MIT license](../LICENSE) and [archive third-party notices](../THIRD_PARTY_NOTICES.md)
+| If you want to | Read |
+| --- | --- |
+| Install the signed Linux x86_64 release | [Install guide](install.md) and [release notes](release-notes.md) |
+| Verify the source archive or build it manually | [Source installation](source-install.md) |
+| Connect an agent or undo registration | [Client setup](setup.md) |
+| Search memories, inspect code, or handle ingest refusals | [CLI and MCP reference](reference.md) |
+| Understand storage, provenance, and confinement | [Architecture](architecture.md) and [memory model](memory-model.md) |
+| Back up or restore a trusted database | [Offline recovery](offline-recovery.md) |
+| See what has landed since the release and what comes next | [Development roadmap](roadmap.md) |
+| Reproduce first-ingest timings | [Benchmark and fixture](ingest-performance.md) |
+| Contribute or report a vulnerability | [Development checks](../CONTRIBUTING.md) and [security policy](../SECURITY.md) |
 
-The README has a short quickstart against your own repository. The install
-operator reference (sections 6 to 9) includes the complete temporary Git-repository demo and a
-standalone Python/stdio MCP memory example, so an AI account is not required. Execute examples against the verified archive build; a build of public
-main can differ.
-
-The supported profile is Linux x86_64 without embedding models: explicit memories,
-legacy Markdown/text, committed Git content, lexical retrieval and Rust symbols.
-Canonical document/PDF ingestion and unfinished M8 publication are unsupported.
-Other existing design documents, experiments, reviews and benchmark records in
-this repository are historical development material. They are not required for
-installation and do not extend supported Alpha capabilities.
+The published v0.1.0-alpha.2 archive supports lexical retrieval and Rust symbol
+search. The development branch also indexes Go, JavaScript/JSX, TypeScript/TSX,
+and inline Svelte scripts. Historical design and qualification reports describe
+the revisions named in each report.

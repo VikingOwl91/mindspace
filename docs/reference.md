@@ -1,8 +1,9 @@
-# Alpha CLI and MCP reference
+# CLI and MCP reference
 
-These examples are selected/adapted from the qualified RC.5 README, reference
-and install guide. First [verify and install the archive](source-install.md).
-Public main is the development line: the release source plus later changes.
+The CLI examples below work with the published v0.1.0-alpha.2 unless marked
+as development features. The repository ingest, language coverage and deadline
+sections describe the current development checkout. The signed archive has its
+own [release notes](release-notes.md).
 
 ## Database configuration
 
@@ -31,8 +32,24 @@ mind doctor
 
 Use `mind ingest /path/to/note.md --space demo` for an existing legacy text or
 Markdown file. Git ingestion reads committed objects, not dirty/untracked files.
-`--history` selects ref tips, not every ancestor's file content. Serialize ingests
-while changing HEAD. Across an observed HEAD move from the same worktree,
+`--history` selects ref tips. To capture a change of HEAD, finish one ingest
+before switching revisions, then ingest again.
+`mind inspect <memory-id> --json` inspects a returned memory.
+Create an explicit memory with `mind memory create "text" --space demo`.
+Use `--subject` to set its subject or `-` to read from standard input.
+Repeating a creation only adds missing spaces. MCP also supports updating a
+memory. To retire it from the CLI, run `mind retire <memory-id>`.
+
+## Repository ingest on main
+
+Git, directory and single-file ingestion accept UTF-8 text up to and including
+32 MiB per file. The report identifies eligible paths skipped for invalid
+UTF-8 or size. Re-ingest after upgrading to retire memories derived from lossy
+or oversized text under the old policy. Earlier evidence remains available.
+For skipped filesystem paths, check the reported previous version ID to see
+whether earlier eligible content is still searchable.
+
+Across an observed HEAD move from the same worktree,
 `mind trace <memory-id>` shows the successor or predecessor when the Git path
 and normalized subject match uniquely and all other views remain stable.
 Deleted files, renamed paths and ambiguous matches appear as retired.
@@ -41,14 +58,14 @@ symbols at other recorded tips stay current, including tips shared by multiple
 worktrees. Use an ordinary `mind ingest` to reconcile removed worktrees, changed
 ref selections or older aggregate view data.
 `mind search <query> --at <timestamp>` can still find the displaced episode.
-`mind inspect <memory-id> --json` inspects a returned memory.
-Create a memory on the command line with
-`mind memory create "text" --space demo` (`--subject` sets the subject, `-` reads the text from
-standard input, repeating it only adds missing spaces). MCP offers the same plus update; retire
-is also available as `mind retire`. The install
-guide includes a standalone Python/stdio MCP example. Use the verified binary's
-`--help` and subcommand help for full syntax. These examples are retained docs,
-not a new runtime qualification.
+
+The opt-in MCP tool `repo_ingest_git_isolated` reads only the requested HEAD.
+It supports linked worktrees and local alternate object stores. If Git metadata
+or borrowed objects live outside the checkout, the checkout and its dependencies
+must fit within one configured static read-write root. Any applicable read-only
+restriction still applies. Offline partial clones need the HEAD commit, its
+trees and their blobs locally. A missing object returns `missing_local_object`.
+The worker never fetches it. See the [Git worker layout example](https://github.com/VikingOwl91/mindspace/blob/77eeff0c028c7a5ee21672377b496660182e6e91/docs/m7.3b5e-mcp-git-tool.md#linked-worktrees-local-alternates-and-partial-clones).
 
 ## Symbol language coverage
 
@@ -153,10 +170,11 @@ For an MCP client using `mcpServers` JSON (replace both paths):
 
 An agent must explicitly create a memory or ingest content. Memory tools include
 create/update/retire/get/search/history. Repository tools include `repo_outline`
-and `repo_ingest`. `code_search` finds symbols in Rust, Go, JavaScript, TypeScript, TSX and Svelte. Spaces organize retrieval
+and `repo_ingest`. The release supports Rust in `code_search`. The checkout
+supports the additional languages listed under [symbol coverage](#symbol-language-coverage). Spaces organize retrieval
 and are not access controls. MCP is local stdio without authentication.
 
-Repository policy failures expose a stable category in `structuredContent.error.kind`.
+On `main`, repository policy failures expose a stable category in `structuredContent.error.kind`.
 Clients can distinguish `invalid_argument`, `root_not_authorized`, and `read_only_root`.
 `too_many_files` identifies a file-count limit. `too_large` identifies a byte, frame, or
 Git structure limit. `timeout` identifies a deadline. A successful ingest can include
@@ -183,7 +201,7 @@ ingestion has no equivalent kernel-confinement promise. Do not treat
 [sandbox capabilities](sandbox-capabilities.md) and
 [security policy](../SECURITY.md).
 
-Known limits of this Alpha:
+The following limits describe the published v0.1.0-alpha.2 archive.
 
 - Linux x86_64 is the qualified platform. MCP repository access needs effective
   Landlock ABI 3+; other operating systems and arbitrary filesystems/containers

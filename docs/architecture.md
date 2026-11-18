@@ -1,7 +1,7 @@
 # Alpha architecture
 
-This overview describes the 0.1.0-alpha.2 archive (carried over from the qualified RC.5 documents).
-Public main is the development line: the release source plus later changes.
+This overview describes the v0.1.0-alpha.2 archive. The repository ingest
+section also covers changes available on the development branch.
 
 ## Local engine
 
@@ -34,6 +34,21 @@ independent proof that the content is true. Conversation recording is not automa
 Canonical document/PDF ingestion and M8 document publication are excluded. Private
 ownership/staging administration is unsupported. Package, schema and MCP protocol
 versions are separate. A package version does not qualify arbitrary builds/data.
+
+## Repository ingest on main
+
+The CLI reads committed Git objects and records the checkout views it observes.
+A refresh through the opt-in isolated Git worker updates only its requested
+checkout. Another worktree can stay at an older commit with its own current
+memories and symbols. When the same path and subject identify a unique successor,
+the store links the two memory episodes and retains both commits as evidence.
+
+The worker can read authorized worktree metadata and alternate object stores
+through pinned descriptors. It requires the selected HEAD's objects to be
+available locally. Before persisting the verified result, the writer checks
+its commit lease. The caller can distinguish a refusal before writing, a
+confirmed rollback, and an uncertain commit from the MCP response.
+[Repository ingest reference](reference.md#repository-ingest-on-main)
 
 ## Storage and configuration
 

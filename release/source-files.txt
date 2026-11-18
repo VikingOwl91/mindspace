@@ -18,12 +18,15 @@ docs/architecture.md
 docs/decisions.md
 docs/doctor.md
 docs/grants.md
+docs/index.md
 docs/ingest-performance.md
+docs/install.md
 docs/memory-model.md
 docs/offline-recovery.md
 docs/reference.md
 docs/release-notes.md
 docs/retrieval-performance.md
+docs/roadmap.md
 docs/sandbox-capabilities.md
 docs/sandbox-seccomp.md
 docs/setup.md

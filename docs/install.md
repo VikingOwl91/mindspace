@@ -3,7 +3,7 @@
 The installer selects the newest published GitHub release, including prereleases and excluding
 drafts. It authenticates one explicitly supported source-release contract, builds it with its exact
 Rust toolchain and installs a versioned binary under your home directory. Unsupported or unverifiable
-selected releases stop the operation; an older release is never tried silently. For manual RC.5
+selected releases stop the operation; an older release is never tried silently. For manual archive
 verification and the operator reference, see the [source-install guide](source-install.md).
 
 ## Before you start
@@ -11,9 +11,9 @@ verification and the operator reference, see the [source-install guide](source-i
 - Linux on x86_64; other platforms are unsupported by the current contracts.
 - Python 3.11+, curl, GnuPG with `--assert-signer`, tar, gzip, sha256sum, timeout, flock (util-linux),
   and a C compiler with C headers. Git is needed for repository ingestion.
-- The exact Rust toolchain named by the supported contract. RC.5 requires Rust 1.98.1:
-  `rustup toolchain install 1.98.1 --profile minimal`. Future contracts currently support 1.98.1 or
-  1.100.0. The installer prints the required version and never installs a toolchain itself.
+- The exact Rust toolchain named by the supported contract. For v0.1.0-alpha.2, run
+  `rustup toolchain install 1.100.0 --profile minimal`. The earlier v0.1.0-alpha.1 (RC.5) uses
+  1.98.1. The installer prints the required version and expects it to be installed already.
 - About 2 GiB free in `/tmp` or `TMPDIR`, and access to GitHub, the publisher's key domain and crates.io.
 
 ## Install
@@ -37,7 +37,7 @@ cd mindspace
 sh install.sh
 ```
 
-To select a version explicitly, append `--version 0.1.0-alpha.1` (one optional `v` prefix is accepted).
+To select a version explicitly, append `--version 0.1.0-alpha.2` (one optional `v` prefix is accepted).
 This chooses the authenticated version binding. For a fresh client it does not establish historical
 byte immutability if a publisher re-signs that version; retain an independently authenticated digest
 for stronger reproducibility. Explicit RC.5 with local `--assets-dir` retains offline verification.
@@ -67,13 +67,13 @@ For RC.5 (`v0.1.0-alpha.1`), the installer retains the original seven exact asse
 SHA-256 pins, detached archive and source-manifest signatures, publisher fingerprint and source
 commit. The bundled key is checked for consistency and never establishes identity.
 
-Future releases require a signed `mindspace-release-v1` envelope with the explicitly supported
+The v0.1.0-alpha.2 release uses a signed `mindspace-release-v1` envelope with the explicitly supported
 platform, recipe, exact toolchain and four asset roles. The installer authenticates that envelope
 before using its fields, verifies all declared sizes/hashes, verifies detached archive and source
 manifest signatures, and cross-checks the manifest's source/archive identities and bounded USTAR
 members before extraction. It rejects unknown contracts, key/signature expiry/revocation and a
 changed publisher fingerprint. Key rotation requires an independently authenticated installer update.
-The [contract and trust decisions](installer-release-selection-proposal.md) describe the limits and
+The [contract and trust decisions](https://github.com/VikingOwl91/mindspace/blob/77eeff0c028c7a5ee21672377b496660182e6e91/docs/installer-release-selection-proposal.md) describe the limits and
 future publisher workflow. Published RC.5 assets are unchanged.
 
 ## Running it again
@@ -83,8 +83,8 @@ You can run the installer as often as you like.
 | What it finds | What it does |
 | --- | --- |
 | Nothing | Installs. |
-| An intact install of the selected version | Says `Already up to date`, changes no installed files, exits 0. Rust is unnecessary. Default selection still needs discovery access; future contracts are authenticated before no-op validation. |
-| RC.5 without an install record | Checks layout and reported version; returns a no-op with an explicit authenticity caveat. Future-version prefixes without receipts fail safely and require explicit `--reinstall`. |
+| An intact install of the selected version | Says `Already up to date`, changes no installed files, exits 0. Rust is unnecessary. Default selection still needs discovery access; signed release envelopes are authenticated before no-op validation. |
+| RC.5 without an install record | Checks layout and reported version; returns a no-op with an explicit authenticity caveat. Prefixes using the signed envelope contract without receipts fail safely and require explicit `--reinstall`. |
 | A directory that is not a valid install (missing or non-executable binary, a binary that reports another version or no longer matches its record, a symbolic link, a file) | Stops with exit 1 and tells you what is wrong. A directory that merely exists is never taken as proof of an install. |
 | A validated older version, with this version absent | Stops with exit 1 and explains `--upgrade`. With that option, installs beside the old version, preserving it. |
 | A newer version installed beside this one | Stops with exit 1 unless the intact install of this version is already there. `--allow-older` installs this version beside the newer one. |
@@ -163,16 +163,16 @@ install unless you ask with `--reinstall`.
 ## After installing
 
 Run the binary at the full path printed by the installer, or add that version to your `PATH` yourself.
-The examples below use RC.5; substitute the installed version if different:
+The examples below use v0.1.0-alpha.2; substitute the installed version if different:
 
 ```sh
 # bash or zsh (add to ~/.bashrc or ~/.zshrc to keep it)
-export PATH="$HOME/.local/lib/mindspace/0.1.0-alpha.1/bin:$PATH"
+export PATH="$HOME/.local/lib/mindspace/0.1.0-alpha.2/bin:$PATH"
 ```
 
 ```fish
 # Fish (stores the entry in your universal path)
-fish_add_path ~/.local/lib/mindspace/0.1.0-alpha.1/bin
+fish_add_path ~/.local/lib/mindspace/0.1.0-alpha.2/bin
 ```
 
 Check it, then follow the [README quickstart](../README.md#quickstart):
@@ -229,11 +229,11 @@ To authenticate the release without the installer, follow the
 
 ## Uninstall
 
-The example removes RC.5; use the selected version printed by your installation:
+The example removes v0.1.0-alpha.2; use the selected version printed by your installation:
 
 ```sh
-rm -f -- ~/.local/lib/mindspace/0.1.0-alpha.1/bin/mind ~/.local/lib/mindspace/0.1.0-alpha.1/install-record
-rmdir ~/.local/lib/mindspace/0.1.0-alpha.1/bin ~/.local/lib/mindspace/0.1.0-alpha.1
+rm -f -- ~/.local/lib/mindspace/0.1.0-alpha.2/bin/mind ~/.local/lib/mindspace/0.1.0-alpha.2/install-record
+rmdir ~/.local/lib/mindspace/0.1.0-alpha.2/bin ~/.local/lib/mindspace/0.1.0-alpha.2
 ```
 
 Installs replaced by `--reinstall` are in `~/.local/lib/mindspace/previous/`; delete them when you no longer

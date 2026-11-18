@@ -1299,9 +1299,57 @@ fn failed_revision_allocation_confirms_rollback_before_returning_the_cause() {
         _ => Authorization::Allow,
     }))
     .unwrap();
-    let result = begin_write_for_root(c, &store.revision_state, 3);
+    let result = begin_write_with_ingest_context(c, &store.revision_state, Some(3));
     assert!(matches!(
         result,
         Err(Error::IngestRollbackUnconfirmed { prior_roots: 3, .. })
     ));
+}
+
+#[test]
+fn a_definitive_commit_refusal_with_failed_cleanup_discards_the_ingest_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = SqliteStore::open(&path).unwrap();
+    let before = store
+        .temporal_history_capabilities()
+        .unwrap()
+        .current_revision;
+    {
+        let mut guard = store.connection().unwrap();
+        let c = guard.guard.as_mut().unwrap();
+        c.execute_batch("CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                         CREATE TABLE child (id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
+        c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+        let tx = begin_write(c, &store.revision_state).unwrap();
+        let error = tx
+            .finish_ingest(&Deadline::none().for_root(2), &|| Ok(()), |tx, _| {
+                tx.execute("INSERT INTO child VALUES(1)", []).map_err(dberr)
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::IngestRollbackUnconfirmed { detail, prior_roots: 2 }
+            if detail.contains("FOREIGN KEY constraint failed")),
+            "{error}"
+        );
+    }
+    assert!(matches!(
+        store.create_space("discarded", ""),
+        Err(Error::ConnectionDiscarded)
+    ));
+    drop(store);
+    let reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .temporal_history_capabilities()
+            .unwrap()
+            .current_revision,
+        before
+    );
 }

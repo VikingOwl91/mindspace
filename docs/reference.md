@@ -159,7 +159,7 @@ Git structure limit. `timeout` identifies a deadline. A successful ingest can in
 per-file text exclusions in `skipped_files`. Isolated Git reports `missing_local_object`
 when a required object is unavailable locally. Isolated writes also report `commit_state`.
 `rollback_unconfirmed` with `NOT_COMMITTED` and `persisted: false` means the server
-stopped before COMMIT and could not confirm rollback. `commit_outcome_unknown` with
+could establish that the transaction did not commit, but could not confirm rollback. `commit_outcome_unknown` with
 `UNKNOWN` and `persisted: "unknown"` means the COMMIT outcome could not be established.
 
 `server_status` (read-only) tells you which database a running server opened: the path (the home

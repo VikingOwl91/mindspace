@@ -291,6 +291,12 @@ pub fn run(
                     "NOT_STARTED",
                     json!(false),
                 ),
+                error @ crate::core::Error::IngestWriteNotStarted { .. } => failure_commit(
+                    "persist_failed",
+                    error.to_string(),
+                    "NOT_STARTED",
+                    json!(false),
+                ),
                 error @ crate::core::Error::IngestRollbackUnconfirmed { .. } => failure_commit(
                     "rollback_unconfirmed",
                     error.to_string(),

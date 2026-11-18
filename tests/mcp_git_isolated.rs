@@ -845,6 +845,34 @@ fn head_only_ingestion_reports_what_was_verified_and_what_was_not_and_repeats_wi
 // ------------------------------------------------------------------ authority
 
 #[test]
+fn a_busy_writer_prevents_begin_and_reports_not_started_for_both_isolated_tools() {
+    let w = World::new();
+    let repo = w.repo("repo");
+    let dir = w.dir("dir", &[("d.md", "# D\n")]);
+    let opts = [
+        "--isolated-ingest",
+        "--isolated-git-ingest",
+        "--git-exe",
+        GIT,
+    ];
+    let mut m = mcp!(w, &[&repo, &dir], &opts, &[]);
+    let before = w.counts();
+    let writer = rusqlite::Connection::open(&w.db).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for (tool, path) in [(DIR_TOOL, &dir), (TOOL, &repo)] {
+        let result = m.call(tool, json!({"path": path, "spaces": ["p"]}));
+        assert_refused(&result, "persist_failed");
+    }
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(w.counts(), before);
+    assert_eq!(
+        m.ingest(&repo)["structuredContent"]["commit_state"],
+        "COMMITTED"
+    );
+    m.finish();
+}
+
+#[test]
 fn whole_root_tools_require_effective_read_write_authority() {
     let w = World::new();
     let readonly = w.repo("readonly");

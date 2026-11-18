@@ -89,7 +89,10 @@ pub enum Error {
     #[error("{message}")]
     IngestTimeout { message: String, writing: bool },
 
-    #[error("ingest stopped before COMMIT, but SQLite rollback could not be confirmed ({detail}). {prior_roots} earlier selected roots were committed. Restart the server or reopen the database, then repeat the ingest.")]
+    #[error("SQLite could not start the ingest write transaction: {detail}")]
+    IngestWriteNotStarted { detail: String },
+
+    #[error("SQLite did not commit the ingest, but rollback could not be confirmed ({detail}). {prior_roots} earlier selected roots were committed. Restart the server or reopen the database, then repeat the ingest.")]
     IngestRollbackUnconfirmed { detail: String, prior_roots: usize },
 
     #[error("cannot establish repository identity for {path}: {reason}")]

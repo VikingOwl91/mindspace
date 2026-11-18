@@ -191,7 +191,7 @@ impl WriteTransaction<'_> {
         });
         match result {
             Ok(report) => {
-                self.commit()?;
+                self.commit_with_ingest_context(Some(deadline.prior_roots()))?;
                 Ok(report)
             }
             Err(error) => Err(self.rollback_error(error, deadline.prior_roots())),
@@ -219,7 +219,11 @@ impl WriteTransaction<'_> {
         }
     }
 
-    fn commit(mut self) -> Result<()> {
+    fn commit(self) -> Result<()> {
+        self.commit_with_ingest_context(None)
+    }
+
+    fn commit_with_ingest_context(mut self, prior_roots: Option<usize>) -> Result<()> {
         let tx = self
             .tx
             .take()
@@ -229,15 +233,29 @@ impl WriteTransaction<'_> {
             .active_revision
             .store(0, Ordering::SeqCst);
         if let Err(e) = result {
-            if !self.conn.is_autocommit() {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
+            let rollback_error = if self.conn.is_autocommit() {
+                None
+            } else {
+                self.conn.execute_batch("ROLLBACK").err()
+            };
             let error = commit_failure(e);
             // A COMMIT SQLite defines as "not committed" (busy, locked, constraint) that left the
             // connection outside a transaction again leaves a clean handle: keep using it. An
             // unknown outcome, or a handle still inside a transaction, is discarded.
-            if matches!(error, Error::CommitOutcomeUnknown { .. }) || !self.conn.is_autocommit() {
+            if matches!(error, Error::CommitOutcomeUnknown { .. }) {
                 self.revision_state.poisoned.store(true, Ordering::SeqCst);
+            } else if !self.conn.is_autocommit() {
+                self.revision_state.poisoned.store(true, Ordering::SeqCst);
+                if let Some(prior_roots) = prior_roots {
+                    let cleanup = rollback_error.map_or_else(
+                        || "SQLite still has an active transaction".into(),
+                        |e| e.to_string(),
+                    );
+                    return Err(Error::IngestRollbackUnconfirmed {
+                        detail: format!("SQLite refused COMMIT ({error}), rollback: {cleanup}"),
+                        prior_roots,
+                    });
+                }
             }
             return Err(error);
         }
@@ -849,13 +867,13 @@ fn begin_write<'conn>(
     conn: &'conn Connection,
     state: &Arc<RevisionState>,
 ) -> Result<WriteTransaction<'conn>> {
-    begin_write_for_root(conn, state, 0)
+    begin_write_with_ingest_context(conn, state, None)
 }
 
-fn begin_write_for_root<'conn>(
+fn begin_write_with_ingest_context<'conn>(
     conn: &'conn Connection,
     state: &Arc<RevisionState>,
-    prior_roots: usize,
+    prior_roots: Option<usize>,
 ) -> Result<WriteTransaction<'conn>> {
     if state.poisoned.load(Ordering::SeqCst) {
         return Err(Error::ConnectionDiscarded);
@@ -866,7 +884,15 @@ fn begin_write_for_root<'conn>(
         ));
     }
 
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|e| {
+        if prior_roots.is_some() {
+            Error::IngestWriteNotStarted {
+                detail: e.to_string(),
+            }
+        } else {
+            dberr(e)
+        }
+    })?;
     let tx = WriteTransaction {
         tx: Some(tx),
         conn,
@@ -874,7 +900,7 @@ fn begin_write_for_root<'conn>(
     };
     match allocate_revision(&tx, state) {
         Ok(()) => Ok(tx),
-        Err(error) => Err(tx.rollback_error(error, prior_roots)),
+        Err(error) => Err(tx.rollback_error(error, prior_roots.unwrap_or(0))),
     }
 }
 
@@ -2408,7 +2434,11 @@ impl Store for SqliteStore {
         // them before they are committed. Any error (or a crash before the COMMIT) leaves nothing.
         let repository_id = observation.repository_id;
         let conn = self.connection()?;
-        let tx = begin_write_for_root(&conn, &self.revision_state, deadline.prior_roots())?;
+        let tx = begin_write_with_ingest_context(
+            &conn,
+            &self.revision_state,
+            Some(deadline.prior_roots()),
+        )?;
         tx.finish_ingest(deadline, before_commit, |tx, deadline| {
             let mut report = record_git_observation_tx(tx, &observation, deadline)?;
             if let Some(code) = code {
@@ -2482,7 +2512,11 @@ impl Store for SqliteStore {
         // and its derivations commit together, or (on any error, or a crash before the commit)
         // neither does. The two `record_*` methods above remain for callers that want one part.
         let conn = self.connection()?;
-        let tx = begin_write_for_root(&conn, &self.revision_state, deadline.prior_roots())?;
+        let tx = begin_write_with_ingest_context(
+            &conn,
+            &self.revision_state,
+            Some(deadline.prior_roots()),
+        )?;
         tx.finish_ingest(deadline, before_commit, |tx, deadline| {
             let mut report = record_observation_tx(tx, observation, deadline)?;
             if let Some(code) = code {

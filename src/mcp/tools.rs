@@ -31,6 +31,7 @@ impl ToolFailure {
     fn repository_error(error: Error) -> Self {
         let kind = match &error {
             Error::IngestTimeout { .. } => "timeout",
+            Error::IngestWriteNotStarted { .. } => "persist_failed",
             Error::IngestRollbackUnconfirmed { .. } => "rollback_unconfirmed",
             Error::CommitOutcomeUnknown { .. } => "commit_outcome_unknown",
             Error::InvalidPath { .. } => "invalid_argument",

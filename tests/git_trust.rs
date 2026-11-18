@@ -11,6 +11,9 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -48,11 +51,7 @@ fn copy_git(dir: &Path) -> PathBuf {
 }
 
 fn skip() -> bool {
-    if !Path::new(GIT).exists() {
-        eprintln!("SKIP: {GIT} not found");
-        return true;
-    }
-    false
+    !prerequisites::system_git()
 }
 
 fn refused(r: Result<GitExecutable, mindspace::core::Error>) -> String {
@@ -69,8 +68,7 @@ fn the_system_git_passes_the_default_root_only_policy_and_is_pinned() {
     }
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(GIT).unwrap();
-    if md.uid() != 0 {
-        eprintln!("SKIP: {GIT} is not root-owned here");
+    if !prerequisites::require(md.uid() == 0, "root-owned /usr/bin/git") {
         return;
     }
     let g = GitExecutable::resolve_trusted(Path::new(GIT), &TrustPolicy::default()).unwrap();

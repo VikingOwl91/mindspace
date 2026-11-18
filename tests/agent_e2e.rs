@@ -8,7 +8,7 @@
 //!
 //! - `record_manual_write_is_found_in_trait_and_impl` always runs on a
 //!   fixture shaped like the original failure.
-//! - `real_repo_agent_flow` runs against any repository when
+//! - `real_repo_agent_flow` runs explicitly with `--ignored` when
 //!   `MINDSPACE_E2E_REPO=<repo dir>` is set (optionally
 //!   `MINDSPACE_E2E_REQUIRED="symbol:path1,path2;symbol2:path"`). The repo is
 //!   never touched: only its `.git` directory is copied into a temp dir.
@@ -509,11 +509,10 @@ fn fixture_details_qualified_names_scoping_and_memory_boundary() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires an operator-selected repository in MINDSPACE_E2E_REPO"]
 fn real_repo_agent_flow() {
-    let Some(repo) = std::env::var_os("MINDSPACE_E2E_REPO").map(PathBuf::from) else {
-        eprintln!("skipped: set MINDSPACE_E2E_REPO=<repo dir> to run against a real repository");
-        return;
-    };
+    let repo =
+        PathBuf::from(std::env::var_os("MINDSPACE_E2E_REPO").expect("set MINDSPACE_E2E_REPO"));
     let spec = std::env::var("MINDSPACE_E2E_REQUIRED").unwrap_or_default();
     let required: Vec<(&str, Vec<&str>)> = spec
         .split(';')

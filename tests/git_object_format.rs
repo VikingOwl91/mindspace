@@ -5,6 +5,9 @@
 //! fail: it returned 40-digit entry ids that name no object and left hash bytes in the next entry's
 //! mode, and the ingestion stored them. These tests use REAL SHA-256 repositories.
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,7 +32,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// A repository with a nested directory (so there are trees below the root) and Rust code.
-fn repo(format: &str) -> Option<(tempfile::TempDir, PathBuf)> {
+fn repo(format: &str) -> (tempfile::TempDir, PathBuf) {
     let d = tempfile::tempdir().unwrap();
     let path = std::fs::canonicalize(d.path()).unwrap().join("repo");
     std::fs::create_dir_all(path.join("src/inner")).unwrap();
@@ -42,13 +45,14 @@ fn repo(format: &str) -> Option<(tempfile::TempDir, PathBuf)> {
             "main",
             &format!("--object-format={format}"),
         ],
-    )?;
+    )
+    .expect("initialize repository fixture");
     std::fs::write(path.join("README.md"), "# Readme\n\nalpha\n").unwrap();
     std::fs::write(path.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
     std::fs::write(path.join("src/inner/deep.rs"), "pub fn deep() {}\n").unwrap();
-    git(&path, &["add", "-A"])?;
-    git(&path, &["commit", "-q", "-m", "one"])?;
-    Some((d, path))
+    git(&path, &["add", "-A"]).expect("add fixture files");
+    git(&path, &["commit", "-q", "-m", "one"]).expect("commit fixture files");
+    (d, path)
 }
 
 fn db() -> (tempfile::TempDir, PathBuf) {
@@ -102,10 +106,10 @@ fn dump(path: &Path) -> BTreeMap<String, Vec<String>> {
 
 #[test]
 fn a_sha256_repository_is_refused_with_a_clear_error_and_nothing_is_stored() {
-    let Some((_d, repo)) = repo("sha256") else {
-        eprintln!("SKIP: this git cannot create a SHA-256 repository");
+    if !prerequisites::git_object_format("git") {
         return;
-    };
+    }
+    let (_d, repo) = repo("sha256");
     let (_dir, dbp) = db();
     let before = dump(&dbp);
     let store = open_existing(&dbp).unwrap();
@@ -137,7 +141,7 @@ fn a_sha256_repository_is_refused_with_a_clear_error_and_nothing_is_stored() {
 
 #[test]
 fn a_sha1_repository_still_ingests_and_its_tree_entries_are_real_objects() {
-    let (_d, repo) = repo("sha1").unwrap();
+    let (_d, repo) = repo("sha1");
     let (_dir, dbp) = db();
     let store = open_existing(&dbp).unwrap();
     ingest::ingest_path(&store, &repo, &["p"]).unwrap();

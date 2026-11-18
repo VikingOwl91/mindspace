@@ -24,7 +24,15 @@ sh tests/scripts/install_sh_test.sh                   # release installer, no bu
 shellcheck -s sh install.sh                           # POSIX shell lint of the installer
 ```
 
-Linux is the only tested platform.
+Linux is the only tested platform. CI sets `MINDSPACE_STRICT_TESTS=1` on both full
+suites. A missing runtime prerequisite fails the test. Local runs print the test name
+and missing prerequisite on stderr. Broker tests require a writable delegated cgroup v2
+subtree, and the aggregate-memory test also needs its memory controller.
+
+To exercise the optional installed clients, run `cargo test --test setup real_ -- --ignored`
+with the selected clients installed (or filter by client name). For the real-repository
+flow, set `MINDSPACE_E2E_REPO` and run
+`cargo test --test agent_e2e real_repo_agent_flow -- --exact --ignored`.
 
 ## Rust toolchain
 

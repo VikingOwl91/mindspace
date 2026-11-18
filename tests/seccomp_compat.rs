@@ -11,6 +11,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -299,17 +302,10 @@ fn find_id(v: &Value) -> Option<String> {
 }
 
 fn applicable() -> bool {
-    use mindspace::doctor::capabilities::{probe_kernel, LandlockState};
-    if mindspace::sandbox::seccomp::audit_arch().is_none() {
-        eprintln!("skipped: the filter is not applied on this architecture (UNKNOWN)");
-        return false;
-    }
-    let k = probe_kernel();
-    if !matches!(k.landlock, LandlockState::Available(v) if v >= 3) {
-        eprintln!("skipped: Landlock ABI 3+ unavailable (the sandbox, and so the filter, is off)");
-        return false;
-    }
-    true
+    prerequisites::require(
+        mindspace::sandbox::seccomp::audit_arch().is_some(),
+        "seccomp audit architecture",
+    ) && prerequisites::landlock(3)
 }
 
 // ------------------------------------------------------------------- tests

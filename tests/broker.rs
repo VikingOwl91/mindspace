@@ -11,6 +11,9 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -108,21 +111,9 @@ fn slow_source() -> String {
     format!("const X: [u8; 1] = [{}];\n", vec!["1"; 950_000].join(","))
 }
 
-fn cgroup_available() -> bool {
-    let c = BrokerConfig::new(mind());
-    let a = StaticRoots::new(&[std::env::temp_dir()]).unwrap();
-    match Broker::new(Box::new(a), c) {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("SKIPPED: cgroup v2 delegation is unavailable here: {e}");
-            false
-        }
-    }
-}
-
 macro_rules! need_cgroup {
     () => {
-        if !cgroup_available() {
+        if !prerequisites::cgroup_delegated(prerequisites::Cgroup::DirectOrSibling) {
             return;
         }
     };
@@ -675,7 +666,9 @@ fn the_unreliable_process_group_mode_is_explicit_and_reported() {
 
 #[test]
 fn an_aggregate_memory_limit_ends_the_operation_and_leaves_the_broker_alive() {
-    need_cgroup!();
+    if !prerequisites::cgroup_delegated(prerequisites::Cgroup::WithControllers) {
+        return;
+    }
     let d = slow_tree(); // the slow parse needs well over 128 MiB (see docs/m7.3b-context-exchange.md)
     let root = canon(d.path());
     let db = Arc::new(db());

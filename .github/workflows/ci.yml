@@ -48,7 +48,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --features spawn-gate -- -D warnings
       - name: Tests with embeddings and fault injection
-        run: cargo test --locked --features spawn-gate
+        run: scripts/test-strict.sh --features spawn-gate
       - name: Check the installer binary against staged receipts
         shell: bash
         run: |
@@ -82,7 +82,7 @@ jobs:
         run: |
           cargo metadata --locked --format-version 1 --no-default-features |
             jq -e '.resolve | .root as $root | [.nodes[] | select(.id == $root) | .features] == [[]]'
-      - run: cargo test --locked --no-default-features
+      - run: scripts/test-strict.sh --no-default-features
 
   dependencies:
     name: Dependencies (audit, deny)

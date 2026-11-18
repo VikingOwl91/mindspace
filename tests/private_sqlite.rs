@@ -10,6 +10,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/prerequisites.rs"]
+mod prerequisites;
+
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -153,7 +156,9 @@ fn failed_initialization_leaves_private_recoverable_storage() {
 
 #[test]
 fn permission_denied_creation_does_not_modify_existing_parents() {
-    run_child("denied", 0o022);
+    if prerequisites::require(unsafe { libc::geteuid() } != 0, "unprivileged test account") {
+        run_child("denied", 0o022);
+    }
 }
 
 #[test]
@@ -480,10 +485,6 @@ fn failed_initialization(root: &Path) {
 }
 
 fn denied(root: &Path) {
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("SKIP: permission-denial fixture requires an unprivileged test account");
-        return;
-    }
     let parent = root.join("denied");
     fs::create_dir(&parent).unwrap();
     chmod(&parent, 0o500);

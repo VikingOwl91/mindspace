@@ -72,21 +72,31 @@ pub fn is_installed(entry: &ModelManifestEntry) -> bool {
 }
 
 pub fn is_installed_in(base: &Path, entry: &ModelManifestEntry) -> bool {
-    entry.artifacts.iter().all(|a| {
-        let p = model_dir_in(base, entry.id).join(a.filename);
-        if !p.is_file() {
-            return false;
-        }
-        match fs::metadata(&p) {
-            Ok(m) if m.len() == a.size => verify_file(&p, a).is_ok(),
-            _ => false,
-        }
+    let dir = model_dir_in(base, entry.id);
+    entry
+        .artifacts
+        .iter()
+        .all(|art| verify_file(&dir.join(art.filename), art).is_ok())
+}
+
+/// Check manifest sizes without opening or hashing model files.
+pub(crate) fn model_files_present(base: &Path, entry: &ModelManifestEntry) -> bool {
+    let dir = model_dir_in(base, entry.id);
+    entry.artifacts.iter().all(|art| {
+        fs::symlink_metadata(dir.join(art.filename))
+            .is_ok_and(|m| m.is_file() && m.len() == art.size)
     })
 }
 
 pub fn verify_file(path: &Path, art: &crate::embeddings::manifest::Artifact) -> Result<()> {
     reject_symlink(path)?;
     let meta = fs::metadata(path).map_err(|e| Error::Storage(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(Error::Storage(format!(
+            "expected a regular file at {}",
+            path.display()
+        )));
+    }
     if meta.len() != art.size {
         return Err(Error::Storage(format!(
             "size mismatch for {}: got {}, expected {}",
@@ -95,25 +105,38 @@ pub fn verify_file(path: &Path, art: &crate::embeddings::manifest::Artifact) -> 
             art.size
         )));
     }
-    let mut f = fs::File::open(path).map_err(|e| Error::Storage(e.to_string()))?;
+    let f = fs::File::open(path).map_err(|e| Error::Storage(e.to_string()))?;
+    verify_contents(f, art, Error::Storage, |_| Ok(()))
+}
+
+/// Authenticate the opened stream. Strict staging retains each chunk from that same stream.
+pub(super) fn verify_contents(
+    file: fs::File,
+    art: &crate::embeddings::manifest::Artifact,
+    invalid: impl Fn(String) -> Error,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut reader = file.take(art.size.saturating_add(1));
     let mut hasher = Sha256::new();
+    let mut total = 0;
     let mut buf = [0u8; 65536];
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        if n == 0 {
+        let n = reader.read(&mut buf).map_err(|e| invalid(e.to_string()))?;
+        total += n as u64;
+        if total > art.size || n == 0 {
             break;
         }
+        consume(&buf[..n])?;
         hasher.update(&buf[..n]);
+    }
+    if total != art.size {
+        return Err(invalid(format!("size mismatch for {}", art.filename)));
     }
     let got = hex(hasher.finalize());
     if got != art.sha256 {
-        return Err(Error::Storage(format!(
+        return Err(invalid(format!(
             "checksum mismatch for {}: got {}, expected {}",
-            path.display(),
-            got,
-            art.sha256
+            art.filename, got, art.sha256
         )));
     }
     Ok(())
@@ -322,20 +345,14 @@ pub fn status_in(base: &Path, store: &dyn Store) -> EmbeddingsStatus {
     let selected = selected_model(store);
     let (installed, verified, dimension) = match selected.as_deref().and_then(find_model) {
         Some(e) => {
-            let inst = is_installed_in(base, e);
-            let ver = if inst {
-                e.artifacts
-                    .iter()
-                    .all(|a| verify_file(&model_dir_in(base, e.id).join(a.filename), a).is_ok())
-            } else {
-                false
-            };
-            (inst, ver, Some(e.dimension))
+            let present = model_files_present(base, e);
+            let verified = present && is_installed_in(base, e);
+            (present, verified, Some(e.dimension))
         }
         None => (false, false, None),
     };
     #[cfg(feature = "embeddings")]
-    let indexing_available = enabled && installed;
+    let indexing_available = enabled && verified;
     #[cfg(not(feature = "embeddings"))]
     let indexing_available = false;
     #[cfg(feature = "embeddings")]

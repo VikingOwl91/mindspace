@@ -7,7 +7,6 @@ use crate::core::{encode_f32_le, sha256_hex, Error, Result};
 use candle_core::{DType, Device};
 use candle_transformers::models::nomic_bert::NomicBertModel;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -85,39 +84,17 @@ fn protected_file(path: &Path, size: u64) -> Result<File> {
 }
 /// The very bytes authenticated here, not a subsequent path open, are used by the loader.
 fn read_verified(path: &Path, artifact: &Artifact, deadline: Instant) -> Result<Vec<u8>> {
-    use sha2::{Digest, Sha256};
     check_deadline(deadline)?;
-    let mut file = protected_file(path, artifact.size)?;
+    let file = protected_file(path, artifact.size)?;
     let capacity =
         usize::try_from(artifact.size).map_err(|_| bad("artifact size cannot fit this build"))?;
     let mut bytes = Vec::with_capacity(capacity);
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    loop {
+    super::manager::verify_contents(file, artifact, bad, |chunk| {
         check_deadline(deadline)?;
-        let remaining = (artifact.size + 1).saturating_sub(bytes.len() as u64);
-        if remaining == 0 {
-            return Err(bad("strict artifact exceeded pinned byte bound"));
-        }
-        let read_len = buffer.len().min(remaining as usize);
-        let n = file
-            .read(&mut buffer[..read_len])
-            .map_err(|e| bad(format!("strict artifact read failed: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..n]);
-        hash.update(&buffer[..n]);
-    }
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    })?;
     check_deadline(deadline)?;
-    let actual = hash
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    if bytes.len() as u64 != artifact.size || actual != artifact.sha256 {
-        return Err(bad("strict artifact bytes do not match pinned manifest"));
-    }
     Ok(bytes)
 }
 fn artifact(entry: &ModelManifestEntry, name: &str) -> Result<Artifact> {

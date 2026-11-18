@@ -688,14 +688,14 @@ fn check_embeddings(
         };
         let dir = crate::embeddings::manager::model_dir_in(&base, entry.id);
         d["model_directory"] = json!(dir.display().to_string());
-        if crate::embeddings::manager::is_installed_in(&base, entry) {
-            d["files_verified"] = json!(false);
+        d["files_verified"] = json!(false);
+        if crate::embeddings::manager::model_files_present(&base, entry) {
             Check::new(
                 id,
                 title,
                 Status::Pass,
                 format!(
-                    "enabled; model {} is installed (hashes not re-checked here)",
+                    "enabled; model {} files are present with the expected sizes (hashes not checked)",
                     entry.id
                 ),
             )

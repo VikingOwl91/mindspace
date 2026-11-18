@@ -624,6 +624,37 @@ fn embeddings_disabled_is_a_skip_and_a_missing_model_is_a_warning() {
     );
 }
 
+#[cfg(feature = "embeddings")]
+#[test]
+fn doctor_checks_model_sizes_and_status_authenticates_the_contents() {
+    use mindspace::embeddings::{manager, manifest};
+    let t = tmp();
+    let xdg = t.path().join("xdg");
+    let db = initialized(&xdg);
+    let entry = manifest::default_model();
+    set_embedding_state(&db, true, Some(entry.id));
+    let data = xdg.join("mindspace");
+    let dir = manager::model_dir_in(&data, entry.id);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Sparse files have the expected sizes and deliberately incorrect digests.
+    for art in entry.artifacts {
+        std::fs::File::create(dir.join(art.filename))
+            .unwrap()
+            .set_len(art.size)
+            .unwrap();
+    }
+    let (code, report, _) = doctor_with_xdg(&xdg, &[]);
+    assert_eq!(code, 0);
+    let model = check(&report, "embeddings");
+    assert_eq!(model["status"], "pass");
+    assert_eq!(model["details"]["files_verified"], false);
+    let store = mindspace::SqliteStore::open(&db).unwrap();
+    let status = manager::status_in(&data, &store);
+    assert!(status.installed);
+    assert!(!status.verified);
+    assert!(!status.indexing_available);
+}
+
 // ---------------------------------------------------------------- config
 
 #[test]

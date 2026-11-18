@@ -15,7 +15,7 @@ mind doctor --json   # one JSON document on stdout, nothing else
 | `database` | path and its origin, existence, schema version against what this binary supports | |
 | `config` | effective database path, data directory, model directory, `MINDSPACE_MCP_ALLOW_ROOTS`, `MINDSPACE_MCP_INGEST_TIMEOUT`, each with its origin | an unset optional value |
 | `git` | `git --version` | git is missing (`warn`: repositories cannot be ingested, documents still work) |
-| `embeddings` | enabled, selected model, whether its files are present (hashes are not re-checked; use `mind embeddings status`) | disabled (`skip`), enabled without an installed model (`warn`) |
+| `embeddings` | enabled, selected model, whether its files are regular files of the manifest sizes (use `mind embeddings status` to check hashes) | disabled (`skip`), enabled without an installed model (`warn`) |
 | `sandbox` | a self-test of the MCP repository tools, see below | the sandbox is unavailable (`warn`, the tools are off and fail closed) |
 
 ## Statuses and exit codes
@@ -124,6 +124,6 @@ Nothing is written, created or locked for writing; exit codes and the other fiel
   itself. A grandchild (for example a `git` from the server's own start-up probe) is not supervised; it ends by its
   own deadlines (the server bounds its git calls). The doctor does not wait for such a process, so it cannot delay the
   deadline, but it may briefly outlive the doctor.
-- It does not verify model file hashes (that takes seconds); `mind embeddings status` does.
+- It checks model file types and sizes. In `mind embeddings status`, `installed` means all files are present at the expected sizes. `verified` means their SHA-256 hashes also match the manifest. Indexing requires verified files.
 - It does not look at MCP client configuration files and cannot tell whether a client is set up.
 - Nothing is checked about a running server; start-up messages of `mind mcp` go to its stderr.

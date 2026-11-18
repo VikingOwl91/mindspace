@@ -350,6 +350,63 @@ fn an_honest_transport_is_accepted_and_agrees_with_the_independent_in_process_in
 }
 
 #[test]
+fn consecutive_verified_head_transports_link_their_document_episodes() {
+    let Some(mut f) = fixture() else { return };
+    let store = f.store();
+    let persist = |f: &Fixture| {
+        let (extracted, _) = receive(&f.records(), &StreamLimits::default()).unwrap();
+        let Extracted::Git(g) = extracted else {
+            panic!()
+        };
+        assert!(g.observation.ref_events.is_empty());
+        persist_git(&store, g, &Deadline::none()).unwrap()
+    };
+    let first = persist(&f);
+    let old = first
+        .files
+        .iter()
+        .find(|f| f.path == "README.md")
+        .unwrap()
+        .actions[0]
+        .memory_id;
+    std::fs::write(f.repo.join("README.md"), "# Readme\nnewmarker").unwrap();
+    git(&f.repo, &["add", "README.md"]);
+    git(&f.repo, &["commit", "-q", "-m", "document change"]);
+    f.extracted = extract_git_repository_selected_with_deadline(
+        &StoreContext(&store),
+        &f.repo,
+        &["p"],
+        &PathSelection::all(),
+        GitScope::Head,
+        &Deadline::none(),
+    )
+    .unwrap();
+    f.closure = closure_of(&f.repo, &VerifyLimits::default());
+    let second = persist(&f);
+    let new = second
+        .files
+        .iter()
+        .find(|f| f.path == "README.md")
+        .unwrap()
+        .actions[0]
+        .memory_id;
+    assert!(second.stale_superseded > 0);
+    assert_eq!(
+        store
+            .get_memory_detail(old)
+            .unwrap()
+            .unwrap()
+            .memory
+            .superseded_by,
+        Some(new)
+    );
+    let successor = store.get_memory_detail(new).unwrap().unwrap();
+    assert_eq!(successor.supersedes[0].memory_id, old);
+    assert_eq!(successor.git.unwrap().commit_oid, f.head());
+    assert_eq!(persist(&f).stale_superseded, 0);
+}
+
+#[test]
 fn a_verified_transport_persists_the_same_code_structure_as_the_in_process_ingestion() {
     let Some(f) = fixture() else { return };
     let (got, _) = receive(&f.records(), &StreamLimits::default()).unwrap();

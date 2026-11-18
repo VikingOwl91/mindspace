@@ -27,6 +27,7 @@ use crate::core::{
 use crate::ingest::deadline::Deadline;
 use crate::storage::Store;
 mod files;
+mod git_lineage;
 mod read_session;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -5158,6 +5159,7 @@ fn record_git_observation_tx(
     deadline: &Deadline,
 ) -> Result<GitObservationReport> {
     let at = observation.session.observed_at;
+    let head_move = git_lineage::HeadMove::observed(conn, observation, deadline)?;
 
     // 1. Session journal entry.
     let session_id = Uuid::now_v7();
@@ -5434,10 +5436,7 @@ fn record_git_observation_tx(
         });
     }
 
-    // 5. Derivations: text blobs at ref tips routed through the existing
-    //    spine. The logical source is scoped per (repository, commit, path):
-    //    branches are not belief timelines, so content never supersedes
-    //    across commits; same content reconciles to reuse.
+    // 5. Record each immutable commit/path derivation and its own episodes.
     let mut files = Vec::with_capacity(observation.derivations.len());
     let mut derivations_new: u64 = 0;
     let mut derivations_reused: u64 = 0;
@@ -5504,10 +5503,12 @@ fn record_git_observation_tx(
         });
     }
 
-    // 6. Current views: the commits in `current_commits` (HEAD, worktrees,
-    //    selected refs) define the repository's current knowledge. Memories
-    //    derived at any other commit are stale. They are retired (never
-    //    deleted) with a reason naming the commit and the current views.
+    // Link newly created, uniquely matching HEAD episodes before retiring
+    // the remaining active memories outside the current views.
+    let stale_superseded = match head_move {
+        Some(change) => change.link_successors(conn, observation, &mut files, deadline)?,
+        None => 0,
+    };
     let mut stale_retired: u64 = 0;
     if let Some(current) = &observation.current_commits {
         let current_set: std::collections::BTreeSet<&str> =
@@ -5640,6 +5641,7 @@ fn record_git_observation_tx(
         derivations_new,
         derivations_reused,
         stale_retired,
+        stale_superseded,
         code: CodeObservationReport::default(),
         files,
         events,

@@ -365,6 +365,12 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
         "derivations: {} new, {} reused",
         report.derivations_new, report.derivations_reused
     );
+    if report.stale_superseded > 0 || report.stale_retired > 0 {
+        println!(
+            "displaced memories: {} superseded, {} retired",
+            report.stale_superseded, report.stale_retired
+        );
+    }
     println!(
         "code: {} supported, {} parsed, {} reused, {} entities, {} parse errors",
         report.code.supported_inputs,
@@ -703,12 +709,7 @@ pub fn inspect(detail: &MemoryDetail, as_json: bool) {
     }
     let m = &detail.memory;
     display_line!("memory   {} ({}, created {})", m.id, m.state, m.created_at);
-    if let Some(sb) = &detail.superseded_by {
-        display_line!("superseded by {} (created {})", sb.memory_id, sb.created_at);
-    }
-    for s in &detail.supersedes {
-        display_line!("supersedes {} (created {})", s.memory_id, s.created_at);
-    }
+    render_memory_links(detail);
     if let Some(at) = m.retired_at {
         display_line!(
             "retired  {} {}",
@@ -771,6 +772,15 @@ pub fn inspect(detail: &MemoryDetail, as_json: bool) {
     );
 }
 
+fn render_memory_links(detail: &MemoryDetail) {
+    if let Some(sb) = &detail.superseded_by {
+        display_line!("superseded by {} (created {})", sb.memory_id, sb.created_at);
+    }
+    for s in &detail.supersedes {
+        display_line!("supersedes {} (created {})", s.memory_id, s.created_at);
+    }
+}
+
 pub fn trace(detail: &MemoryDetail, as_json: bool) {
     if as_json {
         json(detail);
@@ -786,6 +796,7 @@ pub fn trace(detail: &MemoryDetail, as_json: bool) {
         m.state,
         m.created_at
     );
+    render_memory_links(detail);
     display_line!(
         "assertion {} kind={} subject=\"{}\" extraction={} extracted={}",
         a.id,

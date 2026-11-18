@@ -1624,9 +1624,9 @@ pub struct GitObservation {
     pub derivations: Vec<GitDerivedFile>,
     pub ref_events: Vec<GitRefEventDraft>,
     /// The commits that make up the repository's current views (HEAD,
-    /// worktrees, and any selected refs). Active git-derived memories of this
-    /// repository derived at any other commit are retired in the same
-    /// transaction. `None` keeps every derivation active (history scope).
+    /// worktrees, and any selected refs). Active git-derived memories outside
+    /// these views are superseded or retired in this transaction. `None`
+    /// keeps every file derivation active (history scope).
     pub current_commits: Option<Vec<String>>,
     /// `(virtual path, blob oid)` of every release derived from a tag ref in
     /// this observation. Active release memories of this repository that are
@@ -1739,9 +1739,11 @@ pub struct GitObservationReport {
     pub objects_existing: u64,
     pub derivations_new: u64,
     pub derivations_reused: u64,
-    /// Memories retired because they were derived at a commit other than the
-    /// current one (head scope only).
+    /// Displaced memories without a successor, including moved/deleted releases.
     pub stale_retired: u64,
+    /// Displaced Git file episodes linked to a fresh episode at the new HEAD.
+    #[serde(default)]
+    pub stale_superseded: u64,
     /// Syntax-only structural derivations. These counters never include memories.
     pub code: CodeObservationReport,
     pub files: Vec<GitFileReport>,

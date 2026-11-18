@@ -32,7 +32,12 @@ mind doctor
 Use `mind ingest /path/to/note.md --space demo` for an existing legacy text or
 Markdown file. Git ingestion reads committed objects, not dirty/untracked files.
 `--history` selects ref tips, not every ancestor's file content. Serialize ingests
-while changing HEAD. `mind inspect <memory-id> --json` inspects a returned memory.
+while changing HEAD. Across an observed HEAD move from the same worktree,
+`mind trace <memory-id>` shows the successor or predecessor when the Git path
+and normalized subject match uniquely and all other views remain stable.
+Deleted files, renamed paths and ambiguous matches appear as retired.
+`mind search <query> --at <timestamp>` can still find the displaced episode.
+`mind inspect <memory-id> --json` inspects a returned memory.
 Create a memory on the command line with
 `mind memory create "text" --space demo` (`--subject` sets the subject, `-` reads the text from
 standard input, repeating it only adds missing spaces). MCP offers the same plus update; retire

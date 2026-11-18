@@ -1219,52 +1219,195 @@ fn head_scope_derives_only_head_and_still_journals_every_ref() {
 }
 
 #[test]
-fn head_move_retires_memories_derived_at_the_previous_commit() {
+fn head_move_links_unique_episodes_with_their_own_provenance() {
     let e = env();
     let store = e.open();
     store.create_space("coding", "").unwrap();
     let r = repo();
-    r.write("docs.md", "# Setup\n\nuse iced for the ui\n");
-    let first = r.commit("v1");
+    r.write("docs.md", "# Setup\n\nfirstmarker\n");
+    let first = r.commit("first");
     ingest_scoped(&store, &r, ingest::GitScope::Head);
-    assert_eq!(search(&store, "iced").len(), 1);
+    let old = search(&store, "firstmarker")[0].memory_id;
+    let before = store.get_memory_detail(old).unwrap().unwrap();
 
-    // Unchanged HEAD: idempotent, nothing retired.
-    let again = ingest_scoped(&store, &r, ingest::GitScope::Head);
-    assert_eq!(again.stale_retired, 0);
-    assert_eq!(search(&store, "iced").len(), 1);
-
-    r.write("docs.md", "# Setup\n\nuse slint for the ui\n");
-    let second = r.commit("v2");
+    r.write("docs.md", "# SETUP\n\nsecondmarker\n");
+    let second = r.commit("second");
     let report = ingest_scoped(&store, &r, ingest::GitScope::Head);
-    assert!(report.stale_retired >= 1);
-
-    assert_eq!(search(&store, "slint").len(), 1, "new HEAD is current");
+    let new = search(&store, "secondmarker")[0].memory_id;
+    let predecessor = store.get_memory_detail(old).unwrap().unwrap();
+    let successor = store.get_memory_detail(new).unwrap().unwrap();
+    assert_eq!(predecessor.memory.state, MemoryState::Superseded);
+    assert_eq!(predecessor.memory.superseded_by, Some(new));
     assert_eq!(
-        search(&store, "iced").len(),
-        0,
-        "old HEAD is no longer current"
+        predecessor.memory.superseded_at,
+        Some(successor.memory.created_at)
+    );
+    assert_eq!(successor.supersedes[0].memory_id, old);
+    assert_eq!(predecessor.git.unwrap().commit_oid, first);
+    assert_eq!(successor.git.unwrap().commit_oid, second);
+    assert_eq!(predecessor.evidence, before.evidence);
+    assert_ne!(predecessor.evidence.id, successor.evidence.id);
+    assert_eq!(report.stale_retired, 0);
+    assert_eq!(report.stale_superseded, 1);
+    assert!(matches!(report.files[0].actions[0].action,
+        mindspace::core::MemoryActionKind::Superseded { old_memory_id } if old_memory_id == old));
+    assert!(search(&store, "firstmarker").is_empty());
+
+    let cli = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_mind"))
+            .arg("--db")
+            .arg(&e.db)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(cli(&["trace", &old.to_string()]).contains(&format!("superseded by {new}")));
+    assert!(cli(&["trace", &new.to_string()]).contains(&format!("supersedes {old}")));
+    assert!(cli(&[
+        "search",
+        "firstmarker",
+        "--at",
+        &before.memory.created_at.to_string(),
+        "--json"
+    ])
+    .contains(&old.to_string()));
+    assert!(cli(&["history", "setup"]).contains(&format!("-> {new}")));
+
+    let repeat = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(repeat.stale_superseded, 0);
+    assert!(matches!(
+        repeat.files[0].actions[0].action,
+        mindspace::core::MemoryActionKind::Unchanged
+    ));
+    assert_eq!(store.list_memories_by_subject("setup").unwrap().len(), 2);
+    assert_eq!(
+        store
+            .get_memory_detail(new)
+            .unwrap()
+            .unwrap()
+            .supersedes
+            .len(),
+        1
     );
 
-    // The stale memory stays inspectable, with a reason naming both commits.
-    let hits = store
-        .search(&SearchQuery {
-            text: "iced".into(),
-            space_ids: None,
-            limit: 10,
-            at: None,
-            include_superseded: true,
-            include_retired: true,
-        })
-        .unwrap();
-    assert_eq!(hits.len(), 1);
-    let detail = store.get_memory_detail(hits[0].memory_id).unwrap().unwrap();
-    assert_eq!(detail.memory.state, MemoryState::Retired);
-    let reason = detail.memory.retire_reason.unwrap();
-    assert!(
-        reason.contains(&second[..12]) && reason.contains(&first[..12]),
-        "{reason}"
+    // A return to the first commit reuses immutable evidence while opening
+    // a fresh episode. Updating the original would produce a lineage cycle.
+    git(r.path(), &["checkout", "-q", "--detach", &first]);
+    let back = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(back.stale_superseded, 1);
+    let active = search(&store, "firstmarker")[0].memory_id;
+    assert_ne!(active, old);
+    let back_detail = store.get_memory_detail(active).unwrap().unwrap();
+    assert_eq!(back_detail.supersedes[0].memory_id, new);
+    assert_eq!(back_detail.evidence.id, before.evidence.id);
+}
+
+#[test]
+fn head_move_retires_deleted_renamed_or_ambiguous_subjects() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("a.md", "# Pair\nleftold\n# Pair\nrightold\n# Split\nsplitold\n# Missing\nremovedold\n# Stable\nunchangedmarker");
+    r.write("b.md", "# Same\nrenamedmarker");
+    r.commit("older");
+    let older = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    r.write(
+        "a.md",
+        "# Pair\nmergednew\n# Split\nfirstnew\n# Split\nsecondnew\n# Stable\nunchangedmarker",
     );
+    r.rm("b.md");
+    r.write("c.md", "# Same\nrenamedmarker");
+    r.commit("newer");
+
+    let newer = ingest_scoped(&store, &r, ingest::GitScope::Head);
+    assert_eq!(newer.stale_retired, 5);
+    for action in older.files.iter().flat_map(|f| &f.actions) {
+        let detail = store.get_memory_detail(action.memory_id).unwrap().unwrap();
+        if action.subject == "Stable" {
+            let next = detail.superseded_by.unwrap();
+            assert_eq!(next.content, detail.assertion.content);
+            assert_ne!(next.assertion_id, detail.assertion.id);
+        } else {
+            assert_eq!(detail.memory.state, MemoryState::Retired);
+            assert!(detail.superseded_by.is_none());
+        }
+    }
+    for action in newer
+        .files
+        .iter()
+        .flat_map(|f| &f.actions)
+        .filter(|a| a.subject != "Stable")
+    {
+        assert!(store
+            .get_memory_detail(action.memory_id)
+            .unwrap()
+            .unwrap()
+            .supersedes
+            .is_empty());
+    }
+}
+
+#[test]
+fn failed_head_lineage_write_rolls_back_the_entire_transition_and_can_retry() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("a.md", "# Item\noldmarker");
+    r.commit("old");
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    let old = search(&store, "oldmarker")[0].memory_id;
+    let raw = Connection::open(&e.db).unwrap();
+    let revisions = || {
+        raw.query_row("SELECT max(revision_id) FROM m6_revisions", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let before = revisions();
+    raw.execute_batch(
+        "CREATE TRIGGER reject_lineage BEFORE UPDATE ON memories
+        WHEN NEW.state='superseded' BEGIN SELECT RAISE(ABORT, 'lineage rollback fixture'); END",
+    )
+    .unwrap();
+    r.write("a.md", "# Item\nnewmarker");
+    r.commit("new");
+    let error = ingest::ingest_paths(
+        &store,
+        r.path(),
+        &ingest::outline::PathSelection::all(),
+        ingest::GitScope::Head,
+        &["coding"],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("lineage rollback fixture"));
+    assert_eq!(revisions(), before);
+    assert_eq!(search(&store, "oldmarker")[0].memory_id, old);
+    assert!(search(&store, "newmarker").is_empty());
+
+    raw.execute_batch("DROP TRIGGER reject_lineage").unwrap();
+    ingest_scoped(&store, &r, ingest::GitScope::Head);
+    let new = search(&store, "newmarker")[0].memory_id;
+    let after = revisions();
+    assert_eq!(after, before + 1);
+    let history = |rev, id: mindspace::core::Uuid| {
+        raw.query_row(
+        "SELECT state, superseded_by FROM m6_memory_history WHERE revision_id=?1 AND memory_id=?2",
+        rusqlite::params![rev, id.to_string()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).unwrap()
+    };
+    assert_eq!(history(before, old), ("active".into(), None));
+    assert_eq!(
+        history(after, old),
+        ("superseded".into(), Some(new.to_string()))
+    );
+    assert_eq!(history(after, new), ("active".into(), None));
 }
 
 #[test]
@@ -1338,6 +1481,84 @@ fn linked_worktrees_are_current_views_and_do_not_retire_each_other() {
     let again = ingest_at(&store, r.path(), ingest::GitScope::Head);
     assert_eq!(again.stale_retired, 0);
     assert_eq!(search(&store, "featmarker").len(), 1);
+}
+
+#[test]
+fn one_moving_head_links_only_its_own_episodes_among_stable_views() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let (r, _keep, wt) = repo_with_worktree();
+    let old_head = git(r.path(), &["rev-parse", "HEAD"]);
+    let first = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    let old = first
+        .files
+        .iter()
+        .find(|f| f.commit_oid == old_head.trim() && f.path == "a.md")
+        .unwrap()
+        .actions[0]
+        .memory_id;
+    r.write("a.md", "# A\nchangedmarker");
+    r.commit("changed");
+    ingest_at(&store, r.path(), ingest::GitScope::Head);
+    let new = search(&store, "changedmarker")[0].memory_id;
+    assert_eq!(
+        store
+            .get_memory_detail(old)
+            .unwrap()
+            .unwrap()
+            .memory
+            .superseded_by,
+        Some(new)
+    );
+    let stable = search(&store, "mainmarker")[0].memory_id;
+    let untouched = store.get_memory_detail(stable).unwrap().unwrap();
+    assert_eq!(untouched.memory.state, MemoryState::Active);
+    assert!(untouched.supersedes.is_empty());
+
+    // Move both worktrees, then ingest from the other worktree. Matching
+    // the repository-global last HEAD to the other worktree would invent an edge.
+    r.write("a.md", "# A\nnewmain");
+    r.commit("main again");
+    std::fs::write(wt.join("a.md"), "# A\nnewlinked").unwrap();
+    git(&wt, &["add", "a.md"]);
+    git(&wt, &["commit", "-q", "-m", "linked"]);
+    ingest_at(&store, &wt, ingest::GitScope::Head);
+    for displaced in [new, stable] {
+        let detail = store.get_memory_detail(displaced).unwrap().unwrap();
+        assert_eq!(detail.memory.state, MemoryState::Retired);
+        assert!(detail.superseded_by.is_none());
+    }
+}
+
+#[test]
+fn changing_worktree_origin_does_not_link_simultaneous_head_changes() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let (r, _keep, wt) = repo_with_worktree();
+    let previous = git(r.path(), &["rev-parse", "HEAD"]);
+    let stable = git(&wt, &["rev-parse", "HEAD"]);
+    let first = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    let old = first
+        .files
+        .iter()
+        .find(|f| f.commit_oid == previous.trim() && f.path == "a.md")
+        .unwrap()
+        .actions[0]
+        .memory_id;
+
+    // The sets differ by exactly (old, new), but the new commit belongs to
+    // the linked worktree. Main moved to its old tip.
+    git(r.path(), &["checkout", "-q", "--detach", stable.trim()]);
+    std::fs::write(wt.join("a.md"), "# A\nchangedlinked").unwrap();
+    git(&wt, &["add", "a.md"]);
+    git(&wt, &["commit", "-q", "-m", "new linked"]);
+    let observed = ingest_at(&store, &wt, ingest::GitScope::Head);
+    assert_eq!(observed.stale_superseded, 0);
+    let detail = store.get_memory_detail(old).unwrap().unwrap();
+    assert_eq!(detail.memory.state, MemoryState::Retired);
+    assert!(detail.superseded_by.is_none());
 }
 
 #[test]

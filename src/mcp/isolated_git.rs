@@ -382,6 +382,7 @@ pub fn run(
             "derivations_new": report.derivations_new,
             "derivations_reused": report.derivations_reused,
             "stale_retired": report.stale_retired,
+            "stale_superseded": report.stale_superseded,
             "files": report.files.len(),
             "skipped_files": { "total": report.skipped_files.len(), "sample": report.skipped_files.iter().take(10).collect::<Vec<_>>() },
             "code": {

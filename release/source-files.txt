@@ -139,6 +139,7 @@ src/storage/sqlite/documents.rs
 src/storage/sqlite/fence_plan_migration_tests.rs
 src/storage/sqlite/fence_plans.rs
 src/storage/sqlite/files.rs
+src/storage/sqlite/git_lineage.rs
 src/storage/sqlite/lexical_input.rs
 src/storage/sqlite/lexical_input_tests.rs
 src/storage/sqlite/lexical_staging.rs

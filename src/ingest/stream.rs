@@ -2853,8 +2853,8 @@ impl<'a> Assembler<'a> {
                 tags: Vec::new(),
                 derivations: self.derivations,
                 ref_events: Vec::new(),
-                // HEAD is the only view: memories derived at other commits are retired, exactly
-                // as for the in-process HEAD scope; tag releases are left untouched
+                // The storage transaction reconciles this HEAD against its previous
+                // observation. This transport carries no tag inventory.
                 current_commits: Some(vec![head_commit.clone()]),
                 current_tags: None,
                 view_commits: vec![head_commit],

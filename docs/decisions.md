@@ -302,7 +302,8 @@ repository keeps its identity while a fresh clone gets its own; remote URLs
 are observations, never identity. Text blobs at ref tips are derived through
 the existing evidence/assertion pipeline with `git:`-prefixed extractor ids;
 the logical source of a derivation is scoped per `(repository, commit,
-path)`, so git-derived memories never auto-supersede across commits.
+path)`. History-mode memories at different commits coexist. ADR-023 covers
+successive observations of the current HEAD.
 Fast-forward is a proven ancestor check; everything else is recorded as
 non_fast_forward without claiming rebase or force-push.
 
@@ -503,39 +504,46 @@ stdout and stderr are drained.
 
 **Not decided here.** Parallel parsing is a separate step.
 
-## ADR-023: Git ingest derives the HEAD view by default; history is opt-in (2026-11-07)
+## ADR-023: Git ingest derives the HEAD view by default; history is opt-in (2026-11-07, amended 2026-11-18)
 
 **Decision.** The default scope interprets *current views*: HEAD of the ingest
 path plus HEAD of every live linked worktree (`git worktree list --porcelain`;
 bare and prunable entries skipped). `--branches`, `--remotes`, and `--tags`
 add those ref classes as further views (annotated tags are peeled). Only
 history reachable from a view is observed and only its files are interpreted.
-All refs are still journaled completely, so the ref journal of ADR-015 is
-unchanged. Memories of this repository derived at any commit that is not a
-current view are retired in the same transaction, with the reason `derived at
-<old>, which is no longer a current view (current: ...)`. Repository identity
-is shared by all worktrees, so ingesting from any of them yields the same set
-of views and no worktree retires another. `mind ingest --history`
-(`GitScope::History`) restores ADR-015 behavior: every ref tip is interpreted,
-derivations at different commits coexist, and nothing is retired.
+All refs are still journaled completely. When HEAD changes between recordings
+at the same ingest path, a Git file episode links to its successor when the only
+view removed is the old HEAD and the only view added is the new HEAD. Additional
+worktree or ref tips can remain current throughout.
 
-**Why.** Per-commit logical sources never supersede (ADR-015), so after every
-new commit the old and new versions of a document were both active, and every
-branch added another copy. Search could not answer "what is true now". Retiring
-is deterministic, reversible in the sense that nothing is deleted, and keeps the
-stale memory inspectable.
+The pair must have the same repository, exact Git path and normalized subject.
+Each side must have exactly one active Git episode for that path and subject.
+Only an episode newly created in this observation can succeed the displaced
+episode, including when the content is unchanged. The old and new episodes keep
+their own source, evidence, blob and commit provenance. The link records an
+observed change in current knowledge and makes no claim about Git ancestry.
 
-**Consequences.** Retirement replaces supersession lineage for HEAD moves:
-`mind history` shows a retired episode, not a link to its successor. Running a
-head-scope ingest after a history-scope one retires the other tips' memories.
-Narrowing `--path` on a later ingest does not keep older-commit memories of
-unselected paths alive. The object graph reachable from HEAD is still stored
-completely, so database size is dominated by commits and tree entries.
-`GitObservationReport.stale_retired` counts the retirements.
+Displaced memories without a unique successor are retired with the reason
+`derived at <old>, which is no longer a current view (current: ...)`. This
+covers deleted files or headings, path changes, ambiguous duplicate subjects
+and paths omitted by a narrower selection. An ingest from another worktree or
+one with several changing views also falls back to retirement. Previously
+retired episodes retain their recorded state.
 
-**Revisit when.** Pairwise supersession across HEAD moves (path and subject
-matching), a configurable default ref instead of HEAD, or a depth limit on the
-stored graph are wanted.
+**Why.** A new commit creates fresh evidence even when a file stays the same.
+Keeping every episode active gave current searches duplicate or conflicting
+results after each commit. Linking unique replacements lets a reader follow
+the change back to the evidence at each commit.
+
+**History and reporting.** `mind ingest --history` interprets every selected
+ref tip and keeps the episodes at different commits active. A later current-view
+ingest removes the stale episodes from current search. `mind trace` and
+`mind inspect` show both directions of a recorded link. Ingest reports count
+linked episodes in `stale_superseded` and unpaired retirements in
+`stale_retired`. Tag release episodes follow ADR-024.
+
+**Revisit when.** A configurable default ref or a depth limit on the stored
+object graph is wanted.
 
 ## ADR-024: Releases are derived from tag refs (2026-11-07)
 

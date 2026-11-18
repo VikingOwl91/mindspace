@@ -1388,6 +1388,45 @@ mod deadline_checkpoints {
     }
 
     #[test]
+    fn head_lineage_checkpoints_roll_back_the_current_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fixture(&root, true);
+        let db = tmp.path().join("m.db");
+        let store = SqliteStore::open(&db).unwrap();
+        store.create_space("s", "").unwrap();
+        let observe = |deadline: &Deadline| {
+            ingest_paths_with_deadline(
+                &store,
+                &root,
+                &outline::PathSelection::all(),
+                GitScope::Head,
+                &["s"],
+                deadline,
+            )
+        };
+        observe(&Deadline::none()).unwrap();
+        let before = snapshot(&db);
+        std::fs::write(root.join("docs/a.md"), "# A\nchanged").unwrap();
+        git(&root, &["add", "docs/a.md"]);
+        git(&root, &["commit", "-q", "-m", "change"]);
+        for phase in [
+            "comparing Git HEAD views",
+            "matching Git HEAD episodes",
+            "linking Git HEAD episodes",
+        ] {
+            let err = observe(&Deadline::expiring_at(phase)).unwrap_err();
+            assert!(matches!(err, Error::IngestTimeout { writing: true, .. }));
+            assert!(err.to_string().contains(phase));
+            assert_eq!(snapshot(&db), before);
+        }
+        let IngestOutcome::Git(report) = observe(&Deadline::none()).unwrap().remove(0) else {
+            panic!()
+        };
+        assert_eq!(report.stale_superseded, 1);
+    }
+
+    #[test]
     fn git_pipeline_aborts_cleanly_at_every_checkpoint() {
         run(
             &[

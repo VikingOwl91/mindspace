@@ -617,18 +617,18 @@ update.
 
 ### 12.4 Derivations
 
-> Default scope is HEAD (ADR-023): only the commit HEAD resolves to is
-> interpreted, and memories derived at other commits are retired when HEAD
-> moves. The text below describes `--history` scope, where every ref tip is
-> interpreted and nothing is retired.
+> Default scope includes HEAD and live worktree tips (ADR-023). Across an
+> unambiguous HEAD move from the same ingest path, a unique episode at the
+> same Git path and normalized subject supersedes the previous episode.
+> Displaced episodes without a unique successor retire. Both retain their
+> commit-bound evidence. The text below describes `--history` scope.
 
 Text blobs at ref tips are derived through the normal pipeline (evidence ->
 assertions -> memories) with git-prefixed extractor ids
 (`git:markdown:section-heading`, ...). The logical source of a derivation is
 scoped per `(repository, commit, path)`: branches are not belief timelines,
-so git-derived memories never auto-supersede across commits, and the same
-text at two commits yields two coexisting memories whose provenance differs
-by exactly the commit. Same blob != same logical source: one blob object,
+so in history scope the same text at two commits yields two coexisting
+memories with distinct commit provenance. Same blob != same logical source: one blob object,
 many path relations. The working tree is never consulted; uncommitted
 content belongs to no ref and is deferred (see README).
 

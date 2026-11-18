@@ -1561,6 +1561,357 @@ fn changing_worktree_origin_does_not_link_simultaneous_head_changes() {
     assert!(detail.superseded_by.is_none());
 }
 
+fn partial(store: &mindspace::SqliteStore, path: &Path) -> mindspace::core::GitObservationReport {
+    ingest::extract::persist_git(
+        store,
+        extract_partial(store, path),
+        &ingest::deadline::Deadline::none(),
+    )
+    .unwrap()
+}
+
+fn extract_partial(store: &mindspace::SqliteStore, path: &Path) -> ingest::extract::ExtractedGit {
+    use ingest::deadline::Deadline;
+    use ingest::extract::StoreContext;
+    let mut g = ingest::extract_git_repository_selected_with_deadline(
+        &StoreContext(store),
+        path,
+        &["coding"],
+        &ingest::outline::PathSelection::all(),
+        ingest::GitScope::Head,
+        &Deadline::none(),
+    )
+    .unwrap();
+    let head = g
+        .observation
+        .refs
+        .iter()
+        .find(|r| r.name == "HEAD")
+        .unwrap()
+        .target_oid
+        .clone();
+    g.observation.view_commits = vec![head.clone()];
+    g.observation.current_commits = Some(vec![head.clone()]);
+    g.observation.current_tags = None;
+    g.observation.refs.retain(|r| r.name == "HEAD");
+    g.observation.ref_events.clear();
+    g.observation.remotes.clear();
+    g.observation.derivations.retain(|d| d.commit_oid == head);
+    g.observation.view_coverage = mindspace::core::GitViewCoverage::Checkout;
+    g
+}
+
+#[test]
+fn partial_head_updates_track_checkout_ownership_across_complete_and_partial_ingests() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let (r, _keep, wt) = repo_with_worktree();
+    git(
+        r.path(),
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "https://example.invalid/team/sample.git",
+        ],
+    );
+    let main = git(r.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    let linked = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    let full = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    let main_old = full
+        .files
+        .iter()
+        .find(|f| f.commit_oid == main && f.path == "a.md")
+        .unwrap()
+        .actions[0]
+        .memory_id;
+    let linked_old = full
+        .files
+        .iter()
+        .find(|f| f.commit_oid == linked && f.path == "b.md")
+        .unwrap()
+        .actions[0]
+        .memory_id;
+    let raw = Connection::open(&e.db).unwrap();
+    let views = || {
+        raw.prepare("SELECT commit_oid FROM git_views ORDER BY commit_oid")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .unwrap()
+    };
+    partial(&store, &wt);
+    partial(&store, r.path());
+    assert_eq!(views(), [main.clone(), linked.clone()].into());
+    assert_eq!(
+        raw.query_row(
+            "SELECT is_current FROM repository_remotes WHERE name='upstream'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    store.create_space("unrelated", "").unwrap();
+    r.write("a.md", "# A\nmainreplacement");
+    r.commit("main");
+    partial(&store, &wt);
+    let moved = partial(&store, r.path());
+    assert_eq!(moved.stale_superseded, 1);
+    assert_eq!(
+        store
+            .get_memory_detail(main_old)
+            .unwrap()
+            .unwrap()
+            .memory
+            .superseded_by,
+        Some(search(&store, "mainreplacement")[0].memory_id)
+    );
+    assert_eq!(
+        store
+            .get_memory_detail(linked_old)
+            .unwrap()
+            .unwrap()
+            .memory
+            .state,
+        MemoryState::Active
+    );
+    assert!(views().contains(&linked));
+}
+
+#[test]
+fn shared_tips_survive_until_the_last_known_checkout_moves() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("note.md", "# Same\nsharedmarker");
+    r.commit("base");
+    let linked = tempfile::tempdir().unwrap();
+    let wt = linked.path().join("linked");
+    git(
+        r.path(),
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    );
+    let first = ingest_at(&store, r.path(), ingest::GitScope::Head);
+    let old = first.files[0].actions[0].memory_id;
+    r.write("note.md", "# Same\nmainmarker");
+    r.commit("main");
+    let a = partial(&store, r.path());
+    assert_eq!((a.stale_superseded, a.stale_retired), (0, 0));
+    assert_eq!(search(&store, "sharedmarker")[0].memory_id, old);
+    std::fs::write(wt.join("note.md"), "# Same\nlinkedmarker").unwrap();
+    git(&wt, &["add", "note.md"]);
+    git(&wt, &["commit", "-qm", "linked"]);
+    let b = partial(&store, &wt);
+    assert_eq!(b.stale_superseded, 1);
+    assert_eq!(search(&store, "mainmarker").len(), 1);
+    assert_eq!(
+        store
+            .get_memory_detail(old)
+            .unwrap()
+            .unwrap()
+            .memory
+            .superseded_by,
+        Some(search(&store, "linkedmarker")[0].memory_id)
+    );
+}
+
+#[test]
+fn missing_or_stale_checkout_attribution_preserves_old_tips_until_complete_refresh() {
+    for stale in [true, false] {
+        let e = env();
+        let store = e.open();
+        store.create_space("coding", "").unwrap();
+        let r = repo();
+        r.write("doc.md", "# Item\npreviousmarker");
+        r.commit("first");
+        let first = ingest_at(&store, r.path(), ingest::GitScope::Head);
+        let raw = Connection::open(&e.db).unwrap();
+        let key = format!("git:checkout-views:v1:{}", first.repository_id);
+        let saved = store.get_meta(&key).unwrap().unwrap();
+        // Simulate the durable state an old writer leaves: the repository got
+        // a genuine newer recording while its attribution retained the old revision.
+        ingest_at(&store, r.path(), ingest::GitScope::Head);
+        let latest: i64 = raw
+            .query_row("SELECT max(revision_id) FROM m6_revisions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        raw.create_scalar_function(
+            "m6_write_revision",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| Ok(latest),
+        )
+        .unwrap();
+        if stale {
+            raw.execute(
+                "UPDATE mind_meta SET value=?1 WHERE key=?2",
+                rusqlite::params![saved, key],
+            )
+            .unwrap();
+        } else {
+            raw.execute("DELETE FROM mind_meta WHERE key=?1", [&key])
+                .unwrap();
+        }
+        r.write("doc.md", "# Item\nnewmarker");
+        r.commit("next");
+        let changed = partial(&store, r.path());
+        assert_eq!((changed.stale_superseded, changed.stale_retired), (0, 0));
+        assert_eq!(search(&store, "previousmarker").len(), 1);
+        let complete = ingest_at(&store, r.path(), ingest::GitScope::Head);
+        assert_eq!(complete.stale_retired, 1);
+        assert!(search(&store, "previousmarker").is_empty());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn worktree_keys_use_original_bytes_including_newlines_and_non_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("doc.md", "# Item\nbase");
+    r.commit("base");
+    let links = tempfile::tempdir().unwrap();
+    let mut expected = vec![mindspace::core::sha256_hex(
+        r.path().as_os_str().as_encoded_bytes(),
+    )];
+    for name in [
+        b"line\nnext".to_vec(),
+        b"raw\xff".to_vec(),
+        "raw�".as_bytes().to_vec(),
+    ] {
+        let path = links.path().join(std::ffi::OsString::from_vec(name));
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(r.path())
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        expected.push(mindspace::core::sha256_hex(
+            path.as_os_str().as_encoded_bytes(),
+        ));
+    }
+    let mut seen = ingest::extract_git_repository_selected_with_deadline(
+        &ingest::extract::StoreContext(&store),
+        r.path(),
+        &["coding"],
+        &ingest::outline::PathSelection::all(),
+        ingest::GitScope::Head,
+        &ingest::deadline::Deadline::none(),
+    )
+    .unwrap()
+    .observation
+    .view_coverage;
+    let mindspace::core::GitViewCoverage::Complete {
+        ref mut checkouts, ..
+    } = seen
+    else {
+        panic!()
+    };
+    assert_eq!(checkouts.len(), expected.len());
+    assert!(expected.iter().all(|k| checkouts.contains_key(k)));
+}
+
+#[test]
+fn isolated_checkout_cannot_remove_an_independently_selected_branch_tip() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("note.md", "# Item\nselectedbefore");
+    let old = r.commit("first");
+    git(r.path(), &["branch", "keep", &old]);
+    let flags = ingest::GitScope::Views(ingest::GitViews {
+        branches: true,
+        ..Default::default()
+    });
+    ingest_scoped(&store, &r, flags);
+    r.write("note.md", "# Item\nselectedafter");
+    r.commit("next");
+    let changed = partial(&store, r.path());
+    assert_eq!((changed.stale_superseded, changed.stale_retired), (0, 0));
+    assert_eq!(search(&store, "selectedbefore").len(), 1);
+    git(r.path(), &["branch", "-d", "keep"]);
+    ingest_scoped(&store, &r, flags);
+    assert!(search(&store, "selectedbefore").is_empty());
+}
+
+#[test]
+fn rejected_partial_commit_preserves_previous_ownership_and_retry_links_once() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("note.md", "# Item\npreviousmarker");
+    let old = r.commit("before");
+    let first = partial(&store, r.path());
+    let key = format!("git:checkout-views:v1:{}", first.repository_id);
+    let ownership = store.get_meta(&key).unwrap();
+    let raw = Connection::open(&e.db).unwrap();
+    let state = || {
+        raw.query_row("SELECT commit_oid,observed_at,(SELECT max(revision_id) FROM m6_revisions) FROM git_views",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap()
+    };
+    let before = state();
+    assert_eq!(before.0, old);
+    r.write("note.md", "# Item\nnewmarker");
+    r.commit("next");
+    let input = extract_partial(&store, r.path());
+    let err = ingest::extract::persist_git_gated(
+        &store,
+        input.clone(),
+        &ingest::deadline::Deadline::none(),
+        &|| Err(mindspace::core::Error::Storage("refused at gate".into())),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("refused at gate"));
+    assert_eq!(store.get_meta(&key).unwrap(), ownership);
+    assert_eq!(state(), before);
+    assert_eq!(search(&store, "previousmarker").len(), 1);
+    assert!(search(&store, "newmarker").is_empty());
+    let ok =
+        ingest::extract::persist_git(&store, input, &ingest::deadline::Deadline::none()).unwrap();
+    assert_eq!(ok.stale_superseded, 1);
+    assert_eq!(state().2, before.2 + 1);
+}
+
+#[test]
+fn delayed_checkout_observation_cannot_restore_a_displaced_tip() {
+    let e = env();
+    let store = e.open();
+    store.create_space("coding", "").unwrap();
+    let r = repo();
+    r.write("doc.md", "# Item\noldmarker");
+    let old = r.commit("before");
+    partial(&store, r.path());
+    let mut delayed = extract_partial(&store, r.path());
+    delayed.observation.session.observed_at = mindspace::core::Ts(1);
+    r.write("doc.md", "# Item\nnewmarker");
+    let new = r.commit("after");
+    partial(&store, r.path());
+    let raw = Connection::open(&e.db).unwrap();
+    let snapshot = || {
+        raw.query_row("SELECT commit_oid,observed_at,(SELECT max(revision_id) FROM m6_revisions) FROM git_views",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap()
+    };
+    let before = snapshot();
+    let err = ingest::extract::persist_git(&store, delayed, &ingest::deadline::Deadline::none())
+        .unwrap_err();
+    assert!(err.to_string().contains("newer HEAD observation"));
+    assert_eq!(before, snapshot());
+    assert_eq!(before.0, new);
+    assert_ne!(before.0, old);
+    assert!(search(&store, "oldmarker").is_empty());
+    assert_eq!(search(&store, "newmarker").len(), 1);
+}
+
 #[test]
 fn removed_worktree_stops_being_a_current_view() {
     let e = env();

@@ -1607,10 +1607,32 @@ pub struct GitRefEventDraft {
     pub to_oid: Option<String>,
 }
 
+/// The authority behind the view list. Historic observations without
+/// per-checkout attribution retain their aggregate semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GitViewCoverage {
+    #[default]
+    Aggregate,
+    Complete {
+        /// SHA-256 of each worktree path and its observed HEAD commit.
+        checkouts: BTreeMap<String, String>,
+        /// Tips also selected independently of a checkout (branches, tags, etc.).
+        pinned: std::collections::BTreeSet<String>,
+    },
+    /// The verified receiver observed only the requested checkout's HEAD.
+    Checkout,
+}
+
+// Bounds derived ownership metadata and its stream frame. Beyond this size
+// a complete observation can still publish every current view as an aggregate.
+pub(crate) const MAX_GIT_VIEW_OWNERS: usize = 4096;
+
 /// Everything one git observation saw, handed to the store in a single
 /// call. The store owns the transaction, identity decisions, and counters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitObservation {
+    #[serde(default)]
+    pub view_coverage: GitViewCoverage,
     #[serde(default)]
     pub skipped_files: Vec<SkippedFile>,
     pub session: SessionDraft,
@@ -1625,7 +1647,8 @@ pub struct GitObservation {
     pub ref_events: Vec<GitRefEventDraft>,
     /// The commits that make up the repository's current views (HEAD,
     /// worktrees, and any selected refs). Active git-derived memories outside
-    /// these views are superseded or retired in this transaction. `None`
+    /// a complete inventory are superseded or retired in this transaction.
+    /// A checkout-only observation can displace only its own previous tip. `None`
     /// keeps every file derivation active (history scope).
     pub current_commits: Option<Vec<String>>,
     /// `(virtual path, blob oid)` of every release derived from a tag ref in

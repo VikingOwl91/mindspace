@@ -304,6 +304,9 @@ pub enum Record {
     Remote {
         item: GitRemoteDraft,
     },
+    ViewCoverage {
+        coverage: crate::core::GitViewCoverage,
+    },
     ViewCommits {
         oids: Vec<String>,
     },
@@ -377,6 +380,7 @@ impl Record {
             Record::Blob { .. } => "blob",
             Record::RefEvent { .. } => "ref_event",
             Record::Remote { .. } => "remote",
+            Record::ViewCoverage { .. } => "view_coverage",
             Record::ViewCommits { .. } => "view_commits",
             Record::CurrentCommits { .. } => "current_commits",
             Record::CurrentTags { .. } => "current_tags",
@@ -885,13 +889,13 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     let repository_id = reader.repository_id()?;
     let space_ids = super::resolve_spaces_with(ctx, space_names)?;
     let refs = reader.refs()?;
-    let worktree_heads: Vec<String> = match scope {
+    let worktree_tips = match scope {
         super::GitScope::History => Vec::new(),
-        _ => reader.worktree_heads()?,
+        _ => reader.live_worktree_tips()?,
     };
     let selected = super::select_refs(&refs, scope);
     let mut tips: Vec<String> = selected.iter().map(|r| r.target_oid.clone()).collect();
-    tips.extend(worktree_heads.iter().cloned());
+    tips.extend(worktree_tips.iter().map(|(_, tip)| tip.clone()));
     tips.sort();
     tips.dedup();
     if tips.is_empty() && !refs.is_empty() {
@@ -959,7 +963,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
         .filter(|r| r.target_kind == GitObjectKind::Commit)
         .map(|r| r.target_oid.clone())
         .collect();
-    tip_commits.extend(worktree_heads.iter().cloned());
+    tip_commits.extend(worktree_tips.iter().map(|(_, tip)| tip.clone()));
     let tag_by_oid: HashMap<&str, &GitTagData> = tags.iter().map(|t| (t.oid.as_str(), t)).collect();
     let mut peel_queue: Vec<String> = tags
         .iter()
@@ -1049,6 +1053,8 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             },
         })?;
     }
+    let coverage = super::git_view_coverage(scope, &worktree_tips, &selected, &tags, &tip_commits);
+    sink.emit(&Record::ViewCoverage { coverage })?;
     let view: Vec<String> = tip_commits.iter().cloned().collect();
     for part in view.chunks(1000) {
         sink.emit(&Record::ViewCommits {
@@ -1565,6 +1571,9 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
             for item in o.remotes {
                 sink.emit(&Record::Remote { item })?;
             }
+            sink.emit(&Record::ViewCoverage {
+                coverage: o.view_coverage,
+            })?;
             for part in o.view_commits.chunks(1000) {
                 sink.emit(&Record::ViewCommits {
                     oids: part.to_vec(),
@@ -1927,6 +1936,7 @@ struct Assembler<'a> {
     blob_index: HashMap<String, usize>,
     ref_events: Vec<GitRefEventDraft>,
     remotes: Vec<GitRemoteDraft>,
+    view_coverage: Option<crate::core::GitViewCoverage>,
     view_commits: Vec<String>,
     current_commits: Option<Vec<String>>,
     current_tags: Option<Vec<(String, String)>>,
@@ -1974,6 +1984,7 @@ impl<'a> Assembler<'a> {
             blob_index: HashMap::new(),
             ref_events: Vec::new(),
             remotes: Vec::new(),
+            view_coverage: None,
             view_commits: Vec::new(),
             current_commits: None,
             current_tags: None,
@@ -2424,6 +2435,13 @@ impl<'a> Assembler<'a> {
                 self.unique("remote", &item.name)?;
                 self.remotes.push(item);
             }
+            Record::ViewCoverage { coverage } => {
+                self.git_unverified("view_coverage")?;
+                self.at(Phase::Views, name)?;
+                if self.view_coverage.replace(coverage).is_some() {
+                    return bad("duplicate view coverage");
+                }
+            }
             Record::ViewCommits { oids } => {
                 self.git_unverified("view_commits")?;
                 self.at(Phase::Views, name)?;
@@ -2767,6 +2785,7 @@ impl<'a> Assembler<'a> {
                         derivations: self.derivations,
                         ref_events: self.ref_events,
                         current_tags: self.current_tags,
+                        view_coverage: self.view_coverage.unwrap_or_default(),
                         view_commits: self.view_commits,
                         spaces: self.spaces,
                         remotes: self.remotes,
@@ -2949,6 +2968,7 @@ impl<'a> Assembler<'a> {
                 // observation. This transport carries no tag inventory.
                 current_commits: Some(vec![head_commit.clone()]),
                 current_tags: None,
+                view_coverage: crate::core::GitViewCoverage::Checkout,
                 view_commits: vec![head_commit],
                 spaces: self.spaces,
                 remotes: self.remotes,

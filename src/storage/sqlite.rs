@@ -28,6 +28,7 @@ use crate::ingest::deadline::Deadline;
 use crate::storage::Store;
 mod files;
 mod git_lineage;
+mod git_views;
 mod read_session;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -3162,6 +3163,11 @@ impl Store for SqliteStore {
     }
 
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        if key.starts_with(git_views::KEY_PREFIX) {
+            return Err(Error::Storage(
+                "Git checkout attribution is maintained by ingestion".into(),
+            ));
+        }
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
         tx.execute(
@@ -5159,7 +5165,8 @@ fn record_git_observation_tx(
     deadline: &Deadline,
 ) -> Result<GitObservationReport> {
     let at = observation.session.observed_at;
-    let head_move = git_lineage::HeadMove::observed(conn, observation, deadline)?;
+    let view_plan = git_views::ViewPlan::prepare(conn, observation, deadline)?;
+    let head_move = git_lineage::HeadMove::observed(conn, observation, &view_plan)?;
 
     // 1. Session journal entry.
     let session_id = Uuid::now_v7();
@@ -5195,11 +5202,13 @@ fn record_git_observation_tx(
     )?;
     // Remotes as observed: the latest observation is current, earlier rows
     // keep their first/last observation times.
-    conn.execute(
-        "UPDATE repository_remotes SET is_current = 0 WHERE repository_id = ?1",
-        rusqlite::params![observation.repository_id.to_string()],
-    )
-    .map_err(dberr)?;
+    if observation.view_coverage != crate::core::GitViewCoverage::Checkout {
+        conn.execute(
+            "UPDATE repository_remotes SET is_current = 0 WHERE repository_id = ?1",
+            rusqlite::params![observation.repository_id.to_string()],
+        )
+        .map_err(dberr)?;
+    }
     for r in &observation.remotes {
         deadline.check("writing Git observations")?;
         conn.execute(
@@ -5510,9 +5519,17 @@ fn record_git_observation_tx(
         None => 0,
     };
     let mut stale_retired: u64 = 0;
-    if let Some(current) = &observation.current_commits {
-        let current_set: std::collections::BTreeSet<&str> =
-            current.iter().map(String::as_str).collect();
+    let checkout_only = observation.view_coverage == crate::core::GitViewCoverage::Checkout;
+    if let Some(current) = observation
+        .current_commits
+        .as_ref()
+        .filter(|_| !checkout_only || !view_plan.before.is_subset(&view_plan.after))
+    {
+        let current_set: BTreeSet<&str> = if checkout_only {
+            view_plan.after.iter().map(String::as_str).collect()
+        } else {
+            current.iter().map(String::as_str).collect()
+        };
         let derived: Vec<(String, String)> = {
             let mut stmt = conn
                 .prepare(
@@ -5536,11 +5553,15 @@ fn record_git_observation_tx(
             rows
         };
         let short = |oid: &str| oid[..oid.len().min(12)].to_string();
-        let shown: Vec<String> = current.iter().take(3).map(|c| short(c)).collect();
-        let more = current.len().saturating_sub(3);
+        let shown: Vec<String> = current_set.iter().take(3).map(|c| short(c)).collect();
+        let more = current_set.len().saturating_sub(3);
         for (id, commit) in derived {
             deadline.check("writing Git observations")?;
-            if current_set.contains(commit.as_str()) {
+            // Only a complete inventory can retire historical episodes that
+            // were outside the previous set of current views.
+            if current_set.contains(commit.as_str())
+                || (checkout_only && !view_plan.before.contains(&commit))
+            {
                 continue;
             }
             let id = Uuid::parse_str(&id).map_err(|e| Error::Storage(e.to_string()))?;
@@ -5559,21 +5580,7 @@ fn record_git_observation_tx(
         }
     }
 
-    // 6b. Current code views of this repository, replaced wholesale. Syntax
-    //     facts are immutable, so currency is recorded here, not on them.
-    conn.execute(
-        "DELETE FROM git_views WHERE repository_id = ?1",
-        rusqlite::params![observation.repository_id.to_string()],
-    )
-    .map_err(dberr)?;
-    for commit in &observation.view_commits {
-        deadline.check("writing Git observations")?;
-        conn.execute(
-            "INSERT OR IGNORE INTO git_views (repository_id, commit_oid, observed_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![observation.repository_id.to_string(), commit, at.0],
-        )
-        .map_err(dberr)?;
-    }
+    view_plan.persist(conn, observation, deadline)?;
 
     // 7. Releases follow their tag refs, not the views: a deleted or moved
     //    tag retires its release memory.

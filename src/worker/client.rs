@@ -591,6 +591,7 @@ fn run_session(
     stats.startup = begun.elapsed();
 
     // 2. the request: what to extract, under which limits
+    let requested_at = crate::core::Ts::now();
     let request = Request {
         v: PROTOCOL,
         op,
@@ -653,7 +654,7 @@ fn run_session(
         (&writer)
             .write_all(&bytes)
             .map_err(|e| by_cause(WorkerError::Io(format!("sending the context: {e}"))))?;
-        let extracted = match consume(
+        let mut extracted = match consume(
             &mut reader,
             op,
             Kind::GitVerified,
@@ -670,7 +671,7 @@ fn run_session(
             }
             Err(e) => return Err(by_cause(WorkerError::stream(e))),
         };
-        let Extracted::Git(g) = &extracted else {
+        let Extracted::Git(g) = &mut extracted else {
             return Err(WorkerError::Stream(
                 "the result is not a Git observation".into(),
             ));
@@ -683,6 +684,11 @@ fn run_session(
                 "the result names another root than the one the broker authorized".into(),
             ));
         }
+        // The receiver owns checkout attribution and the observation clock.
+        // Use the exact authorized label and the local request timestamp.
+        g.observation.repository_path = request.root.clone();
+        g.observation.session.root = request.root;
+        g.observation.session.observed_at = requested_at;
         check_result_git(g, op, repository_id, spaces, &policy, &context)
             .map_err(WorkerError::Stream)?;
         return Ok(extracted);

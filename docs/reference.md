@@ -36,6 +36,10 @@ while changing HEAD. Across an observed HEAD move from the same worktree,
 `mind trace <memory-id>` shows the successor or predecessor when the Git path
 and normalized subject match uniquely and all other views remain stable.
 Deleted files, renamed paths and ambiguous matches appear as retired.
+An isolated Git ingest updates only the requested checkout. Memories and
+symbols at other recorded tips stay current, including tips shared by multiple
+worktrees. Use an ordinary `mind ingest` to reconcile removed worktrees, changed
+ref selections or older aggregate view data.
 `mind search <query> --at <timestamp>` can still find the displaced episode.
 `mind inspect <memory-id> --json` inspects a returned memory.
 Create a memory on the command line with

@@ -1041,6 +1041,9 @@ fn unverified_record_families_and_misplaced_records_are_refused() {
     // parsed-object records have no place in a verified transport
     let reference = &f.extracted.observation;
     for extra in [
+        Record::ViewCoverage {
+            coverage: mindspace::core::GitViewCoverage::Aggregate,
+        },
         Record::Commit {
             item: reference.commits[0].clone(),
         },

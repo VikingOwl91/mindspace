@@ -658,15 +658,15 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
 
     // Refs: heads, remotes, tags, and HEAD, sorted by name.
     let refs = reader.refs()?;
-    let worktree_heads: Vec<String> = match scope {
+    let worktree_tips = match scope {
         GitScope::History => Vec::new(),
-        _ => reader.worktree_heads()?,
+        _ => reader.live_worktree_tips()?,
     };
     let selected = select_refs(&refs, scope);
 
     // Object discovery: everything reachable from the scope's tips.
     let mut tips: Vec<String> = selected.iter().map(|r| r.target_oid.clone()).collect();
-    tips.extend(worktree_heads.iter().cloned());
+    tips.extend(worktree_tips.iter().map(|(_, tip)| tip.clone()));
     tips.sort();
     tips.dedup();
     if tips.is_empty() && !refs.is_empty() {
@@ -706,7 +706,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         .filter(|r| r.target_kind == GitObjectKind::Commit)
         .map(|r| r.target_oid.clone())
         .collect();
-    tip_commits.extend(worktree_heads.iter().cloned());
+    tip_commits.extend(worktree_tips.iter().map(|(_, tip)| tip.clone()));
     let tag_by_oid: std::collections::HashMap<&str, &crate::core::GitTagData> =
         tags.iter().map(|t| (t.oid.as_str(), t)).collect();
     let mut peel_queue: Vec<String> = tags
@@ -840,6 +840,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         None
     };
     let observation = GitObservation {
+        view_coverage: git_view_coverage(scope, &worktree_tips, &selected, &tags, &tip_commits),
         skipped_files,
         session: SessionDraft {
             root: repo_path.display().to_string(),
@@ -880,6 +881,53 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
         code_inputs,
         reused: Default::default(),
     })
+}
+
+fn git_view_coverage(
+    scope: GitScope,
+    worktrees: &[(Option<String>, String)],
+    selected: &[&crate::core::GitRefObservation],
+    tags: &[crate::core::GitTagData],
+    views: &BTreeSet<String>,
+) -> crate::core::GitViewCoverage {
+    use crate::core::{GitObjectKind, GitViewCoverage, MAX_GIT_VIEW_OWNERS};
+    if scope == GitScope::History || worktrees.len() > MAX_GIT_VIEW_OWNERS {
+        return GitViewCoverage::Aggregate;
+    }
+    let mut checkouts = std::collections::BTreeMap::new();
+    let mut pinned = BTreeSet::new();
+    for (key, oid) in worktrees {
+        if let Some(key) = key {
+            if checkouts.insert(key.clone(), oid.clone()).is_some() {
+                return GitViewCoverage::Aggregate;
+            }
+        } else {
+            pinned.insert(oid.clone());
+        }
+    }
+    pinned.extend(
+        selected
+            .iter()
+            .filter(|r| r.name != "HEAD" && r.target_kind == GitObjectKind::Commit)
+            .map(|r| r.target_oid.clone()),
+    );
+    pinned.extend(
+        tags.iter()
+            .filter(|t| t.target_kind == GitObjectKind::Commit)
+            .map(|t| t.target_oid.clone()),
+    );
+    let attributed: BTreeSet<_> = checkouts.values().collect();
+    pinned.extend(
+        views
+            .iter()
+            .filter(|oid| !attributed.contains(oid))
+            .cloned(),
+    );
+    if checkouts.len() + pinned.len() > MAX_GIT_VIEW_OWNERS {
+        GitViewCoverage::Aggregate
+    } else {
+        GitViewCoverage::Complete { checkouts, pinned }
+    }
 }
 
 fn select_refs(

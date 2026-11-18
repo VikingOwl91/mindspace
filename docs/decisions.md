@@ -507,7 +507,7 @@ stdout and stderr are drained.
 ## ADR-023: Git ingest derives the HEAD view by default; history is opt-in (2026-11-07, amended 2026-11-18)
 
 **Decision.** The default scope interprets *current views*: HEAD of the ingest
-path plus HEAD of every live linked worktree (`git worktree list --porcelain`;
+path plus HEAD of every live linked worktree (`git worktree list --porcelain -z`;
 bare and prunable entries skipped). `--branches`, `--remotes`, and `--tags`
 add those ref classes as further views (annotated tags are peeled). Only
 history reachable from a view is observed and only its files are interpreted.
@@ -529,6 +529,16 @@ covers deleted files or headings, path changes, ambiguous duplicate subjects
 and paths omitted by a narrower selection. An ingest from another worktree or
 one with several changing views also falls back to retirement. Previously
 retired episodes retain their recorded state.
+
+The isolated tool observes one authorized checkout. It updates that checkout's
+tip and keeps sibling and independently selected ref tips current for both memory
+and symbol search. A shared tip stays current until its last recorded owner
+moves. The next complete ingest reconciles released worktrees and refs.
+A bounded per-repository record in schema-17 `mind_meta` tracks checkout
+path hashes, tips and observation times. Its revision must match the latest M6
+recording of this repository and its tips must reproduce `git_views`. Older
+or oversized inventories provide only aggregate tips. Isolated reads preserve
+those tips until a complete refresh supplies attribution.
 
 **Why.** A new commit creates fresh evidence even when a file stays the same.
 Keeping every episode active gave current searches duplicate or conflicting

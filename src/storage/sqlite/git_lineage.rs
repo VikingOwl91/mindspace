@@ -5,7 +5,7 @@ use super::{dberr, supersede_existing_memory, uuid_col, GIT_PRODUCER_FAMILY};
 use crate::core::{GitFileReport, GitObjectKind, GitObservation, MemoryActionKind, Result};
 use crate::ingest::deadline::Deadline;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub(super) struct HeadMove<'a> {
@@ -19,9 +19,9 @@ impl<'a> HeadMove<'a> {
     pub(super) fn observed(
         conn: &Connection,
         observation: &'a GitObservation,
-        deadline: &Deadline,
+        views: &super::git_views::ViewPlan,
     ) -> Result<Option<Self>> {
-        let Some(current_views) = &observation.current_commits else {
+        let Some(memory_views) = &observation.current_commits else {
             return Ok(None);
         };
         let mut heads = observation.refs.iter().filter(|r| r.name == "HEAD");
@@ -31,49 +31,50 @@ impl<'a> HeadMove<'a> {
         if heads.next().is_some()
             || head.target_kind != GitObjectKind::Commit
             || !Path::new(&observation.repository_path).is_absolute()
+            || (observation.view_coverage != crate::core::GitViewCoverage::Checkout
+                && observation
+                    .repository_path
+                    .contains(char::REPLACEMENT_CHARACTER))
         {
             return Ok(None);
         }
         let current = head.target_oid.as_str();
         let repository = observation.repository_id.to_string();
-        let previous: Option<String> = conn
-            .query_row(
-                "SELECT h.target_oid FROM git_refs h
+        let previous: Option<String> =
+            if observation.view_coverage == crate::core::GitViewCoverage::Checkout {
+                views.checkout_previous.clone()
+            } else {
+                conn.query_row(
+                    "SELECT h.target_oid FROM git_refs h
              JOIN repositories r ON r.id = h.repository_id
              JOIN git_views v ON v.repository_id = h.repository_id AND v.commit_oid = h.target_oid
                              AND v.observed_at = h.last_observed_at
              WHERE h.repository_id = ?1 AND h.name = 'HEAD' AND h.target_kind = 'commit'
                AND r.current_path = ?2 AND h.target_oid <> ?3 AND h.last_observed_at <= ?4",
-                params![
-                    repository,
-                    observation.repository_path,
-                    current,
-                    observation.session.observed_at.0
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(dberr)?;
+                    params![
+                        repository,
+                        observation.repository_path,
+                        current,
+                        observation.session.observed_at.0
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(dberr)?
+            };
         let Some(previous) = previous else {
             return Ok(None);
         };
 
+        if observation.view_coverage != crate::core::GitViewCoverage::Checkout
+            && (memory_views.contains(&previous) || !memory_views.contains(&head.target_oid))
+        {
+            return Ok(None);
+        }
         // Removing the old HEAD and adding this one must be the only view
         // changes. Unrelated worktrees that stayed at their tips coexist.
-        let mut before = BTreeSet::new();
-        let mut stmt = conn
-            .prepare("SELECT commit_oid FROM git_views WHERE repository_id = ?1")
-            .map_err(dberr)?;
-        for oid in stmt
-            .query_map([repository], |row| row.get::<_, String>(0))
-            .map_err(dberr)?
-        {
-            deadline.check("comparing Git HEAD views")?;
-            before.insert(oid.map_err(dberr)?);
-        }
-        let after: BTreeSet<_> = current_views.iter().cloned().collect();
-        let departing = before.difference(&after).map(String::as_str);
-        let arriving = after.difference(&before).map(String::as_str);
+        let departing = views.before.difference(&views.after).map(String::as_str);
+        let arriving = views.after.difference(&views.before).map(String::as_str);
         if !departing.eq([previous.as_str()]) || !arriving.eq([current]) {
             return Ok(None);
         }

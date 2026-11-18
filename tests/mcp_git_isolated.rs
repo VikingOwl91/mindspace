@@ -1340,6 +1340,100 @@ fn a_failed_commit_is_a_clean_rollback_and_an_unknown_outcome_is_reported_as_unk
     }
 }
 
+fn fixture_git(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new(GIT)
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture Git returned {}",
+        output.status
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn isolated_checkout_refresh_keeps_sibling_memories_and_symbols_current() {
+    let w = World::new();
+    let enclosure = w.root.join("projects");
+    std::fs::create_dir(&enclosure).unwrap();
+    let main = w.repo("projects/main");
+    let linked = enclosure.join("linked");
+    fixture_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let update = |root: &Path, marker: &str| {
+        std::fs::write(root.join("README.md"), format!("# Topic\n{marker}")).unwrap();
+        std::fs::write(root.join("src/topic.rs"), format!("pub fn {marker}() {{}}")).unwrap();
+        fixture_git(root, &["add", "README.md", "src/topic.rs"]);
+        fixture_git(root, &["commit", "-qm", marker]);
+    };
+    update(&main, "mainbefore");
+    update(&linked, "linkedbefore");
+    w.ok(&["ingest", main.to_str().unwrap(), "--space", "p"]);
+    let search = |command: &str, marker: &str| -> Vec<Value> {
+        serde_json::from_str(&w.ok(&[command, marker, "--json"])).unwrap()
+    };
+    let old = search("search", "mainbefore")[0]["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut m = mcp!(w, &[&enclosure, &main, &linked], OPT_IN, &[]);
+    for root in [&linked, &main, &linked] {
+        let result = m.ingest(root);
+        assert_eq!(
+            result["structuredContent"]["commit_state"], "COMMITTED",
+            "{result}"
+        );
+        for marker in ["mainbefore", "linkedbefore"] {
+            assert_eq!(search("search", marker).len(), 1);
+            assert_eq!(search("symbols", marker).len(), 1);
+        }
+    }
+    update(&main, "mainafter");
+    let result = m.ingest(&main);
+    assert_eq!(
+        result["structuredContent"]["counts"]["stale_superseded"], 1,
+        "{result}"
+    );
+    let next = search("search", "mainafter")[0]["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(w
+        .ok(&["trace", &old])
+        .contains(&format!("superseded by {next}")));
+    assert!(w
+        .ok(&["trace", &next])
+        .contains(&format!("supersedes {old}")));
+    assert!(search("search", "mainbefore").is_empty());
+    assert!(search("symbols", "mainbefore").is_empty());
+    assert_eq!(search("symbols", "mainafter").len(), 1);
+    assert_eq!(search("symbols", "linkedbefore").len(), 1);
+    assert_eq!(search("search", "linkedbefore").len(), 1);
+    m.finish();
+}
+
 /// A real repository of each supported layout goes through the production MCP broker, cgroup,
 /// worker, hash verification and database. All repositories and Git transports are local.
 #[test]
@@ -1351,29 +1445,7 @@ fn linked_worktree_local_alternates_and_partial_clone_use_only_local_head_object
     let main = enclosure.join("main");
     let linked = enclosure.join("linked");
     let pool = enclosure.join("pool");
-    let git = |cwd: &Path, args: &[&str]| {
-        let output = Command::new(GIT)
-            .arg("-C")
-            .arg(cwd)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .env_clear()
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "fixture Git returned {}",
-            output.status
-        );
-        String::from_utf8(output.stdout).unwrap()
-    };
+    let git = fixture_git;
     let p = |p: &Path| p.to_str().unwrap().to_owned();
     let head = w.head(&source);
     git(

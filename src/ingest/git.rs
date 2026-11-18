@@ -562,31 +562,49 @@ impl GitReader {
     /// and linked ones), sorted. Bare entries, prunable worktrees whose
     /// directory is gone, and unborn HEADs are skipped. One git call.
     pub fn worktree_heads(&self) -> Result<Vec<String>> {
-        let mut heads = std::collections::BTreeSet::new();
-        for w in self.worktrees()? {
-            if w.bare || w.prunable {
-                continue;
-            }
-            if let Some(h) = w.head.filter(|h| h.chars().any(|c| c != '0')) {
-                heads.insert(h);
-            }
-        }
+        let heads: std::collections::BTreeSet<_> = self
+            .live_worktree_tips()?
+            .into_iter()
+            .map(|(_, oid)| oid)
+            .collect();
         Ok(heads.into_iter().collect())
+    }
+
+    pub(super) fn live_worktree_tips(&self) -> Result<Vec<(Option<String>, String)>> {
+        Ok(self
+            .worktrees_with_keys()?
+            .into_iter()
+            .filter(|(w, _)| !w.bare && !w.prunable)
+            .filter_map(|(w, key)| {
+                w.head
+                    .filter(|h| h.chars().any(|c| c != '0'))
+                    .map(|h| (key, h))
+            })
+            .collect())
     }
 
     /// Every worktree of this repository as git lists them; the first entry
     /// is the main worktree. One git call.
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
+        Ok(self
+            .worktrees_with_keys()?
+            .into_iter()
+            .map(|(worktree, _)| worktree)
+            .collect())
+    }
+
+    fn worktrees_with_keys(&self) -> Result<Vec<(Worktree, Option<String>)>> {
         let out = run(
             &self.path,
             &self.deadline,
             self.pin.as_ref(),
-            &["worktree", "list", "--porcelain"],
+            &["worktree", "list", "--porcelain", "-z"],
             None,
         )?;
-        let text = String::from_utf8_lossy(&out);
+        let fields: Vec<_> = out.split(|b| *b == 0).collect();
         let mut result = Vec::new();
-        for (i, block) in text.split("\n\n").enumerate() {
+        for (i, block) in fields.split(|field| field.is_empty()).enumerate() {
+            let mut key = None;
             let mut w = Worktree {
                 path: String::new(),
                 head: None,
@@ -597,9 +615,14 @@ impl GitReader {
                 locked: false,
                 is_main: i == 0,
             };
-            for line in block.lines() {
-                if let Some(p) = line.strip_prefix("worktree ") {
-                    w.path = p.to_string();
+            for raw in block {
+                let line = String::from_utf8_lossy(raw);
+                if let Some(path) = raw.strip_prefix(b"worktree ") {
+                    w.path = String::from_utf8_lossy(path).into_owned();
+                    // Display labels may be lossy. Ownership keys use Git's original bytes.
+                    if Path::new(&w.path).is_absolute() {
+                        key = Some(crate::core::sha256_hex(path));
+                    }
                 } else if let Some(h) = line.strip_prefix("HEAD ") {
                     w.head = Some(h.trim().to_string());
                 } else if let Some(b) = line.strip_prefix("branch ") {
@@ -615,7 +638,7 @@ impl GitReader {
                 }
             }
             if !w.path.is_empty() {
-                result.push(w);
+                result.push((w, key));
             }
         }
         Ok(result)

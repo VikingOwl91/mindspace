@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::core::Uuid;
+use crate::core::{Refusal, RefusalKind, Uuid};
 use crate::ingest::confined::Anchor;
 use crate::ingest::extract::{Extracted, ExtractedGit};
 use crate::ingest::stream::{consume, Kind, ProducerLimits, StreamLimits};
@@ -83,7 +83,8 @@ pub enum WorkerError {
     Spawn(String),
     /// The broker refused the operation (root not authorized, replay, busy, confinement not
     /// observed, no cgroup...). Nothing was started or everything started was ended.
-    Refused(String),
+    Refused(Refusal),
+    Extraction(Refusal),
     /// The worker is not confined as required (or said nothing sensible); it was killed.
     Sandbox(String),
     /// The hard wall-clock limit or the idle limit expired; the worker's group was killed.
@@ -98,6 +99,7 @@ pub enum WorkerError {
     Context(String),
     /// The stream was malformed, truncated, over budget or inconsistent; nothing was kept.
     Stream(String),
+    Truncated(String),
     /// The worker ended without delivering a complete stream, or failed after it.
     Died {
         status: String,
@@ -111,6 +113,7 @@ impl std::fmt::Display for WorkerError {
         match self {
             Self::Spawn(m) => write!(f, "cannot start the extraction worker: {m}"),
             Self::Refused(m) => write!(f, "the broker refused the extraction: {m}"),
+            Self::Extraction(r) => write!(f, "extraction refused: {r}"),
             Self::Sandbox(m) => write!(f, "the extraction worker is not confined: {m}"),
             Self::Timeout(w) => write!(f, "the extraction worker timed out ({w})"),
             Self::Cancelled => write!(f, "the extraction was cancelled"),
@@ -119,7 +122,7 @@ impl std::fmt::Display for WorkerError {
                 "the grant for this directory was revoked while the extraction ran; nothing was persisted"
             ),
             Self::Context(m) => write!(f, "the context exchange was refused: {m}"),
-            Self::Stream(m) => write!(f, "the extraction worker's result was refused: {m}"),
+            Self::Stream(m) | Self::Truncated(m) => write!(f, "the extraction worker's result was refused: {m}"),
             Self::Died { status, stderr } => {
                 write!(f, "the extraction worker ended ({status}): {stderr}")
             }
@@ -128,6 +131,39 @@ impl std::fmt::Display for WorkerError {
     }
 }
 
+impl WorkerError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Refused(r) | Self::Extraction(r) => r.kind.as_str(),
+            Self::Sandbox(_) => "confinement_not_verified",
+            Self::Timeout(_) => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Revoked => "revoked",
+            Self::Context(_) => "context_refused",
+            Self::Stream(_) | Self::Truncated(_) => "result_refused",
+            Self::Died { .. } => "worker_failed",
+            Self::Spawn(_) | Self::Io(_) => "broker_io",
+        }
+    }
+
+    fn manifest(e: crate::core::Error) -> Self {
+        match e {
+            crate::core::Error::Refused(r) => Self::Extraction(r),
+            _ => Self::Context(e.to_string()),
+        }
+    }
+
+    fn stream(e: crate::core::Error) -> Self {
+        if matches!(e, crate::core::Error::TruncatedExtraction(_)) {
+            return Self::Truncated(e.to_string());
+        }
+        if let Some(kind) = e.refusal_kind() {
+            Self::Extraction(Refusal::new(kind, e.to_string()))
+        } else {
+            Self::Stream(e.to_string())
+        }
+    }
+}
 impl std::error::Error for WorkerError {}
 
 #[derive(Debug, Clone, Default)]
@@ -390,7 +426,7 @@ pub fn extract_directory(
 
     // Did the worker end by itself? (Asked before we end it; a stream that stops short usually
     // means it did, and the close of its channel can come a moment before it is waitable.)
-    let stopped_short = matches!(&outcome, Err(WorkerError::Stream(m)) if m.contains("ended") || m.contains("truncated"));
+    let stopped_short = matches!(&outcome, Err(WorkerError::Truncated(_)));
     let ended_by_itself = match &outcome {
         Ok(_) => exited_within(pgid, cfg.exit_grace),
         Err(_) => exited_within(
@@ -444,7 +480,7 @@ pub fn extract_directory(
                 })
             }
         }
-        Err(WorkerError::Stream(m)) if ended_by_itself => {
+        Err(WorkerError::Truncated(m)) if ended_by_itself => {
             // a stream that stops short because the worker ended: say how it ended
             Err(WorkerError::Died {
                 status: format!("{} ({m})", stats.exit),
@@ -456,8 +492,21 @@ pub fn extract_directory(
             status: format!("{status} [{}]", stats.exit),
             stderr: err_text,
         }),
+        Err(WorkerError::Truncated(m)) => Err(WorkerError::Stream(m)),
         Err(e) => Err(e),
     }
+}
+
+fn check_producer_failure(line: &[u8], op: Uuid) -> Result<(), WorkerError> {
+    if let Ok(failure) = serde_json::from_slice::<super::ProducerFailure>(line) {
+        if failure.v != PROTOCOL || failure.op != op {
+            return Err(WorkerError::Context(
+                "the producer refusal belongs to another operation or protocol".into(),
+            ));
+        }
+        return Err(WorkerError::Extraction(failure.refusal.refusal()));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,9 +622,12 @@ fn run_session(
                     stderr: String::new(),
                 }))
             }
-            Ok(_) if line.last() == Some(&b'\n') => {}
+            Ok(_) if line.len() <= MAX_MANIFEST_LINE && line.last() == Some(&b'\n') => {}
             Ok(_) if line.len() > MAX_MANIFEST_LINE => {
-                return Err(WorkerError::Context("the manifest is too long".into()))
+                return Err(WorkerError::Extraction(Refusal::new(
+                    RefusalKind::TooLarge,
+                    "the manifest is too long",
+                )))
             }
             Ok(_) => {
                 return Err(by_cause(WorkerError::Died {
@@ -585,11 +637,12 @@ fn run_session(
             }
             Err(e) => return Err(by_cause(WorkerError::Io(e.to_string()))),
         }
+        check_producer_failure(&line, op)?;
         let manifest: GitManifest = serde_json::from_slice(&line)
             .map_err(|e| WorkerError::Context(format!("unreadable manifest: {e}")))?;
         manifest
-            .validate(op, repository_id)
-            .map_err(WorkerError::Context)?;
+            .validate_for_receiver(op, repository_id)
+            .map_err(WorkerError::manifest)?;
         let policy = cfg.producer.parse_policy;
         let context = answer_git(ctx, op, &policy, &manifest)
             .map_err(|e| WorkerError::Context(format!("answering the manifest: {e}")))?;
@@ -615,7 +668,7 @@ fn run_session(
                 stats.verification = st.verification;
                 extracted
             }
-            Err(e) => return Err(by_cause(WorkerError::Stream(e.to_string()))),
+            Err(e) => return Err(by_cause(WorkerError::stream(e))),
         };
         let Extracted::Git(g) = &extracted else {
             return Err(WorkerError::Stream(
@@ -648,9 +701,12 @@ fn run_session(
                 stderr: String::new(),
             }))
         }
-        Ok(_) if line.last() == Some(&b'\n') => {}
+        Ok(_) if line.len() <= MAX_MANIFEST_LINE && line.last() == Some(&b'\n') => {}
         Ok(_) if line.len() > MAX_MANIFEST_LINE => {
-            return Err(WorkerError::Context("the manifest is too long".into()))
+            return Err(WorkerError::Extraction(Refusal::new(
+                RefusalKind::TooLarge,
+                "the manifest is too long",
+            )))
         }
         Ok(_) => {
             return Err(by_cause(WorkerError::Died {
@@ -660,9 +716,12 @@ fn run_session(
         }
         Err(e) => return Err(by_cause(WorkerError::Io(e.to_string()))),
     }
+    check_producer_failure(&line, op)?;
     let manifest: Manifest = serde_json::from_slice(&line)
         .map_err(|e| WorkerError::Context(format!("unreadable manifest: {e}")))?;
-    manifest.validate(op).map_err(WorkerError::Context)?;
+    manifest
+        .validate_for_receiver(op)
+        .map_err(WorkerError::manifest)?;
     let policy = cfg.producer.parse_policy;
     let context = answer(ctx, op, &policy, &manifest)
         .map_err(|e| WorkerError::Context(format!("answering the manifest: {e}")))?;
@@ -689,7 +748,7 @@ fn run_session(
             stats.records = st.records;
             extracted
         }
-        Err(e) => return Err(by_cause(WorkerError::Stream(e.to_string()))),
+        Err(e) => return Err(by_cause(WorkerError::stream(e))),
     };
     // 5. the result against what was asked, still before anything is persisted
     if let Extracted::Files(files) = &extracted {
@@ -826,8 +885,9 @@ fn broker_operation(
         let mut b = serde_json::to_vec(m).map_err(|e| WorkerError::Io(e.to_string()))?;
         b.push(b'\n');
         (&*link).write_all(&b).map_err(|e| {
-            WorkerError::Refused(format!(
-                "the broker is not available (it never started or has exited): {e}"
+            WorkerError::Refused(Refusal::new(
+                RefusalKind::BrokerUnavailable,
+                format!("the broker is not available (it never started or has exited): {e}"),
             ))
         })
     };
@@ -845,15 +905,18 @@ fn broker_operation(
     if bytes.is_empty() {
         // end of file: the broker (or its watchdog) is gone. Explicit, never a silent fallback to
         // an in-process or unconfined extraction.
-        return Err(WorkerError::Refused(
-            "the broker is not available (it never started or has exited)".into(),
-        ));
+        return Err(WorkerError::Refused(Refusal::new(
+            RefusalKind::BrokerUnavailable,
+            "the broker is not available (it never started or has exited)",
+        )));
     }
     let text = String::from_utf8_lossy(&bytes);
     let ready: FromBroker = serde_json::from_str(text.trim_end())
         .map_err(|e| WorkerError::Io(format!("unreadable answer from the broker: {e}")))?;
     let (observed, got_spaces, got_root, authority, repository_id) = match ready {
-        FromBroker::Refused { reason } => return Err(WorkerError::Refused(reason)),
+        FromBroker::Refused { kind, reason } => {
+            return Err(WorkerError::Refused(Refusal::new(kind, reason)))
+        }
         FromBroker::Ready {
             v,
             op: o,
@@ -935,6 +998,7 @@ fn broker_operation(
     let Some(FromBroker::Finished {
         op: fop,
         exit,
+        exit_code,
         ended_by,
         exited_by_itself,
         descendants_killed,
@@ -945,9 +1009,10 @@ fn broker_operation(
     else {
         if broker_gone {
             // the broker (or its watchdog) ended during the operation: explicit, not a worker death
-            return Err(WorkerError::Refused(
-                "the broker is not available (it exited during the operation)".into(),
-            ));
+            return Err(WorkerError::Refused(Refusal::new(
+                RefusalKind::BrokerUnavailable,
+                "the broker is not available (it exited during the operation)",
+            )));
         }
         return Err(outcome.err().unwrap_or(WorkerError::Io(
             "the broker did not report how the worker ended".into(),
@@ -980,17 +1045,18 @@ fn broker_operation(
         cgroup_peak_bytes,
     };
     match outcome {
-        Ok(extracted) if ended_by == EndedBy::Done && exited_by_itself && exit == "exit code 0" => {
+        Ok(extracted) if ended_by == EndedBy::Done && exited_by_itself && exit_code == Some(0) => {
             Ok((extracted, stats, report))
         }
         Ok(_) => Err(WorkerError::Died {
             status: exit,
             stderr: String::new(),
         }),
-        Err(WorkerError::Stream(m)) if exited_by_itself => Err(WorkerError::Died {
+        Err(WorkerError::Truncated(m)) if exited_by_itself => Err(WorkerError::Died {
             status: format!("{exit} ({m})"),
             stderr: String::new(),
         }),
+        Err(WorkerError::Truncated(m)) => Err(WorkerError::Stream(m)),
         Err(e) => Err(e),
     }
 }
@@ -1001,7 +1067,7 @@ pub enum CommitAnswer {
     /// A lease is held: commit (or abandon), then call [`commit_done`].
     Granted,
     /// The broker said no: do NOT commit. The link is still in step.
-    Denied(String),
+    Denied(Refusal),
     /// No usable answer (timeout, end of file, garbage): the broker may still answer or may hold a
     /// lease. Do NOT commit, and do not use this link again.
     Lost(String),
@@ -1036,7 +1102,11 @@ pub fn commit_request(link: &UnixStream, op: Uuid) -> CommitAnswer {
     }
     match serde_json::from_slice::<FromBroker>(&line) {
         Ok(FromBroker::CommitGranted { op: o }) if o == op => CommitAnswer::Granted,
-        Ok(FromBroker::CommitDenied { op: o, reason }) if o == op => CommitAnswer::Denied(reason),
+        Ok(FromBroker::CommitDenied {
+            op: o,
+            kind,
+            reason,
+        }) if o == op => CommitAnswer::Denied(Refusal::new(kind, reason)),
         other => lost(format!(
             "unexpected answer to the commit request: {other:?}"
         )),
@@ -1172,7 +1242,7 @@ pub(crate) fn persist_with_lease<T>(
                 }
                 Ok(())
             }
-            CommitAnswer::Denied(reason) => refuse("revoked", reason, false),
+            CommitAnswer::Denied(reason) => refuse(reason.kind.as_str(), reason.detail, false),
             CommitAnswer::Lost(reason) => {
                 release.set(true);
                 let kind = if reason.contains("broker is not available") {

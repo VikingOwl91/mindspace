@@ -7,7 +7,7 @@ pub use document::{
     DocumentExtractionReport, DocumentRefusal, LiveObservation, NodeKind, Resolution,
     RetainedBytes, StoredCitation, MAX_NODES,
 };
-pub use error::{Error, Result};
+pub use error::{Error, Refusal, RefusalKind, Result};
 
 use std::collections::BTreeMap;
 use std::fmt;

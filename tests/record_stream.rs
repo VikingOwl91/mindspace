@@ -999,16 +999,20 @@ fn the_root_and_the_content_budget_are_checked() {
     l.extraction.max_content_bytes = 1000;
     let e = consume(&bytes[..], op, Kind::Files, Some(&f.root), &l, None)
         .err()
-        .unwrap()
-        .to_string();
-    assert!(e.contains("exceed the limit"), "{e}");
+        .unwrap();
+    assert_eq!(
+        e.refusal_kind(),
+        Some(mindspace::core::RefusalKind::TooLarge)
+    );
     let mut l = StreamLimits::default();
     l.extraction.max_files = 2;
     let e = consume(&bytes[..], op, Kind::Files, Some(&f.root), &l, None)
         .err()
-        .unwrap()
-        .to_string();
-    assert!(e.contains("exceed the limit"), "{e}");
+        .unwrap();
+    assert_eq!(
+        e.refusal_kind(),
+        Some(mindspace::core::RefusalKind::TooManyFiles)
+    );
 }
 
 #[test]

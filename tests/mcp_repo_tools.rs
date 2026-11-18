@@ -283,6 +283,10 @@ fn outline_then_scoped_ingest_then_search() {
         json!({"path": p, "spaces": ["p"], "paths": ["../x"]}),
     );
     assert_eq!(bad_sel["isError"], true);
+    assert_eq!(
+        bad_sel["structuredContent"]["error"]["kind"],
+        "invalid_argument"
+    );
 }
 
 #[test]
@@ -299,6 +303,7 @@ fn unscoped_ingest_of_a_huge_tree_is_refused() {
 
     let r = s.call("repo_ingest", json!({"path": p, "spaces": ["p"]}));
     assert_eq!(r["isError"], true);
+    assert_eq!(r["structuredContent"]["error"]["kind"], "too_many_files");
     assert!(text(&r).contains("repo_outline"), "{}", text(&r));
     let ok = s.call(
         "repo_ingest",

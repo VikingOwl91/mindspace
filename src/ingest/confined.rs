@@ -53,21 +53,13 @@ const OUTSIDE: &str = "path is not accessible or outside the allowed roots";
 const SMALL: usize = 64 * 1024;
 
 fn refuse(msg: impl Into<String>) -> Error {
-    Error::Storage(msg.into())
-}
-
-fn read_only_message(root: &Path) -> String {
-    format!(
-        "path is inside the read-only root {root}; ingesting needs a read-write root \
-         (start the server with --allow-root {root}:rw)",
-        root = root.display()
-    )
+    Error::refused(crate::core::RefusalKind::Refused, msg)
 }
 
 /// The path of an open descriptor as the kernel reports it right now.
 fn real_path_of(file: &File) -> Result<PathBuf> {
     let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-        .map_err(|_| refuse(OUTSIDE))?;
+        .map_err(|_| Error::refused(crate::core::RefusalKind::RootNotAuthorized, OUTSIDE))?;
     if link.to_string_lossy().ends_with(" (deleted)") {
         return Err(refuse(
             "the directory was removed while it was being opened",
@@ -98,7 +90,7 @@ impl Anchor {
             .read(true)
             .custom_flags(libc::O_DIRECTORY)
             .open(path)
-            .map_err(|_| refuse(OUTSIDE))?;
+            .map_err(|_| Error::refused(crate::core::RefusalKind::RootNotAuthorized, OUTSIDE))?;
         let real = real_path_of(&file)?;
         if let Some(e) = expected {
             if real != e {
@@ -108,8 +100,11 @@ impl Anchor {
             }
         }
         match policy.governing(&real) {
-            None => Err(refuse(OUTSIDE)),
-            Some((root, Mode::ReadOnly)) if need_rw => Err(refuse(read_only_message(&root))),
+            None => Err(Error::refused(
+                crate::core::RefusalKind::RootNotAuthorized,
+                OUTSIDE,
+            )),
+            Some((root, Mode::ReadOnly)) if need_rw => Err(Error::read_only_root(&root)),
             Some(_) => Ok(Anchor { file, real }),
         }
     }
@@ -198,7 +193,10 @@ impl Anchor {
             source: e,
         })?;
         if max.is_some_and(|m| buf.len() > m) {
-            return Err(refuse(format!("{} is unexpectedly large", rel.display())));
+            return Err(Error::refused(
+                crate::core::RefusalKind::TooLarge,
+                format!("{} is unexpectedly large", rel.display()),
+            ));
         }
         Ok(Some(buf))
     }
@@ -241,8 +239,13 @@ impl Anchor {
         match policy.governing(&real) {
             Some((_, Mode::ReadWrite)) => {}
             Some((_, Mode::ReadOnly)) if !need_rw => {}
-            Some((root, Mode::ReadOnly)) => return Err(refuse(read_only_message(&root))),
-            None => return Err(refuse(OUTSIDE)),
+            Some((root, Mode::ReadOnly)) => return Err(Error::read_only_root(&root)),
+            None => {
+                return Err(Error::refused(
+                    crate::core::RefusalKind::RootNotAuthorized,
+                    OUTSIDE,
+                ))
+            }
         }
         Ok(Some(file))
     }
@@ -313,7 +316,7 @@ pub fn open_git_reader(
             let target = parse_gitdir_pointer(&bytes).ok_or_else(|| refuse("`.git` is not a valid gitdir pointer"))?;
             let p = Path::new(&target);
             let abs = if p.is_absolute() { p.to_path_buf() } else { anchor.real().join(p) };
-            let canonical = std::fs::canonicalize(&abs).map_err(|_| refuse(OUTSIDE))?;
+            let canonical = std::fs::canonicalize(&abs).map_err(|_| Error::refused(crate::core::RefusalKind::RootNotAuthorized, OUTSIDE))?;
             Anchor::open(&canonical, Some(&canonical), policy, need_rw)?
         }
         Ok(_) => return Err(refuse("`.git` is neither a directory nor a file")),
@@ -328,7 +331,9 @@ pub fn open_git_reader(
             } else {
                 gitdir.real().join(p)
             };
-            let canonical = std::fs::canonicalize(&abs).map_err(|_| refuse(OUTSIDE))?;
+            let canonical = std::fs::canonicalize(&abs).map_err(|_| {
+                Error::refused(crate::core::RefusalKind::RootNotAuthorized, OUTSIDE)
+            })?;
             Anchor::open(&canonical, Some(&canonical), policy, need_rw)?
         }
         None => gitdir.try_clone()?,
@@ -413,7 +418,7 @@ fn check_alternates(common: &Anchor, policy: &dyn PathPolicy, need_rw: bool) -> 
     }
     let (repo_root, _) = policy
         .governing(common.real())
-        .ok_or_else(|| refuse(OUTSIDE))?;
+        .ok_or_else(|| Error::refused(crate::core::RefusalKind::RootNotAuthorized, OUTSIDE))?;
     if policy.contains_read_only(&repo_root) {
         return Err(refuse(
             "alternate object stores are not supported in a root that contains a read-only area \

@@ -83,7 +83,10 @@ pub fn run(store: &dyn Store, config: &McpConfig, root_arg: &str) -> Result<()> 
     let path = match config.authorize(root_arg, Access::ReadOnly) {
         Ok(p) => p,
         Err(e) => {
-            out.insert("authorize".into(), json!({"ok": false, "error": e}));
+            out.insert(
+                "authorize".into(),
+                json!({"ok": false, "error": e.to_string()}),
+            );
             println!("{}", serde_json::Value::Object(out));
             return Ok(());
         }

@@ -119,7 +119,7 @@ pub fn definition() -> Value {
     })
 }
 
-fn failure(kind: &str, message: impl Into<String>) -> ToolFailure {
+pub(super) fn failure(kind: &str, message: impl Into<String>) -> ToolFailure {
     failure_with(kind, message, json!(false))
 }
 
@@ -152,25 +152,9 @@ fn failure_commit(
 }
 
 fn error_of(e: WorkerError) -> (ToolFailure, bool) {
-    use WorkerError::*;
     let text = e.to_string();
-    let poison = matches!(e, Io(_));
-    let kind = match &e {
-        Refused(m) if m.contains("not authorized") => "root_not_authorized",
-        Refused(m) if m.contains("broker is not available") => "broker_unavailable",
-        Refused(m) if m.contains("busy") => "busy",
-        Refused(m) if m.contains("already used") => "replay_refused",
-        Refused(_) => "refused",
-        Revoked => "revoked",
-        Timeout(_) => "timeout",
-        Cancelled => "cancelled",
-        Context(_) => "context_refused",
-        Stream(m) if m.contains("files exceed the limit") => "too_many_files",
-        Stream(_) => "result_refused",
-        Sandbox(_) => "confinement_not_verified",
-        Died { .. } => "worker_failed",
-        Spawn(_) | Io(_) => "broker_io",
-    };
+    let poison = matches!(e, WorkerError::Io(_));
+    let kind = e.kind();
     let text = if kind == "too_many_files" {
         format!(
             "refusing an ingest of more than {MAX_UNSCOPED_INGEST_FILES} ingestable files: this tool \

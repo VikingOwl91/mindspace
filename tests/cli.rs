@@ -773,25 +773,37 @@ fn manual_controls_related_hits_and_inherited_spaces_are_safe_but_json_is_exact(
 }
 
 #[test]
-fn ingest_error_from_an_untrusted_filename_is_terminal_safe() {
+fn ingest_skip_and_error_from_an_untrusted_filename_are_terminal_safe() {
     let mind = Mind::new();
     assert!(mind.run(&["init"]).2);
     assert!(mind.run(&["space", "create", "coding"]).2);
-    let directory = mind.db.path().join("untrusted");
-    std::fs::create_dir(&directory).unwrap();
     let filename = "Grüße 日本語 🦉 \u{1b}]0;error\u{7}\u{202e}.txt";
-    std::fs::write(directory.join(filename), [0xff, 0xfe]).unwrap();
-    for json in [false, true] {
-        let mut args = vec!["ingest", directory.to_str().unwrap(), "--space", "coding"];
-        if json {
-            args.push("--json");
-        }
-        let (out, err, ok) = mind.run(&args);
+    let path = mind.db.path().join(filename);
+    std::fs::write(&path, [0xff, 0xfe]).unwrap();
+    let mut args = vec!["ingest", path.to_str().unwrap(), "--space", "coding"];
+    let (out, err, ok) = mind.run(&args);
+    assert!(ok, "{err}");
+    assert_terminal_safe(&out);
+    assert!(out.contains("skipped"));
+    assert!(out.contains("Grüße 日本語 🦉"));
+    assert!(out.contains("2 bytes, invalid UTF-8"));
+    args.push("--json");
+    let (out, err, ok) = mind.run(&args);
+    assert!(ok, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        report["skipped_files"],
+        serde_json::json!([{
+            "path": path.to_str().unwrap(), "size_bytes": 2, "reason": {"kind": "invalid_utf8"}
+        }])
+    );
+    std::fs::remove_file(&path).unwrap();
+    for args in [&args[..args.len() - 1], &args[..]] {
+        let (out, err, ok) = mind.run(args);
         assert!(!ok);
         assert!(out.is_empty());
         assert_terminal_safe(&err);
-        assert!(err.contains("Grüße 日本語 🦉"));
-        assert!(err.contains("not valid UTF-8"));
+        assert!(err.contains("Grüße 日本語 🦉"), "{err}");
     }
 }
 

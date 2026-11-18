@@ -121,29 +121,40 @@ pub fn validate_spaces(spaces: &[Uuid]) -> std::result::Result<(), String> {
     Ok(())
 }
 
+fn invalid<T>(detail: impl Into<String>) -> Result<T> {
+    Err(Error::InvalidExtraction(detail.into()))
+}
+
 impl Manifest {
     /// Strict check on the parent's side: right version, this operation, bounded, well-formed and
     /// free of duplicates.
     pub fn validate(&self, op: Uuid) -> std::result::Result<(), String> {
+        self.validate_for_receiver(op).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn validate_for_receiver(&self, op: Uuid) -> Result<()> {
         if self.v != PROTOCOL {
-            return bad(format!("manifest protocol {}", self.v));
+            return invalid(format!("manifest protocol {}", self.v));
         }
         if self.op != op {
-            return bad("the manifest belongs to another operation");
+            return invalid("the manifest belongs to another operation");
         }
         if self.entries.len() > MAX_MANIFEST_ENTRIES {
-            return bad(format!(
-                "{} manifest entries (at most {MAX_MANIFEST_ENTRIES})",
-                self.entries.len()
+            return Err(crate::core::Error::refused(
+                crate::core::RefusalKind::TooManyFiles,
+                format!(
+                    "{} manifest entries (at most {MAX_MANIFEST_ENTRIES})",
+                    self.entries.len()
+                ),
             ));
         }
         let mut seen = HashSet::with_capacity(self.entries.len());
         for e in &self.entries {
             if !valid_hash(&e.hash) {
-                return bad("a manifest hash is not a lowercase SHA-256");
+                return invalid("a manifest hash is not a lowercase SHA-256");
             }
             if !seen.insert((e.language, e.hash.as_str())) {
-                return bad("a manifest entry is repeated");
+                return invalid("a manifest entry is repeated");
             }
         }
         Ok(())
@@ -390,9 +401,12 @@ impl crate::ingest::extract::ExtractionContext for Collector {
             hash: content_hash.to_string(),
         });
         if set.len() > MAX_MANIFEST_ENTRIES {
-            return Err(Error::InvalidExtraction(format!(
+            return Err(Error::refused(
+                crate::core::RefusalKind::TooManyFiles,
+                format!(
                 "more than {MAX_MANIFEST_ENTRIES} source files: too many for the context exchange"
-            )));
+            ),
+            ));
         }
         Ok(true)
     }
@@ -495,31 +509,39 @@ pub struct GitContext {
 impl GitManifest {
     /// Strict check on the parent's side. `repository_id` is the identity the broker bound.
     pub fn validate(&self, op: Uuid, repository_id: Uuid) -> std::result::Result<(), String> {
+        self.validate_for_receiver(op, repository_id)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn validate_for_receiver(&self, op: Uuid, repository_id: Uuid) -> Result<()> {
         if self.v != PROTOCOL {
-            return bad(format!("manifest protocol {}", self.v));
+            return invalid(format!("manifest protocol {}", self.v));
         }
         if self.op != op {
-            return bad("the manifest belongs to another operation");
+            return invalid("the manifest belongs to another operation");
         }
         if self.repository_id != repository_id {
-            return bad("the manifest names another repository than the one the broker bound");
+            return invalid("the manifest names another repository than the one the broker bound");
         }
         if !crate::ingest::gitverify::is_sha1_oid(&self.head) {
-            return bad("the manifest head is not a SHA-1 object id");
+            return invalid("the manifest head is not a SHA-1 object id");
         }
         if self.entries.len() > MAX_MANIFEST_ENTRIES {
-            return bad(format!(
-                "{} manifest entries (at most {MAX_MANIFEST_ENTRIES})",
-                self.entries.len()
+            return Err(crate::core::Error::refused(
+                crate::core::RefusalKind::TooManyFiles,
+                format!(
+                    "{} manifest entries (at most {MAX_MANIFEST_ENTRIES})",
+                    self.entries.len()
+                ),
             ));
         }
         let mut seen = HashSet::with_capacity(self.entries.len());
         for e in &self.entries {
             if !crate::ingest::gitverify::is_sha1_oid(&e.blob_oid) {
-                return bad("a manifest blob id is not a SHA-1 object id");
+                return invalid("a manifest blob id is not a SHA-1 object id");
             }
             if !seen.insert((e.language, e.blob_oid.as_str())) {
-                return bad("a manifest entry is repeated");
+                return invalid("a manifest entry is repeated");
             }
         }
         Ok(())

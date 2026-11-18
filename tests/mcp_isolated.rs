@@ -719,7 +719,7 @@ fn a_malformed_worker_stream_changes_no_rows() {
         "printf '{\"v\":2,\"pid\":1,\"sandbox\":{}}\\n' >&3\nread -r req <&3\n\
          op=$(printf '%s' \"$req\" | sed 's/.*\"op\":\"\\([^\"]*\\)\".*/\\1/')\n\
          printf '{\"v\":2,\"op\":\"%s\",\"entries\":[]}\\n' \"$op\" >&3\nread -r ctx <&3\n\
-         printf 'not-a-frame-at-all-not-a-frame' >&3\nsleep 5",
+         printf '\\001\\000\\000\\000?' >&3\nsleep 5",
     );
     for (script, expect) in [(garbage, "context_refused"), (late, "result_refused")] {
         let mut m = mcp!(

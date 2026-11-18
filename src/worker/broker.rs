@@ -34,12 +34,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::Uuid;
+use crate::core::{Refusal, RefusalKind, Uuid};
 
 use super::context::validate_spaces;
 use super::{CHANNEL_FD, CONTROL_FD, ROOT_FD};
 
-pub const BROKER_PROTOCOL: u32 = 1;
+/// Version 2 requires a typed exit code before accepting a completed extraction.
+pub const BROKER_PROTOCOL: u32 = 2;
 /// Every broker line is at most this long (newline included).
 pub const MAX_LINE: usize = 8 * 1024;
 const MAX_ROOT_BYTES: usize = 4096;
@@ -661,21 +662,25 @@ pub enum FromBroker {
         repository_id: Option<Uuid>,
     },
     Refused {
+        #[serde(default)]
+        kind: RefusalKind,
         reason: String,
     },
     /// The frontend may commit now; revocations wait until `CommitDone`, a hang-up or
     /// [`COMMIT_HOLD_MAX`].
-    CommitGranted {
-        op: Uuid,
-    },
+    CommitGranted { op: Uuid },
     /// The frontend must not commit.
     CommitDenied {
         op: Uuid,
+        #[serde(default)]
+        kind: RefusalKind,
         reason: String,
     },
     Finished {
         op: Uuid,
         exit: String,
+        #[serde(default)]
+        exit_code: Option<i32>,
         ended_by: EndedBy,
         /// The leader ended on its own before the broker ended it.
         exited_by_itself: bool,
@@ -1440,7 +1445,7 @@ impl Broker {
                 Ok(Some(l)) => l,
                 Ok(None) => return,
                 Err(e) => {
-                    self.refuse(&sock, &e);
+                    self.refuse(&sock, e.into());
                     return;
                 }
             };
@@ -1459,7 +1464,7 @@ impl Broker {
                             terminal_pending = end.terminal_pending;
                             awaiting = end.commit;
                         }
-                        Err(why) => self.refuse(&sock, &why),
+                        Err(why) => self.refuse(&sock, why),
                     }
                 }
                 Ok(ToBroker::CommitRequest { op }) => {
@@ -1473,20 +1478,21 @@ impl Broker {
                 }
                 // Done/Cancel outside an operation, or anything unparsable: a protocol violation
                 Ok(_) => {
-                    self.refuse(&sock, "a message outside an operation");
+                    self.refuse(&sock, "a message outside an operation".into());
                     return;
                 }
                 Err(e) => {
-                    self.refuse(&sock, &format!("unreadable message: {e}"));
+                    self.refuse(&sock, format!("unreadable message: {e}").into());
                     return;
                 }
             }
         }
     }
 
-    fn refuse(&self, sock: &UnixStream, why: &str) {
+    fn refuse(&self, sock: &UnixStream, why: Refusal) {
         let m = FromBroker::Refused {
-            reason: why.chars().take(500).collect(),
+            kind: why.kind,
+            reason: why.detail.chars().take(500).collect(),
         };
         let mut b = serde_json::to_vec(&m).unwrap_or_default();
         b.push(b'\n');
@@ -1503,34 +1509,50 @@ impl Broker {
         kind: OpKind,
         root: String,
         spaces: Vec<Uuid>,
-    ) -> Result<OpEnd, String> {
+    ) -> Result<OpEnd, Refusal> {
         if v != BROKER_PROTOCOL {
-            return Err(format!("broker protocol {v}"));
+            return Err(Refusal::new(
+                RefusalKind::InvalidArgument,
+                format!("broker protocol {v}"),
+            ));
         }
         if root.len() > MAX_ROOT_BYTES || root.contains('\0') {
-            return Err("the root name is too long or contains NUL".into());
+            return Err(Refusal::new(
+                RefusalKind::InvalidArgument,
+                "the root name is too long or contains NUL",
+            ));
         }
-        validate_spaces(&spaces)?;
+        validate_spaces(&spaces).map_err(|m| Refusal::new(RefusalKind::InvalidArgument, m))?;
         // 1. authority: from trusted state, the root must be exactly one of the authorized ones
         let roots = self.authority.roots()?;
         let Some(auth) = roots.iter().find(|r| r.path == Path::new(&root)).cloned() else {
-            return Err("the root is not authorized".into());
+            return Err(Refusal::new(
+                RefusalKind::RootNotAuthorized,
+                "the root is not authorized",
+            ));
         };
         // 2. replay: an operation id is usable once, and only after authorization succeeded
         if !self.remember(op) {
-            return Err("the operation id was already used".into());
+            return Err(Refusal::new(
+                RefusalKind::ReplayRefused,
+                "the operation id was already used",
+            ));
         }
         // 3. concurrency
         if self.active.fetch_add(1, Ordering::SeqCst) >= self.cfg.max_concurrent {
             self.active.fetch_sub(1, Ordering::SeqCst);
-            return Err("busy: too many operations".into());
+            return Err(Refusal::new(RefusalKind::Busy, "busy: too many operations"));
         }
         let _permit = Permit(&self.active);
         // 4. the root, pinned: opened here, checked against the approved identity and path
-        let pinned = crate::sandbox::open_verified_dir(&auth.path, (auth.dev, auth.ino))?;
+        let pinned = crate::sandbox::open_verified_dir(&auth.path, (auth.dev, auth.ino))
+            .map_err(|m| Refusal::new(RefusalKind::RootNotAuthorized, m))?;
         let real = real_path_of_fd(&pinned).map_err(|e| e.to_string())?;
         if real != auth.path {
-            return Err("the root is not at its authorized path".into());
+            return Err(Refusal::new(
+                RefusalKind::RootNotAuthorized,
+                "the root is not at its authorized path",
+            ));
         }
         // 4b. Git: the broker itself checks that the layout is one a worker can confine and reads the
         //     repository identity from the pinned root (no process started, no content parsed).
@@ -1541,7 +1563,10 @@ impl Broker {
             OpKind::DirectoryExtract => (self.cfg.args.clone(), None),
             OpKind::GitExtract => {
                 let Some(git) = &self.cfg.git else {
-                    return Err("git extraction is not configured on this broker".into());
+                    return Err(Refusal::new(
+                        RefusalKind::GitUnavailable,
+                        "git extraction is not configured on this broker",
+                    ));
                 };
                 use crate::ingest::confined_git::layout;
                 let root_file = std::fs::File::from(pinned.try_clone().map_err(|e| e.to_string())?);
@@ -1551,7 +1576,12 @@ impl Broker {
                     self.cfg.git_projection_parent.as_deref(),
                     |path| git_dependency(&root_file, &auth, &roots, path),
                 )
-                .map_err(|e| format!("repository refused: {e}"))?;
+                .map_err(|e| {
+                    Refusal::new(
+                        e.refusal_kind().unwrap_or_default(),
+                        format!("repository refused: {e}"),
+                    )
+                })?;
                 git_layout = prepared;
                 let mut a: Vec<OsString> = vec![
                     OsString::from("git-extraction-worker"),
@@ -1650,7 +1680,7 @@ impl Broker {
             Cleanup::ProcessGroupOnly
         };
         // 7. READY, observed from outside, then GO
-        let observed = match self.await_ready(&ctl_broker, &run, cleanup) {
+        let observed = match self.await_ready(&ctl_broker, &run, cleanup, kind) {
             Ok(o) => o,
             Err(e) => {
                 run.finish(self.cfg.exit_grace, false);
@@ -1687,6 +1717,7 @@ impl Broker {
         let fin = FromBroker::Finished {
             op,
             exit: describe(run.status),
+            exit_code: libc::WIFEXITED(run.status).then(|| libc::WEXITSTATUS(run.status)),
             ended_by,
             exited_by_itself: by_itself && run.leader_exited_alone(),
             descendants_killed: killed,
@@ -1721,12 +1752,17 @@ impl Broker {
         let Some((_, auth)) = awaiting.filter(|(a, _)| *a == op) else {
             reply(&FromBroker::CommitDenied {
                 op,
+                kind: RefusalKind::CommitNotAuthorized,
                 reason: "no finished operation awaits a commit".into(),
             });
             return;
         };
         match self.authority.hold(&auth, COMMIT_HOLD_MAX) {
-            Err(reason) => reply(&FromBroker::CommitDenied { op, reason }),
+            Err(reason) => reply(&FromBroker::CommitDenied {
+                op,
+                kind: RefusalKind::Revoked,
+                reason,
+            }),
             Ok(hold) => {
                 // Test builds only (feature `spawn-gate`): answer late, to exercise a frontend
                 // that gives up waiting while the lease is already held.
@@ -1872,20 +1908,38 @@ impl Broker {
         ctl: &UnixStream,
         run: &Running,
         cleanup: Cleanup,
-    ) -> Result<Observed, String> {
+        kind: OpKind,
+    ) -> Result<Observed, Refusal> {
+        let unconfined = |detail: String| Refusal::new(RefusalKind::ConfinementNotVerified, detail);
         ctl.set_read_timeout(Some(self.cfg.startup_timeout))
             .map_err(|e| e.to_string())?;
         let mut line = [0u8; 6];
         let mut got = 0;
         while got < line.len() {
             match (&*ctl).read(&mut line[got..]) {
-                Ok(0) => return Err("the worker ended before it was confined".into()),
+                Ok(0) => return Err(unconfined("the worker ended before it was confined".into())),
                 Ok(n) => got += n,
-                Err(_) => return Err("the worker did not report in time".into()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(Refusal::new(
+                        RefusalKind::Timeout,
+                        "the worker did not report in time",
+                    ))
+                }
+                Err(e) => return Err(unconfined(e.to_string())),
             }
         }
+        if kind == OpKind::GitExtract && &line == super::GIT_UNAVAILABLE {
+            return Err(Refusal::new(RefusalKind::GitUnavailable, "the required Git executable is unavailable or failed verification before the worker was confined"));
+        }
         if &line != b"READY\n" {
-            return Err("the worker sent something else than READY".into());
+            return Err(unconfined(
+                "the worker sent something else than READY".into(),
+            ));
         }
         let pid = run.pid;
         let field = |k: &str| status_field(pid, k).unwrap_or_default();
@@ -1905,16 +1959,28 @@ impl Broker {
             cleanup,
         };
         if self.cfg.verify_confinement && o.seccomp != "2" {
-            return Err(format!("/proc says Seccomp: {:?}, expected 2", o.seccomp));
+            return Err(unconfined(format!(
+                "/proc says Seccomp: {:?}, expected 2",
+                o.seccomp
+            )));
         }
         if self.cfg.verify_confinement && o.no_new_privs != "1" {
-            return Err(format!("/proc says NoNewPrivs: {:?}", o.no_new_privs));
+            return Err(unconfined(format!(
+                "/proc says NoNewPrivs: {:?}",
+                o.no_new_privs
+            )));
         }
         if self.cfg.verify_confinement && o.tracer_pid != "0" {
-            return Err(format!("the worker is traced: {:?}", o.tracer_pid));
+            return Err(unconfined(format!(
+                "the worker is traced: {:?}",
+                o.tracer_pid
+            )));
         }
         if self.cfg.verify_confinement && !o.cap_eff.trim_start_matches('0').is_empty() {
-            return Err(format!("the worker holds capabilities: {}", o.cap_eff));
+            return Err(unconfined(format!(
+                "the worker holds capabilities: {}",
+                o.cap_eff
+            )));
         }
         if let Some(cg) = &run.cg {
             let want = cg
@@ -1923,10 +1989,10 @@ impl Broker {
                 .map(|p| format!("/{}", p.display()))
                 .unwrap_or_default();
             if o.cgroup.as_deref() != Some(want.as_str()) {
-                return Err(format!(
+                return Err(unconfined(format!(
                     "the worker is in cgroup {:?}, expected {want}",
                     o.cgroup
-                ));
+                )));
             }
         }
         Ok(o)

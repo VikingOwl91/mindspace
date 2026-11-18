@@ -519,17 +519,23 @@ fn require_sha1_oids(oids: &[String]) -> Result<()> {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }) {
         None => Ok(()),
-        Some(bad) => Err(refuse(format!(
-            "unsupported object id `{}`: only 40-digit SHA-1 object ids are supported",
-            bad.chars().take(80).collect::<String>()
-        ))),
+        Some(bad) => Err(Error::refused(
+            crate::core::RefusalKind::UnsupportedObjectFormat,
+            format!(
+                "unsupported object id `{}`: only 40-digit SHA-1 object ids are supported",
+                bad.chars().take(80).collect::<String>()
+            ),
+        )),
     }
 }
 
 // ---------------------------------------------------------------------------------- reader
 
 fn missing_local_object() -> Error {
-    refuse("a required HEAD object is missing locally or has the wrong type")
+    Error::refused(
+        crate::core::RefusalKind::MissingLocalObject,
+        "a required HEAD object is missing locally or has the wrong type",
+    )
 }
 
 /// What HEAD points at: the commit and every entry of its tree (`mode`, `kind`, `oid`, `path`;
@@ -547,49 +553,61 @@ pub struct HeadSnapshot {
 fn check_layout(root_fd: RawFd) -> Result<File> {
     match kind_of(root_fd, ".") {
         Ok(Some(k)) if k == libc::S_IFDIR => {}
-        _ => return Err(refuse("the root descriptor is not a directory")),
+        _ => {
+            return Err(Error::refused(
+                crate::core::RefusalKind::UnsupportedRepository,
+                "the root descriptor is not a directory",
+            ))
+        }
     }
     match kind_of(root_fd, ".git").map_err(|e| Error::Io {
             path: ".git".into(),
             source: e,
         })? {
             None => {
-                return Err(refuse(
+                return Err(Error::refused(crate::core::RefusalKind::NotARepository,
                     "not a git repository: the root has no `.git` (bare repositories are not supported)",
                 ))
             }
             Some(k) if k == libc::S_IFLNK => {
-                return Err(refuse(
+                return Err(Error::refused(crate::core::RefusalKind::UnsupportedRepository,
                     "`.git` is a symbolic link; a repository that points elsewhere through a link is not supported",
                 ))
             }
             Some(k) if k == libc::S_IFREG => {
-                return Err(refuse(
+                return Err(Error::refused(crate::core::RefusalKind::UnsupportedRepository,
                     "unsupported repository: `.git` is a file (a linked worktree); linked worktrees are not supported",
                 ))
             }
             Some(k) if k == libc::S_IFDIR => {}
-            Some(_) => return Err(refuse("`.git` is neither a directory nor a file")),
+            Some(_) => return Err(Error::refused(crate::core::RefusalKind::UnsupportedRepository, "`.git` is neither a directory nor a file")),
         }
-    let git_dir = open_beneath(root_fd, ".git", libc::O_RDONLY | libc::O_DIRECTORY)
-        .map_err(|e| refuse(format!("cannot open `.git`: {e}")))?;
+    let git_dir =
+        open_beneath(root_fd, ".git", libc::O_RDONLY | libc::O_DIRECTORY).map_err(|e| {
+            Error::refused(
+                crate::core::RefusalKind::UnsupportedRepository,
+                format!("cannot open `.git`: {e}"),
+            )
+        })?;
     let gfd = git_dir.as_raw_fd();
     // layouts v1 cannot confine
     if exists_beneath(gfd, &["commondir"])? {
-        return Err(refuse(
+        return Err(Error::refused(
+            crate::core::RefusalKind::UnsupportedRepository,
             "unsupported repository: the git directory belongs to a linked worktree (`commondir`)",
         ));
     }
     // HEAD-only plumbing never traverses the worktrees registry of a main checkout.
     for alt in ["alternates", "http-alternates"] {
         if exists_beneath(gfd, &["objects", "info", alt])? {
-            return Err(refuse(format!(
+            return Err(Error::refused(crate::core::RefusalKind::UnsupportedRepository, format!(
                     "unsupported repository: object alternates (`objects/info/{alt}`) are not supported"
                 )));
         }
     }
     if exists_beneath(gfd, &["info", "grafts"])? {
-        return Err(refuse(
+        return Err(Error::refused(
+            crate::core::RefusalKind::UnsupportedRepository,
             "unsupported repository: `info/grafts` rewrites history and cannot be switched off",
         ));
     }
@@ -609,14 +627,18 @@ fn check_layout(root_fd: RawFd) -> Result<File> {
             source: e,
         })? {
             if k == libc::S_IFLNK {
-                return Err(refuse(format!(
-                    "the git directory contains a symbolic link (`{name}`); not supported"
-                )));
+                return Err(Error::refused(
+                    crate::core::RefusalKind::UnsupportedRepository,
+                    format!("the git directory contains a symbolic link (`{name}`); not supported"),
+                ));
             }
         }
     }
     if kind_of(gfd, "HEAD").ok().flatten() != Some(libc::S_IFREG) {
-        return Err(refuse("not a git repository: `.git/HEAD` is missing"));
+        return Err(Error::refused(
+            crate::core::RefusalKind::NotARepository,
+            "not a git repository: `.git/HEAD` is missing",
+        ));
     }
     Ok(git_dir)
 }
@@ -633,10 +655,8 @@ fn read_marker_at(git_dir_fd: RawFd) -> Result<Uuid> {
     let pin = match open_beneath(git_dir_fd, NAME, libc::O_PATH) {
         Ok(f) => f,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-            return Err(at(
-                "identity_missing: this repository has no identity marker; ingest it once with `mind ingest`"
-                    .into(),
-            ))
+            return Err(Error::refused(crate::core::RefusalKind::IdentityMissing,
+                "identity_missing: this repository has no identity marker; ingest it once with `mind ingest`"));
         }
         Err(e) => return Err(at(format!("cannot read marker: {e}"))),
     };
@@ -789,8 +809,12 @@ impl ConfinedGitReader {
         };
         require_sha1_oids(std::slice::from_ref(&commit_oid))?;
         let symbolic = self.inner.head_symbolic()?;
-        let too_big =
-            |what: &str| refuse(format!("the repository is too large to transport: {what}"));
+        let too_big = |what: &str| {
+            Error::refused(
+                crate::core::RefusalKind::TooLarge,
+                format!("the repository is too large to transport: {what}"),
+            )
+        };
         let mut objects: Vec<RawObject> = Vec::new();
         let mut total: u64 = 0;
         let mut take = |raw: Vec<(String, GitObjectKind, Vec<u8>)>,

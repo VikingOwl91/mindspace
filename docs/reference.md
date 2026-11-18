@@ -149,8 +149,18 @@ For an MCP client using `mcpServers` JSON (replace both paths):
 
 An agent must explicitly create a memory or ingest content. Memory tools include
 create/update/retire/get/search/history. Repository tools include `repo_outline`
-and `repo_ingest`; `code_search` finds Rust definitions. Spaces organize retrieval
+and `repo_ingest`. `code_search` finds symbols in Rust, Go, JavaScript, TypeScript, TSX and Svelte. Spaces organize retrieval
 and are not access controls. MCP is local stdio without authentication.
+
+Repository policy failures expose a stable category in `structuredContent.error.kind`.
+Clients can distinguish `invalid_argument`, `root_not_authorized`, and `read_only_root`.
+`too_many_files` identifies a file-count limit. `too_large` identifies a byte, frame, or
+Git structure limit. `timeout` identifies a deadline. A successful ingest can include
+per-file text exclusions in `skipped_files`. Isolated Git reports `missing_local_object`
+when a required object is unavailable locally. Isolated writes also report `commit_state`.
+`rollback_unconfirmed` with `NOT_COMMITTED` and `persisted: false` means the server
+stopped before COMMIT and could not confirm rollback. `commit_outcome_unknown` with
+`UNKNOWN` and `persisted: "unknown"` means the COMMIT outcome could not be established.
 
 `server_status` (read-only) tells you which database a running server opened: the path (the home
 directory is shown as `~`; pass `full_path: true` for the absolute path), what chose it (`--db`,

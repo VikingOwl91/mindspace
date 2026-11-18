@@ -365,10 +365,13 @@ impl Extracted {
     /// hashes consistent. A failing result is dropped whole; nothing is repaired.
     pub fn validate(&self, root: Option<&Path>, limits: &ExtractionLimits) -> Result<()> {
         if self.content_bytes() > limits.max_content_bytes {
-            return reject(format!(
-                "{} bytes of content exceed the limit of {}",
-                self.content_bytes(),
-                limits.max_content_bytes
+            return Err(Error::refused(
+                crate::core::RefusalKind::TooLarge,
+                format!(
+                    "{} bytes of content exceed the limit of {}",
+                    self.content_bytes(),
+                    limits.max_content_bytes
+                ),
             ));
         }
         match self {
@@ -378,7 +381,10 @@ impl Extracted {
                 }
                 let count = f.observation.files.len() + f.observation.skipped_files.len();
                 if count > limits.max_files {
-                    return reject(format!("{count} files exceed the limit"));
+                    return Err(Error::refused(
+                        crate::core::RefusalKind::TooManyFiles,
+                        format!("{count} files exceed the limit"),
+                    ));
                 }
                 if let Some(root) = root {
                     if Path::new(&f.observation.session.root) != root {
@@ -387,7 +393,10 @@ impl Extracted {
                 }
                 for file in &f.observation.files {
                     if file.size_bytes > super::text_policy::MAX_TEXT_BYTES {
-                        return reject("one file exceeds the ingestion limit");
+                        return Err(Error::refused(
+                            crate::core::RefusalKind::TooLarge,
+                            "one file exceeds the ingestion limit",
+                        ));
                     }
                     if file.location.len() > limits.max_path_bytes || file.location.contains('\0') {
                         return reject("a file location is too long or contains NUL");
@@ -424,13 +433,19 @@ impl Extracted {
                 }
                 let count = o.derivations.len() + o.skipped_files.len();
                 if count > limits.max_files {
-                    return reject(format!("{count} derivations exceed the limit"));
+                    return Err(Error::refused(
+                        crate::core::RefusalKind::TooManyFiles,
+                        format!("{count} derivations exceed the limit"),
+                    ));
                 }
                 for d in &o.derivations {
                     if d.source_kind == crate::core::SourceKind::GitBlob
                         && d.content.len() as u64 > super::text_policy::MAX_TEXT_BYTES
                     {
-                        return reject("one blob exceeds the ingestion limit");
+                        return Err(Error::refused(
+                            crate::core::RefusalKind::TooLarge,
+                            "one blob exceeds the ingestion limit",
+                        ));
                     }
                     check_relative(&d.path, limits)?;
                     if !is_oid(&d.blob_oid) || !is_oid(&d.commit_oid) {
@@ -445,7 +460,10 @@ impl Extracted {
                         .as_ref()
                         .is_some_and(|s| s.len() as u64 > super::text_policy::MAX_TEXT_BYTES)
                     {
-                        return reject("one blob exceeds the ingestion limit");
+                        return Err(Error::refused(
+                            crate::core::RefusalKind::TooLarge,
+                            "one blob exceeds the ingestion limit",
+                        ));
                     }
                     if !is_oid(&b.oid) {
                         return reject("malformed blob id");
@@ -469,7 +487,10 @@ fn code_bytes(inputs: &[CodeInputDraft]) -> u64 {
 fn check_code(inputs: &[CodeInputDraft], limits: &ExtractionLimits) -> Result<()> {
     for c in inputs {
         if c.content.len() as u64 > super::text_policy::MAX_TEXT_BYTES {
-            return reject("one code input exceeds the ingestion limit");
+            return Err(Error::refused(
+                crate::core::RefusalKind::TooLarge,
+                "one code input exceeds the ingestion limit",
+            ));
         }
         if sha256_hex(c.content.as_bytes()) != c.content_hash {
             return reject("code content hash mismatch");

@@ -668,8 +668,7 @@ pub fn ingest(
     let outcomes = ingest::confined::ingest_confined(
         store, &anchor, config, &selection, scope, &spaces, &deadline,
     )?;
-    // The limit stops the ingest only before it writes; the write itself runs
-    // to its end, so a call can finish after the limit. Say so.
+    // A COMMIT already in progress finishes even if the deadline expires.
     Ok(json!({
         "ingested": outcomes.iter().map(summarize).collect::<Vec<_>>(),
         "elapsed_ms": deadline.elapsed().as_millis() as u64,

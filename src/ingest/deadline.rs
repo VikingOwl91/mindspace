@@ -1,11 +1,7 @@
 //! A cooperative time limit for one ingest.
 //!
-//! The limit is checked between the steps of the preparation phase and while
-//! waiting for git, which is killed when the limit expires. It is deliberately
-//! NOT checked once the database write has started: an interrupted write
-//! transaction poisons the store's write fence (an uncertain outcome), so the
-//! write phase always runs to its end. See ADR-026, addendum on the ingest
-//! time limit.
+//! Checkpoints run during preparation and between persistence work items in the open
+//! transaction. A timeout before COMMIT unwinds through the normal rollback path.
 
 use std::time::{Duration, Instant};
 
@@ -14,6 +10,8 @@ use crate::core::{Error, Result};
 #[derive(Debug, Clone, Copy)]
 pub struct Deadline {
     started: Instant,
+    prior_roots: usize,
+    writing: bool,
     limit: Option<Duration>,
     /// Test seam: expire exactly when this phase is checked, so every
     /// checkpoint can be exercised deterministically instead of by timing.
@@ -26,6 +24,8 @@ impl Deadline {
     pub fn none() -> Self {
         Self {
             started: Instant::now(),
+            prior_roots: 0,
+            writing: false,
             limit: None,
             #[cfg(test)]
             expire_at: None,
@@ -35,6 +35,8 @@ impl Deadline {
     pub fn after(limit: Duration) -> Self {
         Self {
             started: Instant::now(),
+            prior_roots: 0,
+            writing: false,
             limit: Some(limit),
             #[cfg(test)]
             expire_at: None,
@@ -48,6 +50,24 @@ impl Deadline {
         Self {
             expire_at: Some(phase),
             ..Self::after(Duration::from_secs(3600))
+        }
+    }
+
+    pub(crate) fn prior_roots(&self) -> usize {
+        self.prior_roots
+    }
+
+    pub(crate) fn for_root(self, prior_roots: usize) -> Self {
+        Self {
+            prior_roots,
+            ..self
+        }
+    }
+
+    pub(crate) fn writing(self) -> Self {
+        Self {
+            writing: true,
+            ..self
         }
     }
 
@@ -68,10 +88,19 @@ impl Deadline {
         self.limit.map(|l| l.saturating_sub(self.started.elapsed()))
     }
 
-    /// Fails when the limit has expired. Call only where nothing has been
-    /// written yet: the message states that the database was not changed.
+    /// Fails before COMMIT, while the current root can still be discarded.
     pub fn check(&self, phase: &str) -> Result<()> {
-        self.check_with(phase, "the database was not changed")
+        self.check_with(phase, self.effect())
+    }
+
+    pub(super) fn effect(&self) -> &'static str {
+        if self.writing {
+            "the current root was rolled back"
+        } else if self.prior_roots > 0 {
+            "the current root was not committed"
+        } else {
+            "the database was not changed"
+        }
     }
 
     /// Like [`check`](Self::check), with an explicit statement of what was
@@ -90,11 +119,25 @@ impl Deadline {
 
     pub fn error(&self, phase: &str, effect: &str) -> Error {
         let limit = self.limit.map(|l| l.as_secs_f64()).unwrap_or_default();
+        let kept = if self.prior_roots == 0 {
+            String::new()
+        } else {
+            let (noun, verb) = if self.prior_roots == 1 {
+                ("path", "was")
+            } else {
+                ("paths", "were")
+            };
+            format!(
+                "; {} earlier selected {noun} {verb} committed and kept",
+                self.prior_roots
+            )
+        };
         Error::IngestTimeout {
+            writing: self.writing,
             message: format!(
-                "ingest stopped after {:.1} s (limit {} s) while {phase}; {effect}. \
-                 Select directories with repo_outline and pass them as `paths`, or start the \
-                 server with a larger --ingest-timeout.",
+                "ingest stopped after {:.1} s (limit {} s) while {phase}; {effect}{kept}. \
+                 Select fewer directories with --path (MCP: `paths` from repo_outline), or increase \
+                 --ingest-timeout.",
                 self.elapsed().as_secs_f64(),
                 limit
             ),

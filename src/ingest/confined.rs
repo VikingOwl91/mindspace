@@ -474,24 +474,17 @@ pub fn ingest_confined<S: AsRef<str>>(
             store, anchor, policy, &space_ids, deadline,
         )?]);
     }
-    let total = selection.prefixes().len();
     let mut outcomes = Vec::new();
     for prefix in selection.prefixes() {
-        let kept = outcomes.len();
-        if kept == 0 {
-            deadline.check("starting")?;
-        } else {
-            deadline.check_with(
-                "ingesting selected paths",
-                &format!(
-                    "{kept} of {total} selected paths were ingested and kept; repeating the call \
-                     continues with the rest and is idempotent"
-                ),
-            )?;
-        }
+        let root_deadline = deadline.for_root(outcomes.len());
+        root_deadline.check("ingesting selected paths")?;
         let child = anchor.child_dir(prefix, policy, true)?;
         outcomes.push(ingest_directory(
-            store, &child, policy, &space_ids, deadline,
+            store,
+            &child,
+            policy,
+            &space_ids,
+            &root_deadline,
         )?);
     }
     Ok(outcomes)

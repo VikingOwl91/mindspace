@@ -474,7 +474,7 @@ fn static_and_dynamic_roots_unauthorized_roots_revocation_and_reuse() {
     // 4. a root approved AFTER startup, no restart
     let r = m.ingest(&dynamic);
     assert_eq!(err_kind(&r), "root_not_authorized", "{r}");
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let r = m.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(r["structuredContent"]["isolation"]["authority"], "grant");
@@ -546,7 +546,7 @@ fn revoking_a_grant_during_extraction_cancels_it_and_persists_nothing() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let dynamic = w.dir("dynamic", &[("a.md", "# D\n"), ("z.rs", &slow_source())]);
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let mut m = mcp!(w, &[&project], OPT_IN, &[]);
     let before = w.rows();
     let id = m.send_call(
@@ -589,7 +589,7 @@ fn revoking_a_grant_during_the_context_exchange_cancels_it() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let dynamic = w.dir("dynamic", &[("a.md", "# D\n")]);
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     // STAND-IN worker: says hello, reads the request, then never sends its manifest: the
     // operation sits inside the context exchange until the broker ends it.
     let script = standin(
@@ -629,7 +629,7 @@ fn a_static_root_is_not_revocable_and_a_timeout_ends_the_operation() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     // a grant on the very directory that is also a static root: the static authority governs
-    w.ok(&["grant", "add", project.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", project.to_str().unwrap(), "--rw", "--yes"]);
     let script = standin(&w, "stall.sh", "sleep 600");
     let mut m = mcp!(
         w,
@@ -745,7 +745,7 @@ fn a_worker_crash_does_not_end_mcp_and_a_broker_crash_gives_a_clear_error() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let slow = w.dir("slow", &[("a.md", "# S\n"), ("z.rs", &slow_source())]);
-    w.ok(&["grant", "add", slow.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", slow.to_str().unwrap(), "--rw", "--yes"]);
     let mut m = mcp!(w, &[&project], OPT_IN, &[]);
     // 9. a real worker killed mid-operation
     let before = w.rows();
@@ -905,7 +905,7 @@ fn measure_isolated_vs_in_process_and_revocation_latency() {
     let mut m = mcp!(w, &[&project], OPT_IN, &[]);
     let mut lat = vec![];
     for i in 0..8 {
-        w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+        w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
         let id = m.send_call(
             TOOL,
             json!({"path": dynamic.to_str().unwrap(), "spaces": ["p"]}),
@@ -990,7 +990,7 @@ fn revocation_after_worker_completion_but_before_persistence_denies_the_commit()
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.rows();
     let id = m.send_call(
         TOOL,
@@ -1037,7 +1037,7 @@ fn revocation_during_persistence_waits_for_the_commit_and_is_ordered_after_it() 
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.rows();
     let id = m.send_call(
         TOOL,
@@ -1090,7 +1090,7 @@ fn a_frontend_that_never_begins_its_commit_is_removed_at_the_grant_ceiling() {
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     let frontend = m.child.id();
     m.send_call(
@@ -1358,7 +1358,7 @@ fn frontend_crash_before_commit_leaves_no_trace_and_no_lock_and_a_retry_is_clean
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     m.send_call(
         TOOL,
@@ -1378,7 +1378,7 @@ fn frontend_crash_before_commit_leaves_no_trace_and_no_lock_and_a_retry_is_clean
     w.ok(&["grant", "revoke", &gid]);
     assert!(t.elapsed() < Duration::from_secs(2));
     // a retry from a new server equals one clean ingestion
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let mut m2 = mcp!(w, &[&project], OPT_IN, &[]);
     let r = m2.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
@@ -1412,7 +1412,7 @@ fn frontend_crash_right_after_commit_keeps_the_data_frees_the_lock_and_a_retry_a
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before_rows = w.rows();
     m.send_call(
         TOOL,
@@ -1441,7 +1441,7 @@ fn frontend_crash_right_after_commit_keeps_the_data_frees_the_lock_and_a_retry_a
     // retry (the client never got an answer): no duplicate structure, one more observation
     let structure = w.structure();
     let observations = w.count("ingest_sessions");
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let mut m2 = mcp!(w, &[&project], OPT_IN, &[]);
     let r = m2.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
@@ -1479,7 +1479,7 @@ fn broker_crash_before_the_commit_is_granted_rolls_back() {
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     let id = m.send_call(
         TOOL,
@@ -1511,7 +1511,7 @@ fn broker_crash_while_holding_the_grant_lock_frees_it_and_the_frontend_does_not_
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     let id = m.send_call(
         TOOL,
@@ -1552,7 +1552,7 @@ fn a_lost_completion_message_costs_the_frontend_at_the_in_flight_ceiling_and_the
             ("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS", "2500".into()),
         ]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let frontend = m.child.id();
     let r = m.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
@@ -1588,7 +1588,7 @@ fn a_commit_decision_that_arrives_too_late_rolls_back_and_the_link_is_not_reused
         OPT_IN,
         &[("MINDSPACE_BROKER_GATE_COMMIT_REPLY_DELAY_MS", "4000".into())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     let t = Instant::now();
     let r = m.ingest(&dynamic);
@@ -1634,7 +1634,7 @@ fn a_frontend_stalled_after_the_commit_is_removed_and_the_committed_data_stays()
             ("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS", "2500".into()),
         ]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let frontend = m.child.id();
     m.send_call(
         TOOL,
@@ -1672,7 +1672,7 @@ fn revocation_racing_the_commit_boundary_is_always_ordered_one_way_or_the_other(
     );
     let (mut committed, mut denied) = (0, 0);
     for i in 0..14 {
-        w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+        w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
         pause.reset();
         let before = w.dump();
         let id = m.send_call(
@@ -1733,7 +1733,7 @@ fn a_failed_sqlite_commit_is_rolled_back_and_costs_no_revision() {
         OPT_IN,
         &[("MINDSPACE_STORE_GATE_FAIL_COMMIT", "1".into())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     let revisions = w.count("m6_revisions");
     // a real SQLite COMMIT failure (the commit hook vetoes): SQLite turns it into a rollback
@@ -1755,7 +1755,7 @@ fn a_failed_sqlite_commit_is_rolled_back_and_costs_no_revision() {
         "the lock leaked"
     );
     // the fault was one-shot: a retry succeeds and costs exactly one revision
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let r = m.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(w.count("m6_revisions"), revisions + 1);
@@ -1773,7 +1773,7 @@ fn an_unknown_commit_outcome_is_never_reported_as_success_and_a_retry_is_consist
         OPT_IN,
         &[("MINDSPACE_STORE_GATE_LOSE_ACK", "1".into())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before_rows = w.rows();
     // the COMMIT really succeeds, but the storage layer reports that it does not know
     let r = m.ingest(&dynamic);
@@ -1791,7 +1791,7 @@ fn an_unknown_commit_outcome_is_never_reported_as_success_and_a_retry_is_consist
     assert_eq!(err_kind(&r), "store_discarded", "{r}");
     m.finish();
     // the documented remedy: restart, then ingest the same directory again. It reuses everything.
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let mut m2 = mcp!(w, &[&project], OPT_IN, &[]);
     let r = m2.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
@@ -1858,7 +1858,7 @@ fn a_commit_held_inside_sqlite_beyond_the_ceiling_is_aborted_by_removing_the_fro
             ("MINDSPACE_BROKER_GATE_COMMIT_INFLIGHT_MS", "2500".into()),
         ]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     let frontend = m.child.id();
     m.send_call(
@@ -1914,7 +1914,7 @@ fn a_commit_in_flight_within_the_ceiling_finishes_before_the_revocation_complete
             ("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED", pause.var()),
         ]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before_rows = w.rows();
     let id = m.send_call(
         TOOL,
@@ -1956,7 +1956,7 @@ fn a_frontend_that_dies_during_the_commit_aborts_it_and_frees_the_lock() {
         OPT_IN,
         &[("MINDSPACE_STORE_GATE_PAUSE_IN_COMMIT", pause.var())]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.dump();
     m.send_call(
         TOOL,
@@ -1995,7 +1995,7 @@ fn a_broker_that_dies_during_the_commit_loses_the_lease_which_is_the_documented_
             ("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED", pause.var()),
         ]
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let before_rows = w.rows();
     let id = m.send_call(
         TOOL,

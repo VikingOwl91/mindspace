@@ -633,6 +633,18 @@ pub enum EndedBy {
     Timeout,
     /// The grant behind the operation was revoked or expired, or could not be verified.
     Revoked,
+    /// A current access-mode exception covers part of this observation.
+    ReadOnly,
+}
+
+impl EndedBy {
+    fn from_authority(reason: Refusal) -> Self {
+        if reason.kind == RefusalKind::ReadOnlyRoot {
+            Self::ReadOnly
+        } else {
+            Self::Revoked
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1231,7 +1243,7 @@ pub struct Broker {
 /// What `operation` leaves for the serve loop.
 struct OpEnd {
     terminal_pending: bool,
-    commit: Option<(Uuid, AuthorizedRoot)>,
+    commit: Option<(Uuid, IngestScope)>,
 }
 
 /// Released when an operation ends, whatever the way.
@@ -1278,6 +1290,60 @@ fn reopen_dir(pinned: &OwnedFd) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Whole-directory extraction covers the target and all its descendants. Equal-path
+/// declarations use their most restrictive mode, independently of who owns the lease.
+fn read_only_scope<'a>(
+    roots: impl Iterator<Item = &'a AuthorizedRoot> + Clone,
+    path: &Path,
+) -> Option<&'a Path> {
+    use crate::mcp::Access;
+    let governing = roots
+        .clone()
+        .filter(|r| path.starts_with(&r.path))
+        .max_by_key(|r| (r.path.components().count(), std::cmp::Reverse(r.access)));
+    governing
+        .filter(|r| r.access == Access::ReadOnly)
+        .or_else(|| {
+            roots
+                .filter(|r| r.access == Access::ReadOnly)
+                .find(|r| r.path.starts_with(path))
+        })
+        .map(|r| r.path.as_path())
+}
+
+struct IngestScope {
+    root: AuthorizedRoot,
+    dependencies: Vec<PathBuf>,
+}
+
+impl IngestScope {
+    fn check(&self, roots: &[AuthorizedRoot]) -> Result<(), Refusal> {
+        if !roots.iter().any(|r| {
+            r.source == self.root.source
+                && r.path == self.root.path
+                && r.dev == self.root.dev
+                && r.ino == self.root.ino
+        }) {
+            return Err(Refusal::new(
+                RefusalKind::Revoked,
+                "root authority was revoked or expired",
+            ));
+        }
+        for path in std::iter::once(&self.root.path).chain(&self.dependencies) {
+            if let Some(restricted) = read_only_scope(roots.iter(), path) {
+                return Err(Refusal::new(
+                    RefusalKind::ReadOnlyRoot,
+                    format!(
+                        "ingest would include the read-only root {}",
+                        restricted.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Local metadata may extend beyond the selected checkout only inside an explicit static
 /// read-write enclosure. A separate revocable grant cannot share the checkout's commit lease.
 fn git_dependency(
@@ -1309,14 +1375,18 @@ fn git_dependency(
     };
     // Git reads contents below each granted directory. A nested read-only exception must
     // exclude the whole dependency even when the pointer names its read-write parent.
-    let restricted = roots.iter().any(|r| {
-        r.source == AuthoritySource::Static
-            && r.access == Access::ReadOnly
-            && (r.path.starts_with(path)
-                || (path.starts_with(&r.path) && r.path.starts_with(&anchor.path)))
-    });
-    if restricted || selected.access != Access::ReadWrite {
-        return Err(deny());
+    // An external dependency must be writable under the enclosing static authority
+    // independently of any dynamic grant. Dynamic declarations may further restrict it.
+    let static_restriction = if path.starts_with(&selected.path) {
+        None
+    } else {
+        read_only_scope(
+            roots.iter().filter(|r| r.source == AuthoritySource::Static),
+            path,
+        )
+    };
+    if let Some(restricted) = static_restriction.or_else(|| read_only_scope(roots.iter(), path)) {
+        return Err(crate::core::Error::read_only_root(restricted));
     }
     let base = if anchor.path == selected.path {
         root.try_clone().map_err(|_| deny())?
@@ -1439,7 +1509,7 @@ impl Broker {
         // message is expected and ignored; any other stray message stays a protocol violation.
         let mut terminal_pending = false;
         // the operation that ended `done` and whose result the frontend may ask to commit
-        let mut awaiting: Option<(Uuid, AuthorizedRoot)> = None;
+        let mut awaiting: Option<(Uuid, IngestScope)> = None;
         loop {
             let line = match read_line_limited(&mut reader) {
                 Ok(Some(l)) => l,
@@ -1531,6 +1601,12 @@ impl Broker {
                 "the root is not authorized",
             ));
         };
+        let mut scope = IngestScope {
+            root: auth,
+            dependencies: Vec::new(),
+        };
+        scope.check(&roots)?;
+        let auth = &scope.root;
         // 2. replay: an operation id is usable once, and only after authorization succeeded
         if !self.remember(op) {
             return Err(Refusal::new(
@@ -1570,11 +1646,18 @@ impl Broker {
                 };
                 use crate::ingest::confined_git::layout;
                 let root_file = std::fs::File::from(pinned.try_clone().map_err(|e| e.to_string())?);
+                let dependencies = std::cell::RefCell::new(Vec::new());
                 let (id, prepared) = layout::prepare(
                     &root_file,
                     &auth.path,
                     self.cfg.git_projection_parent.as_deref(),
-                    |path| git_dependency(&root_file, &auth, &roots, path),
+                    |path| {
+                        let file = git_dependency(&root_file, auth, &roots, path)?;
+                        if !path.starts_with(&auth.path) {
+                            dependencies.borrow_mut().push(path.to_owned());
+                        }
+                        Ok(file)
+                    },
                 )
                 .map_err(|e| {
                     Refusal::new(
@@ -1582,6 +1665,7 @@ impl Broker {
                         format!("repository refused: {e}"),
                     )
                 })?;
+                scope.dependencies = dependencies.into_inner();
                 git_layout = prepared;
                 let mut a: Vec<OsString> = vec![
                     OsString::from("git-extraction-worker"),
@@ -1709,7 +1793,7 @@ impl Broker {
         }
         drop(front_end);
         // 9. supervise
-        let (ended_by, by_itself, consumed) = self.supervise(sock, reader, &mut run, &auth);
+        let (ended_by, by_itself, consumed) = self.supervise(sock, reader, &mut run, &scope);
         // the timeout belongs to supervision only; the connection serves the next operation
         let _ = sock.set_read_timeout(None);
         let peak = run.cg.as_ref().and_then(|c| c.peak());
@@ -1732,7 +1816,7 @@ impl Broker {
         // its way. commit: only an operation that ended `done` may ask for a commit lease.
         Ok(OpEnd {
             terminal_pending: !consumed,
-            commit: (ended_by == EndedBy::Done).then_some((op, auth)),
+            commit: (ended_by == EndedBy::Done).then_some((op, scope)),
         })
     }
 
@@ -1742,14 +1826,14 @@ impl Broker {
         sock: &UnixStream,
         reader: &mut BufReader<UnixStream>,
         op: Uuid,
-        awaiting: Option<(Uuid, AuthorizedRoot)>,
+        awaiting: Option<(Uuid, IngestScope)>,
     ) {
         let reply = |m: &FromBroker| {
             let mut b = serde_json::to_vec(m).unwrap_or_default();
             b.push(b'\n');
             let _ = (&*sock).write_all(&b);
         };
-        let Some((_, auth)) = awaiting.filter(|(a, _)| *a == op) else {
+        let Some((_, scope)) = awaiting.filter(|(a, _)| *a == op) else {
             reply(&FromBroker::CommitDenied {
                 op,
                 kind: RefusalKind::CommitNotAuthorized,
@@ -1757,11 +1841,19 @@ impl Broker {
             });
             return;
         };
-        match self.authority.hold(&auth, COMMIT_HOLD_MAX) {
+        let hold = self
+            .authority
+            .hold(&scope.root, COMMIT_HOLD_MAX)
+            .map_err(|m| Refusal::new(RefusalKind::Revoked, m))
+            .and_then(|hold| {
+                self.check_authority(&scope)?;
+                Ok(hold)
+            });
+        match hold {
             Err(reason) => reply(&FromBroker::CommitDenied {
                 op,
-                kind: RefusalKind::Revoked,
-                reason,
+                kind: reason.kind,
+                reason: reason.detail,
             }),
             Ok(hold) => {
                 // Test builds only (feature `spawn-gate`): answer late, to exercise a frontend
@@ -1998,22 +2090,12 @@ impl Broker {
         Ok(o)
     }
 
-    /// Whether the authority an operation started with still holds. A static root is not
-    /// revocable and is not rechecked against the grant store (the two stay distinct). A grant
-    /// must still be listed with the same id, path and device/inode; if the store cannot be
-    /// verified the answer is no (fail closed).
-    fn still_authorized(&self, auth: &AuthorizedRoot) -> bool {
-        match &auth.source {
-            AuthoritySource::Static => true,
-            AuthoritySource::Grant(_) => self.authority.roots().is_ok_and(|rs| {
-                rs.iter().any(|r| {
-                    r.source == auth.source
-                        && r.path == auth.path
-                        && r.dev == auth.dev
-                        && r.ino == auth.ino
-                })
-            }),
-        }
+    fn check_authority(&self, scope: &IngestScope) -> Result<(), Refusal> {
+        let roots = self
+            .authority
+            .roots()
+            .map_err(|m| Refusal::new(RefusalKind::Revoked, m))?;
+        scope.check(&roots)
     }
 
     /// Runs until the operation ends and says how. A revocable grant is rechecked every
@@ -2025,7 +2107,7 @@ impl Broker {
         sock: &UnixStream,
         reader: &mut BufReader<UnixStream>,
         run: &mut Running,
-        auth: &AuthorizedRoot,
+        scope: &IngestScope,
     ) -> (EndedBy, bool, bool) {
         let deadline = Instant::now() + self.cfg.wall_timeout;
         let mut next_check = Instant::now() + self.cfg.recheck_interval;
@@ -2037,8 +2119,8 @@ impl Broker {
             }
             if now >= next_check {
                 next_check = now + self.cfg.recheck_interval;
-                if !self.still_authorized(auth) {
-                    return (EndedBy::Revoked, false, false);
+                if let Err(reason) = self.check_authority(scope) {
+                    return (EndedBy::from_authority(reason), false, false);
                 }
             }
             // the worker may end on its own (crash, or done) while the frontend is still reading
@@ -2054,10 +2136,9 @@ impl Broker {
                     return match serde_json::from_slice::<ToBroker>(&line) {
                         Ok(ToBroker::Done) => {
                             let by_itself = run.wait_leader(self.cfg.exit_grace);
-                            if self.still_authorized(auth) {
-                                (EndedBy::Done, by_itself, true)
-                            } else {
-                                (EndedBy::Revoked, false, true)
+                            match self.check_authority(scope) {
+                                Ok(()) => (EndedBy::Done, by_itself, true),
+                                Err(reason) => (EndedBy::from_authority(reason), false, true),
                             }
                         }
                         // Cancel, a second Begin, junk: all end the operation

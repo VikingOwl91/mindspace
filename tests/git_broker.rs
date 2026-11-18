@@ -810,7 +810,7 @@ fn granted(root: &Path) -> Grants {
         &policy,
         &NewGrant {
             path: root,
-            access: mindspace::mcp::Access::ReadOnly,
+            access: mindspace::mcp::Access::ReadWrite,
             ttl: None,
             request_id: None,
             source: "cli-add",

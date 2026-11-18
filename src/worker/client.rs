@@ -1027,6 +1027,12 @@ fn broker_operation(
     stats.worker_peak_rss_kb = peak_rss_kb;
     // The broker's word comes first: a revoked operation is never accepted, whatever the stream
     // looked like, and a broker timeout is a timeout, not a dead worker.
+    if ended_by == EndedBy::ReadOnly {
+        return Err(WorkerError::Refused(Refusal::new(
+            RefusalKind::ReadOnlyRoot,
+            "the ingest scope now includes a read-only root",
+        )));
+    }
     if ended_by == EndedBy::Revoked {
         return Err(WorkerError::Revoked);
     }

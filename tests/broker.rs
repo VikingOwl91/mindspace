@@ -395,7 +395,7 @@ fn revoking_a_grant_refuses_the_next_operation() {
         &policy,
         &NewGrant {
             path: &root,
-            access: mindspace::mcp::Access::ReadOnly,
+            access: mindspace::mcp::Access::ReadWrite,
             ttl: None,
             request_id: None,
             source: "cli-add",

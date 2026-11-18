@@ -845,6 +845,55 @@ fn head_only_ingestion_reports_what_was_verified_and_what_was_not_and_repeats_wi
 // ------------------------------------------------------------------ authority
 
 #[test]
+fn whole_root_tools_require_effective_read_write_authority() {
+    let w = World::new();
+    let readonly = w.repo("readonly");
+    let outer = w.repo("outer");
+    let nested = w.repo("outer/hidden");
+    let sibling = w.repo("outer/sibling");
+    let duplicated = w.repo("duplicate");
+    let dynamic = w.repo("dynamic");
+    let ro = |p: &Path| PathBuf::from(format!("{}:ro", p.display()));
+    let opts = [
+        "--grants",
+        "--isolated-ingest",
+        "--isolated-git-ingest",
+        "--git-exe",
+        GIT,
+    ];
+    let mut m = mcp!(
+        w,
+        &[&ro(&readonly), &outer, &ro(&nested), &sibling, &duplicated],
+        &opts,
+        &[]
+    );
+    // A dynamic grant's default is read-only, including when the same path is static.
+    for p in [&duplicated, &dynamic] {
+        w.ok(&["grant", "add", p.to_str().unwrap(), "--yes"]);
+    }
+    let before = w.counts();
+    for p in [&readonly, &outer, &nested, &duplicated, &dynamic] {
+        for tool in ["repo_ingest_isolated", TOOL] {
+            assert_refused(
+                &m.call(tool, json!({"path":p, "spaces":["p"]})),
+                "read_only_root",
+            );
+        }
+    }
+    assert_eq!(w.counts(), before);
+    // The read-only subtree leaves its separately permitted sibling accessible.
+    assert_eq!(m.ingest(&sibling)["isError"], false);
+    w.ok(&["grant", "revoke", &w.grant_id(&duplicated)]);
+    assert_eq!(
+        m.ingest(&duplicated)["structuredContent"]["isolation"]["authority"],
+        "static_root"
+    );
+    w.ok(&["grant", "revoke", &w.grant_id(&dynamic)]);
+    assert_refused(&m.ingest(&dynamic), "root_not_authorized");
+    m.finish();
+}
+
+#[test]
 fn static_and_dynamic_authority_root_identity_and_unsupported_repositories() {
     let w = World::new();
     let project = w.repo("project");
@@ -891,7 +940,7 @@ fn static_and_dynamic_authority_root_identity_and_unsupported_repositories() {
     assert_eq!(r["isError"], true, "symlink spelling: {r}");
     assert_eq!(r["structuredContent"]["persisted"], false);
     // a grant, added after start-up, authorizes without a restart
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let r = m.ingest(&dynamic);
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(r["structuredContent"]["isolation"]["authority"], "grant");
@@ -978,7 +1027,7 @@ fn missing_identity_unsupported_layouts_and_sha256_are_refused_and_persist_nothi
     assert_eq!(m.ingest(&with_worktrees)["isError"], false);
     // the server still works afterwards
     let ok = w.repo("fine");
-    w.ok(&["grant", "add", ok.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", ok.to_str().unwrap(), "--rw", "--yes"]);
     assert_eq!(m.ingest(&ok)["isError"], false);
     m.finish();
 }
@@ -998,7 +1047,7 @@ fn revocation_before_the_commit_denies_it_and_leaves_no_trace_and_no_revision() 
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE", pause.var())]
     );
-    w.ok(&["grant", "add", repo.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", repo.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.counts();
     let id = m.send_call(
         TOOL,
@@ -1027,7 +1076,7 @@ fn revocation_during_extraction_ends_the_worker_and_its_git_child() {
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let repo = w.repo("repo");
     let mut m = mcp!(w, &[&project], OPT_IN, &gate_git("hang"));
-    w.ok(&["grant", "add", repo.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", repo.to_str().unwrap(), "--rw", "--yes"]);
     let before = w.counts();
     let id = m.send_call(
         TOOL,
@@ -1066,7 +1115,7 @@ fn a_commit_held_by_the_lease_orders_a_concurrent_revocation_after_it() {
         OPT_IN,
         &[("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED", pause.var())]
     );
-    w.ok(&["grant", "add", repo.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", repo.to_str().unwrap(), "--rw", "--yes"]);
     let rev0 = w.revisions();
     let id = m.send_call(
         TOOL,
@@ -1471,7 +1520,14 @@ fn linked_worktree_local_alternates_and_partial_clone_use_only_local_head_object
     std::fs::write(&alt, "../../../pool\n").unwrap();
     let read_only = PathBuf::from(format!("{}:ro", source.join(".git/objects/pack").display()));
     let mut m = mcp!(w, &[&enclosure, &partial, &read_only], OPT_IN, &[]);
-    assert_refused(&m.ingest(&partial), "unsupported_repository");
+    assert_refused(&m.ingest(&partial), "read_only_root");
+    assert_eq!(w.counts(), before);
+    m.finish();
+
+    // A live RO grant over the same supplemental store also restricts static authority.
+    let mut m = mcp!(w, &[&enclosure, &partial], OPT_IN, &[]);
+    w.ok(&["grant", "add", pool.to_str().unwrap(), "--yes"]);
+    assert_refused(&m.ingest(&partial), "read_only_root");
     assert_eq!(w.counts(), before);
     m.finish();
 }

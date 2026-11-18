@@ -74,6 +74,32 @@ only unsupported files. Ordinary Git counts each selected (tip, path); the
 isolated Git tool derives whole-HEAD counts from its verified tree. Outlines and
 ingest reports group unrecognized and extensionless names under `other`. Policy skips and recovered parses can affect results.
 
+## Repository ingest deadlines in the development checkout
+
+`mind ingest ./repo --space demo --ingest-timeout 60` gives one call a
+60-second budget. CLI ingestion defaults to unlimited. For MCP use
+`mind mcp --ingest-timeout 60` or set `MINDSPACE_MCP_INGEST_TIMEOUT=60`.
+The MCP default is 30 seconds. Both options accept 0.001 through 3600 seconds.
+
+The deadline covers extraction and the database write. The writer checks it
+between work items and immediately before SQLite COMMIT. On expiry it confirms
+rollback before reporting that the current root was rolled back. Earlier
+selected plain-directory roots remain committed and the error reports how many.
+Git path selections form a single transaction. A first Git ingest may already
+have created the repository identity marker during preparation.
+
+Retry with a larger budget or select fewer paths. Path selection still records
+the reachable Git object graph. A running SQLite statement, lock wait, rollback
+or COMMIT can finish after the deadline. A successful MCP result with
+`over_limit: true` means the ingest committed. A reported uncertain COMMIT
+requires reopening the database and checking its state. A distinct rollback
+confirmation failure means COMMIT was never attempted for that root and the
+writer has been discarded. Reopen the database before retrying.
+
+The ordinary MCP tool is synchronous. Give the client enough time to receive
+the result, including cleanup. The server does not process MCP cancellation
+notifications during the call. See the [first-ingest benchmark](ingest-performance.md).
+
 ## Client registration
 
 ```sh

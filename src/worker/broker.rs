@@ -189,15 +189,15 @@ impl RootAuthority for GrantRoots {
             r.source == auth.source && r.path == auth.path && r.dev == auth.dev && r.ino == auth.ino
         });
         if valid {
-            Ok(Hold(guard))
+            Ok(Hold(Some(guard)))
         } else {
             Err("the grant was revoked, expired or can no longer be verified".to_string())
         }
     }
 }
 
-/// Static roots always; grants too when a store is configured. A grant store that cannot be
-/// verified contributes NO root (fewer roots, never more), the static roots stay usable.
+/// When grants are configured their read-only exceptions also constrain static roots.
+/// Without a verifiable grant ledger the effective scope cannot be authorized.
 pub struct CombinedAuthority {
     pub static_roots: StaticRoots,
     pub grants: Option<GrantRoots>,
@@ -207,16 +207,22 @@ impl RootAuthority for CombinedAuthority {
     fn roots(&self) -> Result<Vec<AuthorizedRoot>, String> {
         let mut v = self.static_roots.roots()?;
         if let Some(g) = &self.grants {
-            if let Ok(more) = g.roots() {
-                v.extend(more);
-            }
+            v.extend(g.roots()?);
         }
         Ok(v)
     }
 
     fn hold(&self, auth: &AuthorizedRoot, horizon: Duration) -> Result<Hold, String> {
         match &auth.source {
-            AuthoritySource::Static => self.static_roots.hold(auth, horizon),
+            AuthoritySource::Static => {
+                let hold = self.static_roots.hold(auth, horizon)?;
+                match &self.grants {
+                    Some(g) => Ok(Hold(Some(
+                        g.store.hold_shared().map_err(|e| e.to_string())?,
+                    ))),
+                    None => Ok(hold),
+                }
+            }
             AuthoritySource::Grant(_) => match &self.grants {
                 Some(g) => g.hold(auth, horizon),
                 None => Err("no grant store is configured".to_string()),
@@ -1311,6 +1317,17 @@ fn read_only_scope<'a>(
         .map(|r| r.path.as_path())
 }
 
+/// Supplemental authority comes only from static roots. Dynamic declarations
+/// can restrict external metadata, but a separate expiring RW grant cannot expand it.
+fn external_read_only_scope<'a>(roots: &'a [AuthorizedRoot], path: &Path) -> Option<&'a Path> {
+    read_only_scope(
+        roots.iter().filter(|r| {
+            r.source == AuthoritySource::Static || r.access == crate::mcp::Access::ReadOnly
+        }),
+        path,
+    )
+}
+
 struct IngestScope {
     root: AuthorizedRoot,
     dependencies: Vec<PathBuf>,
@@ -1329,16 +1346,19 @@ impl IngestScope {
                 "root authority was revoked or expired",
             ));
         }
-        for path in std::iter::once(&self.root.path).chain(&self.dependencies) {
-            if let Some(restricted) = read_only_scope(roots.iter(), path) {
-                return Err(Refusal::new(
-                    RefusalKind::ReadOnlyRoot,
-                    format!(
-                        "ingest would include the read-only root {}",
-                        restricted.display()
-                    ),
-                ));
-            }
+        let restricted = read_only_scope(roots.iter(), &self.root.path).or_else(|| {
+            self.dependencies
+                .iter()
+                .find_map(|path| external_read_only_scope(roots, path))
+        });
+        if let Some(restricted) = restricted {
+            return Err(Refusal::new(
+                RefusalKind::ReadOnlyRoot,
+                format!(
+                    "ingest would include the read-only root {}",
+                    restricted.display()
+                ),
+            ));
         }
         Ok(())
     }
@@ -1377,15 +1397,12 @@ fn git_dependency(
     // exclude the whole dependency even when the pointer names its read-write parent.
     // An external dependency must be writable under the enclosing static authority
     // independently of any dynamic grant. Dynamic declarations may further restrict it.
-    let static_restriction = if path.starts_with(&selected.path) {
-        None
+    let restricted = if path.starts_with(&selected.path) {
+        read_only_scope(roots.iter(), path)
     } else {
-        read_only_scope(
-            roots.iter().filter(|r| r.source == AuthoritySource::Static),
-            path,
-        )
+        external_read_only_scope(roots, path)
     };
-    if let Some(restricted) = static_restriction.or_else(|| read_only_scope(roots.iter(), path)) {
+    if let Some(restricted) = restricted {
         return Err(crate::core::Error::read_only_root(restricted));
     }
     let base = if anchor.path == selected.path {
@@ -1594,7 +1611,10 @@ impl Broker {
         }
         validate_spaces(&spaces).map_err(|m| Refusal::new(RefusalKind::InvalidArgument, m))?;
         // 1. authority: from trusted state, the root must be exactly one of the authorized ones
-        let roots = self.authority.roots()?;
+        let roots = self
+            .authority
+            .roots()
+            .map_err(|m| Refusal::new(RefusalKind::RootNotAuthorized, m))?;
         let Some(auth) = roots.iter().find(|r| r.path == Path::new(&root)).cloned() else {
             return Err(Refusal::new(
                 RefusalKind::RootNotAuthorized,

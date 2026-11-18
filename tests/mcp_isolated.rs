@@ -1027,6 +1027,58 @@ fn revocation_after_worker_completion_but_before_persistence_denies_the_commit()
 
 #[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
 #[test]
+fn the_first_read_only_grant_waits_for_a_static_commit_then_restricts_it() {
+    let w = World::new();
+    let project = w.dir("project", &[("d.md", "# D\n")]);
+    let ledger = w.state.join("mindspace/grants.jsonl");
+    let pause = Pause::new(&w, "first-grant");
+    let mut m = mcp!(
+        w,
+        &[&project],
+        OPT_IN,
+        &[("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER", pause.var())]
+    );
+    assert!(!ledger.exists(), "normal first use starts without a ledger");
+    let id = m.send_call(TOOL, json!({"path":&project,"spaces":["p"]}));
+    pause.wait_reached();
+    let mut add = w
+        .mind(&["grant", "add", project.to_str().unwrap(), "--yes"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        add.try_wait().unwrap().is_none(),
+        "the first addition must wait for this lease"
+    );
+    pause.go();
+    let result = m.read_result(id);
+    assert_eq!(
+        result["structuredContent"]["commit_state"], "COMMITTED",
+        "{result}"
+    );
+    assert!(add.wait().unwrap().success());
+    let before = w.rows();
+    assert_eq!(err_kind(&m.ingest(&project)), "read_only_root");
+    std::fs::write(&ledger, b"invalid ledger record\n").unwrap();
+    assert_eq!(err_kind(&m.ingest(&project)), "root_not_authorized");
+    assert_eq!(w.rows(), before);
+    m.finish();
+
+    // A server started without grants uses only its static policy.
+    let mut m = mcp!(w, &[&project], &["--isolated-ingest"], &[]);
+    let result = m.ingest(&project);
+    assert_eq!(
+        result["structuredContent"]["commit_state"], "COMMITTED",
+        "{result}"
+    );
+    assert_eq!(std::fs::read(ledger).unwrap(), b"invalid ledger record\n");
+    m.finish();
+}
+
+#[cfg_attr(not(feature = "spawn-gate"), ignore = "requires spawn-gate test hooks")]
+#[test]
 fn revocation_during_persistence_waits_for_the_commit_and_is_ordered_after_it() {
     let w = World::new();
     let (project, dynamic) = grant_world(&w, &[("x.rs", "pub fn during_symbol() {}\n")]);

@@ -392,7 +392,7 @@ fn static_and_dynamic_roots_unauthorized_roots_and_the_frontends_own_view() {
         r["error"].as_str().unwrap().contains("not authorized"),
         "{r}"
     );
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     let r1 = w.rows();
     let r = fe.extract(&dynamic);
     assert_eq!(r["ok"], true, "{r}");
@@ -426,7 +426,7 @@ fn the_worker_cannot_read_the_database_or_grant_store_and_the_frontend_cannot_to
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let dynamic = w.dir("dynamic", &[("ok.md", "# fine\n")]);
-    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", dynamic.to_str().unwrap(), "--rw", "--yes"]);
     // hostile content: symlinks to the database and to every file of the grant store
     std::os::unix::fs::symlink(&w.db, dynamic.join("db.md")).unwrap();
     let mut n = 0;
@@ -995,7 +995,7 @@ fn an_aggregate_memory_limit_holds_in_the_watchdog_owned_scope() {
     );
     // a small tree fits and reports its cgroup peak
     let small = w.dir("small", &[("a.md", "# S\n")]);
-    w.ok(&["grant", "add", small.to_str().unwrap(), "--yes"]);
+    w.ok(&["grant", "add", small.to_str().unwrap(), "--rw", "--yes"]);
     let r = fe.extract(&small);
     assert_eq!(r["ok"], true, "{r}");
     let peak = r["cgroup_peak_bytes"]

@@ -24,6 +24,7 @@ use crate::core::{
     StoredCitation, TemporalCoverage, TemporalCoverageStatus, TemporalDimension,
     TemporalHistoryCapabilities, Ts, UnembeddedAssertion, EXTRACTION_MANUAL_WRITE,
 };
+use crate::ingest::deadline::Deadline;
 use crate::storage::Store;
 mod files;
 mod read_session;
@@ -135,7 +136,12 @@ impl Drop for ConnectionGuard<'_> {
         if self.revision_state.poisoned.load(Ordering::SeqCst) {
             let still_open = self.guard.as_ref().is_some_and(|conn| conn.is_autocommit());
             if !still_open {
-                self.guard.take();
+                if let Some(mut conn) = self.guard.take() {
+                    // Closing a poisoned connection can roll back a still-open
+                    // transaction. Disarm its Rust hook before SQLite destroys
+                    // the associated client data during connection teardown.
+                    let _ = conn.rollback_hook(None::<fn()>);
+                }
             }
         }
     }
@@ -166,6 +172,46 @@ impl<'conn> DerefMut for WriteTransaction<'conn> {
 }
 
 impl WriteTransaction<'_> {
+    /// The deadline is cooperative. SQLite never receives an interrupt during
+    /// a statement, rollback or COMMIT. Only a confirmed rollback returns the
+    /// ordinary write-timeout message and leaves the connection reusable.
+    fn finish_ingest<T>(
+        mut self,
+        deadline: &Deadline,
+        before_commit: &dyn Fn() -> Result<()>,
+        write: impl FnOnce(&Connection, &Deadline) -> Result<T>,
+    ) -> Result<T> {
+        let deadline = deadline.writing();
+        let result = write(&self, &deadline).and_then(|report| {
+            deadline.check("authorizing the current root")?;
+            before_commit()?;
+            deadline.check("committing the current root")?;
+            Ok(report)
+        });
+        match result {
+            Ok(report) => {
+                self.commit()?;
+                Ok(report)
+            }
+            Err(error @ Error::IngestTimeout { .. }) => {
+                let tx = self.tx.take().expect("ingest still owns its transaction");
+                let rollback = tx.rollback();
+                if rollback.is_ok() && self.conn.is_autocommit() {
+                    return Err(error);
+                }
+                self.revision_state.poisoned.store(true, Ordering::SeqCst);
+                Err(Error::IngestRollbackUnconfirmed {
+                    detail: rollback.err().map_or_else(
+                        || "SQLite still has an active transaction".into(),
+                        |e| e.to_string(),
+                    ),
+                    prior_roots: deadline.prior_roots(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn commit(mut self) -> Result<()> {
         let tx = self
             .tx
@@ -2275,7 +2321,7 @@ impl Store for SqliteStore {
     fn record_observation(&self, observation: IngestObservation) -> Result<ObservationReport> {
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let report = record_observation_tx(&tx, observation)?;
+        let report = record_observation_tx(&tx, observation, &Deadline::none())?;
         tx.commit()?;
         Ok(report)
     }
@@ -2321,7 +2367,7 @@ impl Store for SqliteStore {
     ) -> Result<GitObservationReport> {
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let report = record_git_observation_tx(&tx, &observation)?;
+        let report = record_git_observation_tx(&tx, &observation, &Deadline::none())?;
         tx.commit()?;
         Ok(report)
     }
@@ -2332,29 +2378,45 @@ impl Store for SqliteStore {
         resolutions: crate::storage::GitResolutionPlan<'_>,
         before_commit: &dyn Fn() -> Result<()>,
     ) -> Result<GitObservationReport> {
+        self.record_git_ingest_with_deadline(
+            observation,
+            code,
+            resolutions,
+            &Deadline::none(),
+            before_commit,
+        )
+    }
+    fn record_git_ingest_with_deadline(
+        &self,
+        observation: crate::core::GitObservation,
+        code: Option<CodeObservation>,
+        resolutions: crate::storage::GitResolutionPlan<'_>,
+        deadline: &Deadline,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<GitObservationReport> {
         // ONE transaction, ONE recording revision for the whole logical ingestion. The resolutions
         // read the rows the code write made a moment earlier: inside this transaction they see
         // them before they are committed. Any error (or a crash before the COMMIT) leaves nothing.
         let repository_id = observation.repository_id;
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let mut report = record_git_observation_tx(&tx, &observation)?;
-        if let Some(code) = code {
-            report.code = record_code_observation_tx(&tx, code)?;
-            for commit in resolutions.commits {
-                resolve_git_code_relationships_tx(
-                    &tx,
-                    repository_id,
-                    commit,
-                    resolutions.resolver,
-                    resolutions.version,
-                )?;
+        tx.finish_ingest(deadline, before_commit, |tx, deadline| {
+            let mut report = record_git_observation_tx(tx, &observation, deadline)?;
+            if let Some(code) = code {
+                report.code = record_code_observation_tx(tx, code, deadline)?;
+                for commit in resolutions.commits {
+                    resolve_git_code_relationships_tx(
+                        tx,
+                        repository_id,
+                        commit,
+                        resolutions.resolver,
+                        resolutions.version,
+                        deadline,
+                    )?;
+                }
             }
-        }
-        // an error here drops `tx`, which rolls back: nothing of this ingestion is committed
-        before_commit()?;
-        tx.commit()?;
-        Ok(report)
+            Ok(report)
+        })
     }
     fn git_refs_current(&self, repository_id: Uuid) -> Result<Vec<GitRefObservation>> {
         let conn = self.connection()?;
@@ -2387,7 +2449,7 @@ impl Store for SqliteStore {
     ) -> Result<CodeObservationReport> {
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let report = record_code_observation_tx(&tx, observation)?;
+        let report = record_code_observation_tx(&tx, observation, &Deadline::none())?;
         tx.commit()?;
         Ok(report)
     }
@@ -2398,19 +2460,27 @@ impl Store for SqliteStore {
         code: Option<CodeObservation>,
         before_commit: &dyn Fn() -> Result<()>,
     ) -> Result<ObservationReport> {
+        self.record_files_ingest_with_deadline(observation, code, &Deadline::none(), before_commit)
+    }
+    fn record_files_ingest_with_deadline(
+        &self,
+        observation: IngestObservation,
+        code: Option<CodeObservation>,
+        deadline: &Deadline,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<ObservationReport> {
         // ONE transaction, ONE recording revision for the whole logical ingestion: the observation
         // and its derivations commit together, or (on any error, or a crash before the commit)
         // neither does. The two `record_*` methods above remain for callers that want one part.
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let mut report = record_observation_tx(&tx, observation)?;
-        if let Some(code) = code {
-            report.code = record_code_observation_tx(&tx, code)?;
-        }
-        // an error here drops `tx`, which rolls back: nothing of this ingestion is committed
-        before_commit()?;
-        tx.commit()?;
-        Ok(report)
+        tx.finish_ingest(deadline, before_commit, |tx, deadline| {
+            let mut report = record_observation_tx(tx, observation, deadline)?;
+            if let Some(code) = code {
+                report.code = record_code_observation_tx(tx, code, deadline)?;
+            }
+            Ok(report)
+        })
     }
 
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>> {
@@ -2783,8 +2853,14 @@ impl Store for SqliteStore {
     ) -> Result<crate::core::CodeResolutionReport> {
         let conn = self.connection()?;
         let tx = begin_write(&conn, &self.revision_state)?;
-        let report =
-            resolve_git_code_relationships_tx(&tx, repository_id, commit_oid, resolver, version)?;
+        let report = resolve_git_code_relationships_tx(
+            &tx,
+            repository_id,
+            commit_oid,
+            resolver,
+            version,
+            &Deadline::none(),
+        )?;
         tx.commit()?;
         Ok(report)
     }
@@ -3368,7 +3444,9 @@ fn resolve_git_code_relationships_tx(
     commit_oid: &str,
     resolver: &str,
     version: &str,
+    deadline: &Deadline,
 ) -> Result<crate::core::CodeResolutionReport> {
+    deadline.check("resolving code relationships")?;
     let existing:Option<String>=tx.query_row("SELECT id FROM code_resolution_derivations WHERE repository_id=?1 AND commit_oid=?2 AND resolver=?3 AND resolver_version=?4",rusqlite::params![repository_id.to_string(),commit_oid,resolver,version],|r|r.get(0)).optional().map_err(dberr)?;
     if existing.is_some() {
         return Ok(crate::core::CodeResolutionReport {
@@ -3405,6 +3483,7 @@ fn resolve_git_code_relationships_tx(
     let mut observations: BTreeMap<String, (String, String, Option<String>, Option<String>)> =
         BTreeMap::new();
     for row in rows {
+        deadline.check("resolving code relationships")?;
         let (id, kind, raw, source, path) = row.map_err(dberr)?;
         if !module_index.reachable_paths.contains(&path) {
             continue;
@@ -3422,6 +3501,7 @@ fn resolve_git_code_relationships_tx(
     }
     drop(stmt);
     for (oid, (kind, raw, source, path)) in observations {
+        deadline.check("resolving code relationships")?;
         let current_module = path
             .as_ref()
             .and_then(|path| module_index.module_for_observation(path, source.as_deref()));
@@ -3447,6 +3527,7 @@ fn resolve_git_code_relationships_tx(
         tx.execute("INSERT INTO code_relationship_resolutions(id,resolution_derivation_id,observation_id,state,target_entity_id,raw_external_target) VALUES(?1,?2,?3,?4,?5,NULL)",rusqlite::params![rid.to_string(),did.to_string(),oid,state,if candidates.len()==1{Some(candidates[0].clone())}else{None}]).map_err(dberr)?;
         if state == "ambiguous" {
             for c in candidates {
+                deadline.check("resolving code relationships")?;
                 tx.execute(
                     "INSERT INTO code_resolution_candidates(resolution_id,entity_id) VALUES(?1,?2)",
                     rusqlite::params![rid.to_string(), c],
@@ -3468,9 +3549,11 @@ fn resolve_git_code_relationships_tx(
 fn record_code_observation_tx(
     tx: &Connection,
     observation: CodeObservation,
+    deadline: &Deadline,
 ) -> Result<CodeObservationReport> {
     let mut report = CodeObservationReport::default();
     for input in observation.inputs {
+        deadline.check("writing code structure")?;
         report.supported_inputs += 1;
         *report
             .inputs_by_language
@@ -3500,6 +3583,7 @@ fn record_code_observation_tx(
             tx.execute("INSERT INTO code_inputs(id,content_hash,repository_id,blob_oid,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![input_id,input.content_hash,input.repository_id.map(|x|x.to_string()),input.blob_oid,Ts::now().0]).map_err(dberr)?;
         }
         for context in input.contexts {
+            deadline.check("writing code structure")?;
             // A directory context has no commit id. A NULL in the key makes every row distinct,
             // so INSERT OR IGNORE would add the same context again on each re-ingestion (and
             // `code_search` would repeat every hit): check explicitly.
@@ -3540,12 +3624,15 @@ fn record_code_observation_tx(
             report.parse_errors += u64::from(d.status != crate::core::CodeParseStatus::Complete);
         }
         for e in &d.entities {
+            deadline.check("writing code structure")?;
             tx.execute("INSERT INTO code_entities(id,derivation_id,kind,name,qualified_name,syntax_path,parent_syntax_path,start_byte,end_byte,start_line,start_column,end_line,end_column,signature,visibility,is_async) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),e.kind.as_str(),e.name,e.qualified_name,e.syntax_path,e.parent_syntax_path,e.range.start_byte as i64,e.range.end_byte as i64,e.range.start_line,e.range.start_column,e.range.end_line,e.range.end_column,e.signature,e.visibility,e.is_async]).map_err(dberr)?;
         }
         for i in &d.imports {
+            deadline.check("writing code structure")?;
             tx.execute("INSERT INTO code_imports(id,derivation_id,raw,target,alias,start_byte,end_byte,start_line,start_column,end_line,end_column) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),i.raw,i.target,i.alias,i.range.start_byte as i64,i.range.end_byte as i64,i.range.start_line,i.range.start_column,i.range.end_line,i.range.end_column]).map_err(dberr)?;
         }
         for relationship in &d.relationships {
+            deadline.check("writing code structure")?;
             tx.execute("INSERT INTO code_relationship_observations(id,derivation_id,kind,source_syntax_path,raw_target,start_byte,end_byte) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![Uuid::now_v7().to_string(),did.to_string(),relationship.kind.as_str(),relationship.source_syntax_path,relationship.raw_target,relationship.range.start_byte as i64,relationship.range.end_byte as i64]).map_err(dberr)?;
         }
     }
@@ -3558,6 +3645,7 @@ fn record_code_observation_tx(
 fn plan_file_observation<'conn>(
     conn: &'conn Connection,
     observation: IngestObservation,
+    deadline: &Deadline,
 ) -> Result<FileObservationPlan<'conn>> {
     let IngestObservation {
         session,
@@ -3595,6 +3683,7 @@ fn plan_file_observation<'conn>(
             })
             .map_err(dberr)?;
         for r in rows {
+            deadline.check("planning file observations")?;
             let (id, state, location) = r.map_err(dberr)?;
             let logical = Uuid::parse_str(&id)
                 .map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")))?;
@@ -3621,9 +3710,11 @@ fn plan_file_observation<'conn>(
     if full {
         let mut expected: HashMap<String, Uuid> = HashMap::new();
         for (logical, (location, _)) in &present {
+            deadline.check("planning file observations")?;
             expected.insert(location.clone(), *logical);
         }
         for (idx, file) in files.iter().enumerate() {
+            deadline.check("planning file observations")?;
             if let Some(logical) = expected.get(&file.location).copied() {
                 let latest = present[&logical].1.as_deref();
                 if latest == Some(file.content_hash.as_str()) {
@@ -3653,6 +3744,7 @@ fn plan_file_observation<'conn>(
             .chain(skipped_files.iter().map(|s| s.path.as_str()))
             .collect();
         for (logical, (location, _)) in &present {
+            deadline.check("planning file observations")?;
             if !observed_paths.contains(location.as_str()) {
                 gone.insert(*logical, location.clone());
             }
@@ -3661,6 +3753,7 @@ fn plan_file_observation<'conn>(
         // Partial (file-scope) observation: path-local continuity only.
         // Never marks anything disappeared, never infers moves.
         for (idx, file) in files.iter().enumerate() {
+            deadline.check("planning file observations")?;
             if let Some(logical) = present_logical_at(conn, &file.location)? {
                 if latest_version_hash(conn, &logical)?.as_deref()
                     == Some(file.content_hash.as_str())
@@ -3714,16 +3807,19 @@ fn plan_file_observation<'conn>(
     // a move.
     if full {
         for (idx, file) in files.iter().enumerate() {
+            deadline.check("planning file observations")?;
             if !unmatched_new.contains(&idx) {
                 continue;
             }
             let mut candidates: Vec<(Uuid, Option<String>)> = Vec::new();
             for logical in gone.keys() {
+                deadline.check("planning file observations")?;
                 if !matched.contains_key(logical) {
                     candidates.push((*logical, Some(gone[logical].clone())));
                 }
             }
             for logical in absent.keys() {
+                deadline.check("planning file observations")?;
                 if !matched.contains_key(logical) && !gone.contains_key(logical) {
                     candidates.push((*logical, Some(absent[logical].0.clone())));
                 }
@@ -3790,17 +3886,21 @@ fn plan_file_observation<'conn>(
 fn record_observation_tx(
     conn: &Connection,
     observation: IngestObservation,
+    deadline: &Deadline,
 ) -> Result<ObservationReport> {
     #[cfg(test)]
     observation_planning_tests::checkpoint("before_plan", conn)?;
-    let plan = plan_file_observation(conn, observation)?;
+    let plan = plan_file_observation(conn, observation, deadline)?;
     #[cfg(test)]
     observation_planning_tests::checkpoint("after_plan", conn)?;
-    apply_file_observation(plan)
+    apply_file_observation(plan, deadline)
 }
 
 /// Apply captured file classifications; ordinary version/knowledge reconciliation remains here.
-fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationReport> {
+fn apply_file_observation(
+    plan: FileObservationPlan<'_>,
+    deadline: &Deadline,
+) -> Result<ObservationReport> {
     let FileObservationPlan {
         conn,
         session,
@@ -3833,6 +3933,7 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
     let mut events: Vec<SourceEvent> = Vec::new();
 
     for plan in classifications {
+        deadline.check("writing file observations")?;
         match plan {
             Plan::Unchanged {
                 location,
@@ -3844,15 +3945,22 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
                 // and a manually retired memory must be recreated on an
                 // explicit re-ingest. Content equality guarantees the
                 // reconciliation can only reuse (never supersede).
-                let (_, _, evidence_ids) =
-                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
-                let actions = reconcile_logical(
+                let (_, _, evidence_ids) = ensure_version_with_deadline(
                     conn,
                     logical,
+                    SourceKind::File,
+                    &files[file_idx],
+                    at,
+                    deadline,
+                )?;
+                let actions = reconcile_logical(
+                    conn,
+                    Some(logical),
                     &files[file_idx],
                     &evidence_ids,
                     at,
                     FILE_PRODUCER_FAMILY,
+                    deadline,
                 )?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
                 report_files.push(FileObservation {
@@ -3867,15 +3975,22 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
                 logical,
                 file_idx,
             } => {
-                let (_, _, evidence_ids) =
-                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
-                let actions = reconcile_logical(
+                let (_, _, evidence_ids) = ensure_version_with_deadline(
                     conn,
                     logical,
+                    SourceKind::File,
+                    &files[file_idx],
+                    at,
+                    deadline,
+                )?;
+                let actions = reconcile_logical(
+                    conn,
+                    Some(logical),
                     &files[file_idx],
                     &evidence_ids,
                     at,
                     FILE_PRODUCER_FAMILY,
+                    deadline,
                 )?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
                 report_files.push(FileObservation {
@@ -3887,15 +4002,22 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
             }
             Plan::Created { location, file_idx } => {
                 let logical = create_logical_source(conn, &files[file_idx], at)?;
-                let (_, _, evidence_ids) =
-                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
-                let actions = reconcile_logical(
+                let (_, _, evidence_ids) = ensure_version_with_deadline(
                     conn,
                     logical,
+                    SourceKind::File,
+                    &files[file_idx],
+                    at,
+                    deadline,
+                )?;
+                let actions = reconcile_logical(
+                    conn,
+                    None,
                     &files[file_idx],
                     &evidence_ids,
                     at,
                     FILE_PRODUCER_FAMILY,
+                    deadline,
                 )?;
                 record_observation_row(conn, session_id, logical, &files[file_idx], at)?;
                 report_files.push(FileObservation {
@@ -3913,8 +4035,14 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
             } => {
                 // The content version already exists and is reused; only
                 // the lifecycle moves. No knowledge is touched.
-                let (added, _, _) =
-                    ensure_version(conn, logical, SourceKind::File, &files[file_idx], at)?;
+                let (added, _, _) = ensure_version_with_deadline(
+                    conn,
+                    logical,
+                    SourceKind::File,
+                    &files[file_idx],
+                    at,
+                    deadline,
+                )?;
                 debug_assert!(!added, "a continued source reuses its version");
                 conn.execute(
                     "UPDATE logical_sources SET state = 'present', current_location = ?1 \
@@ -3951,6 +4079,7 @@ fn apply_file_observation(plan: FileObservationPlan<'_>) -> Result<ObservationRe
     // This records absence; it does NOT retire derived memories
     // (disappearance is not falsehood).
     for (logical, location) in &residual_disappearances {
+        deadline.check("writing file observations")?;
         conn.execute(
             "UPDATE logical_sources SET state = 'absent' WHERE id = ?1",
             rusqlite::params![logical.to_string()],
@@ -4050,6 +4179,17 @@ fn ensure_version(
     file: &ObservedFile,
     at: Ts,
 ) -> Result<(bool, Uuid, Vec<Uuid>)> {
+    ensure_version_with_deadline(conn, logical, kind, file, at, &Deadline::none())
+}
+
+fn ensure_version_with_deadline(
+    conn: &Connection,
+    logical: Uuid,
+    kind: SourceKind,
+    file: &ObservedFile,
+    at: Ts,
+    deadline: &Deadline,
+) -> Result<(bool, Uuid, Vec<Uuid>)> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT id FROM sources WHERE logical_id = ?1 AND content_hash = ?2",
@@ -4071,6 +4211,7 @@ fn ensure_version(
             })
             .map_err(dberr)?;
         for r in rows {
+            deadline.check("writing source evidence")?;
             let s = r.map_err(dberr)?;
             evidence_ids.push(
                 Uuid::parse_str(&s)
@@ -4100,23 +4241,25 @@ fn ensure_version(
     .map_err(dberr)?;
     let mut evidence_ids = Vec::with_capacity(file.evidences.len());
     for d in &file.evidences {
+        deadline.check("writing source evidence")?;
         let id = Uuid::now_v7();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO evidence (id, source_id, kind, heading_path, start_line, end_line, \
                  ordinal, content, content_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                id.to_string(),
-                version_id.to_string(),
-                d.kind.as_str(),
-                d.heading_path,
-                d.start_line.map(i64::from),
-                d.end_line.map(i64::from),
-                i64::from(d.ordinal),
-                d.content,
-                d.content_hash,
-            ],
         )
+        .map_err(dberr)?
+        .execute(rusqlite::params![
+            id.to_string(),
+            version_id.to_string(),
+            d.kind.as_str(),
+            d.heading_path,
+            d.start_line.map(i64::from),
+            d.end_line.map(i64::from),
+            i64::from(d.ordinal),
+            d.content,
+            d.content_hash,
+        ])
         .map_err(dberr)?;
         evidence_ids.push(id);
     }
@@ -4372,23 +4515,30 @@ fn insert_source_event(
 /// duplicates knowledge; this runs only when content changed.
 fn reconcile_logical(
     conn: &Connection,
-    logical: Uuid,
+    previous_logical: Option<Uuid>,
     file: &ObservedFile,
     evidence_ids: &[Uuid],
     at: Ts,
     producer_family: &str,
+    deadline: &Deadline,
 ) -> Result<Vec<MemoryAction>> {
     let mut olds_by_subject: BTreeMap<String, Vec<MemorySummary>> = BTreeMap::new();
-    let olds = load_summaries(
-        conn,
-        "",
-        "m.state = 'active' AND src.logical_id = ? AND m.producer_family = ?",
-        vec![
-            Value::Text(logical.to_string()),
-            Value::Text(producer_family.to_string()),
-        ],
-    )?;
+    // A freshly allocated logical identity has no prior episodes to reconcile.
+    let olds = if let Some(logical) = previous_logical {
+        load_summaries(
+            conn,
+            "",
+            "m.state = 'active' AND src.logical_id = ? AND m.producer_family = ?",
+            vec![
+                Value::Text(logical.to_string()),
+                Value::Text(producer_family.to_string()),
+            ],
+        )?
+    } else {
+        Vec::new()
+    };
     for o in olds {
+        deadline.check("reconciling document memories")?;
         olds_by_subject
             .entry(o.subject_normalized.clone())
             .or_default()
@@ -4396,6 +4546,7 @@ fn reconcile_logical(
     }
     let mut news_by_subject: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, d) in file.assertions.iter().enumerate() {
+        deadline.check("reconciling document memories")?;
         news_by_subject
             .entry(d.subject_normalized.clone())
             .or_default()
@@ -4406,10 +4557,12 @@ fn reconcile_logical(
     let mut requested_by_assertion: HashMap<usize, Vec<Uuid>> = HashMap::new();
     let mut space_names: BTreeMap<Uuid, String> = BTreeMap::new();
     for spec in &file.memories {
+        deadline.check("reconciling document memories")?;
         let entry = requested_by_assertion
             .entry(spec.assertion_idx)
             .or_default();
         for sid in &spec.spaces {
+            deadline.check("reconciling document memories")?;
             if !entry.contains(sid) {
                 entry.push(*sid);
             }
@@ -4453,6 +4606,7 @@ fn reconcile_logical(
         .cloned()
         .collect();
     for subject in subjects {
+        deadline.check("reconciling document memories")?;
         let olds: &[MemorySummary] = olds_by_subject
             .get(&subject)
             .map(Vec::as_slice)
@@ -4463,6 +4617,7 @@ fn reconcile_logical(
             .unwrap_or(&[]);
         let pairs = olds.len().max(news.len());
         for i in 0..pairs {
+            deadline.check("reconciling document memories")?;
             match (olds.get(i), news.get(i)) {
                 (Some(old), Some(&ai)) => {
                     let draft = &file.assertions[ai];
@@ -4519,6 +4674,7 @@ fn reconcile_logical(
     // Content that survived a rename or a move keeps its lineage.
     let mut unmatched_olds: Vec<MemorySummary> = Vec::new();
     for old in pending_olds {
+        deadline.check("reconciling document memories")?;
         match pending_news
             .iter()
             .position(|&ai| file.assertions[ai].content == old.content)
@@ -4541,6 +4697,7 @@ fn reconcile_logical(
         }
     }
     for ai in pending_news {
+        deadline.check("reconciling document memories")?;
         let assertion_id = get_assertion(conn, ai)?;
         let new_id = create_memory(conn, assertion_id, at, producer_family)?;
         let requested = requested_by_assertion.get(&ai).cloned().unwrap_or_default();
@@ -4554,6 +4711,7 @@ fn reconcile_logical(
         )?;
     }
     for old in unmatched_olds {
+        deadline.check("reconciling document memories")?;
         retire_conn(
             conn,
             old.memory_id,
@@ -4598,28 +4756,34 @@ fn get_or_create_assertion(
     }
 
     let id = Uuid::now_v7();
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO assertions (id, kind, subject, subject_normalized, predicate, \
              content, content_hash, extraction, created_at, evidence_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        rusqlite::params![
-            id.to_string(),
-            draft.kind.as_str(),
-            draft.subject,
-            draft.subject_normalized,
-            draft.predicate,
-            draft.content,
-            content_hash,
-            draft.extraction,
-            at.0,
-            evidence_id.to_string(),
-        ],
     )
+    .map_err(dberr)?
+    .execute(rusqlite::params![
+        id.to_string(),
+        draft.kind.as_str(),
+        draft.subject,
+        draft.subject_normalized,
+        draft.predicate,
+        draft.content,
+        content_hash,
+        draft.extraction,
+        at.0,
+        evidence_id.to_string(),
+    ])
     .map_err(dberr)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO assertion_fts (assertion_id, subject, content) VALUES (?1, ?2, ?3)",
-        rusqlite::params![id.to_string(), draft.subject, draft.content],
     )
+    .map_err(dberr)?
+    .execute(rusqlite::params![
+        id.to_string(),
+        draft.subject,
+        draft.content
+    ])
     .map_err(dberr)?;
     Ok(id)
 }
@@ -4696,10 +4860,15 @@ fn add_spaces(conn: &Connection, memory_id: Uuid, space_ids: &[Uuid], at: Ts) ->
         if existing.contains(&sid.to_string()) {
             continue;
         }
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO memory_spaces (memory_id, space_id, created_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![memory_id.to_string(), sid.to_string(), at.0],
         )
+        .map_err(dberr)?
+        .execute(rusqlite::params![
+            memory_id.to_string(),
+            sid.to_string(),
+            at.0
+        ])
         .map_err(dberr)?;
         added.push(*sid);
         existing.insert(sid.to_string());
@@ -4714,8 +4883,8 @@ fn create_memory(
     producer_family: &str,
 ) -> Result<Uuid> {
     let id = Uuid::now_v7();
-    conn.execute(
-        "INSERT INTO memories (id, assertion_id, state, created_at, producer_family) VALUES (?1, ?2, 'active', ?3, ?4)",
+    conn.prepare_cached(
+        "INSERT INTO memories (id, assertion_id, state, created_at, producer_family) VALUES (?1, ?2, 'active', ?3, ?4)").map_err(dberr)?.execute(
         rusqlite::params![id.to_string(), assertion_id.to_string(), created_at.0, producer_family],
     )
     .map_err(dberr)?;
@@ -4986,6 +5155,7 @@ fn load_source_lifecycle(conn: &Connection, logical_id: Uuid) -> Result<Option<S
 fn record_git_observation_tx(
     conn: &Connection,
     observation: &GitObservation,
+    deadline: &Deadline,
 ) -> Result<GitObservationReport> {
     let at = observation.session.observed_at;
 
@@ -5029,6 +5199,7 @@ fn record_git_observation_tx(
     )
     .map_err(dberr)?;
     for r in &observation.remotes {
+        deadline.check("writing Git observations")?;
         conn.execute(
             "INSERT INTO repository_remotes \
                  (repository_id, name, url, slug_key, slug, first_observed_at, last_observed_at, is_current) \
@@ -5053,6 +5224,7 @@ fn record_git_observation_tx(
     //    unreachable objects that were observed before are retained.
     let mut existing: HashSet<String> = HashSet::new();
     for table in ["git_commits", "git_trees", "git_blobs", "git_tags"] {
+        deadline.check("writing Git observations")?;
         let sql = format!("SELECT oid FROM {table} WHERE repository_id = ?1");
         let mut stmt = conn.prepare(&sql).map_err(dberr)?;
         let rows = stmt
@@ -5062,6 +5234,7 @@ fn record_git_observation_tx(
             )
             .map_err(dberr)?;
         for r in rows {
+            deadline.check("writing Git observations")?;
             existing.insert(r.map_err(dberr)?);
         }
     }
@@ -5076,6 +5249,7 @@ fn record_git_observation_tx(
     let mut objects_new: u64 = 0;
     let mut objects_existing: u64 = 0;
     for oid in &all_oids {
+        deadline.check("writing Git observations")?;
         if existing.contains(*oid) {
             objects_existing += 1;
         } else {
@@ -5084,6 +5258,7 @@ fn record_git_observation_tx(
     }
     let is_new = |oid: &str| !existing.contains(oid);
     for c in &observation.commits {
+        deadline.check("writing Git observations")?;
         if !is_new(&c.oid) {
             continue;
         }
@@ -5106,6 +5281,7 @@ fn record_git_observation_tx(
         )
         .map_err(dberr)?;
         for (position, parent) in c.parents.iter().enumerate() {
+            deadline.check("writing Git observations")?;
             conn.execute(
                 "INSERT INTO git_commit_parents (repository_id, commit_oid, position, parent_oid) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -5120,37 +5296,43 @@ fn record_git_observation_tx(
         }
     }
     for t in &observation.trees {
+        deadline.check("writing Git observations")?;
         if !is_new(&t.oid) {
             continue;
         }
-        conn.execute(
-            "INSERT INTO git_trees (repository_id, oid) VALUES (?1, ?2)",
-            rusqlite::params![observation.repository_id.to_string(), t.oid],
-        )
-        .map_err(dberr)?;
+        conn.prepare_cached("INSERT INTO git_trees (repository_id, oid) VALUES (?1, ?2)")
+            .map_err(dberr)?
+            .execute(rusqlite::params![
+                observation.repository_id.to_string(),
+                t.oid
+            ])
+            .map_err(dberr)?;
         for e in &t.entries {
-            conn.execute(
+            deadline.check("writing Git observations")?;
+            conn.prepare_cached(
                 "INSERT INTO git_tree_entries (repository_id, tree_oid, name, mode, target_oid, \
                      target_kind) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    observation.repository_id.to_string(),
-                    t.oid,
-                    e.name,
-                    e.mode,
-                    e.target_oid,
-                    e.target_kind.as_str(),
-                ],
             )
+            .map_err(dberr)?
+            .execute(rusqlite::params![
+                observation.repository_id.to_string(),
+                t.oid,
+                e.name,
+                e.mode,
+                e.target_oid,
+                e.target_kind.as_str(),
+            ])
             .map_err(dberr)?;
         }
     }
     for b in &observation.blobs {
+        deadline.check("writing Git observations")?;
         if !is_new(&b.oid) {
             continue;
         }
-        conn.execute(
-            "INSERT INTO git_blobs (repository_id, oid, size_bytes, content) VALUES (?1, ?2, ?3, ?4)",
+        conn.prepare_cached(
+            "INSERT INTO git_blobs (repository_id, oid, size_bytes, content) VALUES (?1, ?2, ?3, ?4)").map_err(dberr)?.execute(
             rusqlite::params![
                 observation.repository_id.to_string(),
                 b.oid,
@@ -5161,6 +5343,7 @@ fn record_git_observation_tx(
         .map_err(dberr)?;
     }
     for t in &observation.tags {
+        deadline.check("writing Git observations")?;
         if !is_new(&t.oid) {
             continue;
         }
@@ -5186,6 +5369,7 @@ fn record_git_observation_tx(
     //    Ref names are observations, not identity: a deleted ref loses its
     //    current-state row (once), never its journal and never its objects.
     for r in &observation.refs {
+        deadline.check("writing Git observations")?;
         conn.execute(
             "INSERT INTO git_refs (repository_id, name, target_oid, target_kind, \
                  symbolic_target, last_observed_at) \
@@ -5209,6 +5393,7 @@ fn record_git_observation_tx(
     let mut events = Vec::with_capacity(observation.ref_events.len());
     let (mut refs_added, mut refs_changed, mut refs_removed) = (0u64, 0u64, 0u64);
     for e in &observation.ref_events {
+        deadline.check("writing Git observations")?;
         match e.kind {
             crate::core::GitRefEventKind::Created => refs_added += 1,
             crate::core::GitRefEventKind::FastForward
@@ -5257,7 +5442,8 @@ fn record_git_observation_tx(
     let mut derivations_new: u64 = 0;
     let mut derivations_reused: u64 = 0;
     for d in &observation.derivations {
-        let logical = find_or_create_git_logical(
+        deadline.check("writing Git observations")?;
+        let (logical, previous_logical) = find_or_create_git_logical(
             conn,
             observation.repository_id,
             &d.commit_oid,
@@ -5277,7 +5463,7 @@ fn record_git_observation_tx(
             memories: d.memories.clone(),
         };
         let (added, version_id, evidence_ids) =
-            ensure_version(conn, logical, d.source_kind, &observed, at)?;
+            ensure_version_with_deadline(conn, logical, d.source_kind, &observed, at, deadline)?;
         if added {
             conn.execute(
                 "INSERT INTO git_source_versions (source_id, repository_id, blob_oid, path, \
@@ -5298,11 +5484,12 @@ fn record_git_observation_tx(
         }
         let actions = reconcile_logical(
             conn,
-            logical,
+            previous_logical,
             &observed,
             &evidence_ids,
             at,
             GIT_PRODUCER_FAMILY,
+            deadline,
         )?;
         files.push(GitFileReport {
             path: d.path.clone(),
@@ -5351,6 +5538,7 @@ fn record_git_observation_tx(
         let shown: Vec<String> = current.iter().take(3).map(|c| short(c)).collect();
         let more = current.len().saturating_sub(3);
         for (id, commit) in derived {
+            deadline.check("writing Git observations")?;
             if current_set.contains(commit.as_str()) {
                 continue;
             }
@@ -5378,6 +5566,7 @@ fn record_git_observation_tx(
     )
     .map_err(dberr)?;
     for commit in &observation.view_commits {
+        deadline.check("writing Git observations")?;
         conn.execute(
             "INSERT OR IGNORE INTO git_views (repository_id, commit_oid, observed_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![observation.repository_id.to_string(), commit, at.0],
@@ -5421,6 +5610,7 @@ fn record_git_observation_tx(
             rows
         };
         for (id, path, blob) in releases {
+            deadline.check("writing Git observations")?;
             if keep.contains(&(path.as_str(), blob.as_str())) {
                 continue;
             }
@@ -5432,6 +5622,7 @@ fn record_git_observation_tx(
     }
 
     for skip in &observation.skipped_files {
+        deadline.check("writing Git observations")?;
         text_policy::recheck(conn, Some(observation.repository_id), skip, at)?;
     }
     Ok(GitObservationReport {
@@ -5462,7 +5653,7 @@ fn find_or_create_git_logical(
     commit_oid: &str,
     path: &str,
     at: Ts,
-) -> Result<Uuid> {
+) -> Result<(Uuid, Option<Uuid>)> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT id FROM logical_sources WHERE repository_id = ?1 AND commit_oid = ?2 \
@@ -5473,7 +5664,8 @@ fn find_or_create_git_logical(
         .optional()
         .map_err(dberr)?;
     if let Some(id) = existing {
-        return Uuid::parse_str(&id).map_err(|e| Error::Storage(format!("corrupt id '{id}': {e}")));
+        let id = uuid_from_storage(&id)?;
+        return Ok((id, Some(id)));
     }
     let id = Uuid::now_v7();
     conn.execute(
@@ -5490,7 +5682,7 @@ fn find_or_create_git_logical(
         ],
     )
     .map_err(dberr)?;
-    Ok(id)
+    Ok((id, None))
 }
 
 fn git_display_location(path: &str, commit_oid: &str) -> String {

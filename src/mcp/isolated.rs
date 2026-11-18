@@ -231,6 +231,7 @@ pub fn run(
     config: &McpConfig,
     obj: &Map<String, Value>,
 ) -> std::result::Result<Value, ToolFailure> {
+    let deadline = Deadline::after(config.ingest_timeout());
     let Some(iso) = config.isolated() else {
         return Err(failure(
             "not_enabled",
@@ -290,7 +291,12 @@ pub fn run(
 
     #[allow(unused_mut)]
     let mut cfg = WorkerConfig::new("/nonexistent"); // the broker starts the worker; this path is unused
-    cfg.wall_timeout = config.ingest_timeout();
+    deadline
+        .check("starting the extraction worker")
+        .map_err(|e| failure("timeout", e.to_string()))?;
+    cfg.wall_timeout = deadline
+        .remaining()
+        .expect("isolated ingest has a configured deadline");
     // This tool is always unscoped (there is no `paths`), so it gets the limit `repo_ingest` has
     // for unscoped trees. The producer streams files one by one: the 2001st is refused as it
     // arrives and the worker is ended, without a pre-scan.
@@ -371,7 +377,7 @@ pub fn run(
         &link,
         rep.op,
         |authorize| {
-            let result = persist_files_gated(store, files, &Deadline::none(), &|| {
+            let result = persist_files_gated(store, files, &deadline, &|| {
                 #[cfg(feature = "spawn-gate")]
                 gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE");
                 authorize()
@@ -389,17 +395,18 @@ pub fn run(
         std::env::var_os("MINDSPACE_ISOLATED_GATE_DROP_COMMIT_DONE").is_some(),
     );
     let persist_ms = t_persist.elapsed().as_millis() as u64;
-    let report = match result {
-        Ok(report) => report,
-        Err(PersistFailure::Denied {
-            kind,
-            reason,
-            discard_link,
-        }) => {
-            return Err(iso.lease_refusal(kind, &reason, discard_link));
-        }
-        Err(PersistFailure::Store(e)) => {
-            return Err(match e {
+    let report =
+        match result {
+            Ok(report) => report,
+            Err(PersistFailure::Denied {
+                kind,
+                reason,
+                discard_link,
+            }) => {
+                return Err(iso.lease_refusal(kind, &reason, discard_link));
+            }
+            Err(PersistFailure::Store(e)) => {
+                return Err(match e {
                 crate::core::Error::CommitOutcomeUnknown { detail } => failure_commit(
                     "commit_outcome_unknown",
                     format!(
@@ -420,6 +427,19 @@ pub fn run(
                     "NOT_STARTED",
                     json!(false),
                 ),
+                error @ crate::core::Error::IngestRollbackUnconfirmed { .. } => failure_commit(
+                    "rollback_unconfirmed", error.to_string(), "NOT_COMMITTED", json!(false),
+                ),
+                crate::core::Error::IngestTimeout { message, writing } => failure_commit(
+                    "timeout",
+                    message,
+                    if writing {
+                        "ROLLED_BACK"
+                    } else {
+                        "NOT_STARTED"
+                    },
+                    json!(false),
+                ),
                 other => failure_commit(
                     "persist_failed",
                     other.to_string(),
@@ -427,8 +447,8 @@ pub fn run(
                     json!(false),
                 ),
             });
-        }
-    };
+            }
+        };
     drop(link);
     let outcome = crate::core::IngestOutcome::Files(report);
     let authority = match rep.authority {

@@ -981,10 +981,7 @@ fn collect_output(
         if deadline.expired() {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(deadline.error(
-                &format!("waiting for `git {command}`"),
-                "the database was not changed",
-            ));
+            return Err(deadline.error(&format!("waiting for `git {command}`"), deadline.effect()));
         }
         let left = deadline.remaining().unwrap_or(nap);
         std::thread::sleep(nap.min(left.max(Duration::from_millis(1))));

@@ -1,16 +1,8 @@
 //! Time limit for `repo_ingest` over MCP (MIND-4).
 //!
-//! `mind mcp --ingest-timeout <SECONDS>` (default 30) bounds the part of an
-//! ingest that can be stopped cleanly: everything before the first database
-//! write, including the git subprocesses. An aborted ingest changes nothing in
-//! the database. Once the first write transaction starts it runs to the end,
-//! because the write fence treats an interrupted transaction as an uncertain
-//! outcome and refuses all later writes of the session (verified in a
-//! throwaway experiment, recorded in the ADR-026 addendum). So the limit is NOT
-//! a bound on total duration; the tests only claim what the design delivers.
-//!
-//! These tests were written before the implementation. Before it, the flag did
-//! not exist and an ingest could only run to completion.
+//! The cooperative deadline covers preparation and writes until COMMIT begins.
+//! SQLite rolls the current root back on an expired write. Each selected plain
+//! directory is an independent root. A COMMIT already in progress finishes.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -534,4 +526,28 @@ fn the_default_is_documented_in_the_help() {
     let help = String::from_utf8_lossy(&o.stdout);
     assert!(help.contains("--ingest-timeout"), "{help}");
     assert!(help.contains("30"), "default not documented: {help}");
+}
+
+#[test]
+fn cli_ingest_accepts_the_same_deadline_and_can_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    small_repo(&repo);
+    let db = new_db(tmp.path());
+    let before = snapshot(&db);
+    let ingest = |limit| {
+        mind()
+            .env("MINDSPACE_DB", &db)
+            .arg("ingest")
+            .arg(&repo)
+            .args(["--space", "p", "--ingest-timeout", limit])
+            .output()
+            .unwrap()
+    };
+    let stopped = ingest("0.001");
+    assert!(!stopped.status.success());
+    assert!(String::from_utf8_lossy(&stopped.stderr).contains("--ingest-timeout"));
+    assert_eq!(snapshot(&db), before);
+    assert!(ingest("120").status.success());
+    assert!(active_memories(&db) > 0);
 }

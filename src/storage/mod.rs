@@ -12,6 +12,7 @@ use crate::core::{
     SourceLifecycle, Space, SpaceLink, StoredCitation, TemporalDimension,
     TemporalHistoryCapabilities, Ts, UnembeddedAssertion,
 };
+use crate::ingest::deadline::Deadline;
 
 /// The relationship resolutions that belong to one Git ingestion: run for each commit after the
 /// ingestion's code structure was recorded.
@@ -172,6 +173,19 @@ pub trait Store {
         code: Option<CodeObservation>,
         before_commit: &dyn Fn() -> Result<()>,
     ) -> Result<ObservationReport>;
+    /// As [`Self::record_files_ingest`], with a cooperative deadline before COMMIT.
+    fn record_files_ingest_with_deadline(
+        &self,
+        observation: IngestObservation,
+        code: Option<CodeObservation>,
+        deadline: &Deadline,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<ObservationReport> {
+        self.record_files_ingest(observation, code, &|| {
+            before_commit()?;
+            deadline.writing().check("committing the current root")
+        })
+    }
     /// Atomically records one logical Git ingestion: the git observation, then (when there is any)
     /// the code structure derived from its blobs, then one relationship resolution per commit of
     /// `resolutions`, which reads the rows the code write just made. Everything commits as ONE
@@ -185,6 +199,20 @@ pub trait Store {
         resolutions: GitResolutionPlan<'_>,
         before_commit: &dyn Fn() -> Result<()>,
     ) -> Result<GitObservationReport>;
+    /// As [`Self::record_git_ingest`], with a cooperative deadline before COMMIT.
+    fn record_git_ingest_with_deadline(
+        &self,
+        observation: GitObservation,
+        code: Option<CodeObservation>,
+        resolutions: GitResolutionPlan<'_>,
+        deadline: &Deadline,
+        before_commit: &dyn Fn() -> Result<()>,
+    ) -> Result<GitObservationReport> {
+        self.record_git_ingest(observation, code, resolutions, &|| {
+            before_commit()?;
+            deadline.writing().check("committing the current root")
+        })
+    }
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>>;
     /// Symbol search over the code-structure layer: definitions whose name,
     /// qualified name, signature, or path match every query term, ranked by

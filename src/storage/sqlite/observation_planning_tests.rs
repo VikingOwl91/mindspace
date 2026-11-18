@@ -246,6 +246,7 @@ fn planner_accepts_no_mutation_sql_after_the_existing_tentative_m6_revision() {
             &[w.other],
             200,
         ),
+        &Deadline::none(),
     )
     .unwrap();
     assert_eq!(plan.files[0].location, format!("{ROOT}/a.md"));
@@ -475,6 +476,7 @@ fn move_classification_reuses_the_first_fallible_hash_observation() {
             &[w.notes],
             200,
         ),
+        &Deadline::none(),
     )
     .unwrap();
     assert!(
@@ -483,7 +485,7 @@ fn move_classification_reuses_the_first_fallible_hash_observation() {
     assert!(plan.residual_disappearances.is_empty());
     assert_eq!(reads.load(AtomicOrdering::SeqCst), 1);
     drop(reset);
-    let result = apply_file_observation(plan).unwrap();
+    let result = apply_file_observation(plan, &Deadline::none()).unwrap();
     tx.commit().unwrap();
     clear_authorizer(c.guard.as_mut().unwrap());
     drop(c);
@@ -515,6 +517,7 @@ fn missing_version_hash_is_optional_but_corrupt_lineage_is_an_error() {
                 &[w.notes],
                 100,
             ),
+            &Deadline::none(),
         )
         .unwrap();
         assert!(matches!(&plan.classifications[0],Plan::Changed{logical:id,..}if *id==logical));
@@ -570,6 +573,7 @@ fn actual_read_io_failure_during_planning_has_no_durable_effects() {
                     &[w.notes],
                     200,
                 ),
+                &Deadline::none(),
             );
             assert!(matches!(result, Err(Error::Storage(_))));
             // SAFETY: still-live exclusively owned SQLite handle, before another SQL operation.
@@ -608,11 +612,12 @@ fn full_and_partial_plans_preserve_ambiguity_replacement_and_disappearance_rules
             &[w.other],
             200,
         ),
+        &Deadline::none(),
     )
     .unwrap();
     assert!(matches!(plan.classifications[0], Plan::Created { .. }));
     assert_eq!(plan.residual_disappearances.len(), 3);
-    let report = apply_file_observation(plan).unwrap();
+    let report = apply_file_observation(plan, &Deadline::none()).unwrap();
     tx.commit().unwrap();
     drop(c);
     assert!(matches!(report.files[0].outcome, FileOutcome::Created));
@@ -782,6 +787,7 @@ fn duplicate_input_locations_keep_the_existing_preapply_classification_policy() 
             &[w.notes],
             100,
         ),
+        &Deadline::none(),
     )
     .unwrap();
     assert_eq!(plan.classifications.len(), 2);
@@ -793,7 +799,7 @@ fn duplicate_input_locations_keep_the_existing_preapply_classification_policy() 
     assert!(plan.files[1].content.contains("SYNTHETIC_B"));
     // Existing schema rejects two source observations at one location in a
     // session. Planning must neither silently deduplicate nor widen that policy.
-    let result = apply_file_observation(plan);
+    let result = apply_file_observation(plan, &Deadline::none());
     assert!(
         matches!(result, Err(Error::Storage(ref detail)) if detail.contains("UNIQUE constraint failed: source_observations.session_id, source_observations.location")),
         "{result:?}"
@@ -1126,4 +1132,58 @@ fn modified_disappeared_and_reappeared_files_preserve_historical_vector_bytes_an
     assert_eq!(historic[0].memory_id, old.memory_id);
     assert_eq!(historic[0].score, 1.0);
     assert_integrity(&w.store);
+}
+
+#[test]
+fn write_timeout_with_refused_rollback_discards_the_handle_without_attempting_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mind.db");
+    let store = SqliteStore::open(&path).unwrap();
+    let before = store
+        .temporal_history_capabilities()
+        .unwrap()
+        .current_revision;
+    {
+        let mut guard = store.connection().unwrap();
+        let c = guard.guard.as_mut().unwrap();
+        c.authorizer(Some(|ctx: AuthContext<'_>| {
+            if matches!(
+                ctx.action,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback
+                }
+            ) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .unwrap();
+        let tx = begin_write(c, &store.revision_state).unwrap();
+        let error = tx
+            .finish_ingest(
+                &Deadline::expiring_at("committing the current root"),
+                &|| Ok(()),
+                |_tx, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::IngestRollbackUnconfirmed { .. }),
+            "{error}"
+        );
+    }
+    assert!(matches!(
+        store.create_space("after-failure", ""),
+        Err(Error::ConnectionDiscarded)
+    ));
+    drop(store);
+    let reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .temporal_history_capabilities()
+            .unwrap()
+            .current_revision,
+        before
+    );
+    reopened.create_space("after-reopen", "").unwrap();
 }

@@ -85,6 +85,10 @@ pub enum Command {
     /// Ingest a file, directory, or git repository as sources
     Ingest {
         path: PathBuf,
+        /// Cooperative time limit through the final pre-COMMIT check, in seconds (0.001 to 3600).
+        /// Defaults to unlimited. An expired write rolls back the current ingest root.
+        #[arg(long, value_name = "SECONDS", value_parser = crate::mcp::parse_ingest_timeout)]
+        ingest_timeout: Option<std::time::Duration>,
         #[arg(long = "space", required = true)]
         spaces: Vec<String>,
         /// Only ingest this path below a directory or repository root
@@ -302,11 +306,9 @@ pub enum Command {
             env = "MINDSPACE_MCP_ALLOW_ROOTS"
         )]
         allow_roots: Vec<String>,
-        /// Deadline for the PREPARATION of a repo_ingest, in seconds (0.001 to
-        /// 3600). It is not an end-to-end timeout: until the database write
-        /// starts it stops the ingest without changing anything and kills a
-        /// hung git; the write, once started, runs to its end and may exceed
-        /// the limit.
+        /// Cooperative deadline for repository ingestion, in seconds (0.001 to 3600).
+        /// Before COMMIT, expiry rolls back the current root. A COMMIT in progress
+        /// finishes and may exceed the limit.
         #[arg(
             long = "ingest-timeout",
             value_name = "SECONDS",
@@ -525,6 +527,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
         }
         Command::Ingest {
             path,
+            ingest_timeout,
             spaces,
             select,
             history,
@@ -546,7 +549,12 @@ pub fn execute(cli: &Cli) -> Result<()> {
             };
             let selection = ingest::outline::PathSelection::new(select)?;
             let store = open(cli)?;
-            let outcomes = ingest::ingest_paths(&store, path, &selection, scope, spaces)?;
+            let deadline = ingest_timeout
+                .map(ingest::deadline::Deadline::after)
+                .unwrap_or_else(ingest::deadline::Deadline::none);
+            let outcomes = ingest::ingest_paths_with_deadline(
+                &store, path, &selection, scope, spaces, &deadline,
+            )?;
             if *json && outcomes.len() > 1 {
                 // One valid JSON document for several ingest roots.
                 let values: Vec<serde_json::Value> = outcomes

@@ -74,8 +74,7 @@ pub fn ingest_path<S: AsRef<str>>(
 }
 
 /// Like [`ingest_path`], but stops cleanly with [`Error::IngestTimeout`] when
-/// `deadline` expires before the first database write. Once writing has
-/// started it always runs to its end (see [`deadline`]).
+/// `deadline` expires before COMMIT. The current root rolls back on a write timeout.
 pub fn ingest_path_with_deadline<S: AsRef<str>>(
     store: &dyn Store,
     path: &Path,
@@ -421,20 +420,9 @@ pub fn ingest_paths_with_deadline<S: AsRef<str>>(
         )]);
     }
     let mut outcomes = Vec::new();
-    let total = selection.prefixes().len();
     for prefix in selection.prefixes() {
-        let kept = outcomes.len();
-        if kept == 0 {
-            deadline.check("starting")?;
-        } else {
-            deadline.check_with(
-                "ingesting selected paths",
-                &format!(
-                    "{kept} of {total} selected paths were ingested and kept; repeating the call \
-                     continues with the rest and is idempotent"
-                ),
-            )?;
-        }
+        let root_deadline = deadline.for_root(outcomes.len());
+        root_deadline.check("ingesting selected paths")?;
         let target = std::fs::canonicalize(canonical.join(prefix)).map_err(|e| Error::Io {
             path: canonical.join(prefix).display().to_string(),
             source: e,
@@ -449,7 +437,7 @@ pub fn ingest_paths_with_deadline<S: AsRef<str>>(
             store,
             &target,
             space_names,
-            deadline,
+            &root_deadline,
         )?);
     }
     Ok(outcomes)
@@ -1336,13 +1324,17 @@ mod deadline_checkpoints {
                 &Deadline::expiring_at(phase),
             );
             match result {
-                Err(Error::IngestTimeout { message }) => {
+                Err(Error::IngestTimeout { message, writing }) => {
                     assert!(
                         message.contains(phase),
                         "phase `{phase}` not named: {message}"
                     );
                     assert!(
-                        message.contains("database was not changed"),
+                        message.contains(if writing {
+                            "rolled back"
+                        } else {
+                            "database was not changed"
+                        }),
                         "`{phase}`: {message}"
                     );
                 }
@@ -1354,7 +1346,45 @@ mod deadline_checkpoints {
                 before,
                 "database changed when aborting at `{phase}`"
             );
+            store.create_space("after-abort", "").unwrap();
         }
+    }
+
+    #[test]
+    fn timeout_in_second_selected_root_preserves_and_reports_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("files");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/first.md"), "# First\n\nKept.\n").unwrap();
+        std::fs::write(root.join("b/second.rs"), "pub fn second() {}\n").unwrap();
+        let path = tmp.path().join("mind.db");
+        let store = SqliteStore::open(&path).unwrap();
+        store.create_space("s", "").unwrap();
+        let paths = outline::PathSelection::new(&["a", "b"]).unwrap();
+        let error = ingest_paths_with_deadline(
+            &store,
+            &root,
+            &paths,
+            GitScope::Head,
+            &["s"],
+            &Deadline::expiring_at("writing code structure"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::IngestTimeout { writing: true, .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("1 earlier selected path") && message.contains("rolled back"),
+            "{message}"
+        );
+        let counts = snapshot(&path);
+        assert_eq!(counts["ingest_sessions"], 1);
+        assert_eq!(counts["memories"], 1);
+        assert_eq!(counts["code_derivations"], 0);
+        ingest_paths(&store, &root, &paths, GitScope::Head, &["s"]).unwrap();
+        let counts = snapshot(&path);
+        assert_eq!(counts["memories"], 1);
+        assert_eq!(counts["code_derivations"], 1);
     }
 
     #[test]
@@ -1370,6 +1400,13 @@ mod deadline_checkpoints {
                 "deriving memories",
                 "parsing source files",
                 "preparing to write",
+                "writing Git observations",
+                "resolving code relationships",
+                "writing source evidence",
+                "reconciling document memories",
+                "writing code structure",
+                "authorizing the current root",
+                "committing the current root",
             ],
             true,
         );
@@ -1383,6 +1420,13 @@ mod deadline_checkpoints {
                 "reading files",
                 "parsing source files",
                 "preparing to write",
+                "planning file observations",
+                "writing file observations",
+                "writing source evidence",
+                "reconciling document memories",
+                "writing code structure",
+                "authorizing the current root",
+                "committing the current root",
             ],
             false,
         );

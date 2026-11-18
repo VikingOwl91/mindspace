@@ -112,9 +112,7 @@ pub enum Extracted {
     Git(ExtractedGit),
 }
 
-/// Writes an extraction to the database. The deadline is checked once, right
-/// before the first write: the last point where an ingest can still stop
-/// cleanly. After it the writes run to their end.
+/// Writes one extraction atomically, with deadline checkpoints before COMMIT.
 pub fn persist(
     store: &dyn Store,
     extracted: Extracted,
@@ -142,15 +140,19 @@ pub fn persist_files_gated(
     deadline: &Deadline,
     before_commit: &dyn Fn() -> Result<()>,
 ) -> Result<crate::core::ObservationReport> {
-    // The last point where the limit can stop the ingest cleanly.
     deadline.check("preparing to write")?;
     // One transaction for the whole logical ingestion (observation + derivations): see
-    // `Store::record_files_ingest`. (The Git path below is still separate writes.)
+    // `Store::record_files_ingest`.
     let has_code = !extracted.code_inputs.is_empty();
     let code = has_code.then_some(CodeObservation {
         inputs: extracted.code_inputs,
     });
-    let mut report = store.record_files_ingest(extracted.observation, code, before_commit)?;
+    let mut report = store.record_files_ingest_with_deadline(
+        extracted.observation,
+        code,
+        deadline,
+        before_commit,
+    )?;
     report.code.unsupported_extensions = extracted.unsupported_extensions;
     Ok(report)
 }
@@ -188,7 +190,6 @@ pub fn persist_git_gated(
 ) -> Result<crate::core::GitObservationReport> {
     // Sorted, as the ordered set it was derived from.
     let views = extracted.observation.view_commits.clone();
-    // The last point where the limit can stop the ingest cleanly.
     deadline.check("preparing to write")?;
     let has_code = !extracted.code_inputs.is_empty();
     let code = has_code.then_some(CodeObservation {
@@ -200,7 +201,7 @@ pub fn persist_git_gated(
     // reused as if it described the new derivations (it would stay attached to the old ones and
     // the new ones would have no resolution at all).
     let resolver_version = resolver_version();
-    let mut report = store.record_git_ingest(
+    let mut report = store.record_git_ingest_with_deadline(
         extracted.observation,
         code,
         crate::storage::GitResolutionPlan {
@@ -208,6 +209,7 @@ pub fn persist_git_gated(
             resolver: "mind-rust-resolver",
             version: &resolver_version,
         },
+        deadline,
         before_commit,
     )?;
     report.code.unsupported_extensions = extracted.unsupported_extensions;

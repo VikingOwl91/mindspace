@@ -75,10 +75,13 @@ pub enum Error {
     )]
     UnsupportedObjectFormat { format: String },
 
-    /// An ingest hit its time limit before it wrote anything (or between
+    /// An ingest hit its time limit before committing the current root (or between
     /// independent ingest roots). The message says what was and was not kept.
     #[error("{message}")]
-    IngestTimeout { message: String },
+    IngestTimeout { message: String, writing: bool },
+
+    #[error("ingest stopped before COMMIT, but SQLite rollback could not be confirmed ({detail}). {prior_roots} earlier selected roots were committed. Restart the server or reopen the database, then repeat the ingest.")]
+    IngestRollbackUnconfirmed { detail: String, prior_roots: usize },
 
     #[error("cannot establish repository identity for {path}: {reason}")]
     RepositoryIdentity { path: String, reason: String },

@@ -141,6 +141,7 @@ pub fn run(
     config: &McpConfig,
     obj: &Map<String, Value>,
 ) -> std::result::Result<Value, ToolFailure> {
+    let deadline = Deadline::after(config.ingest_timeout());
     let Some(iso) = config.isolated_git() else {
         return Err(failure(
             "not_enabled",
@@ -215,7 +216,12 @@ pub fn run(
 
     #[allow(unused_mut)]
     let mut cfg = WorkerConfig::new("/nonexistent"); // the broker chooses and starts the worker
-    cfg.wall_timeout = config.ingest_timeout();
+    deadline
+        .check("starting the extraction worker")
+        .map_err(|e| failure("timeout", e.to_string()))?;
+    cfg.wall_timeout = deadline
+        .remaining()
+        .expect("isolated ingest has a configured deadline");
     #[cfg(feature = "spawn-gate")]
     if std::env::var_os("MINDSPACE_ISOLATED_GATE_NO_EVIDENCE").is_some() {
         cfg.require_sandbox_evidence = false;
@@ -276,7 +282,7 @@ pub fn run(
         gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE");
     }
     let t_persist = Instant::now();
-    let result = persist_git_with_lease(store, &link, rep.op, extracted, &Deadline::none());
+    let result = persist_git_with_lease(store, &link, rep.op, extracted, &deadline);
     #[cfg(feature = "spawn-gate")]
     if result.is_ok() {
         gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED");
@@ -312,6 +318,22 @@ pub fn run(
                     "the database handle of this server was discarded after an uncertain commit \
                      outcome; restart the server",
                     "NOT_STARTED",
+                    json!(false),
+                ),
+                error @ crate::core::Error::IngestRollbackUnconfirmed { .. } => failure_commit(
+                    "rollback_unconfirmed",
+                    error.to_string(),
+                    "NOT_COMMITTED",
+                    json!(false),
+                ),
+                crate::core::Error::IngestTimeout { message, writing } => failure_commit(
+                    "timeout",
+                    message,
+                    if writing {
+                        "ROLLED_BACK"
+                    } else {
+                        "NOT_STARTED"
+                    },
                     json!(false),
                 ),
                 other => failure_commit(

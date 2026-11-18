@@ -69,6 +69,46 @@ fn read_line(
     String::from_utf8(line).map_err(|_| format!("the {what} is not UTF-8"))
 }
 
+fn finish_stream(
+    mut writer: FrameWriter<'_, impl Write>,
+    result: Result<()>,
+    truncate: bool,
+) -> i32 {
+    match result {
+        Err(e) => {
+            if let Some(reason) = crate::ingest::stream::ProducerRefusal::from_error(&e) {
+                if writer.emit(&Record::ProducerRefused { reason }).is_ok() {
+                    let _ = writer.finish();
+                }
+            }
+            fail(&format!("extraction failed: {e}"), 2)
+        }
+        Ok(()) if truncate => 0,
+        Ok(()) => match writer.finish() {
+            Ok(_) => 0,
+            Err(e) => fail(&format!("extraction failed: {e}"), 2),
+        },
+    }
+}
+
+fn manifest_failure(
+    channel: &mut UnixStream,
+    op: crate::core::Uuid,
+    error: crate::core::Error,
+) -> i32 {
+    if let Some(refusal) = crate::ingest::stream::ProducerRefusal::from_error(&error) {
+        let failure = super::ProducerFailure {
+            v: PROTOCOL,
+            op,
+            refusal,
+        };
+        if serde_json::to_writer(&mut *channel, &failure).is_ok() {
+            let _ = channel.write_all(b"\n");
+        }
+    }
+    fail(&error.to_string(), 2)
+}
+
 fn fail(msg: &str, code: i32) -> i32 {
     eprintln!("mind extraction-worker: {msg}");
     code
@@ -154,7 +194,7 @@ pub fn main() -> i32 {
         &limits,
         &mut NullSink,
     ) {
-        return fail(&format!("listing the sources failed: {e}"), 2);
+        return manifest_failure(&mut channel, request.op, e);
     }
     let manifest = Manifest {
         v: PROTOCOL,
@@ -191,12 +231,8 @@ pub fn main() -> i32 {
         &Deadline::none(),
         &limits,
         &mut writer,
-    )
-    .and_then(|_| writer.finish().map(|_| ()));
-    match result {
-        Ok(()) => 0,
-        Err(e) => fail(&format!("extraction failed: {e}"), 2),
-    }
+    );
+    finish_stream(writer, result, false)
 }
 
 /// TEST HARNESS: a context that claims every derivation is known (a worker forging reuse).
@@ -287,9 +323,15 @@ pub fn main_git(
         }
     };
     // resolved BEFORE the confinement, from the broker's argv
+    let git_unavailable = |error: crate::core::Error| {
+        if let Some(mut ctl) = control.as_ref() {
+            let _ = ctl.write_all(super::GIT_UNAVAILABLE);
+        }
+        fail(&format!("git executable: {error}"), 78)
+    };
     let git = match GitExecutable::resolve(git_path) {
         Ok(g) => g,
-        Err(e) => return fail(&format!("git executable: {e}"), 78),
+        Err(e) => return git_unavailable(e),
     };
     // With pins (the production form) the files are opened and compared with what the broker's
     // trust policy saw; the sandbox's execute rule is then created from THOSE descriptors. A
@@ -310,7 +352,7 @@ pub fn main_git(
                     drop(files);
                     r
                 }
-                Err(e) => return fail(&format!("git executable: {e}"), 78),
+                Err(e) => return git_unavailable(e),
             }
         }
         None => crate::sandbox::enter_extraction_worker_with_layout(
@@ -380,23 +422,23 @@ pub fn main_git(
     };
     let reader = match reader {
         Ok(r) => r,
-        Err(e) => return fail(&format!("repository refused: {e}"), 2),
+        Err(e) => return manifest_failure(&mut channel, request.op, e),
     };
     // the identity the BROKER bound: this worker reads the marker itself and refuses a mismatch
     // (the frontend refuses it too; a worker that lies is caught there)
     let repository_id = match reader.repository_id() {
         Ok(id) if id == expected => id,
         Ok(_) => return fail("the repository identity is not the one the broker bound", 2),
-        Err(e) => return fail(&format!("repository identity: {e}"), 2),
+        Err(e) => return manifest_failure(&mut channel, request.op, e),
     };
     let closure = match reader.head_closure(&verify) {
         Ok(c) => c,
-        Err(e) => return fail(&format!("reading HEAD: {e}"), 2),
+        Err(e) => return manifest_failure(&mut channel, request.op, e),
     };
     // the same verification the frontend will apply, here only to learn the paths of the tree
     let head = match verify_head(&closure.commit_oid, &closure.objects, &verify) {
         Ok(h) => h,
-        Err(e) => return fail(&format!("HEAD does not verify: {e}"), 2),
+        Err(e) => return manifest_failure(&mut channel, request.op, e),
     };
     let selection = PathSelection::all();
     // TEST HARNESS (feature `spawn-gate`): a worker that misbehaves in one named way, started with
@@ -556,17 +598,6 @@ pub fn main_git(
         &Deadline::none(),
         &limits,
         &mut writer,
-    )
-    .and_then(|_| {
-        if truncate {
-            // the stream stops before its closing record
-            drop(writer);
-            return Ok(());
-        }
-        writer.finish().map(|_| ())
-    });
-    match result {
-        Ok(()) => 0,
-        Err(e) => fail(&format!("extraction failed: {e}"), 2),
-    }
+    );
+    finish_stream(writer, result, truncate)
 }

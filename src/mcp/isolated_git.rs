@@ -49,7 +49,7 @@ pub fn definition() -> Value {
     })
 }
 
-fn failure(kind: &str, message: impl Into<String>) -> ToolFailure {
+pub(super) fn failure(kind: &str, message: impl Into<String>) -> ToolFailure {
     failure_commit(kind, message, "NOT_STARTED", json!(false))
 }
 
@@ -76,41 +76,9 @@ fn failure_commit(
 }
 
 fn error_of(e: WorkerError) -> (ToolFailure, bool) {
-    use WorkerError::*;
     let text = e.to_string();
-    let poison = matches!(e, Io(_));
-    let kind = match &e {
-        Refused(m) if m.contains("not authorized") => "root_not_authorized",
-        Refused(m) if m.contains("broker is not available") => "broker_unavailable",
-        Refused(m) if m.contains("busy") => "busy",
-        Refused(m) if m.contains("already used") => "replay_refused",
-        Refused(m) if m.contains("identity_missing") => "identity_missing",
-        Refused(m) if m.contains("repository too large for isolated object projection") => {
-            "too_large"
-        }
-        Refused(m) if m.contains("unsupported repository") => "unsupported_repository",
-        Refused(m) if m.contains("not a git repository") => "not_a_repository",
-        Refused(m) if m.contains("git extraction is not configured") => "git_unavailable",
-        Refused(m) if m.contains("git executable") || m.contains("before it was confined") => {
-            "git_unavailable"
-        }
-        Refused(m) if m.contains("object id") || m.contains("object format") => {
-            "unsupported_object_format"
-        }
-        Refused(_) => "refused",
-        Revoked => "revoked",
-        Timeout(_) => "timeout",
-        Cancelled => "cancelled",
-        Context(_) => "context_refused",
-        Stream(m) if m.contains("unsupported object") || m.contains("SHA-1") => {
-            "unsupported_object_format"
-        }
-        Stream(m) if m.contains("exceed") || m.contains("limit") => "too_large",
-        Stream(_) => "result_refused",
-        Sandbox(_) => "confinement_not_verified",
-        Died { .. } => "worker_failed",
-        Spawn(_) | Io(_) => "broker_io",
-    };
+    let poison = matches!(e, WorkerError::Io(_));
+    let kind = e.kind();
     (failure(kind, text), poison)
 }
 

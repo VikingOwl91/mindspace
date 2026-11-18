@@ -5,6 +5,12 @@ use thiserror::Error;
 /// exists.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("{0}")]
+    Refused(Refusal),
+
+    #[error("{0}")]
+    InvalidArgument(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 
@@ -40,6 +46,9 @@ pub enum Error {
     /// An extraction result failed validation (it is dropped whole).
     #[error("invalid extraction result: {0}")]
     InvalidExtraction(String),
+
+    #[error("invalid extraction result: record stream: {0}")]
+    TruncatedExtraction(String),
 
     /// Legacy strict-reader error. Ordinary ingestion reports per-path text exclusions.
     #[error("`{path}` is {size} bytes, over the limit of {limit} bytes for one text file or blob; exclude it with --path or raise the limit")]
@@ -176,3 +185,113 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Stable refusal categories. Only the component that makes a decision assigns its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalKind {
+    RootNotAuthorized,
+    ReadOnlyRoot,
+    BrokerUnavailable,
+    Busy,
+    ReplayRefused,
+    IdentityMissing,
+    UnsupportedRepository,
+    NotARepository,
+    GitUnavailable,
+    UnsupportedObjectFormat,
+    MissingLocalObject,
+    TooManyFiles,
+    TooLarge,
+    ConfinementNotVerified,
+    Timeout,
+    NotEnabled,
+    InvalidArgument,
+    Revoked,
+    CommitNotAuthorized,
+    #[default]
+    #[serde(other)]
+    Refused,
+}
+
+impl RefusalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::RootNotAuthorized => "root_not_authorized",
+            Self::ReadOnlyRoot => "read_only_root",
+            Self::BrokerUnavailable => "broker_unavailable",
+            Self::Busy => "busy",
+            Self::ReplayRefused => "replay_refused",
+            Self::IdentityMissing => "identity_missing",
+            Self::UnsupportedRepository => "unsupported_repository",
+            Self::NotARepository => "not_a_repository",
+            Self::GitUnavailable => "git_unavailable",
+            Self::UnsupportedObjectFormat => "unsupported_object_format",
+            Self::MissingLocalObject => "missing_local_object",
+            Self::TooManyFiles => "too_many_files",
+            Self::TooLarge => "too_large",
+            Self::ConfinementNotVerified => "confinement_not_verified",
+            Self::Timeout => "timeout",
+            Self::NotEnabled => "not_enabled",
+            Self::InvalidArgument => "invalid_argument",
+            Self::Revoked => "revoked",
+            Self::CommitNotAuthorized => "commit_not_authorized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{detail}")]
+pub struct Refusal {
+    pub kind: RefusalKind,
+    pub detail: String,
+}
+
+impl Refusal {
+    pub fn new(kind: RefusalKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(detail: String) -> Self {
+        Self::new(RefusalKind::Refused, detail)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(detail: &str) -> Self {
+        Self::new(RefusalKind::Refused, detail)
+    }
+}
+
+impl Error {
+    pub fn refused(kind: RefusalKind, detail: impl Into<String>) -> Self {
+        Self::Refused(Refusal::new(kind, detail))
+    }
+
+    pub(crate) fn read_only_root(root: &std::path::Path) -> Self {
+        Self::refused(
+            RefusalKind::ReadOnlyRoot,
+            format!(
+                "path is inside the read-only root {root}; ingesting needs a read-write root \
+                 (start the server with --allow-root {root}:rw)",
+                root = root.display()
+            ),
+        )
+    }
+
+    pub fn refusal_kind(&self) -> Option<RefusalKind> {
+        match self {
+            Self::Refused(r) => Some(r.kind),
+            Self::InvalidArgument(_) => Some(RefusalKind::InvalidArgument),
+            Self::UnsupportedObjectFormat { .. } => Some(RefusalKind::UnsupportedObjectFormat),
+            Self::GitUnavailable { .. } => Some(RefusalKind::GitUnavailable),
+            _ => None,
+        }
+    }
+}

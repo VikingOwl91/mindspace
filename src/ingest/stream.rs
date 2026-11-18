@@ -123,6 +123,69 @@ fn bad<T>(why: impl Into<String>) -> Result<T> {
     )))
 }
 
+fn too_large<T>(why: impl Into<String>) -> Result<T> {
+    Err(Error::refused(
+        crate::core::RefusalKind::TooLarge,
+        format!("record stream: {}", why.into()),
+    ))
+}
+
+/// A worker may report only extraction failures. It has no authority over sandbox,
+/// authorization, timeouts, or the outcome of any write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerRefusal {
+    TooLarge,
+    TooManyFiles,
+    MissingLocalObject,
+    UnsupportedRepository,
+    UnsupportedObjectFormat,
+    NotARepository,
+}
+
+impl ProducerRefusal {
+    pub(crate) fn from_error(error: &Error) -> Option<Self> {
+        use crate::core::RefusalKind as K;
+        Some(match error.refusal_kind()? {
+            K::TooLarge => Self::TooLarge,
+            K::TooManyFiles => Self::TooManyFiles,
+            K::MissingLocalObject => Self::MissingLocalObject,
+            K::UnsupportedRepository => Self::UnsupportedRepository,
+            K::UnsupportedObjectFormat => Self::UnsupportedObjectFormat,
+            K::NotARepository => Self::NotARepository,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn refusal(self) -> crate::core::Refusal {
+        use crate::core::RefusalKind as K;
+        let (kind, detail) = match self {
+            Self::TooLarge => (
+                K::TooLarge,
+                "the extraction exceeded a size or structural limit",
+            ),
+            Self::TooManyFiles => (K::TooManyFiles, "too many files for this extraction"),
+            Self::MissingLocalObject => (
+                K::MissingLocalObject,
+                "a required Git object is unavailable locally",
+            ),
+            Self::UnsupportedRepository => (
+                K::UnsupportedRepository,
+                "the repository layout is unsupported",
+            ),
+            Self::UnsupportedObjectFormat => (
+                K::UnsupportedObjectFormat,
+                "the Git object format is unsupported",
+            ),
+            Self::NotARepository => (
+                K::NotARepository,
+                "the selected root is not a Git repository",
+            ),
+        };
+        crate::core::Refusal::new(kind, detail)
+    }
+}
+
 // ------------------------------------------------------------------ records
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +242,9 @@ pub struct Counts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Record {
+    ProducerRefused {
+        reason: ProducerRefusal,
+    },
     Begin {
         kind: Kind,
     },
@@ -295,6 +361,7 @@ pub enum Record {
 impl Record {
     fn name(&self) -> &'static str {
         match self {
+            Record::ProducerRefused { .. } => "producer_refused",
             Record::Begin { .. } => "begin",
             Record::UnsupportedExtensions { .. } => "unsupported_extensions",
             Record::FilesHeader { .. } => "files_header",
@@ -401,7 +468,7 @@ impl<'a, W: Write> FrameWriter<'a, W> {
         }
         self.buf.extend_from_slice(b"]}");
         if self.buf.len() > MAX_FRAME {
-            return bad(format!(
+            return too_large(format!(
                 "a frame of {} bytes exceeds {MAX_FRAME}",
                 self.buf.len()
             ));
@@ -488,7 +555,7 @@ impl<W: Write> FrameWriter<'_, W> {
     /// Sends a record that does not fit a frame as `Spill` + pieces of its JSON.
     fn spill(&mut self, name: &'static str, json: &[u8]) -> Result<()> {
         if json.len() > MAX_RECORD {
-            return bad(format!(
+            return too_large(format!(
                 "a `{name}` record of {} bytes exceeds the largest record ({MAX_RECORD})",
                 json.len()
             ));
@@ -1607,16 +1674,27 @@ pub fn consume<R: Read>(
         let mut len = [0u8; 4];
         match read_full(&mut input, &mut len)? {
             0 if asm.ended => break,
-            0 => return bad("the stream ended before the closing record"),
-            n if n < 4 => return bad("the stream ended inside a frame header"),
+            0 => {
+                return Err(Error::TruncatedExtraction(
+                    "the stream ended before the closing record".into(),
+                ))
+            }
+            n if n < 4 => {
+                return Err(Error::TruncatedExtraction(
+                    "the stream ended inside a frame header".into(),
+                ))
+            }
             _ => {}
         }
         if asm.ended {
             return bad("data after the closing record");
         }
         let len = u32::from_le_bytes(len) as usize;
-        if len == 0 || len > limits.max_frame {
-            return bad(format!(
+        if len == 0 {
+            return bad("zero frame length");
+        }
+        if len > limits.max_frame {
+            return too_large(format!(
                 "frame length {len} is outside 1..={}",
                 limits.max_frame
             ));
@@ -1624,10 +1702,10 @@ pub fn consume<R: Read>(
         stats.frames += 1;
         stats.bytes += len as u64 + 4;
         if stats.frames > limits.max_frames {
-            return bad(format!("more than {} frames", limits.max_frames));
+            return too_large(format!("more than {} frames", limits.max_frames));
         }
         if stats.bytes > limits.max_total {
-            return bad(format!(
+            return too_large(format!(
                 "more than {} bytes in one operation",
                 limits.max_total
             ));
@@ -1635,7 +1713,9 @@ pub fn consume<R: Read>(
         payload.clear();
         payload.resize(len, 0);
         if read_full(&mut input, &mut payload)? < len {
-            return bad("the stream ended inside a frame (truncated)");
+            return Err(Error::TruncatedExtraction(
+                "the stream ended inside a frame (truncated)".into(),
+            ));
         }
         let frame: FrameIn = match serde_json::from_slice(&payload) {
             Ok(f) => f,
@@ -1956,7 +2036,7 @@ impl<'a> Assembler<'a> {
 
     fn add_file_content(&mut self, n: u64) -> Result<()> {
         if n > DEFAULT_MAX_BLOB {
-            return bad("one text payload exceeds the ingestion limit");
+            return too_large("one text payload exceeds the ingestion limit");
         }
         self.add_content(n)
     }
@@ -1964,7 +2044,7 @@ impl<'a> Assembler<'a> {
     fn add_content(&mut self, n: u64) -> Result<()> {
         self.content_bytes = self.content_bytes.saturating_add(n);
         if self.content_bytes > self.limits.extraction.max_content_bytes {
-            return bad(format!(
+            return too_large(format!(
                 "{} bytes of content exceed the limit of {}",
                 self.content_bytes, self.limits.extraction.max_content_bytes
             ));
@@ -1981,7 +2061,10 @@ impl<'a> Assembler<'a> {
             + self.files.len()
             + usize::from(self.owner.is_some());
         if n > self.limits.extraction.max_files {
-            return bad(format!("{n} files exceed the limit"));
+            return Err(Error::refused(
+                crate::core::RefusalKind::TooManyFiles,
+                format!("{n} files exceed the limit"),
+            ));
         }
         Ok(())
     }
@@ -2050,8 +2133,14 @@ impl<'a> Assembler<'a> {
         }
         match record {
             Record::Spill { record_type, len } => {
-                if len == 0 || len > self.limits.max_record as u64 {
+                if len == 0 {
                     return bad(format!(
+                        "a record of zero bytes is outside 1..={}",
+                        self.limits.max_record
+                    ));
+                }
+                if len > self.limits.max_record as u64 {
+                    return too_large(format!(
                         "an oversized record of {len} bytes is outside 1..={}",
                         self.limits.max_record
                     ));
@@ -2071,6 +2160,7 @@ impl<'a> Assembler<'a> {
             return bad(format!("`{name}` before the opening record"));
         }
         match record {
+            Record::ProducerRefused { reason } => return Err(Error::Refused(reason.refusal())),
             Record::Begin { kind } => {
                 if self.phase != Phase::Start {
                     return bad("a second opening record");
@@ -2187,7 +2277,7 @@ impl<'a> Assembler<'a> {
                 }
                 self.unique("file", &file.location)?;
                 if file.size_bytes > DEFAULT_MAX_BLOB {
-                    return bad("one file exceeds the ingestion limit");
+                    return too_large("one file exceeds the ingestion limit");
                 }
                 self.add_file_content(content_len)?;
                 self.replace_slot(Slot::new(file.location.clone(), content_len, None));
@@ -2240,14 +2330,14 @@ impl<'a> Assembler<'a> {
                 self.raw_commits += commits;
                 self.raw_trees += trees;
                 if self.raw_commits > v.max_commits {
-                    return bad(format!("more than {} commit object(s)", v.max_commits));
+                    return too_large(format!("more than {} commit object(s)", v.max_commits));
                 }
                 if self.raw_trees > v.max_trees {
-                    return bad(format!("more than {} tree objects", v.max_trees));
+                    return too_large(format!("more than {} tree objects", v.max_trees));
                 }
                 // the declared size is checked BEFORE anything is decoded or allocated
                 if size > v.max_raw_object_bytes as u64 {
-                    return bad(format!(
+                    return too_large(format!(
                         "an object of {size} bytes exceeds the limit of {}",
                         v.max_raw_object_bytes
                     ));
@@ -2257,7 +2347,7 @@ impl<'a> Assembler<'a> {
                 }
                 self.raw_bytes = self.raw_bytes.saturating_add(size);
                 if self.raw_bytes > v.max_total_object_bytes {
-                    return bad(format!(
+                    return too_large(format!(
                         "more than {} bytes of objects",
                         v.max_total_object_bytes
                     ));
@@ -2313,7 +2403,7 @@ impl<'a> Assembler<'a> {
                 if self.expect == Kind::GitVerified
                     && self.blobs.len() >= self.limits.verify.max_blobs
                 {
-                    return bad(format!(
+                    return too_large(format!(
                         "more than {} blob records",
                         self.limits.verify.max_blobs
                     ));
@@ -2632,7 +2722,9 @@ impl<'a> Assembler<'a> {
 
     fn finish(mut self) -> Result<(Extracted, Option<super::gitverify::VerificationSummary>)> {
         if !self.ended {
-            return bad("the stream ended before the closing record");
+            return Err(Error::TruncatedExtraction(
+                "the stream ended before the closing record".into(),
+            ));
         }
         let session = self
             .session

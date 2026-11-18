@@ -971,8 +971,7 @@ fn missing_identity_unsupported_layouts_and_sha256_are_refused_and_persist_nothi
     );
     if let Some(s) = &sha256 {
         let r = m.ingest(s);
-        assert_eq!(r["isError"], true, "{r}");
-        assert_eq!(r["structuredContent"]["persisted"], false);
+        assert_refused(&r, "unsupported_object_format");
         assert_eq!(w.counts(), before);
     }
     // A registered worktree does not change the main checkout HEAD.
@@ -1441,8 +1440,7 @@ fn linked_worktree_local_alternates_and_partial_clone_use_only_local_head_object
     std::fs::write(&alt, "../../../pool\n").unwrap();
     std::fs::remove_file(pool.join("info/alternates")).unwrap();
     let r = m.ingest(&partial);
-    assert_eq!(r["isError"], true, "{r}");
-    assert_eq!(r["structuredContent"]["persisted"], false, "{r}");
+    assert_refused(&r, "missing_local_object");
     assert_eq!(w.counts(), before);
     assert_eq!(w.revisions(), rev);
     assert!(!Command::new(GIT)

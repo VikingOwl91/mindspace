@@ -483,7 +483,7 @@ fn repeated_ingestion_reuses_announced_derivations_and_an_extractor_change_re_de
 
 fn refused(out: Outcome) -> String {
     match out {
-        Err(WorkerError::Refused(m)) => m,
+        Err(WorkerError::Refused(m)) => m.detail,
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
 }
@@ -594,7 +594,7 @@ fn a_sha256_repository_is_refused_before_anything_is_persisted() {
     // the broker cannot tell (it runs no git); the confined worker refuses at open
     let e = ingest(&r, &repo.path, &db).expect_err("a SHA-256 repository was accepted");
     assert!(
-        !matches!(e, WorkerError::Refused(ref m) if m.contains("not authorized")),
+        !matches!(e, WorkerError::Refused(ref m) if m.kind == mindspace::core::RefusalKind::RootNotAuthorized),
         "{e}"
     );
     assert_eq!(before, db.counts());
@@ -1186,7 +1186,7 @@ fn the_worker_gets_the_pins_and_a_binary_that_changed_before_it_started_never_ru
         .expect_err("a modified git binary was run");
     // refused before the worker confined itself or read anything
     assert!(
-        matches!(&e, WorkerError::Refused(m) if m.contains("before it was confined")),
+        matches!(&e, WorkerError::Refused(m) if m.kind == mindspace::core::RefusalKind::GitUnavailable),
         "{e}"
     );
     assert!(gone(pid.load(Ordering::SeqCst)));

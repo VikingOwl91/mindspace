@@ -245,6 +245,7 @@ fn an_expired_limit_aborts_with_a_clear_error_and_changes_nothing() {
     drop(s);
 
     assert_eq!(r["isError"], true, "must fail, got {r}");
+    assert_eq!(r["structuredContent"]["error"]["kind"], "timeout", "{r}");
     let msg = text(&r);
     for needle in ["paths", "repo_outline", "--ingest-timeout", "not changed"] {
         assert!(msg.contains(needle), "message lacks `{needle}`: {msg}");

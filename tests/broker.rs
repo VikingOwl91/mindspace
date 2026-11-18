@@ -14,6 +14,7 @@
 #[path = "common/prerequisites.rs"]
 mod prerequisites;
 
+use mindspace::worker::broker::BROKER_PROTOCOL;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -263,7 +264,7 @@ fn unauthorized_roots_and_root_substitution_are_refused_and_nothing_is_started()
     let before = db.rows();
     let r = rig(fixed(&root), BrokerConfig::new(mind()));
     let refused = |res: Result<_, WorkerError>| match res {
-        Err(WorkerError::Refused(m)) => m,
+        Err(WorkerError::Refused(m)) => m.detail,
         Err(e) => panic!("expected a refusal, got {e}"),
         Ok(_) => panic!("expected a refusal, got success"),
     };
@@ -323,7 +324,7 @@ fn the_ipc_vocabulary_is_closed_and_an_operation_id_works_once() {
     let op = Uuid::now_v7();
     let begin = |extra: &str| {
         format!(
-            "{{\"type\":\"begin\",\"v\":1,\"op\":\"{op}\",\"kind\":\"directory_extract\",\"root\":{}{extra}}}\n",
+            "{{\"type\":\"begin\",\"v\":{BROKER_PROTOCOL},\"op\":\"{op}\",\"kind\":\"directory_extract\",\"root\":{}{extra}}}\n",
             serde_json::to_string(&root.display().to_string()).unwrap()
         )
     };
@@ -412,7 +413,7 @@ fn revoking_a_grant_refuses_the_next_operation() {
     assert_eq!(rep.exit, "exit code 0");
     revoke_grant(&store, &g.id, Some("test"), time::OffsetDateTime::now_utc()).unwrap();
     match extract(&r, &wcfg(), &root, &db) {
-        Err(WorkerError::Refused(m)) => assert!(m.contains("not authorized"), "{m}"),
+        Err(WorkerError::Refused(m)) => assert!(m.detail.contains("not authorized"), "{m}"),
         other => panic!("{other:?}"),
     }
 }
@@ -561,7 +562,7 @@ fn concurrency_is_limited_not_queued() {
     )
     .unwrap_err();
     assert!(
-        matches!(&e, WorkerError::Refused(m) if m.contains("busy")),
+        matches!(&e, WorkerError::Refused(m) if m.kind == mindspace::core::RefusalKind::Busy),
         "{e}"
     );
     cancel.store(true, Ordering::SeqCst);
@@ -808,7 +809,7 @@ fn a_worker_that_does_not_show_the_confinement_is_refused_by_the_broker() {
     c.require_sandbox_evidence = false;
     let db = db();
     match extract(&r, &c, &root, &db) {
-        Err(WorkerError::Refused(m)) => assert!(m.contains("Seccomp"), "{m}"),
+        Err(WorkerError::Refused(m)) => assert!(m.detail.contains("Seccomp"), "{m}"),
         other => panic!("{other:?}"),
     }
 }

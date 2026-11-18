@@ -300,16 +300,9 @@ fn probe_binary() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BUILT
         .get_or_init(|| {
-            let exe = std::env::current_exe().unwrap();
-            // The profile directory is the ancestor directly below the target directory, which
-            // Cargo marks with CACHEDIR.TAG. That holds for <target>/<profile>/deps/<exe> and for
-            // the layout of newer Cargo, <target>/<profile>/build/<package>/<hash>/out/<exe>.
-            let profile_dir = exe
-                .ancestors()
-                .skip(1)
-                .find(|a| a.parent().is_some_and(|p| p.join("CACHEDIR.TAG").is_file()))
-                .unwrap_or_else(|| panic!("cannot find the target directory of {exe:?}"))
-                .to_path_buf();
+            // Cargo supplies the profile's binary path even when an existing target
+            // directory has no cache marker or the test uses the newer build layout.
+            let profile_dir = Path::new(env!("CARGO_BIN_EXE_mind")).parent().unwrap();
             let target_dir = profile_dir.parent().unwrap();
             let mut cmd = Command::new(env!("CARGO"));
             cmd.args(["build", "--locked", "--quiet", "--example", "worker_probe"])
@@ -810,7 +803,9 @@ mod fake_workers {
             ),
         ));
         match r {
-            Err(WorkerError::Stream(m)) => assert!(m.contains("frame length"), "{m}"),
+            Err(WorkerError::Extraction(r)) => {
+                assert_eq!(r.kind, mindspace::core::RefusalKind::TooLarge)
+            }
             other => panic!("{other:?}"),
         }
         // a frame of another operation (a replayed stream)

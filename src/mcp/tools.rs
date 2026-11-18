@@ -27,6 +27,28 @@ impl From<String> for ToolFailure {
     }
 }
 
+impl ToolFailure {
+    fn repository_error(error: Error) -> Self {
+        let kind = match &error {
+            Error::IngestTimeout { .. } => "timeout",
+            Error::IngestRollbackUnconfirmed { .. } => "rollback_unconfirmed",
+            Error::CommitOutcomeUnknown { .. } => "commit_outcome_unknown",
+            Error::InvalidPath { .. } => "invalid_argument",
+            _ => match error.refusal_kind() {
+                Some(kind) => kind.as_str(),
+                None => return Self::from(error.to_string()),
+            },
+        };
+        let message = error.to_string();
+        // Ordinary directory requests may commit earlier roots. A policy or timeout
+        // category alone cannot establish whether the whole operation persisted.
+        let structured = json!({ "error": {"kind": kind, "message": message} });
+        Self {
+            message,
+            structured: Some(structured),
+        }
+    }
+}
 impl From<&str> for ToolFailure {
     fn from(message: &str) -> Self {
         message.to_string().into()
@@ -328,7 +350,16 @@ fn call_tool(
     name: &str,
     args: &Value,
 ) -> std::result::Result<Value, ToolFailure> {
-    validate_arguments(name, args)?;
+    validate_arguments(name, args).map_err(|message| match name {
+        #[cfg(unix)]
+        super::isolated::TOOL => super::isolated::failure("invalid_argument", message),
+        #[cfg(unix)]
+        super::isolated_git::TOOL => super::isolated_git::failure("invalid_argument", message),
+        "repo_outline" | "repo_ingest" => {
+            ToolFailure::repository_error(Error::InvalidArgument(message))
+        }
+        _ => ToolFailure::from(message),
+    })?;
     let obj = args.as_object().ok_or("arguments must be an object")?;
     #[cfg(unix)]
     if name == super::isolated::TOOL {
@@ -504,7 +535,10 @@ fn call_tool(
         }
         _ => Err(Error::Storage(format!("unknown tool: {name}"))),
     })();
-    result.map_err(|error| ToolFailure::from(error.to_string()))
+    result.map_err(|error| match name {
+        "repo_outline" | "repo_ingest" => ToolFailure::repository_error(error),
+        _ => ToolFailure::from(error.to_string()),
+    })
 }
 
 fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), String> {

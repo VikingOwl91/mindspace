@@ -290,6 +290,7 @@ fn most_specific_root_wins_rw_parent_ro_child() {
     // The read-only child is refused as a target and as a selected path.
     assert_eq!(s.ingest(&proj.path().join("secret"), None)["isError"], true);
     let sel = s.ingest(proj.path(), Some(&["secret"]));
+    assert_eq!(sel["structuredContent"]["error"]["kind"], "read_only_root");
     assert_eq!(
         sel["isError"],
         true,

@@ -19,11 +19,14 @@ const MAX_FILES: usize = 4096;
 const MAX_ENTRIES: usize = 16_384;
 
 pub(crate) fn unsupported(detail: &str) -> Error {
-    Error::Storage(format!("unsupported repository: {detail}"))
+    Error::refused(
+        crate::core::RefusalKind::UnsupportedRepository,
+        format!("unsupported repository: {detail}"),
+    )
 }
 
 fn too_large() -> Error {
-    Error::Storage("repository too large for isolated object projection: pack loose objects or reduce the number of alternates".into())
+    Error::refused(crate::core::RefusalKind::TooLarge, "repository too large for isolated object projection: pack loose objects or reduce the number of alternates")
 }
 
 fn io_error(source: io::Error) -> Error {
@@ -95,14 +98,21 @@ fn control(dir: &File, name: &str) -> Result<Option<String>> {
     if !pin.metadata().map_err(io_error)?.is_file() {
         return Err(unsupported("Git layout control must be a regular file"));
     }
-    let mut value = String::new();
+    let mut bytes = Vec::new();
     File::open(procfd(pin.as_raw_fd()))
         .map_err(io_error)?
         .take(CONTROL_BYTES + 1)
-        .read_to_string(&mut value)
-        .map_err(|_| unsupported("invalid Git layout control"))?;
-    if value.len() as u64 > CONTROL_BYTES || value.contains('\0') {
-        return Err(unsupported("oversized or malformed Git layout control"));
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > CONTROL_BYTES {
+        return Err(Error::refused(
+            crate::core::RefusalKind::TooLarge,
+            "Git layout control exceeds its byte limit",
+        ));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| unsupported("invalid Git layout control"))?;
+    if value.contains('\0') {
+        return Err(unsupported("malformed Git layout control"));
     }
     Ok(Some(value))
 }

@@ -172,6 +172,7 @@ tests/code_readers_agree.rs
 tests/code_search.rs
 tests/code_structure.rs
 tests/common/mod.rs
+tests/common/prerequisites.rs
 tests/context_exchange.rs
 tests/doctor.rs
 tests/document_chunking.rs
@@ -201,6 +202,7 @@ tests/git_verified.rs
 tests/grants.rs
 tests/indexing.rs
 tests/ingest_confinement.rs
+tests/ingest_refusals.rs
 tests/invariants.rs
 tests/lexical_staging_admin.rs
 tests/lifecycle.rs

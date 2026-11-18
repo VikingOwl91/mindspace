@@ -37,6 +37,13 @@ fn bad<T>(why: impl Into<String>) -> Result<T> {
     )))
 }
 
+fn too_large<T>(why: impl Into<String>) -> Result<T> {
+    Err(Error::refused(
+        crate::core::RefusalKind::TooLarge,
+        format!("git object verification: {}", why.into()),
+    ))
+}
+
 // ------------------------------------------------------------------------------------- SHA-1
 
 /// SHA-1 of `data` (FIPS 180-4). Streaming-free: the inputs here are bounded by the limits.
@@ -318,7 +325,7 @@ fn parse_tree_strict(oid: &str, bytes: &[u8], max_entries: usize) -> Result<Vec<
             return bad(format!("tree {oid}: a truncated entry"));
         }
         if entries.len() >= max_entries {
-            return bad(format!(
+            return too_large(format!(
                 "tree {oid}: more than {max_entries} entries (limit)"
             ));
         }
@@ -423,19 +430,19 @@ pub fn verify_head(
             }
         }
         if commits > limits.max_commits {
-            return bad(format!(
+            return too_large(format!(
                 "more than {} commit object(s) (limit); parents are not transported",
                 limits.max_commits
             ));
         }
         if trees > limits.max_trees {
-            return bad(format!(
+            return too_large(format!(
                 "more than {} tree objects (limit)",
                 limits.max_trees
             ));
         }
         if o.bytes.len() > limits.max_raw_object_bytes {
-            return bad(format!(
+            return too_large(format!(
                 "object `{}` is {} bytes (limit {})",
                 short(&o.oid),
                 o.bytes.len(),
@@ -446,7 +453,7 @@ pub fn verify_head(
             .checked_add(o.bytes.len() as u64)
             .ok_or_else(|| Error::InvalidExtraction("object byte total overflow".into()))?;
         if total > limits.max_total_object_bytes {
-            return bad(format!(
+            return too_large(format!(
                 "more than {} bytes of objects (limit)",
                 limits.max_total_object_bytes
             ));
@@ -487,7 +494,7 @@ pub fn verify_head(
     let mut stack: Vec<(String, String, usize)> = vec![(root_oid.clone(), String::new(), 0)];
     while let Some((tid, prefix, depth)) = stack.pop() {
         if depth > limits.max_depth {
-            return bad(format!(
+            return too_large(format!(
                 "directories nested deeper than {} (limit)",
                 limits.max_depth
             ));
@@ -509,7 +516,7 @@ pub fn verify_head(
                 .checked_add(e.len())
                 .ok_or_else(|| Error::InvalidExtraction("entry count overflow".into()))?;
             if entries_total > limits.max_tree_entries {
-                return bad(format!(
+                return too_large(format!(
                     "more than {} tree entries in all (limit)",
                     limits.max_tree_entries
                 ));
@@ -520,7 +527,7 @@ pub fn verify_head(
         for e in entries {
             work += 1;
             if work > limits.max_work {
-                return bad(format!(
+                return too_large(format!(
                     "the closure needs more than {} entry visits (limit)",
                     limits.max_work
                 ));
@@ -531,7 +538,7 @@ pub fn verify_head(
                 format!("{prefix}/{}", e.name)
             };
             if path.len() > limits.max_path_bytes {
-                return bad(format!(
+                return too_large(format!(
                     "a path over {} bytes (limit)",
                     limits.max_path_bytes
                 ));

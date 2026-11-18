@@ -16,6 +16,7 @@
 #[path = "common/prerequisites.rs"]
 mod prerequisites;
 
+use mindspace::worker::broker::BROKER_PROTOCOL;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -474,7 +475,7 @@ fn the_worker_cannot_read_the_database_or_grant_store_and_the_frontend_cannot_to
     ] {
         let mut fe = fe!(w, project, &[]);
         let line = format!(
-            "raw {{\"type\":\"begin\",\"v\":1,\"op\":\"{}\",\"kind\":\"directory_extract\",\"root\":\"{}\",\"spaces\":[]{extra}}}",
+            "raw {{\"type\":\"begin\",\"v\":{BROKER_PROTOCOL},\"op\":\"{}\",\"kind\":\"directory_extract\",\"root\":\"{}\",\"spaces\":[]{extra}}}",
             uuid_like(),
             dynamic.display()
         );
@@ -508,7 +509,7 @@ fn replay_of_an_operation_id_is_refused() {
     let mut fe = fe!(w, project, &[]);
     let op = uuid_like();
     let line = format!(
-        "raw {{\"type\":\"begin\",\"v\":1,\"op\":\"{op}\",\"kind\":\"directory_extract\",\"root\":\"{}\",\"spaces\":[]}}",
+        "raw {{\"type\":\"begin\",\"v\":{BROKER_PROTOCOL},\"op\":\"{op}\",\"kind\":\"directory_extract\",\"root\":\"{}\",\"spaces\":[]}}",
         project.display()
     );
     let first = fe.cmd(&line);

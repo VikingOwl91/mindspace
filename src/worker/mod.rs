@@ -31,6 +31,8 @@ pub const ROOT_FD: i32 = 4;
 /// Present only when a broker started the worker: the worker reports `READY` here once it is
 /// confined and waits for `GO` (see [`broker`]). Absent for the in-frontend client.
 pub const CONTROL_FD: i32 = 5;
+/// Negative startup response when the pinned Git executable cannot be opened or verified.
+pub(crate) const GIT_UNAVAILABLE: &[u8; 6] = b"NOGIT\n";
 /// Version 2 adds the context exchange (see [`context`]); there is no version-1 fallback.
 pub const PROTOCOL: u32 = 2;
 /// The request is one JSON line of at most this size.
@@ -70,4 +72,14 @@ pub struct Hello {
     pub v: u32,
     pub pid: u32,
     pub sandbox: crate::sandbox::WorkerSandbox,
+}
+
+/// Sent instead of a manifest when the producer cannot build one. Operation and
+/// version are checked before its closed set of failure reasons is accepted.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProducerFailure {
+    v: u32,
+    op: Uuid,
+    refusal: crate::ingest::stream::ProducerRefusal,
 }

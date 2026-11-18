@@ -372,45 +372,59 @@ impl McpConfig {
     /// root that grants at least `need`, or explains the refusal without
     /// disclosing what exists. The permission is decided on the canonical
     /// path, so a symlink cannot move a request into a more permissive root.
-    pub fn authorize(&self, raw: &str, need: Access) -> std::result::Result<PathBuf, String> {
+    pub fn authorize(&self, raw: &str, need: Access) -> Result<PathBuf> {
         if self.roots.is_empty() {
-            return Err(
+            return Err(Error::refused(
+                crate::core::RefusalKind::NotEnabled,
                 "repository tools are disabled: this server has no allowed roots; \
                         start it with `mind mcp --allow-root <DIR>` (or MINDSPACE_MCP_ALLOW_ROOTS)"
                     .to_string(),
-            );
+            ));
         }
         if let SandboxState::Unavailable(reason) = &self.sandbox {
-            return Err(format!(
-                "repository tools are disabled: the kernel sandbox is not active ({reason}). \
+            return Err(Error::refused(
+                crate::core::RefusalKind::ConfinementNotVerified,
+                format!(
+                    "repository tools are disabled: the kernel sandbox is not active ({reason}). \
                  Use a Linux kernel with Landlock ABI 3 or newer (6.2+), or start the server \
                  with --insecure-no-sandbox to accept the reduced protection described in ADR-029"
+                ),
             ));
         }
         let path = Path::new(raw);
         if !path.is_absolute() {
-            return Err(format!("path must be absolute: '{raw}'"));
+            return Err(Error::InvalidArgument(format!(
+                "path must be absolute: '{raw}'"
+            )));
         }
         let denied = || {
-            format!(
-                "path is not accessible or outside the allowed roots ({})",
-                self.roots
-                    .iter()
-                    .map(|r| format!("{}:{}", r.path.display(), r.access.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            Error::refused(
+                crate::core::RefusalKind::RootNotAuthorized,
+                format!(
+                    "path is not accessible or outside the allowed roots ({})",
+                    self.roots
+                        .iter()
+                        .map(|r| format!("{}:{}", r.path.display(), r.access.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )
         };
         let canonical = std::fs::canonicalize(path).map_err(|_| denied())?;
         let root = self.governing(&canonical).ok_or_else(denied)?;
         if need == Access::ReadWrite && root.access == Access::ReadOnly {
-            return Err(read_only_message(&root.path));
+            return Err(Error::read_only_root(&root.path));
         }
         if canonical.components().any(|c| c.as_os_str() == ".git") {
-            return Err("paths inside .git are not allowed".to_string());
+            return Err(Error::refused(
+                crate::core::RefusalKind::RootNotAuthorized,
+                "paths inside .git are not allowed",
+            ));
         }
         if !canonical.is_dir() {
-            return Err("path must be a directory or a git repository root".to_string());
+            return Err(Error::InvalidArgument(
+                "path must be a directory or a git repository root".into(),
+            ));
         }
         Ok(canonical)
     }
@@ -421,11 +435,7 @@ impl McpConfig {
     /// root: otherwise ingesting a parent would capture the read-only part.
     /// Selected paths are checked lexically; directory ingest does not follow
     /// symlinks and git ingest reads objects, not the working tree.
-    pub fn check_ingest_scope(
-        &self,
-        base: &Path,
-        selection: &PathSelection,
-    ) -> std::result::Result<(), String> {
+    pub fn check_ingest_scope(&self, base: &Path, selection: &PathSelection) -> Result<()> {
         let targets: Vec<(String, PathBuf)> = if selection.is_all() {
             vec![(".".to_string(), base.to_path_buf())]
         } else {
@@ -438,29 +448,24 @@ impl McpConfig {
         for (label, target) in targets {
             if let Some(root) = self.governing(&target) {
                 if root.access == Access::ReadOnly {
-                    return Err(read_only_message(&root.path));
+                    return Err(Error::read_only_root(&root.path));
                 }
             }
             if let Some(inner) = self.roots.iter().find(|r| {
                 r.access == Access::ReadOnly && r.path != target && r.path.starts_with(&target)
             }) {
-                return Err(format!(
-                    "ingesting '{label}' would include the read-only root {}; select paths \
+                return Err(Error::refused(
+                    crate::core::RefusalKind::ReadOnlyRoot,
+                    format!(
+                        "ingesting '{label}' would include the read-only root {}; select paths \
                      that avoid it (see repo_outline) or make that root read-write",
-                    inner.path.display()
+                        inner.path.display()
+                    ),
                 ));
             }
         }
         Ok(())
     }
-}
-
-fn read_only_message(root: &Path) -> String {
-    format!(
-        "path is inside the read-only root {root}; ingesting needs a read-write root \
-         (start the server with --allow-root {root}:rw)",
-        root = root.display()
-    )
 }
 
 /// Parses one `--allow-root` value, see [`McpConfig::from_specs`].
@@ -557,9 +562,7 @@ pub fn request_access(
 }
 
 pub fn outline(config: &McpConfig, obj: &serde_json::Map<String, Value>) -> Result<Value> {
-    let path = config
-        .authorize(str_arg(obj, "path")?, Access::ReadOnly)
-        .map_err(Error::Storage)?;
+    let path = config.authorize(str_arg(obj, "path")?, Access::ReadOnly)?;
     let depth = obj
         .get("depth")
         .and_then(Value::as_u64)
@@ -618,15 +621,15 @@ pub fn ingest(
     obj: &serde_json::Map<String, Value>,
 ) -> Result<Value> {
     let deadline = Deadline::after(config.ingest_timeout());
-    let path = config
-        .authorize(str_arg(obj, "path")?, Access::ReadWrite)
-        .map_err(Error::Storage)?;
+    let path = config.authorize(str_arg(obj, "path")?, Access::ReadWrite)?;
     let spaces = string_list(obj, "spaces")?;
-    let selected = string_list(obj, "paths").unwrap_or_default();
+    let selected = if obj.contains_key("paths") {
+        string_list(obj, "paths")?
+    } else {
+        Vec::new()
+    };
     let selection = PathSelection::new(&selected)?;
-    config
-        .check_ingest_scope(&path, &selection)
-        .map_err(Error::Storage)?;
+    config.check_ingest_scope(&path, &selection)?;
     let flag = |k: &str| obj.get(k).and_then(Value::as_bool).unwrap_or(false);
     let scope = if flag("history") {
         GitScope::History
@@ -656,11 +659,14 @@ pub fn ingest(
             .map(|n| n.ingestable_files)
             .unwrap_or(0);
         if total > MAX_UNSCOPED_INGEST_FILES {
-            return Err(Error::Storage(format!(
-                "refusing an unscoped ingest of {total} ingestable files (limit \
+            return Err(Error::refused(
+                crate::core::RefusalKind::TooManyFiles,
+                format!(
+                    "refusing an unscoped ingest of {total} ingestable files (limit \
                  {MAX_UNSCOPED_INGEST_FILES}); call repo_outline and pass the directories you \
                  need as `paths`"
-            )));
+                ),
+            ));
         }
     }
 
@@ -712,20 +718,22 @@ pub(super) fn summarize(outcome: &IngestOutcome) -> Value {
 }
 
 fn str_arg<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str> {
-    obj.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Storage(format!("missing or invalid string argument '{key}'")))
+    obj.get(key).and_then(Value::as_str).ok_or_else(|| {
+        Error::InvalidArgument(format!("missing or invalid string argument '{key}'"))
+    })
 }
 
 fn string_list(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Vec<String>> {
     obj.get(key)
         .and_then(Value::as_array)
-        .ok_or_else(|| Error::Storage(format!("missing or invalid array argument '{key}'")))?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("missing or invalid array argument '{key}'"))
+        })?
         .iter()
         .map(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| Error::Storage(format!("argument '{key}' entries must be strings")))
+            v.as_str().map(str::to_string).ok_or_else(|| {
+                Error::InvalidArgument(format!("argument '{key}' entries must be strings"))
+            })
         })
         .collect()
 }

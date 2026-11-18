@@ -140,9 +140,10 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "minLength": 1 },
+                    "language": { "type": "string", "minLength": 1, "description": "Filter syntax language (rust, go, javascript, typescript, tsx, svelte). Svelte indexes inline JS/TS script declarations." },
                     "kinds": {
                         "type": "array",
-                        "items": { "type": "string", "enum": ["module","struct","enum","trait","type_alias","function","method","constant","static","field","import"] }
+                        "items": { "type": "string", "enum": ["module","struct","enum","trait","type_alias","function","method","constant","static","field","import","class","interface","variable","type_definition"] }
                     },
                     "spaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Only code attached to these spaces or spaces they import." },
                     "repository": { "type": "string", "minLength": 1, "description": "owner/name slug, repository path substring, or id prefix." },
@@ -427,6 +428,9 @@ fn call_tool(
             let hits = retrieval::search_code(
                 store,
                 crate::core::CodeSearchQuery {
+                    language: optional_string(obj, "language")?
+                        .map(retrieval::parse_code_language)
+                        .transpose()?,
                     text: string(obj, "query")?.to_string(),
                     kinds: retrieval::parse_code_kinds(&kinds)?,
                     repository: optional_string(obj, "repository")?.map(str::to_string),
@@ -439,7 +443,7 @@ fn call_tool(
                     all_versions: optional_bool(obj, "all_versions")?.unwrap_or(false),
                 },
             )?;
-            Ok(json!({ "hits": hits }))
+            Ok(json!({ "hits": hits, "supported_languages": crate::core::CodeLanguage::ALL }))
         }
         "repo_outline" => repo_tools::outline(config, obj),
         "repo_ingest" => repo_tools::ingest(store, config, obj),
@@ -527,6 +531,7 @@ fn validate_arguments(name: &str, args: &Value) -> std::result::Result<(), Strin
         "code_search" => (
             &[
                 "query",
+                "language",
                 "kinds",
                 "spaces",
                 "repository",

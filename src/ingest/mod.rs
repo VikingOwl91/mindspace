@@ -253,7 +253,7 @@ pub fn structural_decision(
             Ok(r.unwrap_or(false))
         }
     };
-    let identity = code::identity();
+    let identity = code::identity_for(language);
     if known(&identity)? {
         return Ok((
             crate::core::CodeDerivationDraft {
@@ -276,8 +276,8 @@ pub fn structural_decision(
         if oversized && !matches!(reason, code::SkipReason::SourceBytes { .. }) {
             continue;
         }
-        if known(&code::skip_identity(reason))? {
-            return Ok((code::skip_derivation(reason), true));
+        if known(&code::skip_identity_for(language, reason))? {
+            return Ok((code::skip_derivation_for(language, reason), true));
         }
     }
     let outcome = code::parse_with_policy(language, content, policy);
@@ -767,7 +767,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
                 .and_then(|s| s.to_str())
                 .unwrap_or("untitled")
                 .to_string();
-            let mut parsed = if media_type == "text/rust" {
+            let mut parsed = if code::language_for(Path::new(&path)).is_some() {
                 ParsedMaterial {
                     title: stem.clone(),
                     evidences: vec![],
@@ -938,7 +938,7 @@ fn tip_files_to_code_inputs(
     deadline: &Deadline,
     policy: &code::ParsePolicy,
 ) -> Result<Vec<crate::core::CodeInputDraft>> {
-    let mut grouped: std::collections::BTreeMap<String, crate::core::CodeInputDraft> =
+    let mut grouped: std::collections::BTreeMap<_, crate::core::CodeInputDraft> =
         std::collections::BTreeMap::new();
     for d in derivations {
         let p = Path::new(&d.path);
@@ -946,22 +946,23 @@ fn tip_files_to_code_inputs(
             continue;
         };
         deadline.check("parsing source files")?;
-        if !grouped.contains_key(&d.blob_oid) {
-            let content = contents.get(&d.blob_oid).cloned().unwrap_or_default();
-            let content_hash = sha256_hex(content.as_bytes());
-            let derivation = structural_derivation(
-                ctx,
-                language,
-                &content,
-                &content_hash,
-                Some(repository_id),
-                Some(&d.blob_oid),
-                policy,
-                false,
-            )?;
-            grouped.insert(
-                d.blob_oid.clone(),
-                crate::core::CodeInputDraft {
+        let entry = grouped.entry((&d.blob_oid, language));
+        let entry = match entry {
+            std::collections::btree_map::Entry::Occupied(existing) => existing.into_mut(),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let content = contents.get(&d.blob_oid).cloned().unwrap_or_default();
+                let content_hash = sha256_hex(content.as_bytes());
+                let derivation = structural_derivation(
+                    ctx,
+                    language,
+                    &content,
+                    &content_hash,
+                    Some(repository_id),
+                    Some(&d.blob_oid),
+                    policy,
+                    false,
+                )?;
+                slot.insert(crate::core::CodeInputDraft {
                     language,
                     content_hash,
                     content,
@@ -969,15 +970,13 @@ fn tip_files_to_code_inputs(
                     blob_oid: Some(d.blob_oid.clone()),
                     contexts: vec![],
                     derivation,
-                },
-            );
-        }
-        if let Some(entry) = grouped.get_mut(&d.blob_oid) {
-            entry.contexts.push(crate::core::CodeContextDraft {
-                path: d.path.clone(),
-                commit_oid: Some(d.commit_oid.clone()),
-            });
-        }
+                })
+            }
+        };
+        entry.contexts.push(crate::core::CodeContextDraft {
+            path: d.path.clone(),
+            commit_oid: Some(d.commit_oid.clone()),
+        });
     }
     Ok(grouped.into_values().collect())
 }
@@ -1009,16 +1008,20 @@ fn observe_directory(
 }
 
 fn is_ingestable(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("md" | "markdown" | "txt" | "rs")
-    )
+    media_type_of(path).is_ok()
 }
 
 fn media_type_of(path: &Path) -> Result<&'static str> {
+    if let Some(language) = code::language_for(path) {
+        use crate::core::CodeLanguage::*;
+        return Ok(match language {
+            Rust => "text/rust",
+            Go => "text/x-go",
+            JavaScript => "text/javascript",
+            TypeScript | Tsx => "text/typescript",
+            Svelte => "text/x-svelte",
+        });
+    }
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -1027,7 +1030,6 @@ fn media_type_of(path: &Path) -> Result<&'static str> {
     {
         Some("md" | "markdown") => Ok("text/markdown"),
         Some("txt") => Ok("text/plain"),
-        Some("rs") => Ok("text/rust"),
         _ => Err(Error::UnsupportedFormat {
             path: path.display().to_string(),
         }),
@@ -1066,7 +1068,7 @@ pub(crate) fn observe_bytes(
     })?;
 
     let stem = file_stem(path);
-    let parsed = if media_type == "text/rust" {
+    let parsed = if code::language_for(path).is_some() {
         ParsedMaterial {
             title: stem.clone(),
             evidences: vec![],

@@ -1128,7 +1128,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             })?;
             emit_chunks(sink, &content)?;
             let content_hash = sha256_hex(content.as_bytes());
-            let mut code_input: Option<CodeInputDraft> = None;
+            let mut code_inputs = BTreeMap::new();
             for (commit, path) in uses {
                 deadline.check("deriving memories")?;
                 let media_type = media_type_of(Path::new(path)).unwrap_or("text/rust");
@@ -1137,7 +1137,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
                     .and_then(|s| s.to_str())
                     .unwrap_or("untitled")
                     .to_string();
-                let mut parsed = if media_type == "text/rust" {
+                let mut parsed = if code::language_for(Path::new(path)).is_some() {
                     ParsedMaterial {
                         title: stem.clone(),
                         evidences: vec![],
@@ -1167,41 +1167,41 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
                     },
                     true,
                 )?;
-                // Code input: one per blob, created at its first source path.
+                // One structural derivation per blob and language.
                 let Some(language) = code::language_for(Path::new(path)) else {
                     continue;
                 };
                 deadline.check("parsing source files")?;
-                if code_input.is_none() {
-                    let derivation = super::structural_derivation(
-                        ctx,
-                        language,
-                        &content,
-                        &content_hash,
-                        Some(repository_id),
-                        Some(&blob_oid),
-                        &limits.parse_policy,
-                        false,
-                    )?;
-                    code_input = Some(CodeInputDraft {
-                        language,
-                        content_hash: content_hash.clone(),
-                        content: String::new(),
-                        repository_id: Some(repository_id),
-                        blob_oid: Some(blob_oid.clone()),
-                        contexts: vec![],
-                        derivation,
-                    });
-                }
-                let Some(entry) = code_input.as_mut() else {
-                    continue;
+                let entry = match code_inputs.entry(language) {
+                    std::collections::btree_map::Entry::Occupied(existing) => existing.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        let derivation = super::structural_derivation(
+                            ctx,
+                            language,
+                            &content,
+                            &content_hash,
+                            Some(repository_id),
+                            Some(&blob_oid),
+                            &limits.parse_policy,
+                            false,
+                        )?;
+                        slot.insert(CodeInputDraft {
+                            language,
+                            content_hash: content_hash.clone(),
+                            content: String::new(),
+                            repository_id: Some(repository_id),
+                            blob_oid: Some(blob_oid.clone()),
+                            contexts: vec![],
+                            derivation,
+                        })
+                    }
                 };
                 entry.contexts.push(CodeContextDraft {
                     path: path.clone(),
                     commit_oid: Some(commit.clone()),
                 });
             }
-            if let Some(input) = code_input {
+            for input in code_inputs.into_values() {
                 emit_code_input(sink, input, true, false)?;
             }
         }
@@ -1450,7 +1450,7 @@ pub fn stream_verified_head(
             })?;
             emit_chunks(sink, &content)?;
             let content_hash = sha256_hex(content.as_bytes());
-            let mut code_input: Option<(CodeInputDraft, bool)> = None;
+            let mut code_inputs = BTreeMap::new();
             for path in uses {
                 deadline.check("deriving memories")?;
                 let media_type = media_type_of(Path::new(path)).unwrap_or("text/rust");
@@ -1459,7 +1459,7 @@ pub fn stream_verified_head(
                     .and_then(|s| s.to_str())
                     .unwrap_or("untitled")
                     .to_string();
-                let mut parsed = if media_type == "text/rust" {
+                let mut parsed = if code::language_for(Path::new(path)).is_some() {
                     ParsedMaterial {
                         title: stem.clone(),
                         evidences: vec![],
@@ -1493,39 +1493,39 @@ pub fn stream_verified_head(
                     continue;
                 };
                 deadline.check("parsing source files")?;
-                if code_input.is_none() {
-                    let (derivation, reused) = super::structural_decision(
-                        ctx,
-                        language,
-                        &content,
-                        &content_hash,
-                        Some(repository_id),
-                        Some(&blob_oid),
-                        &limits.parse_policy,
-                        false,
-                    )?;
-                    code_input = Some((
-                        CodeInputDraft {
+                let (entry, _) = match code_inputs.entry(language) {
+                    std::collections::btree_map::Entry::Occupied(existing) => existing.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        let (derivation, reused) = super::structural_decision(
+                            ctx,
                             language,
-                            content_hash: content_hash.clone(),
-                            content: String::new(),
-                            repository_id: Some(repository_id),
-                            blob_oid: Some(blob_oid.clone()),
-                            contexts: vec![],
-                            derivation,
-                        },
-                        reused,
-                    ));
-                }
-                let Some((entry, _)) = code_input.as_mut() else {
-                    continue;
+                            &content,
+                            &content_hash,
+                            Some(repository_id),
+                            Some(&blob_oid),
+                            &limits.parse_policy,
+                            false,
+                        )?;
+                        slot.insert((
+                            CodeInputDraft {
+                                language,
+                                content_hash: content_hash.clone(),
+                                content: String::new(),
+                                repository_id: Some(repository_id),
+                                blob_oid: Some(blob_oid.clone()),
+                                contexts: vec![],
+                                derivation,
+                            },
+                            reused,
+                        ))
+                    }
                 };
                 entry.contexts.push(CodeContextDraft {
                     path: path.clone(),
                     commit_oid: Some(closure.commit_oid.clone()),
                 });
             }
-            if let Some((input, reused)) = code_input {
+            for (input, reused) in code_inputs.into_values() {
                 emit_code_input(sink, input, true, reused)?;
             }
         }
@@ -2461,6 +2461,9 @@ impl<'a> Assembler<'a> {
                     return bad("a `code_input` record must not carry content or parts");
                 }
                 for c in &input.contexts {
+                    if super::code::language_for(Path::new(&c.path)) != Some(input.language) {
+                        return bad("a code context path does not match its language");
+                    }
                     if c.path.len() > self.limits.extraction.max_path_bytes || c.path.contains('\0')
                     {
                         return bad("a code context path is too long or contains NUL");
@@ -2500,7 +2503,7 @@ impl<'a> Assembler<'a> {
                         ctx.path.clone()
                     }
                 };
-                self.unique("code input", &id)?;
+                self.unique("code input", &format!("{}\0{id}", input.language.as_str()))?;
                 match content {
                     ContentSource::Shared => {
                         let len = self.shared_slot(&id)?;

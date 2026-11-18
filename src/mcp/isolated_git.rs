@@ -360,6 +360,7 @@ pub fn run(
             "files": report.files.len(),
             "code": {
                 "supported_inputs": report.code.supported_inputs,
+                "inputs_by_language": report.code.inputs_by_language,
                 "parsed": report.code.parsed,
                 "reused": report.code.reused,
                 "entities": report.code.entities,

@@ -359,7 +359,8 @@ fn manifests_and_contexts_are_validated_strictly_on_both_sides() {
         .unwrap_err()
         .contains("repeated"));
     let mut bad = ctx.clone();
-    bad.known.push((f.blobs[0].clone(), 9));
+    bad.known
+        .push((f.blobs[0].clone(), bad.identities.len() as u8));
     assert!(bad
         .validate(f.op, f.repo_id, &f.head, &policy())
         .unwrap_err()

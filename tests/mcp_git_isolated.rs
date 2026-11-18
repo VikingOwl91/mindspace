@@ -760,6 +760,13 @@ fn head_only_ingestion_reports_what_was_verified_and_what_was_not_and_repeats_wi
     };
     g(&["branch", "side"]);
     std::fs::write(repo.join("src/more.rs"), "pub fn more() {}\n").unwrap();
+    for name in ["shared.js", "shared.ts"] {
+        std::fs::write(
+            repo.join("src").join(name),
+            "export const shared = () => 1;",
+        )
+        .unwrap();
+    }
     g(&["add", "-A"]);
     g(&["commit", "-q", "-m", "two"]);
     let head = w.head(&repo);
@@ -802,6 +809,17 @@ fn head_only_ingestion_reports_what_was_verified_and_what_was_not_and_repeats_wi
             .is_empty(),
         "{hit}"
     );
+    for (lang, path) in [
+        ("javascript", "src/shared.js"),
+        ("typescript", "src/shared.ts"),
+    ] {
+        let result = m.call("code_search", json!({"query":"shared", "language":lang}));
+        let hits = result["structuredContent"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], path);
+        assert_eq!(hits[0]["commit_oid"], head);
+        assert_eq!(s["counts"]["code"]["inputs_by_language"][lang], 1);
+    }
     // repeat: nothing new, placeholders reused, structure stable
     let structure = code_and_git(&w);
     let r2 = m.ingest(&repo);

@@ -142,10 +142,13 @@ pub enum Command {
     },
     /// Find definitions (functions, structs, ...) by name, signature, or path
     Symbols {
+        /// Filter definitions by syntax language (rust, go, javascript, typescript, tsx, svelte)
+        #[arg(long, value_name = "LANGUAGE")]
+        language: Option<String>,
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
         /// Restrict to an entity kind (repeatable): fn, method, struct, enum,
-        /// trait, type, const, static, mod, field, use
+        /// trait, type, type_definition, class, interface, const, static, variable, mod, field, use
         #[arg(long = "kind", value_name = "KIND")]
         kinds: Vec<String>,
         /// Restrict to code attached to this space or any space it imports
@@ -607,6 +610,7 @@ pub fn execute(cli: &Cli) -> Result<()> {
             }
         },
         Command::Symbols {
+            language,
             query,
             kinds,
             spaces,
@@ -630,6 +634,10 @@ pub fn execute(cli: &Cli) -> Result<()> {
             let hits = retrieval::search_code(
                 &store,
                 crate::core::CodeSearchQuery {
+                    language: language
+                        .as_deref()
+                        .map(retrieval::parse_code_language)
+                        .transpose()?,
                     text: query.join(" "),
                     kinds: retrieval::parse_code_kinds(kinds)?,
                     repository: repo.clone(),

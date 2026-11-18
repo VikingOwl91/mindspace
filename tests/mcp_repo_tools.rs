@@ -193,6 +193,12 @@ fn outline_then_scoped_ingest_then_search() {
     let (_g, db) = db();
     let proj = project();
     let root = proj.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("src/widget.svelte"),
+        "<p>UI</p>\n<script lang='ts'>function Panel() {}</script>",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/other.py"), "def omitted(): pass").unwrap();
     let mut s = Server::start(&db, &[&root]);
     let p = root.display().to_string();
 
@@ -204,6 +210,7 @@ fn outline_then_scoped_ingest_then_search() {
     let dirs: Vec<&str> = nodes.iter().map(|n| n["path"].as_str().unwrap()).collect();
     assert!(dirs.contains(&"docs") && dirs.contains(&"src") && dirs.contains(&"other"));
 
+    assert_eq!(nodes[0]["unsupported_extensions"]["py"], 1);
     // Ingest only docs and src (what the outline pointed at).
     let r = s.call(
         "repo_ingest",
@@ -228,6 +235,13 @@ fn outline_then_scoped_ingest_then_search() {
         code["structuredContent"]["hits"].as_array().unwrap().len(),
         1
     );
+    let component = s.call(
+        "code_search",
+        json!({"query": "Panel", "language": "svelte"}),
+    );
+    let found = &component["structuredContent"]["hits"][0];
+    assert_eq!(found["name"], "Panel");
+    assert_eq!(found["start_line"], 2);
     // The ingest attached the directory to space `p`; code_search can scope by it.
     let scoped = s.call(
         "code_search",

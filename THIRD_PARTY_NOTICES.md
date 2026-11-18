@@ -22,3 +22,14 @@ No upstream NOTICE file appears in the complete Nomic file list at the specified
 The fixture is unchanged. Future modifications to the fixture must be prominently identified, and applicable upstream notices retained, as required by Apache License 2.0 section 4.
 
 The archive includes references to external Rust crates in `Cargo.toml` and `Cargo.lock`; their source code, build outputs, and model weights are not included. These crates retain their own licenses. A binary or vendored-source distribution needs a separate inventory of the code and notices it actually contains.
+
+## Additional source grammars
+
+The following Tree-sitter grammar crates are linked by the symbol indexer. Their pinned versions are in `Cargo.lock`. The upstream MIT licenses are included here.
+
+| Grammar | Upstream source | License |
+| --- | --- | --- |
+| Go 0.25.0 | [tree-sitter-go](https://github.com/tree-sitter/tree-sitter-go/tree/v0.25.0) | [MIT](LICENSES/tree-sitter-go.txt) |
+| JavaScript / JSX 0.25.0 | [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript/tree/v0.25.0) | [MIT](LICENSES/tree-sitter-javascript.txt) |
+| TypeScript / TSX 0.23.2 | [tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript/tree/f975a621f4e7f532fe322e13c4f79495e0a7b2e7) | [MIT](LICENSES/tree-sitter-typescript.txt) |
+| Svelte 1.0.2 | [tree-sitter-svelte](https://github.com/tree-sitter-grammars/tree-sitter-svelte/tree/774a65aea563accc35f5d45fafa4d96ec5761f57) | [MIT](LICENSES/tree-sitter-svelte.txt) |

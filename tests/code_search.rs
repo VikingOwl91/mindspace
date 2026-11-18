@@ -128,6 +128,103 @@ fn finds_definitions_ranked_with_locations() {
 }
 
 #[test]
+fn language_specific_definitions_keep_their_path_and_blob_across_ingests() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let common = "export function Shared() { return 1; }\n";
+    let inputs = [
+        ("shared.js", common, "Shared", "javascript", 1),
+        ("shared.ts", common, "Shared", "typescript", 1),
+        (
+            "reader.go",
+            "package reader\nfunc Read() {}\n",
+            "Read",
+            "go",
+            2,
+        ),
+        (
+            "view.tsx",
+            "export const View = () => <div/>;\n",
+            "View",
+            "tsx",
+            1,
+        ),
+        (
+            "page.svelte",
+            "<p>Page</p>\n<script lang='ts'>\nfunction Render() {}\n</script>",
+            "Render",
+            "svelte",
+            3,
+        ),
+    ];
+    for (path, content, ..) in inputs {
+        std::fs::write(root.join(path), content).unwrap();
+    }
+    std::fs::write(root.join("other.py"), "def omitted(): pass\n").unwrap();
+    let mut shared_blobs = Vec::new();
+    for git_repo in [false, true] {
+        let m = Mind::new();
+        if git_repo {
+            git(root, &["init", "-q", "-b", "main"]);
+            git(root, &["add", "."]);
+            git(root, &["commit", "-qm", "neutral declarations"]);
+        }
+        let db = rusqlite::Connection::open(m.dir.path().join("mind.db")).unwrap();
+        for _ in 0..2 {
+            m.ingest(root, &[]);
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM code_derivations", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                inputs.len() as i64
+            );
+            for (path, content, symbol, lang, line) in inputs {
+                let hits = m.symbols(&[symbol, "--language", lang]);
+                assert_eq!(hits.len(), 1, "{hits:?}");
+                let hit = &hits[0];
+                assert_eq!(hit["language"], lang);
+                assert_eq!(hit["start_line"], line);
+                assert_eq!(
+                    hit["content_hash"],
+                    mindspace::core::sha256_hex(content.as_bytes())
+                );
+                if git_repo {
+                    assert_eq!(hit["path"], path);
+                    let oid = Command::new("git")
+                        .arg("-C")
+                        .arg(root)
+                        .args(["rev-parse", &format!("HEAD:{path}")])
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        hit["blob_oid"],
+                        String::from_utf8(oid.stdout).unwrap().trim()
+                    );
+                    if symbol == "Shared" {
+                        shared_blobs.push(hit["blob_oid"].clone());
+                    }
+                } else {
+                    assert_eq!(
+                        hit["path"],
+                        root.canonicalize().unwrap().join(path).to_str().unwrap()
+                    );
+                    assert!(hit["blob_oid"].is_null());
+                }
+            }
+            assert!(m.symbols(&["omitted"]).is_empty());
+        }
+        let (outline, err, ok) = m.run(&["scan", root.to_str().unwrap(), "--json"]);
+        assert!(ok, "{err}");
+        let outline: serde_json::Value = serde_json::from_str(&outline).unwrap();
+        assert_eq!(outline["nodes"][0]["unsupported_extensions"]["py"], 1);
+        let (_, err, ok) = m.run(&["symbols", "omitted", "--language", "python"]);
+        assert!(!ok && err.contains("unsupported symbol language"), "{err}");
+    }
+    assert_eq!(shared_blobs.len(), 4);
+    assert!(shared_blobs.iter().all(|oid| oid == &shared_blobs[0]));
+}
+
+#[test]
 fn file_edits_make_old_definitions_not_current() {
     let m = Mind::new();
     let dir = tempfile::tempdir().unwrap();
@@ -289,6 +386,23 @@ fn mcp_code_search_tool_returns_hits_and_rejects_bad_input() {
     assert_eq!(bad_kind["result"]["isError"], true);
     let extra = call(4, serde_json::json!({"query":"x","bogus":1}));
     assert_eq!(extra["result"]["isError"], true);
+    let unsupported = call(5, serde_json::json!({"query":"x", "language":"python"}));
+    assert_eq!(unsupported["result"]["isError"], true);
+    assert!(unsupported
+        .to_string()
+        .contains("unsupported symbol language"));
+    let absent = call(6, serde_json::json!({"query":"absent", "language":"go"}));
+    assert_eq!(absent["result"]["isError"], false);
+    assert_eq!(
+        absent["result"]["structuredContent"]["hits"],
+        serde_json::json!([])
+    );
+    assert!(absent["result"]["structuredContent"]["supported_languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l == "go"));
+
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -626,7 +626,7 @@ fn rust_module_index(
         syntax: String,
         qualified: Option<String>,
     }
-    let mut stmt = tx.prepare(&format!("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND {EFFECTIVE_DERIVATION} ORDER BY c.path,e.syntax_path,e.id")).map_err(dberr)?;
+    let mut stmt = tx.prepare(&format!("SELECT DISTINCT c.path,e.id,e.kind,e.syntax_path,e.qualified_name FROM code_contexts c JOIN code_inputs i ON i.id=c.input_id JOIN code_derivations d ON d.input_id=i.id JOIN code_entities e ON e.derivation_id=d.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND d.language='rust' AND mind_code_language(c.path)=d.language AND {EFFECTIVE_DERIVATION} ORDER BY c.path,e.syntax_path,e.id")).map_err(dberr)?;
     let rows = stmt
         .query_map(
             rusqlite::params![repository_id.to_string(), commit_oid],
@@ -731,6 +731,21 @@ fn dberr(e: rusqlite::Error) -> Error {
 }
 
 fn register_revision_context(conn: &mut Connection, state: &Arc<RevisionState>) -> Result<()> {
+    // A blob may appear at paths with different syntax languages. Select the
+    // derivation belonging to the path using the ingest classifier itself.
+    conn.create_scalar_function(
+        "mind_code_language",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let path = ctx.get_raw(0).as_str()?;
+            Ok(crate::ingest::code::language_for(std::path::Path::new(path)).map(|l| l.as_str()))
+        },
+    )
+    .map_err(dberr)?;
+
     let function_state = Arc::clone(state);
     conn.create_scalar_function(
         "m6_write_revision",
@@ -1220,7 +1235,7 @@ const FENCED_TABLES: &[&str] = &[
 /// over all of its derivations, whatever their identity. Exactly one row matches (the id breaks
 /// ties), so symbol search, relationship observation/resolution, entity listing and `structure`
 /// agree. `d` is the derivation alias of the enclosing query.
-const EFFECTIVE_DERIVATION: &str = "d.id = (SELECT d2.id FROM code_derivations d2 WHERE d2.input_id = d.input_id ORDER BY d2.created_at DESC, d2.id DESC LIMIT 1)";
+const EFFECTIVE_DERIVATION: &str = "d.id = (SELECT d2.id FROM code_derivations d2 WHERE d2.input_id = d.input_id AND d2.language = d.language ORDER BY d2.created_at DESC, d2.id DESC LIMIT 1)";
 
 const IMMUTABLE_TABLES: &[&str] = &[
     "sources",
@@ -2399,7 +2414,7 @@ impl Store for SqliteStore {
 
     fn code_structure(&self, target: &str) -> Result<Vec<CodeDerivation>> {
         let conn = self.connection()?;
-        let mut stmt=conn.prepare(&format!("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash,d.created_at,(CASE WHEN {EFFECTIVE_DERIVATION} THEN 1 ELSE 0 END) AS effective FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE c.path=?1 OR i.blob_oid=?1 ORDER BY d.created_at, d.id")).map_err(dberr)?;
+        let mut stmt=conn.prepare(&format!("SELECT DISTINCT d.id,d.language,d.extractor,d.extractor_version,d.grammar,d.grammar_version,d.status,d.error_count,i.content_hash,d.created_at,(CASE WHEN {EFFECTIVE_DERIVATION} THEN 1 ELSE 0 END) AS effective FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE (c.path=?1 OR i.blob_oid=?1) AND mind_code_language(c.path)=d.language ORDER BY d.created_at, d.id")).map_err(dberr)?;
         let rows = stmt
             .query_map(rusqlite::params![target], |r| {
                 Ok((
@@ -2544,7 +2559,14 @@ impl Store for SqliteStore {
                                 ORDER BY s.ingested_at DESC, s.rowid DESC LIMIT 1) = i.content_hash) \
              END)";
 
-        let mut wheres: Vec<String> = vec![EFFECTIVE_DERIVATION.to_string()];
+        let mut wheres: Vec<String> = vec![
+            EFFECTIVE_DERIVATION.to_string(),
+            "mind_code_language(c.path)=d.language".into(),
+        ];
+        if let Some(language) = query.language {
+            let n = push(&mut params, language.as_str());
+            wheres.push(format!("d.language = ?{n}"));
+        }
         for t in &terms {
             let n = push(&mut params, t);
             wheres.push(format!(
@@ -2726,15 +2748,29 @@ impl Store for SqliteStore {
 
     fn has_code_derivation(
         &self,
-        _language: crate::core::CodeLanguage,
+        language: crate::core::CodeLanguage,
         content_hash: &str,
         repository_id: Option<Uuid>,
         blob_oid: Option<&str>,
         identity: &crate::core::CodeParserIdentity,
     ) -> Result<bool> {
         let conn = self.connection()?;
-        let found:Option<i64>=match (repository_id,blob_oid) { (Some(repo),Some(blob))=>conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id=?1 AND i.blob_oid=?2 AND d.extractor=?3 AND d.extractor_version=?4 AND d.grammar=?5 AND d.grammar_version=?6",rusqlite::params![repo.to_string(),blob,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?, _=>conn.query_row("SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id WHERE i.repository_id IS NULL AND i.content_hash=?1 AND d.extractor=?2 AND d.extractor_version=?3 AND d.grammar=?4 AND d.grammar_version=?5",rusqlite::params![content_hash,identity.extractor,identity.extractor_version,identity.grammar,identity.grammar_version],|r|r.get(0)).optional().map_err(dberr)?};
-        Ok(found.is_some())
+        let (scope, object, repository) = match (repository_id, blob_oid) {
+            (Some(repo), Some(blob)) => (
+                "i.repository_id=?7 AND i.blob_oid=?6",
+                blob,
+                Some(repo.to_string()),
+            ),
+            _ => (
+                "i.repository_id IS NULL AND ?7 IS NULL AND i.content_hash=?6",
+                content_hash,
+                None,
+            ),
+        };
+        conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM code_derivations d JOIN code_inputs i ON i.id=d.input_id
+            WHERE d.language=?1 AND d.extractor=?2 AND d.extractor_version=?3 AND d.grammar=?4 AND d.grammar_version=?5
+            AND {scope})"), rusqlite::params![language.as_str(), identity.extractor, identity.extractor_version,
+                identity.grammar, identity.grammar_version, object, repository], |row| row.get(0)).map_err(dberr)
     }
 
     fn resolve_git_code_relationships(
@@ -3345,7 +3381,7 @@ fn resolve_git_code_relationships_tx(
         ..Default::default()
     };
     let module_index = rust_module_index(tx, repository_id, commit_oid)?;
-    let mut stmt=tx.prepare(&format!("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND {EFFECTIVE_DERIVATION} ORDER BY o.id,c.path")).map_err(dberr)?;
+    let mut stmt=tx.prepare(&format!("SELECT DISTINCT o.id,o.kind,o.raw_target,o.source_syntax_path,c.path FROM code_relationship_observations o JOIN code_derivations d ON d.id=o.derivation_id JOIN code_inputs i ON i.id=d.input_id JOIN code_contexts c ON c.input_id=i.id WHERE i.repository_id=?1 AND c.commit_oid=?2 AND d.language='rust' AND mind_code_language(c.path)=d.language AND {EFFECTIVE_DERIVATION} ORDER BY o.id,c.path")).map_err(dberr)?;
     let rows = stmt
         .query_map(
             rusqlite::params![repository_id.to_string(), commit_oid],
@@ -3434,6 +3470,10 @@ fn record_code_observation_tx(
     let mut report = CodeObservationReport::default();
     for input in observation.inputs {
         report.supported_inputs += 1;
+        *report
+            .inputs_by_language
+            .entry(input.language.as_str().to_owned())
+            .or_default() += 1;
         let existing: Option<String> = match (&input.repository_id, &input.blob_oid) {
             (Some(repo), Some(blob)) => tx
                 .query_row(
@@ -5502,7 +5542,7 @@ mod effective_derivation_tests {
     #[test]
     fn exactly_one_derivation_is_effective_per_input_even_with_equal_timestamps() {
         let c = rusqlite::Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE code_derivations (id TEXT PRIMARY KEY, input_id TEXT NOT NULL, created_at INTEGER NOT NULL);").unwrap();
+        c.execute_batch("CREATE TABLE code_derivations (id TEXT PRIMARY KEY, input_id TEXT NOT NULL, created_at INTEGER NOT NULL, language TEXT NOT NULL DEFAULT 'rust');").unwrap();
         for (id, input, at) in [
             ("a", "i1", 5),
             ("b", "i1", 5), // tie with a: the greater id wins
@@ -5515,7 +5555,7 @@ mod effective_derivation_tests {
             ("i", "i4", 3), // three-way tie
         ] {
             c.execute(
-                "INSERT INTO code_derivations VALUES (?1,?2,?3)",
+                "INSERT INTO code_derivations(id,input_id,created_at) VALUES (?1,?2,?3)",
                 rusqlite::params![id, input, at],
             )
             .unwrap();

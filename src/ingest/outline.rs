@@ -18,6 +18,9 @@ use crate::core::{Error, Result};
 
 /// Coarse file kind used in outlines. `other` is never ingested.
 pub fn file_kind(path: &Path) -> &'static str {
+    if let Some(language) = super::code::language_for(path) {
+        return language.as_str();
+    }
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -26,7 +29,6 @@ pub fn file_kind(path: &Path) -> &'static str {
     {
         Some("md" | "markdown") => "markdown",
         Some("txt") => "text",
-        Some("rs") => "rust",
         _ => "other",
     }
 }
@@ -42,6 +44,9 @@ pub struct OutlineNode {
     /// Files whose kind Mindspace can ingest (anything but `other`).
     pub ingestable_files: u64,
     pub kinds: BTreeMap<String, u64>,
+    /// Extensions of files this outline counted as other. Counts reflect observed paths only.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub unsupported_extensions: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -69,7 +74,14 @@ where
         ..Default::default()
     };
     for (path, size) in files {
-        let kind = file_kind(Path::new(&path));
+        let file = Path::new(&path);
+        let kind = file_kind(file);
+        let unsupported_ext = (kind == "other").then(|| {
+            file.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("(none)")
+                .to_ascii_lowercase()
+        });
         let dirs: Vec<&str> = {
             let mut parts: Vec<&str> = path.split('/').collect();
             parts.pop(); // the file name
@@ -78,7 +90,9 @@ where
         let apply = |node: &mut OutlineNode| {
             node.files += 1;
             node.bytes += size;
-            if kind != "other" {
+            if let Some(ext) = &unsupported_ext {
+                *node.unsupported_extensions.entry(ext.clone()).or_default() += 1;
+            } else {
                 node.ingestable_files += 1;
             }
             *node.kinds.entry(kind.to_string()).or_default() += 1;

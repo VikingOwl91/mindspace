@@ -35,6 +35,10 @@ Not part of this Alpha: canonical document/PDF ingestion, M8 document
 publication, and embedding-based (semantic or hybrid) search. Rust is the only
 structurally parsed language. Commands and the database schema can still change.
 
+The development checkout also indexes Go, JavaScript/JSX, TypeScript/TSX and inline
+Svelte scripts. See [symbol language coverage](docs/reference.md#symbol-language-coverage)
+for supported declarations and how to inspect omitted extensions.
+
 ## Install
 
 After independently authenticating the publisher fingerprint through a trusted channel outside this

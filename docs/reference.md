@@ -41,6 +41,35 @@ guide includes a standalone Python/stdio MCP example. Use the verified binary's
 `--help` and subcommand help for full syntax. These examples are retained docs,
 not a new runtime qualification.
 
+## Symbol language coverage
+
+The development checkout indexes the following syntax. Ingest the selected files
+again after upgrading to build their symbol index. Existing Rust records remain
+readable. The published Alpha release profile is described below.
+
+| Language filter | File extensions | Symbols |
+| --- | --- | --- |
+| `rust` | rs | Modules, structs, enums, traits, aliases, functions, methods, constants, statics, fields and imports. Rust also records syntactic relationships. |
+| `go` | go | Named functions, receiver methods, interface methods, types, type aliases, named fields, constants and variables in declarations. |
+| `javascript` | js, mjs, cjs, jsx | Named function and class declarations, class/object methods, class fields and identifier variable declarations. Variables directly assigned arrow functions or function expressions are indexed as functions. |
+| `typescript`, `tsx` | ts, mts, cts / tsx | The JavaScript declarations above plus interfaces, namespaces, enums, type aliases and member signatures. TSX uses the JSX-aware TypeScript grammar. |
+| `svelte` | svelte | Declarations in top-level inline instance and module script elements. The Svelte parser locates each script, then JS or TS parses its body at the original component offsets. |
+
+Svelte defaults to JavaScript and accepts static `lang="js"`, `"javascript"`,
+`"ts"` or `"typescript"`. External `src` scripts, other script languages and
+non-JavaScript MIME types are omitted. The index excludes markup, template
+expressions, component usages and CSS. These extractors describe declarations;
+import resolution, cross-language relations and type inference are outside
+their coverage. Additional languages remain future work.
+
+Use `mind symbols Widget --language typescript` or pass `language` to
+MCP `code_search`. An unsupported language produces an error. A supported
+query with zero hits means that no indexed declaration matched its filters.
+`mind scan --json` and `repo_outline` report counts of observed unsupported file
+extensions per directory. Directory scans honor ignore rules; Git scans outline
+HEAD. Ingest reports count submitted code inputs by language, including reused
+and policy-skipped inputs. Policy skips and recovered parses can affect results.
+
 ## Client registration
 
 ```sh

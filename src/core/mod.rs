@@ -969,13 +969,36 @@ pub struct ObservedFile {
 #[serde(rename_all = "snake_case")]
 pub enum CodeLanguage {
     Rust,
+    Go,
+    #[serde(rename = "javascript")]
+    JavaScript,
+    #[serde(rename = "typescript")]
+    TypeScript,
+    Tsx,
+    Svelte,
 }
 impl CodeLanguage {
+    pub const ALL: [Self; 6] = [
+        Self::Rust,
+        Self::Go,
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Tsx,
+        Self::Svelte,
+    ];
+
     pub fn as_str(self) -> &'static str {
-        "rust"
+        match self {
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::Svelte => "svelte",
+        }
     }
     pub fn parse(s: &str) -> Option<Self> {
-        (s == "rust").then_some(Self::Rust)
+        Self::ALL.into_iter().find(|l| l.as_str() == s)
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1005,6 +1028,10 @@ impl CodeParseStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeEntityKind {
+    TypeDefinition,
+    Variable,
+    Interface,
+    Class,
     Module,
     Struct,
     Enum,
@@ -1020,6 +1047,10 @@ pub enum CodeEntityKind {
 impl CodeEntityKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Variable => "variable",
+            Self::TypeDefinition => "type_definition",
             Self::Module => "module",
             Self::Struct => "struct",
             Self::Enum => "enum",
@@ -1035,6 +1066,10 @@ impl CodeEntityKind {
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "class" => Some(Self::Class),
+            "interface" => Some(Self::Interface),
+            "variable" => Some(Self::Variable),
+            "type_definition" => Some(Self::TypeDefinition),
             "module" => Some(Self::Module),
             "struct" => Some(Self::Struct),
             "enum" => Some(Self::Enum),
@@ -1084,6 +1119,7 @@ pub struct CodeEntity {
 /// term must occur in the name, qualified name, signature, or path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeSearchQuery {
+    pub language: Option<CodeLanguage>,
     pub text: String,
     /// Empty means every entity kind.
     pub kinds: Vec<CodeEntityKind>,
@@ -1145,7 +1181,7 @@ pub struct CodeDerivation {
     pub status: CodeParseStatus,
     pub error_count: u32,
     /// The derivation every reader uses for its code input: the one with the greatest
-    /// `(created_at, id)`. Exactly one per input; the others are superseded.
+    /// `(created_at, id)` for its language. Exactly one per input and language.
     #[serde(default)]
     pub effective: bool,
     /// Why the structural parse was skipped (`p1:source_bytes>2097152`), for a policy skip row.
@@ -1266,6 +1302,9 @@ pub struct CodeObservation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CodeObservationReport {
     pub supported_inputs: u64,
+    /// Code inputs submitted by this observation, including policy skips and reuse.
+    #[serde(default)]
+    pub inputs_by_language: std::collections::BTreeMap<String, u64>,
     pub parsed: u64,
     pub reused: u64,
     pub entities: u64,

@@ -120,6 +120,15 @@ pub fn outline(outline: &crate::ingest::outline::Outline, as_json: bool) {
             n.bytes,
             kinds
         );
+        if !n.unsupported_extensions.is_empty() {
+            let extensions = n
+                .unsupported_extensions
+                .iter()
+                .map(|(ext, count)| format!("{}={count}", display(ext)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  unsupported file extensions: {extensions}");
+        }
     }
 }
 
@@ -129,7 +138,12 @@ pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
         return;
     }
     if hits.is_empty() {
-        println!("no definitions found");
+        println!(
+            "no matching definitions; supported languages: {} (Svelte inline scripts only)",
+            crate::core::CodeLanguage::ALL
+                .map(|l| l.as_str())
+                .join(", ")
+        );
         return;
     }
     for (i, h) in hits.iter().enumerate() {
@@ -163,9 +177,16 @@ pub fn code_hits(hits: &[crate::core::CodeHit], as_json: bool) {
     }
 }
 
-/// One line when the structural-parse policy skipped sources: their text was ingested, their
-/// structure was not.
-fn code_skips(code: &crate::core::CodeObservationReport) {
+fn code_coverage(code: &crate::core::CodeObservationReport) {
+    if !code.inputs_by_language.is_empty() {
+        let counts = code
+            .inputs_by_language
+            .iter()
+            .map(|(language, inputs)| format!("{language}={inputs}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("symbol inputs by language: {counts}");
+    }
     if code.skipped == 0 {
         return;
     }
@@ -286,7 +307,7 @@ pub fn observation_report(report: &ObservationReport, as_json: bool) {
             ),
         }
     }
-    code_skips(&report.code);
+    code_coverage(&report.code);
 }
 
 /// Human and JSON output of one git repository observation. The counters
@@ -322,7 +343,7 @@ pub fn git_observation_report(report: &GitObservationReport, as_json: bool) {
         report.code.entities,
         report.code.parse_errors
     );
-    code_skips(&report.code);
+    code_coverage(&report.code);
     for event in &report.events {
         match event.kind {
             crate::core::GitRefEventKind::Created => {

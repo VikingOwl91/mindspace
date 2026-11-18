@@ -514,3 +514,51 @@ fn an_unknown_commit_outcome_is_reported_as_unknown_and_a_retry_adds_no_derived_
         assert_eq!(d.count(t), clean.count(t), "{t} differs after the retry");
     }
 }
+
+/// A socketpair stands in for the broker. It withholds authorization until the client has
+/// returned, so the transaction can only roll back. The cleanup frame must already be queued
+/// when the caller is told to discard the link. No broker process or privileged setup is needed.
+#[cfg(unix)]
+#[test]
+fn a_late_git_lease_is_released_after_rollback_and_the_channel_is_discarded() {
+    use mindspace::core::Uuid;
+    use mindspace::worker::broker::{FromBroker, ToBroker};
+    use mindspace::worker::client::{persist_git_with_lease, PersistFailure};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let _serial = serial();
+    let repository = repo();
+    let db = db();
+    let store = db.store();
+    let extracted = extract(&db, &repository);
+    let before = db.dump();
+    let op = Uuid::now_v7();
+    let (link, mut peer) = UnixStream::pair().unwrap();
+
+    let result = persist_git_with_lease(&store, &link, op, extracted, &Deadline::none());
+    assert!(
+        matches!(
+            result,
+            Err(PersistFailure::Denied {
+                kind: "commit_not_authorized",
+                discard_link: true,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(db.dump(), before, "including the recording revisions");
+
+    serde_json::to_writer(&mut peer, &FromBroker::CommitGranted { op }).unwrap();
+    peer.write_all(b"\n").unwrap();
+    peer.set_nonblocking(true).unwrap();
+    let mut lines = BufReader::new(peer).lines();
+    for expected in [ToBroker::CommitRequest { op }, ToBroker::CommitDone] {
+        let line = lines.next().expect("missing lease message").unwrap();
+        assert_eq!(serde_json::from_str::<ToBroker>(&line).unwrap(), expected);
+    }
+    drop(link);
+    store.get_space("p").unwrap();
+    store.create_space("after-rollback", "").unwrap();
+}

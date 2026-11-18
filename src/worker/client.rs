@@ -1043,7 +1043,7 @@ pub fn commit_request(link: &UnixStream, op: Uuid) -> CommitAnswer {
     }
 }
 
-/// Releases the lease taken by a successful [`commit_request`] (also when the commit failed).
+/// Best-effort release after the transaction ends, including a possible lease whose grant was lost.
 pub fn commit_done(link: &UnixStream) {
     if let Ok(mut b) = serde_json::to_vec(&ToBroker::CommitDone) {
         b.push(b'\n');
@@ -1069,7 +1069,7 @@ const LEASE_BUDGET: Duration = Duration::from_millis(2500);
 
 /// True when nothing is queued on the broker link: a readable link (or a hang-up) means the broker
 /// answered something unexpected or is gone, and the lease must not be relied on.
-fn link_idle(link: &UnixStream) -> bool {
+pub(crate) fn link_idle(link: &UnixStream) -> bool {
     let mut p = libc::pollfd {
         fd: link.as_raw_fd(),
         events: libc::POLLIN | libc::POLLRDHUP,
@@ -1079,13 +1079,18 @@ fn link_idle(link: &UnixStream) -> bool {
     unsafe { libc::poll(&mut p, 1, 0) == 0 }
 }
 
-/// Why [`persist_git_with_lease`] did not persist.
+/// Why a broker-authorized transaction did not persist.
 #[derive(Debug)]
 pub enum PersistFailure {
     /// The commit was not authorized (revoked, expired, no lease, broker unavailable): the
     /// transaction was rolled back, NOTHING was written, no recording revision was consumed.
     /// `kind` names the cause (`revoked`, `broker_unavailable`, `commit_not_authorized`).
-    Denied { kind: &'static str, reason: String },
+    Denied {
+        kind: &'static str,
+        reason: String,
+        /// An unavailable or out-of-step broker link must be discarded before the next operation.
+        discard_link: bool,
+    },
     /// The storage layer failed. `CommitOutcomeUnknown` is the only case in which data may have
     /// been committed; every other error is a rollback.
     Store(crate::core::Error),
@@ -1104,62 +1109,94 @@ pub fn persist_git_with_lease(
     extracted: ExtractedGit,
     deadline: &crate::ingest::deadline::Deadline,
 ) -> Result<crate::core::GitObservationReport, PersistFailure> {
-    use std::cell::RefCell;
-    let leased = Cell::new(false);
-    let lost = Cell::new(false);
-    let denial: RefCell<Option<(&'static str, String)>> = RefCell::new(None);
-    let result = crate::ingest::extract::persist_git_gated(store, extracted, deadline, &|| {
-        let refuse = |kind: &'static str, why: String| {
-            *denial.borrow_mut() = Some((kind, why.clone()));
-            Err(crate::core::Error::Storage(format!(
-                "the commit was not authorized: {why}"
-            )))
+    persist_with_lease(
+        link,
+        op,
+        |authorize| {
+            crate::ingest::extract::persist_git_gated(store, extracted, deadline, authorize)
+        },
+        #[cfg(feature = "spawn-gate")]
+        || {},
+        #[cfg(feature = "spawn-gate")]
+        false,
+    )
+}
+
+/// Run a complete transaction, including its final authorization check. A lost decision
+/// forbids COMMIT but the broker may still have granted a lease. Release it after rollback
+/// and tell the caller to discard the link, since a late answer can still arrive.
+pub(crate) fn persist_with_lease<T>(
+    link: &UnixStream,
+    op: Uuid,
+    persist: impl FnOnce(&dyn Fn() -> crate::core::Result<()>) -> crate::core::Result<T>,
+    #[cfg(feature = "spawn-gate")] after_grant: impl Fn(),
+    #[cfg(feature = "spawn-gate")] drop_completion: bool,
+) -> Result<T, PersistFailure> {
+    let release = Cell::new(false);
+    let denial = std::cell::RefCell::new(None);
+    let result = persist(&|| {
+        let refuse = |kind, reason: String, discard_link| {
+            let error =
+                crate::core::Error::Storage(format!("the commit was not authorized: {reason}"));
+            *denial.borrow_mut() = Some(PersistFailure::Denied {
+                kind,
+                reason,
+                discard_link,
+            });
+            Err(error)
         };
         match commit_request(link, op) {
             CommitAnswer::Granted => {
-                leased.set(true);
+                release.set(true);
                 let granted_at = Instant::now();
+                #[cfg(feature = "spawn-gate")]
+                after_grant();
                 // the broker may have died during the lease (its lock dies with it)
                 if !link_idle(link) {
                     return refuse(
                         "broker_unavailable",
                         "the broker is not available (it went away during the commit lease)"
                             .to_string(),
+                        true,
                     );
                 }
                 if granted_at.elapsed() >= LEASE_BUDGET {
                     return refuse(
                         "commit_not_authorized",
                         "the commit lease expired before the commit".to_string(),
+                        false,
                     );
                 }
                 if let Err(why) = commit_begin(link) {
-                    return refuse("broker_unavailable", why);
+                    return refuse("broker_unavailable", why, true);
                 }
                 Ok(())
             }
-            CommitAnswer::Denied(reason) => refuse("revoked", reason),
+            CommitAnswer::Denied(reason) => refuse("revoked", reason, false),
             CommitAnswer::Lost(reason) => {
-                lost.set(true);
-                leased.set(true);
+                release.set(true);
                 let kind = if reason.contains("broker is not available") {
                     "broker_unavailable"
                 } else {
                     "commit_not_authorized"
                 };
-                refuse(kind, reason)
+                refuse(kind, reason, true)
             }
         }
     });
     // the lease ends with the commit attempt, AFTER the COMMIT returned (never before it); a link
     // that is out of step is not used again
-    if leased.get() && !lost.get() {
+    #[cfg(feature = "spawn-gate")]
+    if drop_completion {
+        release.set(false);
+    }
+    if release.get() {
         commit_done(link);
     }
     match result {
         Ok(report) => Ok(report),
         Err(e) => match denial.into_inner() {
-            Some((kind, reason)) => Err(PersistFailure::Denied { kind, reason }),
+            Some(failure) => Err(failure),
             None => Err(PersistFailure::Store(e)),
         },
     }

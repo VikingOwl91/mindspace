@@ -28,7 +28,6 @@ use crate::worker::client::{
     extract_git_via_broker, persist_git_with_lease, PersistFailure, WorkerConfig, WorkerError,
 };
 
-use super::isolated::link_idle;
 use super::repo_tools::McpConfig;
 use super::tools::ToolFailure;
 
@@ -212,23 +211,7 @@ pub fn run(
         ids.push(id);
     }
 
-    if iso.poisoned.load(Ordering::SeqCst) {
-        return Err(failure(
-            "broker_unavailable",
-            "the broker is not available (its channel is out of step; restart the server)",
-        ));
-    }
-    let link = iso
-        .link
-        .lock()
-        .map_err(|_| failure("broker_unavailable", "the broker channel is unusable"))?;
-    if !link_idle(&link) {
-        iso.poisoned.store(true, Ordering::SeqCst);
-        return Err(failure(
-            "broker_unavailable",
-            "the broker is not available (it never started or has exited)",
-        ));
-    }
+    let link = iso.lock_link()?;
 
     #[allow(unused_mut)]
     let mut cfg = WorkerConfig::new("/nonexistent"); // the broker chooses and starts the worker
@@ -298,20 +281,15 @@ pub fn run(
     if result.is_ok() {
         gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED");
     }
-    drop(link);
     let persist_ms = t_persist.elapsed().as_millis() as u64;
     let report = match result {
         Ok(r) => r,
-        Err(PersistFailure::Denied { kind, reason }) => {
-            if kind == "broker_unavailable" {
-                iso.poisoned.store(true, Ordering::SeqCst);
-            }
-            return Err(failure_commit(
-                kind,
-                format!("the commit was refused: {reason}"),
-                "ROLLED_BACK",
-                json!(false),
-            ));
+        Err(PersistFailure::Denied {
+            kind,
+            reason,
+            discard_link,
+        }) => {
+            return Err(iso.lease_refusal(kind, &reason, discard_link));
         }
         Err(PersistFailure::Store(e)) => {
             return Err(match e {
@@ -345,6 +323,8 @@ pub fn run(
             });
         }
     };
+
+    drop(link);
     // The store's current recording revision right after our commit. The ingestion made exactly one
     // revision; another writer between the commit and this read could only raise the number.
     let revision = store
@@ -421,4 +401,25 @@ pub fn run(
         "elapsed_ms": t0.elapsed().as_millis() as u64,
         "next": "Use code_search for definitions."
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::isolated::IsolatedIngest;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn refusing_an_uncertain_lease_disables_the_link_before_a_late_reply_arrives() {
+        let (local, _peer) = UnixStream::pair().unwrap();
+        let iso = IsolatedIngest::new(local);
+        let link = iso.lock_link().expect("initial clean link");
+        let refusal = iso.lease_refusal("commit_not_authorized", "no reply", true);
+        assert_eq!(refusal.structured.unwrap()["commit_state"], "ROLLED_BACK");
+        drop(link);
+        let error = iso.lock_link().unwrap_err();
+        assert_eq!(
+            error.structured.unwrap()["error"]["kind"],
+            "broker_unavailable"
+        );
+    }
 }

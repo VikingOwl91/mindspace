@@ -22,12 +22,10 @@
 //!   stream and structural-parse limits. There is NO aggregate per-operation memory limit; the
 //!   unit's own `MemoryMax=` (if any) covers the tree because it lives inside the unit.
 
-use std::cell::{Cell, RefCell};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use serde_json::{json, Map, Value};
@@ -37,8 +35,7 @@ use crate::ingest::deadline::Deadline;
 use crate::ingest::extract::{persist_files_gated, Extracted, StoreContext};
 use crate::storage::Store;
 use crate::worker::client::{
-    commit_begin, commit_done, commit_request, extract_via_broker, CommitAnswer, WorkerConfig,
-    WorkerError,
+    extract_via_broker, link_idle, persist_with_lease, PersistFailure, WorkerConfig, WorkerError,
 };
 
 use super::repo_tools::{summarize, McpConfig, MAX_UNSCOPED_INGEST_FILES};
@@ -46,14 +43,11 @@ use super::tools::ToolFailure;
 
 pub const TOOL: &str = "repo_ingest_isolated";
 
-/// How long this side may use a commit lease: shorter than the broker's ceiling.
-const LEASE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
-
 /// The frontend's end of the broker channel. One operation at a time (the lock); a link that may
 /// be out of step is never used again.
 #[derive(Debug)]
 pub struct IsolatedIngest {
-    pub(super) link: Mutex<UnixStream>,
+    link: Mutex<UnixStream>,
     pub(super) poisoned: AtomicBool,
 }
 
@@ -63,6 +57,49 @@ impl IsolatedIngest {
             link: Mutex::new(link),
             poisoned: AtomicBool::new(false),
         }
+    }
+
+    /// Check poison while holding the same lock as the operation that sets it. A queued
+    /// caller must see a lost decision even when the late reply has not arrived yet.
+    pub(super) fn lock_link(&self) -> Result<MutexGuard<'_, UnixStream>, ToolFailure> {
+        let link = self
+            .link
+            .lock()
+            .map_err(|_| failure("broker_unavailable", "the broker channel is unusable"))?;
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(failure(
+                "broker_unavailable",
+                "the broker is not available (its channel is out of step; restart the server)",
+            ));
+        }
+        if !link_idle(&link) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(failure(
+                "broker_unavailable",
+                "the broker is not available (it never started or has exited)",
+            ));
+        }
+
+        Ok(link)
+    }
+
+    /// Both isolated tools hold the link mutex through this step. The next caller must see
+    /// a stale channel even if the late decision is still in transit.
+    pub(super) fn lease_refusal(
+        &self,
+        kind: &str,
+        reason: &str,
+        discard_link: bool,
+    ) -> ToolFailure {
+        if discard_link {
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
+        failure_commit(
+            kind,
+            format!("the commit was refused: {reason}"),
+            "ROLLED_BACK",
+            json!(false),
+        )
     }
 }
 
@@ -112,19 +149,6 @@ fn failure_commit(
         message: structured.to_string(),
         structured: Some(structured),
     }
-}
-
-/// An idle, healthy link has nothing to read. Readable means the peer closed it (end of file) or
-/// something unexpected is queued; both mean it must not be used.
-pub(super) fn link_idle(link: &UnixStream) -> bool {
-    let mut p = libc::pollfd {
-        fd: link.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLRDHUP,
-        revents: 0,
-    };
-    // SAFETY: poll on a descriptor this process owns, zero timeout.
-    let r = unsafe { libc::poll(&mut p, 1, 0) };
-    r == 0
 }
 
 fn error_of(e: WorkerError) -> (ToolFailure, bool) {
@@ -262,24 +286,7 @@ pub fn run(
         ids.push(id);
     }
 
-    // availability is checked before anything is sent
-    if iso.poisoned.load(Ordering::SeqCst) {
-        return Err(failure(
-            "broker_unavailable",
-            "the broker is not available (its channel is out of step; restart the server)",
-        ));
-    }
-    let link = iso
-        .link
-        .lock()
-        .map_err(|_| failure("broker_unavailable", "the broker channel is unusable"))?;
-    if !link_idle(&link) {
-        iso.poisoned.store(true, Ordering::SeqCst);
-        return Err(failure(
-            "broker_unavailable",
-            "the broker is not available (it never started or has exited)",
-        ));
-    }
+    let link = iso.lock_link()?;
 
     #[allow(unused_mut)]
     let mut cfg = WorkerConfig::new("/nonexistent"); // the broker starts the worker; this path is unused
@@ -342,9 +349,6 @@ pub fn run(
             "the result is not a directory ingestion",
         ));
     };
-    let leased = Cell::new(false);
-    let lost = Cell::new(false);
-    let denial: RefCell<Option<(&'static str, String)>> = RefCell::new(None);
     let t_persist = Instant::now();
     #[cfg(feature = "spawn-gate")]
     {
@@ -363,95 +367,38 @@ pub fn run(
             }
         }
     }
-    let result = persist_files_gated(store, files, &Deadline::none(), &|| {
-        #[cfg(feature = "spawn-gate")]
-        gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE");
-        let refuse = |kind: &'static str, why: String| {
-            *denial.borrow_mut() = Some((kind, why.clone()));
-            Err(crate::core::Error::Storage(format!(
-                "the commit was not authorized: {why}"
-            )))
-        };
-        match commit_request(&link, rep.op) {
-            CommitAnswer::Granted => {
-                leased.set(true);
-                let granted_at = Instant::now();
+    let result = persist_with_lease(
+        &link,
+        rep.op,
+        |authorize| {
+            let result = persist_files_gated(store, files, &Deadline::none(), &|| {
                 #[cfg(feature = "spawn-gate")]
-                gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER");
-                // The broker may have died during the lease (its lock dies with it, and a
-                // revocation could then complete). A live link has nothing to read.
-                if !link_idle(&link) {
-                    return refuse(
-                        "broker_unavailable",
-                        "the broker is not available (it went away during the commit lease)"
-                            .to_string(),
-                    );
-                }
-                // The broker lets revocations proceed after COMMIT_HOLD_MAX. A commit must start
-                // inside the lease: use a shorter budget here (the broker's clock started
-                // earlier than this one) and abandon the commit otherwise.
-                if granted_at.elapsed() >= LEASE_BUDGET {
-                    return refuse(
-                        "commit_not_authorized",
-                        "the commit lease expired before the commit".to_string(),
-                    );
-                }
-                // From here the broker keeps the lease for as long as the COMMIT runs (up to its
-                // in-flight ceiling, after which it removes this process). A broker that is gone
-                // refuses nothing and needs nothing: the commit is not started.
-                if let Err(why) = commit_begin(&link) {
-                    return refuse("broker_unavailable", why);
-                }
-                Ok(())
+                gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_BEFORE");
+                authorize()
+            });
+            #[cfg(feature = "spawn-gate")]
+            if result.is_ok() {
+                gate_mark("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED");
+                gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED");
             }
-            CommitAnswer::Denied(reason) => refuse("revoked", reason),
-            CommitAnswer::Lost(reason) => {
-                // The broker may still answer later and may then hold a lease: the link is out
-                // of step and is not used again; a best-effort release follows below.
-                lost.set(true);
-                leased.set(true);
-                let kind = if reason.contains("broker is not available") {
-                    "broker_unavailable"
-                } else {
-                    "commit_not_authorized"
-                };
-                refuse(kind, reason)
-            }
-        }
-    });
-    if result.is_ok() {
+            result
+        },
         #[cfg(feature = "spawn-gate")]
-        {
-            gate_mark("MINDSPACE_ISOLATED_GATE_MARK_COMMITTED");
-            gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_COMMITTED");
-        }
-    }
-    // The lease ends with the commit attempt, AFTER the COMMIT returned (never before it).
-    #[allow(unused_mut)]
-    let mut send_done = leased.get();
-    #[cfg(feature = "spawn-gate")]
-    if std::env::var_os("MINDSPACE_ISOLATED_GATE_DROP_COMMIT_DONE").is_some() {
-        send_done = false; // a lost completion message: the broker's ceiling ends the lease
-    }
-    if send_done {
-        commit_done(&link);
-    }
-    drop(link);
-    if lost.get() {
-        iso.poisoned.store(true, Ordering::SeqCst);
-    }
+        || gate_pause("MINDSPACE_ISOLATED_GATE_PAUSE_AFTER"),
+        #[cfg(feature = "spawn-gate")]
+        std::env::var_os("MINDSPACE_ISOLATED_GATE_DROP_COMMIT_DONE").is_some(),
+    );
     let persist_ms = t_persist.elapsed().as_millis() as u64;
     let report = match result {
         Ok(report) => report,
-        Err(e) => {
-            if let Some((kind, why)) = denial.into_inner() {
-                return Err(failure_commit(
-                    kind,
-                    format!("the commit was refused: {why}"),
-                    "ROLLED_BACK",
-                    json!(false),
-                ));
-            }
+        Err(PersistFailure::Denied {
+            kind,
+            reason,
+            discard_link,
+        }) => {
+            return Err(iso.lease_refusal(kind, &reason, discard_link));
+        }
+        Err(PersistFailure::Store(e)) => {
             return Err(match e {
                 crate::core::Error::CommitOutcomeUnknown { detail } => failure_commit(
                     "commit_outcome_unknown",
@@ -482,6 +429,7 @@ pub fn run(
             });
         }
     };
+    drop(link);
     let outcome = crate::core::IngestOutcome::Files(report);
     let authority = match rep.authority {
         crate::worker::broker::AuthoritySource::Static => "static_root",

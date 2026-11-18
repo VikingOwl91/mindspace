@@ -36,7 +36,7 @@ pub const TOOL: &str = "repo_ingest_git_isolated";
 pub fn definition() -> Value {
     json!({
         "name": TOOL,
-        "description": "EXPERIMENTAL. Ingest the HEAD of a git repository (not its history) through an isolated worker that runs git inside its own sandbox, started by a broker outside this server's sandbox. `path` must be the canonical absolute path of a repository root the broker is authorized to serve (a root this server was started with, or a directory granted with `mind grant`, also after start-up). The repository must carry an identity marker (`mind ingest` writes it once) and use a plain `.git` directory with SHA-1 objects; linked worktrees, alternates, grafts and SHA-256 repositories are refused. The caller cannot name a git executable, environment, arguments, a grant or a limit; the server administrator chose the executable. The result states what was verified: git objects are checked for internal consistency, but that the claimed commit is the repository's real HEAD is NOT verified. Failures are structured (`error.kind`, `persisted`, `commit_state`); an unknown commit outcome is reported as unknown, never as rolled back.",
+        "description": "EXPERIMENTAL. Ingest the HEAD of a git repository (not its history) through an isolated worker that runs git inside its own sandbox, started by a broker outside this server's sandbox. `path` must be the canonical absolute path of a repository root the broker is authorized to serve (a root this server was started with, or a directory granted with `mind grant`, also after start-up). The repository must carry an identity marker (`mind ingest` writes it once) and use SHA-1 objects. Linked worktrees and local alternates need a static read-write root enclosing the selected checkout and all external metadata and object stores. Missing HEAD objects, HTTP alternates, cycles, and grafts are refused. Reads are offline. The caller cannot name a git executable, environment, arguments, a grant or a limit; the server administrator chose the executable. The result states what was verified: git objects are checked for internal consistency, but that the claimed commit is the repository's real HEAD is NOT verified. Failures are structured (`error.kind`, `persisted`, `commit_state`); an unknown commit outcome is reported as unknown, never as rolled back.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -85,6 +85,9 @@ fn error_of(e: WorkerError) -> (ToolFailure, bool) {
         Refused(m) if m.contains("busy") => "busy",
         Refused(m) if m.contains("already used") => "replay_refused",
         Refused(m) if m.contains("identity_missing") => "identity_missing",
+        Refused(m) if m.contains("repository too large for isolated object projection") => {
+            "too_large"
+        }
         Refused(m) if m.contains("unsupported repository") => "unsupported_repository",
         Refused(m) if m.contains("not a git repository") => "not_a_repository",
         Refused(m) if m.contains("git extraction is not configured") => "git_unavailable",

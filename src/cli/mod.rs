@@ -273,6 +273,9 @@ pub enum Command {
         /// `dev:ino:size:uid:mode:sha256` of the binary, from the broker's trust policy.
         #[arg(long)]
         git_pin: Option<String>,
+        /// Read-only Git metadata and object descriptors placed by the broker.
+        #[arg(long, value_delimiter = ',')]
+        layout_fds: Vec<i32>,
         /// The same for the ELF interpreter.
         #[arg(long)]
         interp_pin: Option<String>,
@@ -1189,7 +1192,12 @@ fn mcp_command(
         let broker_req = broker.then(|| crate::sandbox::BrokerRequest {
             // explicit roots only: a grant that was active at start must stay revocable
             static_roots: McpConfig::from_specs(allow_roots)
-                .map(|c| c.roots().iter().map(|r| r.path.clone()).collect())
+                .map(|c| {
+                    c.roots()
+                        .iter()
+                        .map(|r| (r.path.clone(), r.access))
+                        .collect()
+                })
                 .unwrap_or_default(),
             git: git_exec.clone(),
             grants: store_dir.clone().map(|dir| {
@@ -1504,6 +1512,7 @@ pub fn run(cli: &Cli) -> Result<i32> {
         git_exe,
         repository_id,
         git_pin,
+        layout_fds,
         interp_pin,
         #[cfg(feature = "spawn-gate")]
         gate,
@@ -1536,7 +1545,9 @@ pub fn run(cli: &Cli) -> Result<i32> {
                 return Ok(78);
             }
         };
-        return Ok(crate::worker::run::main_git(git_exe, id, pins, gate));
+        return Ok(crate::worker::run::main_git(
+            git_exe, id, pins, layout_fds, gate,
+        ));
     }
     #[cfg(all(unix, feature = "spawn-gate"))]
     if let Command::GitProbe { scenario, git } = &cli.command {

@@ -611,12 +611,8 @@ fn linked_worktrees_external_alternates_grafts_and_links_are_refused() {
         ],
     );
     assert!(refusal(&wt).contains("linked worktree"), "{}", refusal(&wt));
-    // the main repository, now that it HAS a linked worktree
-    assert!(
-        refusal(&fx.root).contains("linked worktrees"),
-        "{}",
-        refusal(&fx.root)
-    );
+    // Reading the main HEAD does not traverse registered worktrees.
+    assert!(open_here(&fx.root).is_ok());
     // ... and again once the worktree is gone
     git(
         &fx.root,

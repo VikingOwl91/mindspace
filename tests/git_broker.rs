@@ -543,23 +543,6 @@ fn git_is_refused_without_configuration_for_an_unauthorized_root_and_for_unsuppo
             }),
         ),
         (
-            "linked worktrees",
-            Box::new(|r| {
-                let wt = r.path.parent().unwrap().join("wt");
-                git(
-                    &r.path,
-                    &[
-                        "worktree",
-                        "add",
-                        "-q",
-                        "--detach",
-                        wt.to_str().unwrap(),
-                        "HEAD~1",
-                    ],
-                );
-            }),
-        ),
-        (
             "symbolic link",
             Box::new(|r| {
                 let real = r.path.parent().unwrap().join("moved.git");

@@ -99,6 +99,10 @@ pub struct ConfinedExec {
     pub exe: PathBuf,
     /// The repository's git directory, opened beneath the verified root.
     pub git_dir_fd: i32,
+    /// A linked worktree's shared metadata. For a plain repository git_dir_fd serves both roles.
+    pub common_dir_fd: Option<i32>,
+    /// Read-only projected object directory followed by pinned regular object and pack files.
+    pub object_pins: Vec<i32>,
     /// The repository root (the work tree): the child's working directory, by `fchdir`.
     pub root_fd: i32,
     /// `false` only in the test harness, to prove what the pins and the kernel each stop. The
@@ -318,7 +322,7 @@ impl GitReader {
         let text = String::from_utf8_lossy(&out);
         let mut result = Vec::with_capacity(oids.len());
         for line in text.lines() {
-            if line.is_empty() {
+            if line.is_empty() || line.ends_with(" missing") {
                 continue;
             }
             let mut parts = line.rsplitn(3, ' ');
@@ -539,6 +543,19 @@ impl GitReader {
             None,
         )?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    /// The ref value before peeling or object lookup. Used to distinguish an absent local
+    /// HEAD object from an unborn or unreadable ref in offline extraction.
+    pub(super) fn unpeeled_head(&self) -> Result<String> {
+        let out = run(
+            &self.path,
+            &self.deadline,
+            self.pin.as_ref(),
+            &["rev-parse", "--verify", "HEAD"],
+            None,
+        )?;
+        Ok(String::from_utf8_lossy(&out).trim().to_owned())
     }
 
     /// HEAD commits of every live worktree of this repository (the main one
@@ -830,7 +847,14 @@ fn confined_command(c: &ConfinedExec) -> Command {
         cmd.env(k, v);
     }
     let fd_path = format!("/proc/self/fd/{}", c.git_dir_fd);
-    cmd.env("GIT_DIR", &fd_path).env("GIT_COMMON_DIR", &fd_path);
+    cmd.env("GIT_DIR", &fd_path).env(
+        "GIT_COMMON_DIR",
+        format!("/proc/self/fd/{}", c.common_dir_fd.unwrap_or(c.git_dir_fd)),
+    );
+    cmd.env("GIT_ALLOW_PROTOCOL", "");
+    if let Some(fd) = c.object_pins.first() {
+        cmd.env("GIT_OBJECT_DIRECTORY", format!("/proc/self/fd/{fd}"));
+    }
     cmd.env("GIT_NO_LAZY_FETCH", "1")
         // dashed helper programs are never wanted; the directory does not exist
         .env("GIT_EXEC_PATH", "/nonexistent")
@@ -840,11 +864,15 @@ fn confined_command(c: &ConfinedExec) -> Command {
     #[cfg(not(feature = "spawn-gate"))]
     let apply_pins = true;
     if apply_pins {
+        cmd.arg("--no-lazy-fetch");
         for cfg in PINNED_CONFIG.iter().chain(CONFINED_CONFIG) {
             cmd.arg("-c").arg(cfg);
         }
     }
-    let (git_fd, root_fd) = (c.git_dir_fd, c.root_fd);
+    let root_fd = c.root_fd;
+    let mut git_fds = vec![c.git_dir_fd];
+    git_fds.extend(c.common_dir_fd);
+    git_fds.extend(&c.object_pins);
     // SAFETY: only async-signal-safe system calls between fork and exec (close_range, fcntl,
     // fchdir); no allocation and no locks.
     unsafe {
@@ -859,8 +887,10 @@ fn confined_command(c: &ConfinedExec) -> Command {
             {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::fcntl(git_fd, libc::F_SETFD, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
+            for &fd in &git_fds {
+                if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             if libc::fchdir(root_fd) != 0 {
                 return Err(std::io::Error::last_os_error());

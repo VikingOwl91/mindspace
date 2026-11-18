@@ -727,6 +727,7 @@ fn ppid(pid: u32) -> u32 {
 }
 
 #[test]
+#[ignore = "manual timeline diagnostic; broker_sigkill_leaves_nothing_running_and_needs_no_restart checks cleanup"]
 fn reproduce_broker_sigkill_timeline() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);

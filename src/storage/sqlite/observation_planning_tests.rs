@@ -968,32 +968,43 @@ fn a_connection_local_commit_veto_rolls_back_the_planned_receiver() {
 #[cfg(feature = "spawn-gate")]
 #[test]
 fn committed_before_ack_loss_is_not_reported_as_rollback() {
-    const CHILD: &str = "MINDSPACE_OBSERVATION_PLANNING_ACK_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let logs = tempfile::tempdir().unwrap();
-        let stdout = std::fs::File::create(logs.path().join("stdout")).unwrap();
-        let stderr = std::fs::File::create(logs.path().join("stderr")).unwrap();
-        let mut child=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::observation_planning_tests::committed_before_ack_loss_is_not_reported_as_rollback","--nocapture","--test-threads=1"]).env_clear().env("PATH","/usr/bin:/bin").env("HOME",logs.path()).env("TMPDIR",logs.path()).env(CHILD,"1").stdout(stdout).stderr(stderr).spawn().unwrap();
-        let deadline = Instant::now() + WAIT;
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("bounded isolated lost-ack test timed out")
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert!(
-            status.success(),
-            "child stdout={} stderr={}",
-            std::fs::read_to_string(logs.path().join("stdout")).unwrap(),
-            std::fs::read_to_string(logs.path().join("stderr")).unwrap()
-        );
-        return;
-    }
+    let logs = tempfile::tempdir().unwrap();
+    let stdout = std::fs::File::create(logs.path().join("stdout")).unwrap();
+    let stderr = std::fs::File::create(logs.path().join("stderr")).unwrap();
+    let mut child = super::test_child::command(module_path!(), "lost_ack_child")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", logs.path())
+        .env("TMPDIR", logs.path())
+        .env("MINDSPACE_ISOLATED_LOST_ACK", "1")
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bounded isolated lost-ack test timed out")
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    super::test_child::check(
+        status,
+        &std::fs::read(logs.path().join("stdout")).unwrap(),
+        &std::fs::read(logs.path().join("stderr")).unwrap(),
+    );
+}
+
+#[cfg(feature = "spawn-gate")]
+#[test]
+#[ignore = "subprocess for the isolated lost-ack test"]
+fn lost_ack_child() {
+    super::test_child::require_lost_ack_subprocess();
     let w = World::new();
     let before = ledger(&w.store);
     gate::LOSE_ACK.store(true, Ordering::SeqCst);
@@ -1024,6 +1035,7 @@ fn committed_before_ack_loss_is_not_reported_as_rollback() {
     assert!(matches!(retry.files[0].outcome, FileOutcome::Unchanged));
     assert_eq!(ledger(&reopened), (before.0 + 2, before.1 + 2));
     assert_integrity(&reopened);
+    super::test_child::finished();
 }
 
 #[test]

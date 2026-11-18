@@ -207,19 +207,14 @@ fn missing_schema_marker_or_enforcement_is_a_failed_open() {
 #[test]
 #[cfg(feature = "spawn-gate")]
 fn lost_migration_ack_is_unknown_and_reopen_applies_no_second_revision() {
-    // Isolate the existing process-global one-shot fault from unrelated unit tests.
-    if std::env::var_os("MINDSPACE_TEST_METADATA_CHILD").is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "storage::sqlite::ownership_migration_tests::lost_migration_ack_is_unknown_and_reopen_applies_no_second_revision", "--nocapture"])
-            .env("MINDSPACE_TEST_METADATA_CHILD", "1").output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    super::test_child::run_lost_ack(module_path!());
+}
+
+#[cfg(feature = "spawn-gate")]
+#[test]
+#[ignore = "subprocess for the isolated lost-ack test"]
+fn lost_ack_child() {
+    super::test_child::require_lost_ack_subprocess();
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mind.db");
     let old = old_store(&path, 12);
@@ -262,4 +257,5 @@ fn lost_migration_ack_is_unknown_and_reopen_applies_no_second_revision() {
     drop(reopened);
     let again = SqliteStore::open(&path).unwrap();
     assert_eq!(revision(&again.connection().unwrap()), before + 5);
+    super::test_child::finished();
 }

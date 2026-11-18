@@ -259,16 +259,14 @@ fn late_sixteen_ddl_and_commit_veto_preserve_fifteen() {
 #[test]
 #[cfg(feature = "spawn-gate")]
 fn lost_sixteen_ack_stays_unknown_and_reopen_is_idempotent() {
-    if std::env::var_os("MINDSPACE_S3D2_METADATA_CHILD").is_none() {
-        let o=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::semantic_staging_migration_tests::lost_sixteen_ack_stays_unknown_and_reopen_is_idempotent","--nocapture"]).env("MINDSPACE_S3D2_METADATA_CHILD","1").output().unwrap();
-        assert!(
-            o.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        );
-        return;
-    }
+    super::test_child::run_lost_ack(module_path!());
+}
+
+#[cfg(feature = "spawn-gate")]
+#[test]
+#[ignore = "subprocess for the isolated lost-ack test"]
+fn lost_ack_child() {
+    super::test_child::require_lost_ack_subprocess();
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("mind.db");
     let old = old_store(&db, 15);
@@ -293,6 +291,7 @@ fn lost_sixteen_ack_stays_unknown_and_reopen_is_idempotent() {
             0
         );
     }
+    super::test_child::finished();
 }
 #[test]
 fn every_semantic_trigger_and_marker_is_required_on_open() {
@@ -325,25 +324,25 @@ fn every_semantic_trigger_and_marker_is_required_on_open() {
 }
 #[test]
 fn six_processes_install_one_semantic_metadata_cutover() {
-    if let Some(db) = std::env::var_os("MINDSPACE_S3D2_MIGRATION_CHILD_DB") {
-        drop(SqliteStore::open(Path::new(&db)).unwrap());
-        return;
-    }
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("mind.db");
     let old = old_store(&db, 15);
     old.create_space("legacy", "").unwrap();
     let r = revision(&old.connection().unwrap());
     drop(old);
-    let children=(0..6).map(|_|std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::semantic_staging_migration_tests::six_processes_install_one_semantic_metadata_cutover","--nocapture"]).env("MINDSPACE_S3D2_MIGRATION_CHILD_DB",&db).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()).collect::<Vec<_>>();
+    let children = (0..6)
+        .map(|_| {
+            super::test_child::command(module_path!(), "concurrent_open_child")
+                .env("MINDSPACE_S3D2_MIGRATION_CHILD_DB", &db)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     for c in children {
         let o = c.wait_with_output().unwrap();
-        assert!(
-            o.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        );
+        super::test_child::check(o.status, &o.stdout, &o.stderr);
     }
     let new = SqliteStore::open(&db).unwrap();
     let c = new.connection().unwrap();
@@ -357,4 +356,13 @@ fn six_processes_install_one_semantic_metadata_cutover() {
         .unwrap(),
         1
     );
+}
+
+#[test]
+#[ignore = "subprocess for concurrent migration"]
+fn concurrent_open_child() {
+    let db = std::env::var_os("MINDSPACE_S3D2_MIGRATION_CHILD_DB")
+        .expect("parent supplies database path");
+    drop(SqliteStore::open(Path::new(&db)).unwrap());
+    super::test_child::finished();
 }

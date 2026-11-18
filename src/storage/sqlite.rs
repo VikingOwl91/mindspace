@@ -5601,6 +5601,69 @@ impl SqliteStore {
 }
 
 #[cfg(test)]
+mod test_child {
+    use std::process::{Command, ExitStatus};
+
+    pub(super) fn command(module: &str, name: &str) -> Command {
+        // libtest's qualified name omits the leading crate component of module_path!().
+        let (_, module) = module.split_once("::").unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            &format!("{module}::{name}"),
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        command
+    }
+
+    #[cfg(feature = "spawn-gate")]
+    pub(super) fn run_lost_ack(module: &str) {
+        let output = command(module, "lost_ack_child")
+            .env("MINDSPACE_ISOLATED_LOST_ACK", "1")
+            .output()
+            .unwrap();
+        check(output.status, &output.stdout, &output.stderr);
+    }
+
+    #[cfg(feature = "spawn-gate")]
+    pub(super) fn require_lost_ack_subprocess() {
+        assert_eq!(
+            std::env::var("MINDSPACE_ISOLATED_LOST_ACK").as_deref(),
+            Ok("1"),
+            "run the parent test to isolate the process-global fault"
+        );
+    }
+
+    const DONE: &str = "completed SQLite subprocess assertions";
+
+    pub(super) fn finished() {
+        eprintln!("{DONE}");
+    }
+
+    pub(super) fn check(status: ExitStatus, stdout: &[u8], stderr: &[u8]) {
+        let stderr = String::from_utf8_lossy(stderr);
+        let stdout = String::from_utf8_lossy(stdout);
+        assert!(
+            status.success(),
+            "child status {status}, stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.lines().any(|line| line == DONE),
+            "child did not report completion, stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "child did not report completion")]
+    fn a_misspelled_test_name_cannot_pass() {
+        let out = command(module_path!(), "no_such_child").output().unwrap();
+        check(out.status, &out.stdout, &out.stderr);
+    }
+}
+
+#[cfg(test)]
 #[path = "sqlite/ownership_migration_tests.rs"]
 mod ownership_migration_tests;
 

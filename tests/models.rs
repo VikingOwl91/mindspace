@@ -46,9 +46,8 @@ fn verify_file_detects_checksum_mismatch() {
 #[test]
 fn is_installed_false_when_missing() {
     let m = find_model("nomic-embed-text-v1.5").unwrap();
-    // Ensure not installed in a clean temp data dir by checking a nonexistent model dir.
-    // We just assert the function runs; installed state depends on environment.
-    let _ = manager::is_installed(m);
+    let dir = TempDir::new().unwrap();
+    assert!(!manager::is_installed_in(dir.path(), m));
 }
 
 #[test]
@@ -79,7 +78,7 @@ fn status_reports_not_installed_when_absent() {
     let path = dir.path().join("mind.db");
     SqliteStore::open(&path).unwrap();
     let store = SqliteStore::open(&path).unwrap();
-    let st = manager::status(&store).unwrap();
+    let st = manager::status_in(dir.path(), &store);
     assert!(!st.installed);
     assert!(!st.verified);
     assert!(!st.indexing_available);
@@ -92,19 +91,9 @@ fn status_reports_no_runtime_without_embedding_support() {
     let path = dir.path().join("mind.db");
     SqliteStore::open(&path).unwrap();
     let store = SqliteStore::open(&path).unwrap();
-    let status = manager::status(&store).unwrap();
+    let status = manager::status_in(dir.path(), &store);
     assert_eq!(status.runtime, "none (build without embeddings)");
     assert!(!status.indexing_available);
-}
-
-#[test]
-fn no_network_during_status() {
-    // Status must not perform network access; just call it.
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("mind.db");
-    SqliteStore::open(&path).unwrap();
-    let store = SqliteStore::open(&path).unwrap();
-    let _ = manager::status(&store);
 }
 
 #[cfg(feature = "embeddings")]
@@ -118,14 +107,12 @@ fn lazy_load_not_triggered_on_construction() {
 
 #[cfg(feature = "embeddings")]
 #[test]
+#[ignore = "requires installed and verified Nomic model weights"]
 fn candle_runtime_prefix_distinction() {
-    // Only run if model is installed.
     let dir = manager::model_dir("nomic-embed-text-v1.5").unwrap();
-    if !manager::is_installed(
+    assert!(manager::is_installed(
         mindspace::embeddings::manifest::find_model("nomic-embed-text-v1.5").unwrap(),
-    ) {
-        return; // skip if not installed
-    }
+    ));
     let rt = mindspace::embeddings::CandleRuntime::load(&dir).unwrap();
     let d = rt.embed_document("machine learning").unwrap();
     let q = rt.embed_query("machine learning").unwrap();
@@ -148,11 +135,6 @@ fn candle_runtime_prefix_distinction() {
     let n: f64 = d.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     assert!((n - 1.0).abs() < 1e-5);
     assert_eq!(d.len(), 768);
-}
-
-#[test]
-fn no_default_features_compiles() {
-    // This test exists only to be compiled; actual no-default check is a build gate.
 }
 
 #[test]

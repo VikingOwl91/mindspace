@@ -217,16 +217,14 @@ fn late_fourteen_ddl_failure_or_veto_leaves_thirteen_exact_and_scope_cleared() {
 #[test]
 #[cfg(feature = "spawn-gate")]
 fn lost_fourteen_migration_ack_is_unknown_and_reopen_does_not_repeat_cutover() {
-    if std::env::var_os("MINDSPACE_TEST_S3C_METADATA_CHILD").is_none() {
-        let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::document_preparation_migration_tests::lost_fourteen_migration_ack_is_unknown_and_reopen_does_not_repeat_cutover","--nocapture"]).env("MINDSPACE_TEST_S3C_METADATA_CHILD","1").output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
+    super::test_child::run_lost_ack(module_path!());
+}
+
+#[cfg(feature = "spawn-gate")]
+#[test]
+#[ignore = "subprocess for the isolated lost-ack test"]
+fn lost_ack_child() {
+    super::test_child::require_lost_ack_subprocess();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mind.db");
     let old = old_store(&path, 13);
@@ -254,6 +252,7 @@ fn lost_fourteen_migration_ack_is_unknown_and_reopen_does_not_repeat_cutover() {
             0
         );
     }
+    super::test_child::finished();
 }
 
 #[test]

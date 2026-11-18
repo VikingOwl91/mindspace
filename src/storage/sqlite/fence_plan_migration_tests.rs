@@ -417,17 +417,14 @@ fn false_when_unknown_udf_is_not_an_inert_old_writer_guard_on_bundled_sqlite() {
 
 #[test]
 fn lost_migration_ack_reopens_once_without_consuming_another_schema_revision() {
-    const CHILD: &str = "MINDSPACE_S3E2_MIGRATION_ACK_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::fence_plan_migration_tests::lost_migration_ack_reopens_once_without_consuming_another_schema_revision","--nocapture"]).env(CHILD,"1").output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
+    super::test_child::run_lost_ack(module_path!());
+}
+
+#[cfg(feature = "spawn-gate")]
+#[test]
+#[ignore = "subprocess for the isolated lost-ack test"]
+fn lost_ack_child() {
+    super::test_child::require_lost_ack_subprocess();
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("mind.db");
     let old = old_store(&db, 16);
@@ -450,4 +447,5 @@ fn lost_migration_ack_reopens_once_without_consuming_another_schema_revision() {
             17
         );
     }
+    super::test_child::finished();
 }

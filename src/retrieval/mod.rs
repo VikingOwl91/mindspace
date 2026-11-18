@@ -299,6 +299,16 @@ pub(crate) fn search_with_mode_resolving_capability_named(
     mode: SearchMode,
     names: Option<&[String]>,
 ) -> Result<SearchOutcome> {
+    search_with_preparer(store, query, mode, names, semantic::prepare)
+}
+
+fn search_with_preparer(
+    store: &dyn Store,
+    query: SearchQuery,
+    mode: SearchMode,
+    names: Option<&[String]>,
+    mut prepare: impl FnMut(&dyn Store) -> Result<semantic::PreparedCapability>,
+) -> Result<SearchOutcome> {
     if query.text.trim().is_empty() {
         return Err(Error::EmptyQuery);
     }
@@ -312,16 +322,6 @@ pub(crate) fn search_with_mode_resolving_capability_named(
             names,
         );
     }
-    search_with_preparer(store, query, mode, names, semantic::prepare)
-}
-
-fn search_with_preparer(
-    store: &dyn Store,
-    query: SearchQuery,
-    mode: SearchMode,
-    names: Option<&[String]>,
-    mut prepare: impl FnMut(&dyn Store) -> Result<semantic::PreparedCapability>,
-) -> Result<SearchOutcome> {
     for attempt in 0..=1 {
         let prepared = prepare(store)?;
         let plan = prepare_plan(mode, &prepared.capability, &query.text, query.limit)?;
@@ -341,24 +341,6 @@ fn search_with_preparer(
         }
     }
     unreachable!("bounded preparation loop returns")
-}
-
-#[cfg(test)]
-fn search_with_mode_and_resolver(
-    store: &dyn Store,
-    query: SearchQuery,
-    mode: SearchMode,
-    resolver: impl FnOnce(&dyn Store) -> Result<SemanticCapability>,
-) -> Result<SearchOutcome> {
-    if query.text.trim().is_empty() {
-        return Err(Error::EmptyQuery);
-    }
-    let capability = if mode == SearchMode::Lexical {
-        SemanticCapability::Unavailable(FallbackReason::EmbeddingsDisabled)
-    } else {
-        resolver(store)?
-    };
-    search_with_mode(store, query, mode, &capability, RetrievalOptions::default())
 }
 
 /// Runs a request using the caller's capability. A Ready capability is bound to
@@ -1093,24 +1075,25 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let resolutions = Cell::new(0);
 
-        let lexical =
-            search_with_mode_and_resolver(&store, query("missing", 0), SearchMode::Lexical, |_| {
+        let lexical = search_with_preparer(
+            &store,
+            query("missing", 0),
+            SearchMode::Lexical,
+            None,
+            |store| {
                 resolutions.set(resolutions.get() + 1);
-                Ok(SemanticCapability::Unavailable(
-                    FallbackReason::EmbeddingsDisabled,
-                ))
-            })
-            .unwrap();
+                semantic::prepare(store)
+            },
+        )
+        .unwrap();
         assert_eq!(lexical.effective, EffectiveMode::NotRun);
         assert_eq!(resolutions.get(), 0);
 
         let modes = [SearchMode::Semantic, SearchMode::Hybrid, SearchMode::Auto];
         for (index, mode) in modes.into_iter().enumerate() {
-            let result = search_with_mode_and_resolver(&store, query("missing", 0), mode, |_| {
+            let result = search_with_preparer(&store, query("missing", 0), mode, None, |store| {
                 resolutions.set(resolutions.get() + 1);
-                Ok(SemanticCapability::Unavailable(
-                    FallbackReason::EmbeddingsDisabled,
-                ))
+                semantic::prepare(store)
             });
             assert_eq!(resolutions.get(), index + 1);
             match mode {
@@ -1132,11 +1115,9 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let resolutions = Cell::new(0);
         let result =
-            search_with_mode_and_resolver(&store, query("   ", 0), SearchMode::Auto, |_| {
+            search_with_preparer(&store, query("   ", 0), SearchMode::Auto, None, |store| {
                 resolutions.set(resolutions.get() + 1);
-                Ok(SemanticCapability::Unavailable(
-                    FallbackReason::EmbeddingsDisabled,
-                ))
+                semantic::prepare(store)
             });
         assert!(matches!(result, Err(Error::EmptyQuery)));
         assert_eq!(resolutions.get(), 0);

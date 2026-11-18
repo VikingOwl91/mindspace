@@ -90,7 +90,10 @@ fn run_child(case: &str, mask: u32) {
     }
     let output = cmd.output().unwrap();
     assert!(
-        output.status.success(),
+        output.status.success()
+            && String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == format!("completed {case}")),
         "{case}, umask {mask:03o}:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -188,6 +191,7 @@ fn private_storage_child() {
         "revisions" => revisions(root.path()),
         other => panic!("unknown private-storage scenario {other}"),
     }
+    eprintln!("completed {case}");
 }
 
 fn lifecycle(root: &Path) {

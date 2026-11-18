@@ -225,16 +225,14 @@ fn late_fifteen_failure_and_commit_veto_preserve_fourteen_exactly() {
 #[test]
 #[cfg(feature = "spawn-gate")]
 fn lost_fifteen_ack_is_unknown_and_reopen_spends_no_second_cutover() {
-    if std::env::var_os("MINDSPACE_S3D_METADATA_CHILD").is_none() {
-        let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::lexical_staging_migration_tests::lost_fifteen_ack_is_unknown_and_reopen_spends_no_second_cutover","--nocapture"]).env("MINDSPACE_S3D_METADATA_CHILD","1").output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
+    super::test_child::run_lost_ack(module_path!());
+}
+
+#[cfg(feature = "spawn-gate")]
+#[test]
+#[ignore = "subprocess for the isolated lost-ack test"]
+fn lost_ack_child() {
+    super::test_child::require_lost_ack_subprocess();
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("mind.db");
     let old = old_store(&db, 14);
@@ -256,6 +254,7 @@ fn lost_fifteen_ack_is_unknown_and_reopen_spends_no_second_cutover() {
             0
         );
     }
+    super::test_child::finished();
 }
 
 #[test]
@@ -290,25 +289,25 @@ fn missing_lexical_trigger_or_marker_fails_open() {
 
 #[test]
 fn concurrent_fifteen_migration_installs_one_cutover() {
-    if let Some(db) = std::env::var_os("MINDSPACE_S3D_MIGRATION_CHILD_DB") {
-        drop(SqliteStore::open(Path::new(&db)).unwrap());
-        return;
-    }
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("mind.db");
     let old = old_store(&db, 14);
     old.create_space("legacy", "preserve").unwrap();
     let r = revision(&old.connection().unwrap());
     drop(old);
-    let children=(0..6).map(|_|std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::sqlite::lexical_staging_migration_tests::concurrent_fifteen_migration_installs_one_cutover","--nocapture"]).env("MINDSPACE_S3D_MIGRATION_CHILD_DB",&db).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()).collect::<Vec<_>>();
+    let children = (0..6)
+        .map(|_| {
+            super::test_child::command(module_path!(), "concurrent_open_child")
+                .env("MINDSPACE_S3D_MIGRATION_CHILD_DB", &db)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     for child in children {
         let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        super::test_child::check(out.status, &out.stdout, &out.stderr);
     }
     let store = SqliteStore::open(&db).unwrap();
     let c = store.connection().unwrap();
@@ -322,4 +321,13 @@ fn concurrent_fifteen_migration_installs_one_cutover() {
         .unwrap(),
         1
     );
+}
+
+#[test]
+#[ignore = "subprocess for concurrent migration"]
+fn concurrent_open_child() {
+    let db = std::env::var_os("MINDSPACE_S3D_MIGRATION_CHILD_DB")
+        .expect("parent supplies database path");
+    drop(SqliteStore::open(Path::new(&db)).unwrap());
+    super::test_child::finished();
 }

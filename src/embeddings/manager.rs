@@ -525,12 +525,22 @@ mod tests {
 
     #[test]
     fn install_idempotent_offline_reuse() {
-        let entry = crate::embeddings::manifest::find_model("nomic-embed-text-v1.5").unwrap();
-        if !is_installed(entry) {
-            return;
-        }
-        assert!(install_model(entry).is_ok());
-        assert!(is_installed(entry));
+        use crate::embeddings::manifest::{Artifact, NOMIC_V1_5};
+        let entry = ModelManifestEntry {
+            artifacts: &[Artifact {
+                filename: "fixture",
+                size: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                url: "offline-fixture",
+            }],
+            ..NOMIC_V1_5
+        };
+        let base = tempfile::tempdir().unwrap();
+        let dir = model_dir_in(base.path(), entry.id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("fixture"), b"abc").unwrap();
+        install_model_opts(&entry, base.path(), None).unwrap();
+        assert!(is_installed_in(base.path(), &entry));
     }
 
     #[test]

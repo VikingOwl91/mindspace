@@ -266,10 +266,14 @@ fn find_watchdog(frontend: u32) -> Option<i32> {
 }
 
 impl Mcp {
-    fn start(w: &World, roots: &[&Path], extra: &[&str], vars: &[(&str, String)]) -> Option<Mcp> {
-        let isolated =
-            extra.contains(&"--isolated-ingest") || extra.contains(&"--isolated-git-ingest");
-        if isolated && !prerequisites::cgroup_delegated(prerequisites::Cgroup::Direct) {
+    fn start(
+        w: &World,
+        roots: &[&Path],
+        extra: &[&str],
+        vars: &[(&str, String)],
+        expect_live_broker: bool,
+    ) -> Option<Mcp> {
+        if expect_live_broker && !prerequisites::cgroup_delegated(prerequisites::Cgroup::Direct) {
             return None;
         }
         let mut c = w.mind(&["mcp"]);
@@ -300,7 +304,7 @@ impl Mcp {
                    "clientInfo":{"name":"t","version":"0"}}),
         );
         m.notify("notifications/initialized");
-        if isolated {
+        if expect_live_broker {
             let pid = m.child.id();
             let wd =
                 find_watchdog(pid).expect("no watchdog appeared after successful cgroup probe");
@@ -393,7 +397,10 @@ impl Drop for Mcp {
 
 macro_rules! mcp {
     ($w:expr, $roots:expr, $extra:expr, $vars:expr) => {
-        match Mcp::start(&$w, $roots, $extra, $vars) {
+        mcp!($w, $roots, $extra, $vars, expect_live_broker = true)
+    };
+    ($w:expr, $roots:expr, $extra:expr, $vars:expr, expect_live_broker = $expected:expr) => {
+        match Mcp::start(&$w, $roots, $extra, $vars, $expected) {
             Some(m) => m,
             None => return,
         }
@@ -528,7 +535,7 @@ fn kill(pid: i32) {
 fn the_tool_exists_only_when_every_gate_passes_and_the_default_listing_is_unchanged() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
-    let mut m = mcp!(w, &[&project], &[], &[]);
+    let mut m = mcp!(w, &[&project], &[], &[], expect_live_broker = false);
     let base_raw = m.rpc("tools/list", json!({}))["result"]["tools"].clone();
     let base = m.tools();
     assert!(!base.iter().any(|t| t == TOOL));
@@ -551,13 +558,25 @@ fn the_tool_exists_only_when_every_gate_passes_and_the_default_listing_is_unchan
         vec!["--broker"],
         vec!["--grants", "--git-exe", GIT],
     ] {
-        let mut m = mcp!(w, &[&project], &extra, &[]);
+        let mut m = mcp!(
+            w,
+            &[&project],
+            &extra,
+            &[],
+            expect_live_broker = extra.contains(&"--broker")
+        );
         assert_eq!(m.tools(), base, "{extra:?}");
         m.finish();
     }
 
     // --isolated-git-ingest without an administrator executable: one line, no tool
-    let mut m = mcp!(w, &[&project], &["--grants", "--isolated-git-ingest"], &[]);
+    let mut m = mcp!(
+        w,
+        &[&project],
+        &["--grants", "--isolated-git-ingest"],
+        &[],
+        expect_live_broker = false
+    );
     assert_eq!(m.tools(), base);
     m.finish();
     assert!(
@@ -611,7 +630,7 @@ fn an_executable_that_fails_the_trust_policy_means_no_tool() {
     let w = World::new();
     let project = w.dir("project", &[("a.md", "# A\n")]);
     let base = {
-        let mut m = mcp!(w, &[&project], &[], &[]);
+        let mut m = mcp!(w, &[&project], &[], &[], expect_live_broker = false);
         let b = m.tools();
         m.finish();
         b
@@ -642,7 +661,8 @@ fn an_executable_that_fails_the_trust_policy_means_no_tool() {
             w,
             &[&project],
             &["--grants", "--isolated-git-ingest", "--git-exe", &exe],
-            &[]
+            &[],
+            expect_live_broker = false
         );
         assert_eq!(m.tools(), base, "{what}: the tool must not be offered");
         let r = m.call(

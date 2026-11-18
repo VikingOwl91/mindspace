@@ -269,6 +269,11 @@ pub enum Record {
         reused: bool,
     },
     // ---- both
+    /// Selected regular paths skipped before opening their contents. Verified HEAD
+    /// computes these counts from the authenticated tree at the receiver.
+    UnsupportedExtensions {
+        counts: super::outline::ExtensionCounts,
+    },
     Chunk {
         data: String,
     },
@@ -291,6 +296,7 @@ impl Record {
     fn name(&self) -> &'static str {
         match self {
             Record::Begin { .. } => "begin",
+            Record::UnsupportedExtensions { .. } => "unsupported_extensions",
             Record::FilesHeader { .. } => "files_header",
             Record::File { .. } => "file",
             Record::Skipped { .. } => "skipped",
@@ -623,6 +629,16 @@ fn emit_parts<T: Serialize>(
     }
 }
 
+fn emit_unsupported(
+    sink: &mut dyn RecordSink,
+    counts: super::outline::ExtensionCounts,
+) -> Result<()> {
+    if !counts.is_empty() {
+        sink.emit(&Record::UnsupportedExtensions { counts })?;
+    }
+    Ok(())
+}
+
 fn emit_file(sink: &mut dyn RecordSink, mut file: ObservedFile) -> Result<()> {
     let content = std::mem::take(&mut file.content);
     let (ev, asr, mem) = (
@@ -727,11 +743,9 @@ pub fn stream_directory(
         spaces: space_ids.to_vec(),
     })?;
     let base = anchor.proc_path();
-    let mut paths: Vec<std::path::PathBuf> = outline::walk_files(&base)?
-        .into_iter()
-        .filter(|p| super::is_ingestable(p))
-        .collect();
-    paths.sort();
+    let mut unsupported = Default::default();
+    let paths = outline::ingest_paths(&base, &mut unsupported)?;
+    emit_unsupported(sink, unsupported)?;
     for path in paths {
         deadline.check("reading files")?;
         let rel = path
@@ -895,6 +909,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
     }
 
     // ---- which blobs are derived, at which commit and path
+    let mut unsupported = Default::default();
     let mut keys: Vec<(String, String, String)> = Vec::new(); // (commit, path, blob)
     for commit in &tip_commits {
         deadline.check("listing files")?;
@@ -905,12 +920,14 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             if !selection.matches(&path) {
                 continue;
             }
-            if !is_ingestable(Path::new(&path)) && code::language_for(Path::new(&path)).is_none() {
+            if !is_ingestable(Path::new(&path)) {
+                super::outline::count_unsupported(&mut unsupported, Path::new(&path));
                 continue;
             }
             keys.push((commit.clone(), path, oid));
         }
     }
+    emit_unsupported(sink, unsupported)?;
     keys.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     let mut by_blob: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (commit, path, blob) in keys {
@@ -1029,7 +1046,7 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
             })?;
             emit_chunks(sink, &content)?;
             let content_hash = sha256_hex(content.as_bytes());
-            let mut code_input: Option<CodeInputDraft> = None;
+            let mut code_inputs = BTreeMap::new();
             for (commit, path) in uses {
                 deadline.check("deriving memories")?;
                 emit_derivation(
@@ -1044,41 +1061,41 @@ pub fn stream_git_with_reader<S: AsRef<str>>(
                     )?,
                     true,
                 )?;
-                // Code input: one per blob, created at its first source path.
+                // One structural derivation per blob and language.
                 let Some(language) = code::language_for(Path::new(path)) else {
                     continue;
                 };
                 deadline.check("parsing source files")?;
-                if code_input.is_none() {
-                    let derivation = super::structural_derivation(
-                        ctx,
-                        language,
-                        &content,
-                        &content_hash,
-                        Some(repository_id),
-                        Some(&blob_oid),
-                        &limits.parse_policy,
-                        false,
-                    )?;
-                    code_input = Some(CodeInputDraft {
-                        language,
-                        content_hash: content_hash.clone(),
-                        content: String::new(),
-                        repository_id: Some(repository_id),
-                        blob_oid: Some(blob_oid.clone()),
-                        contexts: vec![],
-                        derivation,
-                    });
-                }
-                let Some(entry) = code_input.as_mut() else {
-                    continue;
+                let entry = match code_inputs.entry(language) {
+                    std::collections::btree_map::Entry::Occupied(existing) => existing.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        let derivation = super::structural_derivation(
+                            ctx,
+                            language,
+                            &content,
+                            &content_hash,
+                            Some(repository_id),
+                            Some(&blob_oid),
+                            &limits.parse_policy,
+                            false,
+                        )?;
+                        slot.insert(CodeInputDraft {
+                            language,
+                            content_hash: content_hash.clone(),
+                            content: String::new(),
+                            repository_id: Some(repository_id),
+                            blob_oid: Some(blob_oid.clone()),
+                            contexts: vec![],
+                            derivation,
+                        })
+                    }
                 };
                 entry.contexts.push(CodeContextDraft {
                     path: path.clone(),
                     commit_oid: Some(commit.clone()),
                 });
             }
-            if let Some(input) = code_input {
+            for input in code_inputs.into_values() {
                 emit_code_input(sink, input, true, false)?;
             }
         }
@@ -1358,7 +1375,7 @@ pub fn stream_verified_head(
             })?;
             emit_chunks(sink, &content)?;
             let content_hash = sha256_hex(content.as_bytes());
-            let mut code_input: Option<(CodeInputDraft, bool)> = None;
+            let mut code_inputs = BTreeMap::new();
             for path in uses {
                 deadline.check("deriving memories")?;
                 emit_derivation(
@@ -1377,39 +1394,39 @@ pub fn stream_verified_head(
                     continue;
                 };
                 deadline.check("parsing source files")?;
-                if code_input.is_none() {
-                    let (derivation, reused) = super::structural_decision(
-                        ctx,
-                        language,
-                        &content,
-                        &content_hash,
-                        Some(repository_id),
-                        Some(&blob_oid),
-                        &limits.parse_policy,
-                        false,
-                    )?;
-                    code_input = Some((
-                        CodeInputDraft {
+                let (entry, _) = match code_inputs.entry(language) {
+                    std::collections::btree_map::Entry::Occupied(existing) => existing.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        let (derivation, reused) = super::structural_decision(
+                            ctx,
                             language,
-                            content_hash: content_hash.clone(),
-                            content: String::new(),
-                            repository_id: Some(repository_id),
-                            blob_oid: Some(blob_oid.clone()),
-                            contexts: vec![],
-                            derivation,
-                        },
-                        reused,
-                    ));
-                }
-                let Some((entry, _)) = code_input.as_mut() else {
-                    continue;
+                            &content,
+                            &content_hash,
+                            Some(repository_id),
+                            Some(&blob_oid),
+                            &limits.parse_policy,
+                            false,
+                        )?;
+                        slot.insert((
+                            CodeInputDraft {
+                                language,
+                                content_hash: content_hash.clone(),
+                                content: String::new(),
+                                repository_id: Some(repository_id),
+                                blob_oid: Some(blob_oid.clone()),
+                                contexts: vec![],
+                                derivation,
+                            },
+                            reused,
+                        ))
+                    }
                 };
                 entry.contexts.push(CodeContextDraft {
                     path: path.clone(),
                     commit_oid: Some(closure.commit_oid.clone()),
                 });
             }
-            if let Some((input, reused)) = code_input {
+            for (input, reused) in code_inputs.into_values() {
                 emit_code_input(sink, input, true, reused)?;
             }
         }
@@ -1427,6 +1444,7 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 session: f.observation.session,
                 spaces: f.observation.spaces,
             })?;
+            emit_unsupported(sink, f.unsupported_extensions)?;
             let mut code: HashMap<String, CodeInputDraft> = f
                 .code_inputs
                 .into_iter()
@@ -1452,6 +1470,7 @@ pub fn emit_extracted(sink: &mut dyn RecordSink, extracted: Extracted) -> Result
                 repository_path: o.repository_path,
                 spaces: o.spaces,
             })?;
+            emit_unsupported(sink, g.unsupported_extensions)?;
             for item in o.refs {
                 sink.emit(&Record::Ref { item })?;
             }
@@ -1817,6 +1836,7 @@ struct Assembler<'a> {
     spaces: Vec<Uuid>,
     files: Vec<ObservedFile>,
     skipped_files: Vec<SkippedFile>,
+    unsupported_extensions: Option<super::outline::ExtensionCounts>,
     repository_id: Option<Uuid>,
     repository_path: String,
     refs: Vec<GitRefObservation>,
@@ -1863,6 +1883,7 @@ impl<'a> Assembler<'a> {
             spaces: Vec::new(),
             files: Vec::new(),
             skipped_files: Vec::new(),
+            unsupported_extensions: None,
             repository_id: None,
             repository_path: String::new(),
             refs: Vec::new(),
@@ -2061,6 +2082,22 @@ impl<'a> Assembler<'a> {
                     ));
                 }
                 self.phase = Phase::Begun;
+            }
+            Record::UnsupportedExtensions { counts } => {
+                if self.expect == Kind::GitVerified
+                    || self.session.is_none()
+                    || self.unsupported_extensions.is_some()
+                {
+                    return bad("unexpected unsupported extension counts");
+                }
+                if counts.is_empty()
+                    || counts.iter().any(|(key, n)| {
+                        *n == 0 || !super::outline::COVERAGE_EXTENSIONS.contains(&key.as_str())
+                    })
+                {
+                    return bad("invalid unsupported extension counts");
+                }
+                self.unsupported_extensions = Some(counts);
             }
             Record::FilesHeader { session, spaces } => {
                 if self.expect != Kind::Files || self.phase != Phase::Begun {
@@ -2400,6 +2437,11 @@ impl<'a> Assembler<'a> {
                     return bad("a `code_input` record must not carry content or parts");
                 }
                 for c in &input.contexts {
+                    if self.expect != Kind::GitVerified
+                        && super::code::language_for(Path::new(&c.path)) != Some(input.language)
+                    {
+                        return bad("a code context path does not match its language");
+                    }
                     if c.path.len() > self.limits.extraction.max_path_bytes || c.path.contains('\0')
                     {
                         return bad("a code context path is too long or contains NUL");
@@ -2439,7 +2481,7 @@ impl<'a> Assembler<'a> {
                         ctx.path.clone()
                     }
                 };
-                self.unique("code input", &id)?;
+                self.unique("code input", &format!("{}\0{id}", input.language.as_str()))?;
                 match content {
                     ContentSource::Shared => {
                         let len = self.shared_slot(&id)?;
@@ -2603,6 +2645,7 @@ impl<'a> Assembler<'a> {
         }
         Ok(match self.expect {
             Kind::Files => Extracted::Files(ExtractedFiles {
+                unsupported_extensions: self.unsupported_extensions.unwrap_or_default(),
                 observation: IngestObservation {
                     skipped_files: self.skipped_files,
                     session,
@@ -2618,6 +2661,7 @@ impl<'a> Assembler<'a> {
                 self.derivations
                     .sort_by(|a, b| (&a.commit_oid, &a.path).cmp(&(&b.commit_oid, &b.path)));
                 Extracted::Git(ExtractedGit {
+                    unsupported_extensions: self.unsupported_extensions.unwrap_or_default(),
                     observation: GitObservation {
                         skipped_files: self.skipped_files,
                         session,
@@ -2659,11 +2703,18 @@ impl<'a> Assembler<'a> {
         };
         let v = verify_head(&head_oid, &self.raw_objects, &self.limits.verify)?;
         let head_commit = v.commit.oid.clone();
+        let mut unsupported_extensions = Default::default();
 
         // blob ids named by the verified trees, and the paths each one is at
         let mut tree_blobs: HashMap<&str, &str> = HashMap::new(); // oid -> any path
         let mut at_path: HashMap<&str, (&str, GitObjectKind, &str)> = HashMap::new(); // path -> (oid, kind)
         for f in &v.files {
+            if f.kind == GitObjectKind::Blob
+                && f.mode != "120000"
+                && !super::is_ingestable(Path::new(&f.path))
+            {
+                super::outline::count_unsupported(&mut unsupported_extensions, Path::new(&f.path));
+            }
             at_path.insert(&f.path, (&f.oid, f.kind, &f.mode));
             if f.kind == GitObjectKind::Blob {
                 tree_blobs.insert(&f.oid, &f.path);
@@ -2756,6 +2807,9 @@ impl<'a> Assembler<'a> {
                     ))
                     }
                 }
+                if super::code::language_for(Path::new(&ctx.path)) != Some(c.language) {
+                    return bad("a code context path does not match its language");
+                }
             }
         }
 
@@ -2786,6 +2840,7 @@ impl<'a> Assembler<'a> {
             symbolic_target: symbolic,
         }];
         let extracted = Extracted::Git(ExtractedGit {
+            unsupported_extensions,
             observation: GitObservation {
                 skipped_files: self.skipped_files,
                 session,

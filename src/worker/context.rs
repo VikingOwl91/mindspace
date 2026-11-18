@@ -36,9 +36,10 @@ use super::PROTOCOL;
 /// Source files in one operation: the extraction's own file limit.
 pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
 /// Identities in one context: the current parser identity and the three skip identities.
-pub const MAX_IDENTITIES: usize = 4;
+const IDENTITIES_PER_LANGUAGE: usize = 4;
+pub const MAX_IDENTITIES: usize = IDENTITIES_PER_LANGUAGE * CodeLanguage::ALL.len();
 /// Known `(hash, identity)` pairs: every entry may be known under every identity.
-pub const MAX_KNOWN: usize = MAX_MANIFEST_ENTRIES * MAX_IDENTITIES;
+pub const MAX_KNOWN: usize = MAX_MANIFEST_ENTRIES * IDENTITIES_PER_LANGUAGE;
 /// Spaces in one request.
 pub const MAX_SPACES: usize = 64;
 /// One JSON line each, newline included. A hash entry is about 85 bytes.
@@ -83,9 +84,29 @@ fn bad<T>(m: impl Into<String>) -> std::result::Result<T, String> {
 
 /// The identities an operation with this policy can ask about, the current parser identity first.
 pub fn identities_for(policy: &ParsePolicy) -> Vec<CodeParserIdentity> {
-    let mut v = vec![code::identity()];
-    v.extend(policy.reasons().into_iter().map(code::skip_identity));
-    v
+    CodeLanguage::ALL
+        .into_iter()
+        .flat_map(|language| {
+            std::iter::once(code::identity_for(language)).chain(
+                policy
+                    .reasons()
+                    .into_iter()
+                    .map(move |reason| code::skip_identity_for(language, reason)),
+            )
+        })
+        .collect()
+}
+
+fn language_identities(
+    ids: &[CodeParserIdentity],
+    language: CodeLanguage,
+) -> (usize, &[CodeParserIdentity]) {
+    let offset = CodeLanguage::ALL
+        .iter()
+        .position(|l| *l == language)
+        .expect("registered language")
+        * IDENTITIES_PER_LANGUAGE;
+    (offset, &ids[offset..offset + IDENTITIES_PER_LANGUAGE])
 }
 
 /// The spaces of a request: bounded, no duplicates.
@@ -236,13 +257,14 @@ pub fn answer(
     for e in &manifest.entries {
         // the order of the in-process rule: the current identity first; skip identities matter only
         // when it is unknown (the worker never asks otherwise)
-        if src.derivation_known(e.language, &e.hash, &identities[0])? {
-            known.push((e.hash.clone(), 0u8));
+        let (offset, ids) = language_identities(&identities, e.language);
+        if src.derivation_known(e.language, &e.hash, &ids[0])? {
+            known.push((e.hash.clone(), offset as u8));
             continue;
         }
-        for (i, id) in identities.iter().enumerate().skip(1) {
+        for (i, id) in ids.iter().enumerate().skip(1) {
             if src.derivation_known(e.language, &e.hash, id)? {
-                known.push((e.hash.clone(), i as u8));
+                known.push((e.hash.clone(), (offset + i) as u8));
             }
         }
     }
@@ -280,7 +302,6 @@ pub fn check_result(
         return bad("the result names other spaces than the request");
     }
     let allowed = identities_for(policy);
-    let current = &allowed[0];
     let known: HashSet<(&str, &CodeParserIdentity)> = sent
         .known
         .iter()
@@ -294,11 +315,12 @@ pub fn check_result(
         return bad("a reuse declaration points at no code input");
     }
     // one decision per content: equal content must get the same identity and provenance
-    let mut decided: std::collections::HashMap<&str, (&CodeParserIdentity, bool)> =
-        std::collections::HashMap::new();
+    let mut decided = std::collections::HashMap::new();
     for (n, input) in files.code_inputs.iter().enumerate() {
         let id = &input.derivation.identity;
-        if !allowed.contains(id) {
+        let (_, ids) = language_identities(&allowed, input.language);
+        let current = &ids[0];
+        if !ids.contains(id) {
             return bad("a derivation carries an identity this operation cannot produce");
         }
         let hash = input.content_hash.as_str();
@@ -314,7 +336,7 @@ pub fn check_result(
         } else if known.contains(&(hash, id)) || known.contains(&(hash, current)) {
             return bad("a fresh derivation for content announced as known");
         }
-        if let Some(prev) = decided.insert(hash, (id, reused)) {
+        if let Some(prev) = decided.insert((hash, input.language), (id, reused)) {
             if prev != (id, reused) {
                 return bad("conflicting derivations for the same content");
             }
@@ -569,18 +591,14 @@ pub fn answer_git(
     let identities = identities_for(policy);
     let mut known = Vec::new();
     for e in &manifest.entries {
-        if src.git_derivation_known(
-            e.language,
-            manifest.repository_id,
-            &e.blob_oid,
-            &identities[0],
-        )? {
-            known.push((e.blob_oid.clone(), 0u8));
+        let (offset, ids) = language_identities(&identities, e.language);
+        if src.git_derivation_known(e.language, manifest.repository_id, &e.blob_oid, &ids[0])? {
+            known.push((e.blob_oid.clone(), offset as u8));
             continue;
         }
-        for (i, id) in identities.iter().enumerate().skip(1) {
+        for (i, id) in ids.iter().enumerate().skip(1) {
             if src.git_derivation_known(e.language, manifest.repository_id, &e.blob_oid, id)? {
-                known.push((e.blob_oid.clone(), i as u8));
+                known.push((e.blob_oid.clone(), (offset + i) as u8));
             }
         }
     }
@@ -632,7 +650,6 @@ pub fn check_result_git(
         return bad("the result is for another head than the manifest named");
     }
     let allowed = identities_for(policy);
-    let current = &allowed[0];
     let known: HashSet<(&str, &CodeParserIdentity)> = sent
         .known
         .iter()
@@ -645,11 +662,12 @@ pub fn check_result_git(
     if g.reused.iter().any(|i| *i >= g.code_inputs.len()) {
         return bad("a reuse declaration points at no code input");
     }
-    let mut decided: std::collections::HashMap<&str, (&CodeParserIdentity, bool)> =
-        std::collections::HashMap::new();
+    let mut decided = std::collections::HashMap::new();
     for (n, input) in g.code_inputs.iter().enumerate() {
         let id = &input.derivation.identity;
-        if !allowed.contains(id) {
+        let (_, ids) = language_identities(&allowed, input.language);
+        let current = &ids[0];
+        if !ids.contains(id) {
             return bad("a derivation carries an identity this operation cannot produce");
         }
         if input.repository_id != Some(repository_id) {
@@ -670,7 +688,7 @@ pub fn check_result_git(
         } else if known.contains(&(blob, id)) || known.contains(&(blob, current)) {
             return bad("a fresh derivation for a blob announced as known");
         }
-        if let Some(prev) = decided.insert(blob, (id, reused)) {
+        if let Some(prev) = decided.insert((blob, input.language), (id, reused)) {
             if prev != (id, reused) {
                 return bad("conflicting derivations for the same blob");
             }

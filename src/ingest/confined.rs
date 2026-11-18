@@ -541,11 +541,8 @@ pub fn extract_directory(
     deadline: &Deadline,
 ) -> Result<ExtractedFiles> {
     let base = anchor.proc_path();
-    let mut paths: Vec<PathBuf> = outline::walk_files(&base)?
-        .into_iter()
-        .filter(|p| super::is_ingestable(p))
-        .collect();
-    paths.sort();
+    let mut unsupported_extensions = Default::default();
+    let paths = outline::ingest_paths(&base, &mut unsupported_extensions)?;
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
         deadline.check("reading files")?;
@@ -567,6 +564,7 @@ pub fn extract_directory(
         files,
         space_ids.to_vec(),
         deadline,
+        unsupported_extensions,
     )
 }
 

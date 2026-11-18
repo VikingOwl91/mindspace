@@ -574,6 +574,9 @@ fn reobserving_pre_policy_lossy_rows_retires_only_obsolete_results_atomically() 
         ("note.md", "# Intake\n\nlegacy \u{fffd}\n"),
         ("sample.rs", "pub fn marker() {} // \u{fffd}\n"),
         ("separate.rs", "pub fn separate() {} // \u{fffd}\n"),
+        // Two syntax derivations share a single immutable blob and need independent markers.
+        ("shared.js", "export function shared() {} // \u{fffd}\n"),
+        ("shared.ts", "export function shared() {} // \u{fffd}\n"),
         ("literal.md", "# Literal\n\nvalid \u{fffd}\n"),
     ];
     for (name, text) in previous {
@@ -595,7 +598,7 @@ fn reobserving_pre_policy_lossy_rows_retires_only_obsolete_results_atomically() 
         .unwrap()
     };
     let accepted = extract();
-    for (name, text) in &previous[..3] {
+    for (name, text) in &previous[..previous.len() - 1] {
         let (start, end) = text.split_once('\u{fffd}').unwrap();
         let bytes: Vec<u8> = [start.as_bytes(), &[0xff], end.as_bytes()].concat();
         std::fs::write(repo.join(name), bytes).unwrap();
@@ -624,13 +627,12 @@ fn reobserving_pre_policy_lossy_rows_retires_only_obsolete_results_atomically() 
             .find(|b| b.oid == g.blob_oid)
             .unwrap()
             .content = Some(d.content.clone());
-        if excluded.path.ends_with(".rs") {
-            let mut code = accepted
-                .code_inputs
-                .iter()
-                .find(|c| c.contexts[0].path == excluded.path)
-                .unwrap()
-                .clone();
+        if let Some(mut code) = accepted
+            .code_inputs
+            .iter()
+            .find(|c| c.contexts[0].path == excluded.path)
+            .cloned()
+        {
             code.blob_oid = Some(g.blob_oid.clone());
             code.contexts[0].commit_oid = Some(g.commit_oid.clone());
             legacy.code_inputs.push(code);
@@ -658,7 +660,15 @@ fn reobserving_pre_policy_lossy_rows_retires_only_obsolete_results_atomically() 
     assert_eq!(db.dump(), before);
     let report = persist_git(&store, current.clone(), &Deadline::none()).unwrap();
     assert_eq!(report.skipped_files, skips);
-    assert_eq!(counts(), (1, 2));
+    assert_eq!(counts(), (1, 4));
+    let markers = store.code_structure("shared.js").unwrap();
+    assert!(markers.iter().any(|d| d.effective
+        && d.language == mindspace::core::CodeLanguage::JavaScript
+        && d.skip_reason.is_some()));
+    let markers = store.code_structure("shared.ts").unwrap();
+    assert!(markers.iter().any(|d| d.effective
+        && d.language == mindspace::core::CodeLanguage::TypeScript
+        && d.skip_reason.is_some()));
     // Even an assertion that the remaining valid blob is invalid cannot retire
     // its DB-confirmed bytes, including a literal Unicode replacement character.
     let mut claimed = current;
@@ -674,5 +684,5 @@ fn reobserving_pre_policy_lossy_rows_retires_only_obsolete_results_atomically() 
         retained_previous_version: None,
     });
     persist_git(&store, claimed, &Deadline::none()).unwrap();
-    assert_eq!(counts(), (1, 2));
+    assert_eq!(counts(), (1, 4));
 }

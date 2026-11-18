@@ -16,7 +16,7 @@ pub mod stream;
 pub(crate) mod text_policy;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::core::{
     normalize_subject, sha256_hex, AssertionDraft, Error, EvidenceDraft, GitDerivedFile,
@@ -127,11 +127,17 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
     // Spaces must pre-exist; the first missing one fails the ingest.
     let space_ids = resolve_spaces_with(ctx, space_names)?;
 
+    let mut unsupported_extensions = Default::default();
     let (root, scope, candidates) = if metadata.is_dir() {
         (
             canonical.display().to_string(),
             IngestScope::Directory,
-            observe_directory(&canonical, &space_ids, deadline)?,
+            observe_directory(
+                &canonical,
+                &space_ids,
+                deadline,
+                &mut unsupported_extensions,
+            )?,
         )
     } else {
         let file = observe_file(&canonical, &space_ids)?;
@@ -142,7 +148,16 @@ pub fn extract_path_with_deadline<S: AsRef<str>>(
         )
     };
 
-    prepare_observed_files(ctx, root, scope, candidates, space_ids, deadline).map(Extracted::Files)
+    prepare_observed_files(
+        ctx,
+        root,
+        scope,
+        candidates,
+        space_ids,
+        deadline,
+        unsupported_extensions,
+    )
+    .map(Extracted::Files)
 }
 
 /// The code input of one observed file: `None` for files that are not source code.
@@ -254,7 +269,7 @@ pub fn structural_decision(
             Ok(r.unwrap_or(false))
         }
     };
-    let identity = code::identity();
+    let identity = code::identity_for(language);
     if known(&identity)? {
         return Ok((
             crate::core::CodeDerivationDraft {
@@ -277,8 +292,8 @@ pub fn structural_decision(
         if oversized && !matches!(reason, code::SkipReason::SourceBytes { .. }) {
             continue;
         }
-        if known(&code::skip_identity(reason))? {
-            return Ok((code::skip_derivation(reason), true));
+        if known(&code::skip_identity_for(language, reason))? {
+            return Ok((code::skip_derivation_for(language, reason), true));
         }
     }
     let outcome = code::parse_with_policy(language, content, policy);
@@ -299,6 +314,7 @@ pub(crate) fn prepare_observed_files(
     candidates: Vec<text_policy::FileCandidate>,
     space_ids: Vec<Uuid>,
     deadline: &Deadline,
+    unsupported_extensions: outline::ExtensionCounts,
 ) -> Result<ExtractedFiles> {
     let mut files = Vec::new();
     let mut skipped_files = Vec::new();
@@ -325,6 +341,7 @@ pub(crate) fn prepare_observed_files(
         spaces: space_ids.clone(),
     };
     Ok(ExtractedFiles {
+        unsupported_extensions,
         observation,
         code_inputs,
         reused: Default::default(),
@@ -720,6 +737,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
     }
 
     // Text paths at each tip, then blob contents in one batch.
+    let mut unsupported_extensions = Default::default();
     let mut tip_files: Vec<(String, Vec<(String, String)>)> = Vec::new();
     let mut text_blob_oids: BTreeSet<String> = BTreeSet::new();
     for commit in &tip_commits {
@@ -733,7 +751,8 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
             if !selection.matches(&path) {
                 continue;
             }
-            if !is_ingestable(Path::new(&path)) && code::language_for(Path::new(&path)).is_none() {
+            if !is_ingestable(Path::new(&path)) {
+                outline::count_unsupported(&mut unsupported_extensions, Path::new(&path));
                 continue;
             }
             text_blob_oids.insert(oid.clone());
@@ -868,6 +887,7 @@ pub(crate) fn extract_git_with_reader<S: AsRef<str>>(
             .then(|| tip_commits.iter().cloned().collect()),
     };
     Ok(ExtractedGit {
+        unsupported_extensions,
         observation,
         code_inputs,
         reused: Default::default(),
@@ -959,7 +979,7 @@ fn tip_files_to_code_inputs(
     deadline: &Deadline,
     policy: &code::ParsePolicy,
 ) -> Result<Vec<crate::core::CodeInputDraft>> {
-    let mut grouped: std::collections::BTreeMap<String, crate::core::CodeInputDraft> =
+    let mut grouped: std::collections::BTreeMap<_, crate::core::CodeInputDraft> =
         std::collections::BTreeMap::new();
     for d in derivations {
         let p = Path::new(&d.path);
@@ -967,22 +987,28 @@ fn tip_files_to_code_inputs(
             continue;
         };
         deadline.check("parsing source files")?;
-        if !grouped.contains_key(&d.blob_oid) {
-            let content = contents.get(&d.blob_oid).cloned().unwrap_or_default();
-            let content_hash = sha256_hex(content.as_bytes());
-            let derivation = structural_derivation(
-                ctx,
-                language,
-                &content,
-                &content_hash,
-                Some(repository_id),
-                Some(&d.blob_oid),
-                policy,
-                false,
-            )?;
-            grouped.insert(
-                d.blob_oid.clone(),
-                crate::core::CodeInputDraft {
+        let entry = grouped.entry((&d.blob_oid, language));
+        let entry = match entry {
+            std::collections::btree_map::Entry::Occupied(existing) => existing.into_mut(),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let content = contents
+                    .get(&d.blob_oid)
+                    .ok_or_else(|| {
+                        Error::InvalidExtraction("selected source blob has no accepted text".into())
+                    })?
+                    .clone();
+                let content_hash = sha256_hex(content.as_bytes());
+                let derivation = structural_derivation(
+                    ctx,
+                    language,
+                    &content,
+                    &content_hash,
+                    Some(repository_id),
+                    Some(&d.blob_oid),
+                    policy,
+                    false,
+                )?;
+                slot.insert(crate::core::CodeInputDraft {
                     language,
                     content_hash,
                     content,
@@ -990,15 +1016,13 @@ fn tip_files_to_code_inputs(
                     blob_oid: Some(d.blob_oid.clone()),
                     contexts: vec![],
                     derivation,
-                },
-            );
-        }
-        if let Some(entry) = grouped.get_mut(&d.blob_oid) {
-            entry.contexts.push(crate::core::CodeContextDraft {
-                path: d.path.clone(),
-                commit_oid: Some(d.commit_oid.clone()),
-            });
-        }
+                })
+            }
+        };
+        entry.contexts.push(crate::core::CodeContextDraft {
+            path: d.path.clone(),
+            commit_oid: Some(d.commit_oid.clone()),
+        });
     }
     Ok(grouped.into_values().collect())
 }
@@ -1014,12 +1038,9 @@ fn observe_directory(
     root: &Path,
     space_ids: &[Uuid],
     deadline: &Deadline,
+    unsupported_extensions: &mut outline::ExtensionCounts,
 ) -> Result<Vec<text_policy::FileCandidate>> {
-    let mut paths: Vec<PathBuf> = outline::walk_files(root)?
-        .into_iter()
-        .filter(|p| is_ingestable(p))
-        .collect();
-    paths.sort();
+    let paths = outline::ingest_paths(root, unsupported_extensions)?;
     paths
         .iter()
         .map(|p| {
@@ -1030,16 +1051,20 @@ fn observe_directory(
 }
 
 fn is_ingestable(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("md" | "markdown" | "txt" | "rs")
-    )
+    media_type_of(path).is_ok()
 }
 
 fn media_type_of(path: &Path) -> Result<&'static str> {
+    if let Some(language) = code::language_for(path) {
+        use crate::core::CodeLanguage::*;
+        return Ok(match language {
+            Rust => "text/rust",
+            Go => "text/x-go",
+            JavaScript => "text/javascript",
+            TypeScript | Tsx => "text/typescript",
+            Svelte => "text/x-svelte",
+        });
+    }
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -1048,7 +1073,6 @@ fn media_type_of(path: &Path) -> Result<&'static str> {
     {
         Some("md" | "markdown") => Ok("text/markdown"),
         Some("txt") => Ok("text/plain"),
-        Some("rs") => Ok("text/rust"),
         _ => Err(Error::UnsupportedFormat {
             path: path.display().to_string(),
         }),

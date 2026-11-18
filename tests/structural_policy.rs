@@ -232,6 +232,7 @@ fn big_source(n: usize) -> String {
 fn symbols(store: &SqliteStore, text: &str) -> Vec<String> {
     store
         .search_code(&CodeSearchQuery {
+            language: None,
             text: text.into(),
             kinds: vec![],
             repository: None,

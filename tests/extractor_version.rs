@@ -232,7 +232,7 @@ fn the_extractor_is_version_4_and_every_skip_identity_follows() {
         ids[0], id,
         "the context exchange asks about the current identity first"
     );
-    for skip in &ids[1..] {
+    for skip in ids.iter().skip(1).filter(|i| i.grammar == id.grammar) {
         assert!(skip.extractor_version.starts_with("4+skip("), "{skip:?}");
     }
 }
@@ -277,6 +277,7 @@ fn alpha_hits(db: &Db) -> usize {
     mindspace::retrieval::search_code(
         &db.store(),
         mindspace::core::CodeSearchQuery {
+            language: None,
             text: "alpha".into(),
             kinds: vec![],
             repository: None,

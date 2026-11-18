@@ -83,7 +83,7 @@ pub enum Error {
     #[error("cannot establish repository identity for {path}: {reason}")]
     RepositoryIdentity { path: String, reason: String },
 
-    #[error("unsupported file format '{path}'; supported formats: .md, .markdown, .txt")]
+    #[error("unsupported file format '{path}'; supported formats: .md, .markdown, .txt, .rs, .go, .js, .jsx, .mjs, .cjs, .ts, .mts, .cts, .tsx, .svelte")]
     UnsupportedFormat { path: String },
 
     #[error("file '{path}' is not valid UTF-8")]

@@ -918,6 +918,20 @@ pub fn search_code(
     store.search_code(&query)
 }
 
+pub fn parse_code_language(name: &str) -> Result<crate::core::CodeLanguage> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let language = match normalized.as_str() {
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "cts" | "mts" => "typescript",
+        "rs" => "rust",
+        other => other,
+    };
+    crate::core::CodeLanguage::parse(language).ok_or_else(|| {
+        let supported = crate::core::CodeLanguage::ALL.map(|l| l.as_str()).join(", ");
+        Error::QuerySyntax(format!("unsupported symbol language '{name}'; supported: {supported} (Svelte inline scripts only)"))
+    })
+}
+
 /// Parses entity kind names for symbol search. Accepts the canonical names
 /// (`function`, `type_alias`, ...) plus the usual short forms (`fn`, `type`,
 /// `const`, `mod`, `use`).
@@ -937,7 +951,7 @@ pub fn parse_code_kinds<S: AsRef<str>>(names: &[S]) -> Result<Vec<crate::core::C
             crate::core::CodeEntityKind::parse(canonical).ok_or_else(|| {
                 Error::QuerySyntax(format!(
                     "unknown code kind '{}'; expected one of: module, struct, enum, trait, \
-                     type_alias, function, method, constant, static, field, import",
+                     class, interface, type_alias, type_definition, function, method, constant, static, variable, field, import",
                     n.as_ref()
                 ))
             })

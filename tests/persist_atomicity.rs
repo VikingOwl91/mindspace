@@ -246,6 +246,7 @@ fn alpha_hits(db: &Db) -> usize {
     mindspace::retrieval::search_code(
         &db.store(),
         mindspace::core::CodeSearchQuery {
+            language: None,
             text: "alpha".into(),
             kinds: vec![],
             repository: None,

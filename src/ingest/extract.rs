@@ -75,6 +75,8 @@ impl ExtractionContext for StoreContext<'_> {
 /// A file or directory observation, ready to persist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedFiles {
+    #[serde(default)]
+    pub unsupported_extensions: super::outline::ExtensionCounts,
     pub observation: IngestObservation,
     /// Parsed code, recorded after the observation (empty: nothing to record).
     pub code_inputs: Vec<CodeInputDraft>,
@@ -88,6 +90,8 @@ pub struct ExtractedFiles {
 /// A Git repository observation, ready to persist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedGit {
+    #[serde(default)]
+    pub unsupported_extensions: super::outline::ExtensionCounts,
     pub observation: GitObservation,
     pub code_inputs: Vec<CodeInputDraft>,
     /// Indexes into `code_inputs` that a verified record stream declared as reused derivations
@@ -146,7 +150,9 @@ pub fn persist_files_gated(
     let code = has_code.then_some(CodeObservation {
         inputs: extracted.code_inputs,
     });
-    store.record_files_ingest(extracted.observation, code, before_commit)
+    let mut report = store.record_files_ingest(extracted.observation, code, before_commit)?;
+    report.code.unsupported_extensions = extracted.unsupported_extensions;
+    Ok(report)
 }
 
 pub fn persist_git(
@@ -194,7 +200,7 @@ pub fn persist_git_gated(
     // reused as if it described the new derivations (it would stay attached to the old ones and
     // the new ones would have no resolution at all).
     let resolver_version = resolver_version();
-    store.record_git_ingest(
+    let mut report = store.record_git_ingest(
         extracted.observation,
         code,
         crate::storage::GitResolutionPlan {
@@ -203,7 +209,9 @@ pub fn persist_git_gated(
             version: &resolver_version,
         },
         before_commit,
-    )
+    )?;
+    report.code.unsupported_extensions = extracted.unsupported_extensions;
+    Ok(report)
 }
 
 // ------------------------------------------------------------- validation

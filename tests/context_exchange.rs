@@ -639,7 +639,7 @@ fn the_worker_refuses_every_malformed_context() {
     );
     worker_refuses(
         |_| {},
-        |c| c["known"] = serde_json::json!([[HASH_A, 7]]),
+        |c| c["known"] = serde_json::json!([[HASH_A, mindspace::worker::context::MAX_IDENTITIES]]),
         "missing identity",
     );
     worker_refuses(

@@ -1,4 +1,4 @@
-//! Tree-sitter based, byte-only Rust structure extraction. No repository code
+//! Tree-sitter based, byte-only source structure extraction. No repository code
 //! is loaded or executed; parser types end at this module boundary.
 
 use crate::core::{
@@ -9,16 +9,43 @@ use std::path::Path;
 use tree_sitter::{Node, Parser};
 
 pub const IDENTITY: (&str, &str, &str, &str) = ("mind-code", "4", "tree-sitter-rust", "0.24.2");
+mod languages;
+
 pub fn identity() -> CodeParserIdentity {
+    identity_for(CodeLanguage::Rust)
+}
+
+pub fn identity_for(language: CodeLanguage) -> CodeParserIdentity {
+    let (version, grammar, grammar_version) = match language {
+        CodeLanguage::Rust => (IDENTITY.1, IDENTITY.2, IDENTITY.3),
+        CodeLanguage::Go => ("1", "tree-sitter-go", "0.25.0"),
+        CodeLanguage::JavaScript => ("1", "tree-sitter-javascript", "0.25.0"),
+        CodeLanguage::TypeScript => ("1", "tree-sitter-typescript", "0.23.2"),
+        CodeLanguage::Tsx => ("1", "tree-sitter-tsx", "0.23.2"),
+        CodeLanguage::Svelte => (
+            "1",
+            "tree-sitter-svelte-ng+javascript+typescript",
+            "1.0.2+0.25.0+0.23.2",
+        ),
+    };
     CodeParserIdentity {
         extractor: IDENTITY.0.into(),
-        extractor_version: IDENTITY.1.into(),
-        grammar: IDENTITY.2.into(),
-        grammar_version: IDENTITY.3.into(),
+        extractor_version: version.into(),
+        grammar: grammar.into(),
+        grammar_version: grammar_version.into(),
     }
 }
+
 pub fn language_for(path: &Path) -> Option<CodeLanguage> {
-    (path.extension()?.to_str()? == "rs").then_some(CodeLanguage::Rust)
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "rs" => Some(CodeLanguage::Rust),
+        "go" => Some(CodeLanguage::Go),
+        "js" | "jsx" | "mjs" | "cjs" => Some(CodeLanguage::JavaScript),
+        "ts" | "mts" | "cts" => Some(CodeLanguage::TypeScript),
+        "tsx" => Some(CodeLanguage::Tsx),
+        "svelte" => Some(CodeLanguage::Svelte),
+        _ => None,
+    }
 }
 /// Revision of the structural-parse policy. It is part of every skip identity, so a change in
 /// what the budgets count is a new revision and re-evaluates skipped files.
@@ -98,8 +125,13 @@ impl SkipReason {
 /// the extractor version, e.g. `4+skip(p1:source_bytes>2097152)`. Deterministic, and different
 /// from the identity of a real derivation (`identity()`).
 pub fn skip_identity(reason: SkipReason) -> CodeParserIdentity {
-    let mut id = identity();
-    id.extractor_version = format!("{}+skip({POLICY_REVISION}:{})", IDENTITY.1, reason.label());
+    skip_identity_for(CodeLanguage::Rust, reason)
+}
+
+pub fn skip_identity_for(language: CodeLanguage, reason: SkipReason) -> CodeParserIdentity {
+    let mut id = identity_for(language);
+    id.extractor_version
+        .push_str(&format!("+skip({POLICY_REVISION}:{})", reason.label()));
     id
 }
 
@@ -113,8 +145,12 @@ pub fn skip_reason_of(identity: &CodeParserIdentity) -> Option<String> {
 
 /// A skip row: status `failed` (an existing status older binaries decode), no entities.
 pub fn skip_derivation(reason: SkipReason) -> CodeDerivationDraft {
+    skip_derivation_for(CodeLanguage::Rust, reason)
+}
+
+pub fn skip_derivation_for(language: CodeLanguage, reason: SkipReason) -> CodeDerivationDraft {
     CodeDerivationDraft {
-        identity: skip_identity(reason),
+        identity: skip_identity_for(language, reason),
         status: CodeParseStatus::Failed,
         error_count: 0,
         entities: vec![],
@@ -151,7 +187,7 @@ pub fn parse_with_policy(
 ) -> ParseOutcome {
     let failed = |transient: Option<String>| ParseOutcome {
         derivation: CodeDerivationDraft {
-            identity: identity(),
+            identity: identity_for(language),
             status: CodeParseStatus::Failed,
             error_count: 1,
             entities: vec![],
@@ -163,14 +199,11 @@ pub fn parse_with_policy(
         transient,
     };
     let skipped = |reason: SkipReason, accounted: u64| ParseOutcome {
-        derivation: skip_derivation(reason),
+        derivation: skip_derivation_for(language, reason),
         skipped: Some(reason),
         accounted_bytes: accounted,
         transient: None,
     };
-    if language != CodeLanguage::Rust {
-        return failed(None);
-    }
     if source.len() as u64 > policy.max_source_bytes {
         return skipped(
             SkipReason::SourceBytes {
@@ -179,18 +212,12 @@ pub fn parse_with_policy(
             0,
         );
     }
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .is_err()
-    {
-        return failed(Some("the Rust grammar could not be loaded".into()));
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return failed(Some("the parser returned no tree".into()));
+    let tree = match languages::tree(language, source, None) {
+        Ok(tree) => tree,
+        Err(message) => return failed(Some(message)),
     };
     let mut out = CodeDerivationDraft {
-        identity: identity(),
+        identity: identity_for(language),
         status: if tree.root_node().has_error() {
             CodeParseStatus::Recovered
         } else {
@@ -206,7 +233,15 @@ pub fn parse_with_policy(
         limit: policy.max_output_bytes,
         max_depth: policy.max_entity_depth,
     };
-    match walk(tree.root_node(), source, &mut out, &mut budget) {
+    let result = if language == CodeLanguage::Svelte {
+        match languages::svelte_scripts(tree.root_node(), source, &mut out, &mut budget) {
+            Ok(result) => result,
+            Err(message) => return failed(Some(message)),
+        }
+    } else {
+        walk(tree.root_node(), source, &mut out, &mut budget, language)
+    };
+    match result {
         Ok(()) => ParseOutcome {
             derivation: out,
             skipped: None,
@@ -268,6 +303,9 @@ fn digits(mut n: usize) -> u64 {
 /// Number of `ERROR` and missing nodes in the tree. Iterative: a tree can be as
 /// deep as the input is long, so recursion would be bounded by the thread's stack.
 fn count_errors(root: Node) -> u32 {
+    if !root.has_error() {
+        return 0;
+    }
     let mut count = 0u32;
     let mut cursor = root.walk();
     loop {
@@ -566,14 +604,22 @@ fn walk(
     s: &str,
     out: &mut CodeDerivationDraft,
     b: &mut Budget,
+    language: CodeLanguage,
 ) -> Result<(), SkipReason> {
+    let mut inspect = |node: Node, context: &Ctx| {
+        if language == CodeLanguage::Rust {
+            visit(node, s, context, out, b)
+        } else {
+            languages::visit(language, node, s, context, out, b)
+        }
+    };
     let mut cursor = root.walk();
     // stack[d] is the context the children of the node at depth d inherit
-    let mut stack: Vec<Ctx> = vec![visit(root, s, &Ctx::none(), out, b)?];
+    let mut stack: Vec<Ctx> = vec![inspect(root, &Ctx::none())?];
     loop {
         if cursor.goto_first_child() {
             let inherited = stack.last().cloned().unwrap_or_else(Ctx::none);
-            let next = visit(cursor.node(), s, &inherited, out, b)?;
+            let next = inspect(cursor.node(), &inherited)?;
             stack.push(next);
             continue;
         }
@@ -581,7 +627,7 @@ fn walk(
             stack.pop();
             if cursor.goto_next_sibling() {
                 let inherited = stack.last().cloned().unwrap_or_else(Ctx::none);
-                let next = visit(cursor.node(), s, &inherited, out, b)?;
+                let next = inspect(cursor.node(), &inherited)?;
                 stack.push(next);
                 break;
             }

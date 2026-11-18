@@ -193,6 +193,12 @@ fn outline_then_scoped_ingest_then_search() {
     let (_g, db) = db();
     let proj = project();
     let root = proj.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("src/widget.svelte"),
+        "<p>UI</p>\n<script lang='ts'>function Panel() {}</script>",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/other.py"), "def omitted(): pass").unwrap();
     let mut s = Server::start(&db, &[&root]);
     let p = root.display().to_string();
 
@@ -204,12 +210,32 @@ fn outline_then_scoped_ingest_then_search() {
     let dirs: Vec<&str> = nodes.iter().map(|n| n["path"].as_str().unwrap()).collect();
     assert!(dirs.contains(&"docs") && dirs.contains(&"src") && dirs.contains(&"other"));
 
+    assert_eq!(nodes[0]["unsupported_extensions"]["py"], 1);
+    std::fs::create_dir(root.join("unsupported")).unwrap();
+    std::fs::write(root.join("unsupported/only.rb"), "def only; end").unwrap();
+    let only = s.call(
+        "repo_ingest",
+        json!({"path":p,"spaces":["p"],"paths":["unsupported"]}),
+    );
+    assert_eq!(only["isError"], false, "{}", text(&only));
+    assert_eq!(
+        only["structuredContent"]["ingested"][0]["code"]["unsupported_extensions"],
+        json!({"rb":1})
+    );
+
     // Ingest only docs and src (what the outline pointed at).
     let r = s.call(
         "repo_ingest",
         json!({"path": p, "spaces": ["p"], "paths": ["docs", "src"]}),
     );
     assert_eq!(r["isError"], false, "{}", text(&r));
+    let observed: Vec<_> = r["structuredContent"]["ingested"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["code"]["unsupported_extensions"]["py"].as_u64())
+        .collect();
+    assert_eq!(observed, [1]);
     let found = s.call("memory_search", json!({"query": "guidemarker"}));
     assert_eq!(
         found["structuredContent"]["hits"].as_array().unwrap().len(),
@@ -228,6 +254,13 @@ fn outline_then_scoped_ingest_then_search() {
         code["structuredContent"]["hits"].as_array().unwrap().len(),
         1
     );
+    let component = s.call(
+        "code_search",
+        json!({"query": "Panel", "language": "svelte"}),
+    );
+    let found = &component["structuredContent"]["hits"][0];
+    assert_eq!(found["name"], "Panel");
+    assert_eq!(found["start_line"], 2);
     // The ingest attached the directory to space `p`; code_search can scope by it.
     let scoped = s.call(
         "code_search",

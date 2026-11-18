@@ -1187,3 +1187,121 @@ fn write_timeout_with_refused_rollback_discards_the_handle_without_attempting_co
     );
     reopened.create_space("after-reopen", "").unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn denied_lease_and_failed_rollback_report_the_rollback_and_preserve_channel_disposition() {
+    use crate::core::RefusalKind;
+    use crate::worker::broker::{FromBroker, ToBroker};
+    use crate::worker::client::{link_idle, persist_with_lease, PersistFailure};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    for mismatched_reply in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let before = store
+            .temporal_history_capabilities()
+            .unwrap()
+            .current_revision;
+        let op = Uuid::now_v7();
+        let (link, mut peer) = UnixStream::pair().unwrap();
+        let response = FromBroker::CommitDenied {
+            op: if mismatched_reply { Uuid::now_v7() } else { op },
+            kind: RefusalKind::Revoked,
+            reason: "fixture authorization ended".into(),
+        };
+        serde_json::to_writer(&mut peer, &response).unwrap();
+        peer.write_all(b"\n").unwrap();
+        {
+            let mut guard = store.connection().unwrap();
+            let c = guard.guard.as_mut().unwrap();
+            c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
+            let tx = begin_write(c, &store.revision_state).unwrap();
+            let result = persist_with_lease(
+                &link,
+                op,
+                |authorize| {
+                    tx.finish_ingest(&Deadline::none().for_root(2), authorize, |_, _| Ok(()))
+                },
+                #[cfg(feature = "spawn-gate")]
+                || {},
+                #[cfg(feature = "spawn-gate")]
+                false,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(PersistFailure::Store(Error::IngestRollbackUnconfirmed {
+                        prior_roots: 2,
+                        ..
+                    }))
+                ),
+                "{result:?}"
+            );
+        }
+        assert_eq!(link_idle(&link), !mismatched_reply);
+        peer.set_nonblocking(true).unwrap();
+        let mut messages = BufReader::new(peer).lines();
+        let request = messages.next().unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<ToBroker>(&request).unwrap(),
+            ToBroker::CommitRequest { op }
+        );
+        if mismatched_reply {
+            let release = messages.next().unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<ToBroker>(&release).unwrap(),
+                ToBroker::CommitDone
+            );
+            assert!(messages.next().is_none());
+        } else {
+            assert_eq!(
+                messages.next().unwrap().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        assert!(matches!(
+            store.create_space("discarded", ""),
+            Err(Error::ConnectionDiscarded)
+        ));
+        drop(store);
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .temporal_history_capabilities()
+                .unwrap()
+                .current_revision,
+            before
+        );
+    }
+}
+
+#[test]
+fn failed_revision_allocation_confirms_rollback_before_returning_the_cause() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let mut guard = store.connection().unwrap();
+    let c = guard.guard.as_mut().unwrap();
+    c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Insert {
+            table_name: "m6_revisions",
+        }
+        | AuthAction::Transaction {
+            operation: TransactionOperation::Rollback,
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }))
+    .unwrap();
+    let result = begin_write_for_root(c, &store.revision_state, 3);
+    assert!(matches!(
+        result,
+        Err(Error::IngestRollbackUnconfirmed { prior_roots: 3, .. })
+    ));
+}

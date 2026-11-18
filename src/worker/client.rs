@@ -1214,7 +1214,7 @@ pub enum PersistFailure {
         discard_link: bool,
     },
     /// The storage layer failed. `CommitOutcomeUnknown` is the only case in which data may have
-    /// been committed; every other error is a rollback.
+    /// been committed. IngestRollbackUnconfirmed reports a failed pre-COMMIT rollback.
     Store(crate::core::Error),
 }
 
@@ -1312,6 +1312,20 @@ pub(crate) fn persist_with_lease<T>(
     }
     match result {
         Ok(report) => Ok(report),
+        Err(e @ crate::core::Error::IngestRollbackUnconfirmed { .. }) => {
+            // Preserve both facts: the caller must report the unconfirmed rollback,
+            // and a late or mismatched decision makes this connection unusable.
+            if matches!(
+                denial.into_inner(),
+                Some(PersistFailure::Denied {
+                    discard_link: true,
+                    ..
+                })
+            ) {
+                let _ = link.shutdown(std::net::Shutdown::Both);
+            }
+            Err(PersistFailure::Store(e))
+        }
         Err(e) => match denial.into_inner() {
             Some(failure) => Err(failure),
             None => Err(PersistFailure::Store(e)),

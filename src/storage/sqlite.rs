@@ -174,10 +174,10 @@ impl<'conn> DerefMut for WriteTransaction<'conn> {
 
 impl WriteTransaction<'_> {
     /// The deadline is cooperative. SQLite never receives an interrupt during
-    /// a statement, rollback or COMMIT. Only a confirmed rollback returns the
-    /// ordinary write-timeout message and leaves the connection reusable.
+    /// a statement, rollback or COMMIT. Confirm rollback before returning any
+    /// pre-COMMIT write or authorization failure to a caller.
     fn finish_ingest<T>(
-        mut self,
+        self,
         deadline: &Deadline,
         before_commit: &dyn Fn() -> Result<()>,
         write: impl FnOnce(&Connection, &Deadline) -> Result<T>,
@@ -194,22 +194,28 @@ impl WriteTransaction<'_> {
                 self.commit()?;
                 Ok(report)
             }
-            Err(error @ Error::IngestTimeout { .. }) => {
-                let tx = self.tx.take().expect("ingest still owns its transaction");
-                let rollback = tx.rollback();
-                if rollback.is_ok() && self.conn.is_autocommit() {
-                    return Err(error);
-                }
-                self.revision_state.poisoned.store(true, Ordering::SeqCst);
-                Err(Error::IngestRollbackUnconfirmed {
-                    detail: rollback.err().map_or_else(
-                        || "SQLite still has an active transaction".into(),
-                        |e| e.to_string(),
-                    ),
-                    prior_roots: deadline.prior_roots(),
-                })
-            }
-            Err(error) => Err(error),
+            Err(error) => Err(self.rollback_error(error, deadline.prior_roots())),
+        }
+    }
+
+    /// No COMMIT was attempted. SQLite may already have rolled back the entire
+    /// transaction during a failed statement. Otherwise explicitly roll it back.
+    fn rollback_error(mut self, error: Error, prior_roots: usize) -> Error {
+        let tx = self.tx.take().expect("transaction is still owned");
+        if self.conn.is_autocommit() {
+            return error;
+        }
+        let rollback = tx.rollback();
+        if rollback.is_ok() && self.conn.is_autocommit() {
+            return error;
+        }
+        self.revision_state.poisoned.store(true, Ordering::SeqCst);
+        Error::IngestRollbackUnconfirmed {
+            detail: rollback.err().map_or_else(
+                || "SQLite still has an active transaction".into(),
+                |e| e.to_string(),
+            ),
+            prior_roots,
         }
     }
 
@@ -843,6 +849,14 @@ fn begin_write<'conn>(
     conn: &'conn Connection,
     state: &Arc<RevisionState>,
 ) -> Result<WriteTransaction<'conn>> {
+    begin_write_for_root(conn, state, 0)
+}
+
+fn begin_write_for_root<'conn>(
+    conn: &'conn Connection,
+    state: &Arc<RevisionState>,
+    prior_roots: usize,
+) -> Result<WriteTransaction<'conn>> {
     if state.poisoned.load(Ordering::SeqCst) {
         return Err(Error::ConnectionDiscarded);
     }
@@ -853,6 +867,18 @@ fn begin_write<'conn>(
     }
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(dberr)?;
+    let tx = WriteTransaction {
+        tx: Some(tx),
+        conn,
+        revision_state: Arc::clone(state),
+    };
+    match allocate_revision(&tx, state) {
+        Ok(()) => Ok(tx),
+        Err(error) => Err(tx.rollback_error(error, prior_roots)),
+    }
+}
+
+fn allocate_revision(tx: &Connection, state: &RevisionState) -> Result<()> {
     let last_revision: Option<i64> = tx
         .query_row("SELECT MAX(revision_id) FROM m6_revisions", [], |row| {
             row.get(0)
@@ -862,36 +888,18 @@ fn begin_write<'conn>(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| Error::Storage("recording revision space exhausted".to_string()))?;
-    if state
+    state
         .active_revision
         .compare_exchange(0, revision_id, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        rollback_unowned_transaction(tx, conn, state);
-        return Err(Error::Storage(
-            "connection already has an active recording revision".to_string(),
-        ));
-    }
-    if let Err(error) = tx.execute(
+        .map_err(|_| {
+            Error::Storage("connection already has an active recording revision".into())
+        })?;
+    tx.execute(
         "INSERT INTO m6_revisions (revision_id, recorded_at, kind) VALUES (?1, ?2, 'write')",
         rusqlite::params![revision_id, Ts::now().0],
-    ) {
-        state.active_revision.store(0, Ordering::SeqCst);
-        rollback_unowned_transaction(tx, conn, state);
-        return Err(dberr(error));
-    }
-    Ok(WriteTransaction {
-        tx: Some(tx),
-        conn,
-        revision_state: Arc::clone(state),
-    })
-}
-
-fn rollback_unowned_transaction(tx: Transaction<'_>, conn: &Connection, state: &RevisionState) {
-    state.active_revision.store(0, Ordering::SeqCst);
-    if tx.rollback().is_err() || !conn.is_autocommit() {
-        state.poisoned.store(true, Ordering::SeqCst);
-    }
+    )
+    .map_err(dberr)?;
+    Ok(())
 }
 
 /// Shared filter clause for lexical and vector search: temporal `at`,
@@ -2400,7 +2408,7 @@ impl Store for SqliteStore {
         // them before they are committed. Any error (or a crash before the COMMIT) leaves nothing.
         let repository_id = observation.repository_id;
         let conn = self.connection()?;
-        let tx = begin_write(&conn, &self.revision_state)?;
+        let tx = begin_write_for_root(&conn, &self.revision_state, deadline.prior_roots())?;
         tx.finish_ingest(deadline, before_commit, |tx, deadline| {
             let mut report = record_git_observation_tx(tx, &observation, deadline)?;
             if let Some(code) = code {
@@ -2474,7 +2482,7 @@ impl Store for SqliteStore {
         // and its derivations commit together, or (on any error, or a crash before the commit)
         // neither does. The two `record_*` methods above remain for callers that want one part.
         let conn = self.connection()?;
-        let tx = begin_write(&conn, &self.revision_state)?;
+        let tx = begin_write_for_root(&conn, &self.revision_state, deadline.prior_roots())?;
         tx.finish_ingest(deadline, before_commit, |tx, deadline| {
             let mut report = record_observation_tx(tx, observation, deadline)?;
             if let Some(code) = code {
